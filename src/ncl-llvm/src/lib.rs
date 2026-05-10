@@ -26,7 +26,8 @@ use inkwell::values::{FunctionValue, IntValue};
 
 use ncl_ir::Expr;
 use ncl_runtime::{
-    ncl_alloc_cons, ncl_apply, ncl_build_rest_list, ncl_call, ncl_equal, ncl_funcall,
+    ncl_alloc_cons, ncl_apply, ncl_aref_generic, ncl_aset_generic,
+    ncl_build_rest_list, ncl_call, ncl_equal, ncl_funcall,
     ncl_length, ncl_load_function, ncl_load_value, ncl_lookup_keyword,
     ncl_make_closure, ncl_set_car,
     ncl_set_cdr, ncl_set_mv_many, ncl_set_mv_single, ncl_store_value,
@@ -221,6 +222,8 @@ struct Helpers<'ctx> {
     lookup_keyword: FunctionValue<'ctx>,
     set_mv_single: FunctionValue<'ctx>,
     set_mv_many: FunctionValue<'ctx>,
+    aref_generic: FunctionValue<'ctx>,
+    aset_generic: FunctionValue<'ctx>,
 }
 
 fn declare_runtime_helpers<'ctx>(
@@ -395,6 +398,26 @@ fn declare_runtime_helpers<'ctx>(
         Some(Linkage::External),
     );
 
+    // ncl_aref_generic(v, i) -> u64
+    let aref_generic_type =
+        i64_t.fn_type(&[i64_t.into(), i64_t.into()], false);
+    let aref_generic = module.add_function(
+        "ncl_aref_generic",
+        aref_generic_type,
+        Some(Linkage::External),
+    );
+
+    // ncl_aset_generic(mutator, v, i, val) -> u64
+    let aset_generic_type = i64_t.fn_type(
+        &[ptr_t.into(), i64_t.into(), i64_t.into(), i64_t.into()],
+        false,
+    );
+    let aset_generic = module.add_function(
+        "ncl_aset_generic",
+        aset_generic_type,
+        Some(Linkage::External),
+    );
+
     Helpers {
         alloc_cons,
         call_fn,
@@ -415,6 +438,8 @@ fn declare_runtime_helpers<'ctx>(
         lookup_keyword,
         set_mv_single,
         set_mv_many,
+        aref_generic,
+        aset_generic,
     }
 }
 
@@ -438,6 +463,8 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(&helpers.lookup_keyword, ncl_lookup_keyword as *const () as usize);
     engine.add_global_mapping(&helpers.set_mv_single, ncl_set_mv_single as *const () as usize);
     engine.add_global_mapping(&helpers.set_mv_many, ncl_set_mv_many as *const () as usize);
+    engine.add_global_mapping(&helpers.aref_generic, ncl_aref_generic as *const () as usize);
+    engine.add_global_mapping(&helpers.aset_generic, ncl_aset_generic as *const () as usize);
 }
 
 /// Convert an i1 comparison result to a tagged Word (T or NIL).
@@ -1219,6 +1246,34 @@ fn emit_expr<'ctx>(
                     "str_set",
                 )
                 .map_err(|e| format!("build_call string_set: {e}"))?;
+            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+        }
+        Expr::Aref(v, i) => {
+            // ncl_aref_generic(v_word, i_word) — both tagged.
+            let vv = emit_expr(context, builder, function, helpers, arity, locals, v)?;
+            let vi = emit_expr(context, builder, function, helpers, arity, locals, i)?;
+            let call = builder
+                .build_call(
+                    helpers.aref_generic,
+                    &[vv.into(), vi.into()],
+                    "aref",
+                )
+                .map_err(|e| format!("build_call aref_generic: {e}"))?;
+            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+        }
+        Expr::SetAref { v, idx, val } => {
+            // ncl_aset_generic(mutator, v_word, i_word, val_word).
+            let mutator_arg = function.get_nth_param(0).unwrap();
+            let vv = emit_expr(context, builder, function, helpers, arity, locals, v)?;
+            let vi = emit_expr(context, builder, function, helpers, arity, locals, idx)?;
+            let vval = emit_expr(context, builder, function, helpers, arity, locals, val)?;
+            let call = builder
+                .build_call(
+                    helpers.aset_generic,
+                    &[mutator_arg.into(), vv.into(), vi.into(), vval.into()],
+                    "aset",
+                )
+                .map_err(|e| format!("build_call aset_generic: {e}"))?;
             Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
         }
         Expr::StoreGlobal { sym_word, value } => {

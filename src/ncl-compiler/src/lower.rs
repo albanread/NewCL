@@ -565,10 +565,14 @@ fn lower_call_in_mut(
         "LENGTH" => unary_op(&head_name, args, env, coord, Expr::length),
         "EQUAL" => binary_op(&head_name, args, env, coord, Expr::equal),
         "STRING=" => binary_op(&head_name, args, env, coord, Expr::string_eq),
-        // (char s i) and (aref s i) for strings — until we have
-        // generic vectors, both forms route here.
-        "CHAR" | "STRING-CHAR" | "AREF" => {
+        // (char s i) / (string-char s i) — string-specialized read.
+        "CHAR" | "STRING-CHAR" => {
             binary_op(&head_name, args, env, coord, Expr::string_char)
+        }
+        // (aref v i) / (svref v i) — polymorphic read; runtime
+        // tag-dispatches between strings and vectors.
+        "AREF" | "SVREF" => {
+            binary_op(&head_name, args, env, coord, Expr::aref)
         }
         "LET" => lower_let(args, env, coord),
         // `(values v1 v2 ... vN)` — write all into the multi-value
@@ -1070,14 +1074,29 @@ fn lower_setf(
             let value = lower_in_mut(value_form, env, coord)?;
             Ok(Expr::set_cdr(cons, value))
         }
-        "AREF" | "CHAR" | "STRING-CHAR" => {
+        "AREF" | "SVREF" => {
             if place_args.len() != 2 {
                 return Err(CompileError::BadArity {
                     head: format!("setf {place_head}"),
-                    expected: "(aref s i)",
+                    expected: "(aref v i)",
                     got: place_args.len(),
                 });
             }
+            // Polymorphic — runtime tag dispatches to vector or string.
+            let v = lower_in_mut(&place_args[0], env, coord)?;
+            let idx = lower_in_mut(&place_args[1], env, coord)?;
+            let val = lower_in_mut(value_form, env, coord)?;
+            Ok(Expr::set_aref(v, idx, val))
+        }
+        "CHAR" | "STRING-CHAR" => {
+            if place_args.len() != 2 {
+                return Err(CompileError::BadArity {
+                    head: format!("setf {place_head}"),
+                    expected: "(char s i)",
+                    got: place_args.len(),
+                });
+            }
+            // String-specialized.
             let s = lower_in_mut(&place_args[0], env, coord)?;
             let idx = lower_in_mut(&place_args[1], env, coord)?;
             let ch = lower_in_mut(value_form, env, coord)?;

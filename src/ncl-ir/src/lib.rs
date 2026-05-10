@@ -157,9 +157,16 @@ pub enum Expr {
     /// `(string= a b)` — both operands must be strings. Returns T
     /// or NIL.
     StringEq(Box<Expr>, Box<Expr>),
-    /// `(string-char s i)` or `(aref s i)` for strings — read the
-    /// i-th codepoint as a character.
+    /// `(string-char s i)` or `(char s i)` for strings — read the
+    /// i-th codepoint as a character. Emitted by lowering of CHAR
+    /// and STRING-CHAR; the polymorphic `(aref ...)` form goes
+    /// through `Aref` instead.
     StringChar(Box<Expr>, Box<Expr>),
+    /// Polymorphic `(aref v i)` — works on strings (returns a
+    /// character) and vectors (returns the element). Lowers to a
+    /// call to `ncl_aref_generic` which dispatches on the tag of
+    /// `v`. Out-of-bounds and non-sequence cases panic.
+    Aref(Box<Expr>, Box<Expr>),
     /// Mutate the car of a cons cell. The lowered form of
     /// `(setf (car x) v)`. Evaluates to the new value.
     SetCar(Box<Expr>, Box<Expr>),
@@ -167,12 +174,20 @@ pub enum Expr {
     /// `(setf (cdr x) v)`.
     SetCdr(Box<Expr>, Box<Expr>),
     /// Mutate the i-th codepoint of a string. The lowered form of
-    /// `(setf (aref s i) c)` or `(setf (char s i) c)`. Evaluates to
-    /// the new character.
+    /// `(setf (char s i) c)`. Evaluates to the new character.
     SetChar {
         s: Box<Expr>,
         idx: Box<Expr>,
         ch: Box<Expr>,
+    },
+    /// Polymorphic `(setf (aref v i) val)` — dispatches on `v`'s
+    /// tag at runtime. For vectors, writes the cell with card
+    /// marking; for strings, mutates the codepoint. Evaluates to
+    /// `val`.
+    SetAref {
+        v: Box<Expr>,
+        idx: Box<Expr>,
+        val: Box<Expr>,
     },
     /// Lambda expression. JIT-compiles `body` as a separate function
     /// with the lambda's signature; at the construction site,
@@ -242,6 +257,12 @@ impl Expr {
     }
     pub fn string_char(s: Expr, i: Expr) -> Expr {
         Expr::StringChar(Box::new(s), Box::new(i))
+    }
+    pub fn aref(v: Expr, i: Expr) -> Expr {
+        Expr::Aref(Box::new(v), Box::new(i))
+    }
+    pub fn set_aref(v: Expr, idx: Expr, val: Expr) -> Expr {
+        Expr::SetAref { v: Box::new(v), idx: Box::new(idx), val: Box::new(val) }
     }
     pub fn set_car(cons: Expr, value: Expr) -> Expr {
         Expr::SetCar(Box::new(cons), Box::new(value))

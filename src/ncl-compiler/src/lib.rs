@@ -290,6 +290,13 @@ fn install_native_functions(
                    ncl_runtime::multiple_value_list_of_shim, 1);
     install_native(coord, mutator, "%MV-CLEAR",
                    ncl_runtime::mv_clear_shim, 0);
+    // Vectors. AREF and SVREF are special forms (lowered directly
+    // to Expr::Aref); MAKE-ARRAY and VECTOR go through Lisp-callable
+    // shims.
+    install_native(coord, mutator, "MAKE-ARRAY",
+                   ncl_runtime::make_array_shim, 1);
+    install_native(coord, mutator, "VECTOR",
+                   ncl_runtime::vector_shim, 0);
 
     install_native(coord, mutator, "STRING-SPLIT-NEWLINES",
                    string_split_newlines_shim, 1);

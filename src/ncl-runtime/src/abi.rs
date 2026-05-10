@@ -98,6 +98,7 @@ pub extern "C" fn ncl_length(w: u64) -> u64 {
     }
     match word.tag() {
         Tag::String => Word::fixnum(crate::gc_string::char_count(word) as i64).raw(),
+        Tag::Vector => Word::fixnum(vector_payload_len(word) as i64).raw(),
         Tag::Cons => {
             // Walk the cons spine.
             let mut cur = word;
@@ -114,6 +115,37 @@ pub extern "C" fn ncl_length(w: u64) -> u64 {
         }
         _ => panic!("length: not a sequence: {word:?}"),
     }
+}
+
+/// Read a Vector-tagged Word's element count from its header.
+/// SAFETY: `v` must be a valid Vector-tagged Word.
+fn vector_payload_len(v: Word) -> u32 {
+    let p = v.as_ptr::<u64>(Tag::Vector).expect("vector_payload_len: not a vector");
+    let header = crate::heap::HeapHeader::from_raw(unsafe { *p });
+    header.length_cells()
+}
+
+/// Read element `i` of a vector. SAFETY: `v` must be a valid
+/// Vector-tagged Word and `i` must be in bounds.
+fn vector_cell(v: Word, i: u32) -> u64 {
+    let p = v.as_ptr::<u64>(Tag::Vector).expect("vector_cell: not a vector");
+    unsafe { *p.add(1 + i as usize) }
+}
+
+/// Write element `i` of a vector and card-mark via the mutator
+/// for the next GC's old-to-young scan. SAFETY: as `vector_cell`,
+/// plus `mutator` must be the live MutatorState for this thread.
+fn set_vector_cell(
+    mutator: *mut crate::mutator::MutatorState,
+    v: Word,
+    i: u32,
+    val: u64,
+) {
+    let p = v.as_mut_ptr::<u64>(Tag::Vector).expect("set_vector_cell: not a vector");
+    let slot = unsafe { p.add(1 + i as usize) };
+    unsafe { *slot = val };
+    let m = unsafe { &mut *mutator };
+    m.mark_card(slot as *const u8);
 }
 
 /// Structural equality. Recurses through cons cells, treats
@@ -1218,6 +1250,161 @@ pub extern "C-unwind" fn multiple_value_list_of_shim(
         acc = m.alloc_cons(Word::from_raw(v), acc);
     }
     acc.raw()
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Vectors — make-array, vector, aref, svref, (setf aref).
+//
+// CL's `make-array` is heavily overloaded (multidimensional, fill
+// pointers, displaced arrays, element-type, adjustable). We support
+// the simple-vector subset here — that's what Closette and the GUI
+// demos need. If a richer surface is required later, `make-array`'s
+// shim can grow keyword args without touching the underlying
+// vector heap object.
+// ───────────────────────────────────────────────────────────────────
+
+/// `(make-array dim &key initial-element initial-contents)`.
+/// `dim` is a fixnum length (multidimensional shapes deferred —
+/// reject lists for now). `initial-element` fills every cell;
+/// without it, cells are NIL. `initial-contents` (a list) copies
+/// list elements into positions; if shorter than `dim`, trailing
+/// positions stay NIL (or the initial-element).
+pub extern "C-unwind" fn make_array_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args == 0 {
+        panic!("make-array: expected at least 1 arg (dimension)");
+    }
+    let dim_w = Word::from_raw(unsafe { *args });
+    let n = match dim_w.as_fixnum() {
+        Some(n) if n >= 0 => n as u32,
+        _ => panic!(
+            "make-array: dimension must be a non-negative fixnum, got {dim_w:?}"
+        ),
+    };
+    // Scan keyword args. Only :initial-element and :initial-contents
+    // recognised. Unknown keywords are silently ignored, matching
+    // the ergonomic-but-permissive style of the existing shims.
+    let mut init_element: Word = Word::NIL;
+    let mut init_contents: Option<Word> = None;
+    let mut i = 1u64;
+    while i + 1 < n_args {
+        let key = Word::from_raw(unsafe { *args.add(i as usize) });
+        let val = Word::from_raw(unsafe { *args.add((i + 1) as usize) });
+        if let Some(name) = crate::sym_names::lookup(key.raw()) {
+            match name.as_ref() {
+                ":INITIAL-ELEMENT" => init_element = val,
+                ":INITIAL-CONTENTS" => init_contents = Some(val),
+                _ => {}
+            }
+        }
+        i += 2;
+    }
+    let m = unsafe { &mut *mutator };
+    let v = m.alloc_vector(n);
+    // Initialise. alloc_vector zero-fills (zero == fixnum 0 != NIL),
+    // so we always do an explicit init here.
+    for idx in 0..n {
+        set_vector_cell(mutator, v, idx, init_element.raw());
+    }
+    if let Some(list) = init_contents {
+        let mut cur = list;
+        let mut idx = 0u32;
+        while !cur.is_nil() && idx < n {
+            if cur.tag() != Tag::Cons {
+                panic!("make-array :initial-contents must be a proper list");
+            }
+            let p = cur.as_ptr::<u64>(Tag::Cons).unwrap();
+            let elem = unsafe { *p };
+            set_vector_cell(mutator, v, idx, elem);
+            cur = Word::from_raw(unsafe { *p.add(1) });
+            idx += 1;
+        }
+    }
+    v.raw()
+}
+
+/// `(vector e1 e2 ... eN)` — construct a fresh vector containing
+/// the given elements in order. Same length as the call's arg
+/// count.
+pub extern "C-unwind" fn vector_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    let m = unsafe { &mut *mutator };
+    let v = m.alloc_vector(n_args as u32);
+    for i in 0..n_args {
+        let elem = unsafe { *args.add(i as usize) };
+        set_vector_cell(mutator, v, i as u32, elem);
+    }
+    v.raw()
+}
+
+/// `(svref v i)` and `(aref v i)` for vectors. JIT-callable from
+/// the polymorphic AREF lowering. Bounds-checked; out-of-range
+/// indices panic.
+///
+/// SAFETY: arguments come from JIT'd code; both must be valid
+/// Words. `v` must be Vector- or String-tagged for the dispatch
+/// to make sense.
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_aref_generic(v: u64, i: u64) -> u64 {
+    let vw = Word::from_raw(v);
+    let iw = Word::from_raw(i);
+    let idx = match iw.as_fixnum() {
+        Some(n) if n >= 0 => n as usize,
+        _ => panic!("aref: index must be a non-negative fixnum, got {iw:?}"),
+    };
+    match vw.tag() {
+        Tag::Vector => {
+            let n = vector_payload_len(vw) as usize;
+            if idx >= n {
+                panic!("aref: index {idx} out of bounds for vector of length {n}");
+            }
+            vector_cell(vw, idx as u32)
+        }
+        // ncl_string_char takes a raw (untagged) index.
+        Tag::String => crate::abi::ncl_string_char(v, idx as u64),
+        _ => panic!("aref: not a sequence: {vw:?}"),
+    }
+}
+
+/// `(setf (aref v i) val)` for vectors and strings. Polymorphic
+/// dispatch. Returns `val`. Card-marks for vectors (strings have
+/// their own GC story).
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_aset_generic(
+    mutator: *mut crate::mutator::MutatorState,
+    v: u64,
+    i: u64,
+    val: u64,
+) -> u64 {
+    let vw = Word::from_raw(v);
+    let iw = Word::from_raw(i);
+    let idx = match iw.as_fixnum() {
+        Some(n) if n >= 0 => n as usize,
+        _ => panic!("(setf aref): index must be a non-negative fixnum, got {iw:?}"),
+    };
+    match vw.tag() {
+        Tag::Vector => {
+            let n = vector_payload_len(vw) as usize;
+            if idx >= n {
+                panic!(
+                    "(setf aref): index {idx} out of bounds for vector of length {n}"
+                );
+            }
+            set_vector_cell(mutator, vw, idx as u32, val);
+            val
+        }
+        // ncl_string_set takes a raw (untagged) index.
+        Tag::String => crate::abi::ncl_string_set(v, idx as u64, val),
+        _ => panic!("(setf aref): not a sequence: {vw:?}"),
+    }
 }
 
 /// `ncl_lookup_keyword(args, key_start, n_args, keyword) -> value`.

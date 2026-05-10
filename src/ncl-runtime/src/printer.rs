@@ -58,10 +58,35 @@ fn write_word(out: &mut String, w: Word, readable: bool) {
             Some(name) => out.push_str(&name),
             None => out.push_str("<symbol>"),
         },
-        Tag::Vector => out.push_str("<vector>"),
+        Tag::Vector => write_vector(out, w, readable),
         Tag::Function => out.push_str("<function>"),
         Tag::String => write_string(out, w, readable),
     }
+}
+
+/// Print a Vector-tagged Word as `#(elem1 elem2 ...)`. Each
+/// element is recursively formatted with the same `readable`
+/// flag. Skips the heap header (cell 0) and walks the
+/// `length_cells` payload cells.
+fn write_vector(out: &mut String, w: Word, readable: bool) {
+    let p = match w.as_ptr::<u64>(Tag::Vector) {
+        Some(p) => p,
+        None => {
+            out.push_str("#<bad-vector>");
+            return;
+        }
+    };
+    let header = crate::heap::HeapHeader::from_raw(unsafe { *p });
+    let n = header.length_cells();
+    out.push_str("#(");
+    for i in 0..n {
+        if i > 0 {
+            out.push(' ');
+        }
+        let cell = unsafe { *p.add(1 + i as usize) };
+        write_word(out, Word::from_raw(cell), readable);
+    }
+    out.push(')');
 }
 
 /// Print a string. Readable form wraps in `"..."` with `\` and `"`
