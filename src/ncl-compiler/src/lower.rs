@@ -79,9 +79,18 @@ pub enum Binding {
 /// back to: any outer-env name referenced inside the lambda is
 /// added to the lambda's captures list and recorded as a new
 /// `ClosureRef` binding.
+///
+/// Lisp-2: variable lookups consult `bindings`; function-call
+/// lookups consult `fn_bindings`. flet / labels populate
+/// `fn_bindings`; let / lambda params populate `bindings`. A
+/// shadow of one namespace doesn't shadow the other.
 #[derive(Debug, Clone, Default)]
 pub struct LocalEnv {
     bindings: Vec<(Arc<str>, Binding)>,
+    /// Function-namespace bindings — local functions established
+    /// by flet/labels. Same Binding kinds as variable bindings;
+    /// the difference is which namespace's lookup will find them.
+    fn_bindings: Vec<(Arc<str>, Binding)>,
     local_count: usize,
     closure_count: usize,
     /// Set when this env is the inner env of a lambda body. Lookups
@@ -104,6 +113,7 @@ impl LocalEnv {
             .collect();
         LocalEnv {
             bindings,
+            fn_bindings: Vec::new(),
             local_count: 0,
             closure_count: 0,
             capture_parent: None,
@@ -122,6 +132,7 @@ impl LocalEnv {
             .collect();
         LocalEnv {
             bindings,
+            fn_bindings: Vec::new(),
             local_count: 0,
             closure_count: 0,
             capture_parent: Some(Box::new(parent)),
@@ -183,6 +194,50 @@ impl LocalEnv {
         self.find_local(name)
     }
 
+    /// Lookup in the function namespace — local-only, no
+    /// capture. Used by the call-site dispatcher in lower_in_mut
+    /// to decide between a local funcall and a global symbol-cell
+    /// call.
+    pub fn find_fn_local(&self, name: &str) -> Option<Binding> {
+        self.fn_bindings
+            .iter()
+            .rev()
+            .find(|(n, _)| &**n == name)
+            .map(|(_, b)| *b)
+    }
+
+    /// Function-namespace counterpart of `find_or_capture`. If
+    /// NAME isn't bound in this env's fn_bindings, try the
+    /// capture parent's fn_bindings recursively; on a hit, add a
+    /// closure-ref binding here so the lambda's emitted IR can
+    /// reach the value via env[i] at runtime.
+    pub fn find_fn_or_capture(&mut self, name: &str) -> Option<Binding> {
+        if let Some(b) = self.find_fn_local(name) {
+            return Some(b);
+        }
+        let parent = self.capture_parent.as_mut()?;
+        let parent_b = parent.find_fn_or_capture(name)?;
+        let idx = self.closure_count;
+        let (outer_expr, inner_binding) = match parent_b {
+            Binding::Param(i) => (Expr::Param(i), Binding::ClosureRef(idx)),
+            Binding::Local(i) => (Expr::Local(i), Binding::ClosureRef(idx)),
+            Binding::ClosureRef(i) => (Expr::ClosureRef(i), Binding::ClosureRef(idx)),
+            Binding::ParamCell(i) => (Expr::Param(i), Binding::ClosureRefCell(idx)),
+            Binding::LocalCell(i) => (Expr::Local(i), Binding::ClosureRefCell(idx)),
+            Binding::ClosureRefCell(i) => (Expr::ClosureRef(i), Binding::ClosureRefCell(idx)),
+        };
+        self.captures.push(outer_expr);
+        self.fn_bindings.push((Arc::from(name), inner_binding));
+        self.closure_count += 1;
+        Some(inner_binding)
+    }
+
+    /// Add a function-namespace binding pointing at an existing
+    /// let-local slot. Used by flet/labels lowering.
+    pub fn push_fn_binding(&mut self, name: Arc<str>, binding: Binding) {
+        self.fn_bindings.push((name, binding));
+    }
+
     pub fn push_local(&mut self, name: Arc<str>) -> usize {
         let idx = self.local_count;
         self.bindings.push((name, Binding::Local(idx)));
@@ -201,13 +256,14 @@ impl LocalEnv {
         idx
     }
 
-    pub fn checkpoint(&self) -> (usize, usize) {
-        (self.bindings.len(), self.local_count)
+    pub fn checkpoint(&self) -> (usize, usize, usize) {
+        (self.bindings.len(), self.local_count, self.fn_bindings.len())
     }
 
-    pub fn restore(&mut self, cp: (usize, usize)) {
+    pub fn restore(&mut self, cp: (usize, usize, usize)) {
         self.bindings.truncate(cp.0);
         self.local_count = cp.1;
+        self.fn_bindings.truncate(cp.2);
     }
 
     /// Take ownership of the captures list. Called after lambda-
@@ -215,6 +271,22 @@ impl LocalEnv {
     /// resulting `Expr::Lambda`.
     pub fn take_captures(&mut self) -> Vec<Expr> {
         std::mem::take(&mut self.captures)
+    }
+}
+
+/// Build the IR that reads a binding's current value. Cell
+/// variants dereference via Car. Used for variable lookup
+/// (Symbol case in lower_in_mut) and function-call lookup
+/// (when a local function bound by flet/labels needs to be
+/// funcalled — same shape, different namespace).
+fn binding_read(b: Binding) -> Expr {
+    match b {
+        Binding::Param(i) => Expr::Param(i),
+        Binding::Local(i) => Expr::Local(i),
+        Binding::ClosureRef(i) => Expr::ClosureRef(i),
+        Binding::ParamCell(i) => Expr::car(Expr::Param(i)),
+        Binding::LocalCell(i) => Expr::car(Expr::Local(i)),
+        Binding::ClosureRefCell(i) => Expr::car(Expr::ClosureRef(i)),
     }
 }
 
@@ -281,14 +353,7 @@ fn lower_in_mut(
             // Local (param/let/closure-capture), then T, then
             // global value-cell load.
             if let Some(b) = env.find_or_capture(&s.name) {
-                Ok(match b {
-                    Binding::Param(i) => Expr::Param(i),
-                    Binding::Local(i) => Expr::Local(i),
-                    Binding::ClosureRef(i) => Expr::ClosureRef(i),
-                    Binding::ParamCell(i) => Expr::car(Expr::Param(i)),
-                    Binding::LocalCell(i) => Expr::car(Expr::Local(i)),
-                    Binding::ClosureRefCell(i) => Expr::car(Expr::ClosureRef(i)),
-                })
+                Ok(binding_read(b))
             } else if &*s.name == "T" {
                 Ok(Expr::True)
             } else {
@@ -423,16 +488,44 @@ fn lower_call_in_mut(
                     got: args.len(),
                 });
             }
-            let name = match &args[0] {
-                Value::Symbol(s) => Arc::clone(&s.name),
-                other => {
-                    return Err(CompileError::NotImplemented(format!(
-                        "(function …) requires a symbol, got {other:?}"
-                    )));
+            // Two cases per CL: (function SYMBOL) loads the
+            // symbol's function cell as a value; (function
+            // (lambda …)) is just a lambda form value, the
+            // shape `#'(lambda …)` reads as. Closette uses
+            // both — generated emfun bodies do
+            // `(apply #'(lambda (kludge-arglist) …) args)`.
+            // Local fn-namespace bindings (flet/labels) also
+            // resolve here.
+            match &args[0] {
+                Value::Symbol(s) => {
+                    if let Some(b) = env.find_fn_or_capture(&s.name) {
+                        Ok(binding_read(b))
+                    } else {
+                        let sym_word = coord.intern(&s.name);
+                        Ok(Expr::load_function(sym_word.raw()))
+                    }
                 }
-            };
-            let sym_word = coord.intern(&name);
-            Ok(Expr::load_function(sym_word.raw()))
+                Value::Cons(c) => {
+                    // Expect (lambda (params...) body...).
+                    let Value::Symbol(head) = &c.car else {
+                        return Err(CompileError::NotImplemented(format!(
+                            "(function …) form must be a lambda, got head {:?}",
+                            c.car
+                        )));
+                    };
+                    if &*head.name != "LAMBDA" {
+                        return Err(CompileError::NotImplemented(format!(
+                            "(function …) form must be (lambda …), got ({} …)",
+                            head.name
+                        )));
+                    }
+                    let lambda_args = list_to_vec(&c.cdr)?;
+                    lower_lambda(&lambda_args, env, coord)
+                }
+                other => Err(CompileError::NotImplemented(format!(
+                    "(function …) requires a symbol or (lambda …) form, got {other:?}"
+                ))),
+            }
         }
         // (setq name value)  — assign the value cell of `name`. CL
         // also allows (setq a 1 b 2 …) for parallel assignments;
@@ -592,6 +685,8 @@ fn lower_call_in_mut(
             binary_op(&head_name, args, env, coord, Expr::aref)
         }
         "LET" => lower_let(args, env, coord),
+        "FLET" => lower_flet(args, env, coord),
+        "LABELS" => lower_labels(args, env, coord),
         // `(values v1 v2 ... vN)` — write all into the multi-value
         // slot, return `vals[0]` (or NIL). In tail position the
         // surrounding function's transform leaves this alone, so
@@ -609,7 +704,21 @@ fn lower_call_in_mut(
         "DEFUN" => Err(CompileError::BadDefun(
             "(defun ...) is only allowed at top level".into(),
         )),
-        // Unknown head: it's a function call.
+        // Unknown head: it's a function call. First check the
+        // Lisp-2 function namespace — if NAME is bound by an
+        // enclosing flet/labels, emit Funcall on the local; else
+        // fall through to a global symbol-cell call.
+        _ if env.find_fn_or_capture(&head_name).is_some() => {
+            // Re-borrow because the is_some check moved out of
+            // env.borrow above; this find returns the Binding now.
+            let b = env.find_fn_or_capture(&head_name).unwrap();
+            let fn_expr = binding_read(b);
+            let lowered_args: Result<Vec<_>, _> = args
+                .iter()
+                .map(|a| lower_in_mut(a, env, coord))
+                .collect();
+            Ok(Expr::funcall(fn_expr, lowered_args?))
+        }
         _ => {
             let sym_word = coord.intern(&head_name);
             let lowered_args: Result<Vec<_>, _> = args
@@ -840,6 +949,183 @@ fn lower_let(
 
     env.restore(cp);
     Ok(Expr::let_(binding_exprs, body_expr))
+}
+
+/// `(flet ((name (params...) body...) ...) body...)` — establish
+/// local function bindings visible only inside BODY. Sibling
+/// functions can't see each other (parallel-style); use LABELS
+/// for mutual recursion.
+fn lower_flet(
+    args: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
+    if args.is_empty() {
+        return Err(CompileError::BadArity {
+            head: "FLET".into(),
+            expected: "at least 1 (binding list)",
+            got: 0,
+        });
+    }
+    let bindings_list = list_to_vec(&args[0])?;
+    let body_forms = &args[1..];
+
+    // Phase 1: lower each lambda in the OUTER env. No
+    // self/sibling reference for FLET — siblings only become
+    // visible in the body, not in each other's bodies.
+    let mut names: Vec<Arc<str>> = Vec::new();
+    let mut inits: Vec<Expr> = Vec::new();
+    for binding in &bindings_list {
+        let pieces = list_to_vec(binding)?;
+        if pieces.len() < 2 {
+            return Err(CompileError::NotImplemented(format!(
+                "flet binding must be (name (params...) body...), got {pieces:?}"
+            )));
+        }
+        let name = match &pieces[0] {
+            Value::Symbol(s) => Arc::clone(&s.name),
+            other => {
+                return Err(CompileError::NotImplemented(format!(
+                    "flet binding name must be a symbol, got {other:?}"
+                )));
+            }
+        };
+        // pieces[1..] is `((params...) body...)` — exactly the
+        // shape of `lambda`'s args.
+        let lambda_args: Vec<Value> = pieces[1..].to_vec();
+        let lambda_expr = lower_lambda(&lambda_args, env, coord)?;
+        names.push(name);
+        inits.push(lambda_expr);
+    }
+
+    // Phase 2: bind each as a let-local AND register in the
+    // function namespace. Both for the body to see.
+    let cp = env.checkpoint();
+    for name in &names {
+        let idx = env.push_local(Arc::clone(name));
+        env.push_fn_binding(Arc::clone(name), Binding::Local(idx));
+    }
+
+    // Phase 3: lower the body.
+    let body_expr = if body_forms.is_empty() {
+        Expr::Nil
+    } else if body_forms.len() == 1 {
+        lower_in_mut(&body_forms[0], env, coord)?
+    } else {
+        let lowered: Result<Vec<_>, _> = body_forms
+            .iter()
+            .map(|f| lower_in_mut(f, env, coord))
+            .collect();
+        Expr::progn(lowered?)
+    };
+
+    env.restore(cp);
+    Ok(Expr::let_(inits, body_expr))
+}
+
+/// `(labels ((name (params...) body...) ...) body...)` — like
+/// flet but the bindings are visible to each other (mutual
+/// recursion).
+///
+/// Implementation: pre-allocate a `(cons nil nil)` cell per
+/// function name as the let-binding's value. Each cell becomes
+/// a LocalCell in both the variable and function namespace.
+/// Then lower each lambda IN the env that has those fn-bindings;
+/// the lambda's calls to siblings resolve via `(car (Local ...))`
+/// or, after closure capture, `(car (ClosureRef ...))`. Finally,
+/// emit a sequence of `(set-car cell-i lambda-i)` followed by
+/// the body.
+///
+/// At runtime: cells are filled in order. Since lambda creation
+/// just packages captures (it doesn't call the body), a sibling's
+/// cell can be empty when its capturer is created — what matters
+/// is that the cell is filled by the time the capturing lambda
+/// is actually CALLED.
+fn lower_labels(
+    args: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
+    if args.is_empty() {
+        return Err(CompileError::BadArity {
+            head: "LABELS".into(),
+            expected: "at least 1 (binding list)",
+            got: 0,
+        });
+    }
+    let bindings_list = list_to_vec(&args[0])?;
+    let body_forms = &args[1..];
+
+    // Parse names + lambda forms upfront.
+    let mut names: Vec<Arc<str>> = Vec::new();
+    let mut lambda_forms: Vec<Vec<Value>> = Vec::new();
+    for binding in &bindings_list {
+        let pieces = list_to_vec(binding)?;
+        if pieces.len() < 2 {
+            return Err(CompileError::NotImplemented(format!(
+                "labels binding must be (name (params...) body...), got {pieces:?}"
+            )));
+        }
+        let name = match &pieces[0] {
+            Value::Symbol(s) => Arc::clone(&s.name),
+            other => {
+                return Err(CompileError::NotImplemented(format!(
+                    "labels binding name must be a symbol, got {other:?}"
+                )));
+            }
+        };
+        names.push(name);
+        lambda_forms.push(pieces[1..].to_vec());
+    }
+
+    // Pre-allocate cells as let inits — each (cons nil nil).
+    let cell_inits: Vec<Expr> = names
+        .iter()
+        .map(|_| Expr::cons(Expr::Nil, Expr::Nil))
+        .collect();
+
+    // Push locals + fn-bindings BEFORE lowering any lambda.
+    // Each name is a LocalCell so reads through the cell at
+    // call time and lambdas capture the cell (not the value),
+    // which is what makes mutual recursion work.
+    let cp = env.checkpoint();
+    let mut local_indices: Vec<usize> = Vec::new();
+    for name in &names {
+        let idx = env.push_local_cell(Arc::clone(name));
+        local_indices.push(idx);
+        env.push_fn_binding(Arc::clone(name), Binding::LocalCell(idx));
+    }
+
+    // Lower each lambda IN the env that has all sibling fn-
+    // bindings. References to siblings naturally lower to a
+    // funcall on (car (Local idx)) / (car (ClosureRef idx)) via
+    // binding_read on the LocalCell binding.
+    let mut setf_forms: Vec<Expr> = Vec::with_capacity(names.len());
+    for (lambda_args, idx) in lambda_forms.iter().zip(local_indices.iter()) {
+        let lambda_expr = lower_lambda(lambda_args, env, coord)?;
+        setf_forms.push(Expr::set_car(Expr::local(*idx), lambda_expr));
+    }
+
+    // Lower the body in the same env.
+    let body_expr = if body_forms.is_empty() {
+        Expr::Nil
+    } else if body_forms.len() == 1 {
+        lower_in_mut(&body_forms[0], env, coord)?
+    } else {
+        let lowered: Result<Vec<_>, _> = body_forms
+            .iter()
+            .map(|f| lower_in_mut(f, env, coord))
+            .collect();
+        Expr::progn(lowered?)
+    };
+
+    env.restore(cp);
+
+    // Compose: let cells := (cons nil nil); then progn the
+    // setfs followed by the body.
+    let mut progn_forms = setf_forms;
+    progn_forms.push(body_expr);
+    Ok(Expr::let_(cell_inits, Expr::progn(progn_forms)))
 }
 
 /// `(and)` → `t`. `(and x)` → `x`. `(and a b c)` short-circuits:
