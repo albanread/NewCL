@@ -355,6 +355,26 @@
    fixnums for now (sub-pixel waits on float support)."
   (%emit-draw-text x y text size color))
 
+(defun fill-oval (x y w h color)
+  "Filled ellipse, axis-aligned, with the given bounding box."
+  (%emit-fill-oval x y w h color))
+
+(defun stroke-oval (x y w h thickness color)
+  (%emit-stroke-oval x y w h thickness color))
+
+(defun fill-circle (cx cy radius color)
+  (%emit-fill-circle cx cy radius color))
+
+(defun stroke-circle (cx cy radius thickness color)
+  (%emit-stroke-circle cx cy radius thickness color))
+
+(defun draw-arc (cx cy radius rotation-deg aperture-deg thickness color)
+  "Outlined circular arc centered at (CX, CY). ROTATION-DEG is the
+   midpoint angle (0 points right, 90 points down) in degrees;
+   APERTURE-DEG is the full angular span. Both are fixnums for now;
+   floats land when the compiler grows them."
+  (%emit-draw-arc cx cy radius rotation-deg aperture-deg thickness color))
+
 ;; -- Log view ----------------------------------------------------------------
 
 (defun log (control &rest args)

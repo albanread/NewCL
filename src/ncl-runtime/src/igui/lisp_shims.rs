@@ -514,6 +514,132 @@ pub extern "C-unwind" fn emit_stroke_rect_shim(
     Word::T.raw()
 }
 
+/// `(%emit-fill-oval x y w h color)` — filled ellipse with the
+/// given axis-aligned bounding box.
+pub extern "C-unwind" fn emit_fill_oval_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 5 {
+        panic!("%emit-fill-oval: expected 5 args, got {n_args}");
+    }
+    let x = arg_fixnum(args, 0).expect("x") as f32;
+    let y = arg_fixnum(args, 1).expect("y") as f32;
+    let w = arg_fixnum(args, 2).expect("w") as f32;
+    let h = arg_fixnum(args, 3).expect("h") as f32;
+    let c = arg_fixnum(args, 4).expect("color");
+    batch_mod::push(SurfaceCmd::FillOval {
+        rect: Rect { x0: x, y0: y, x1: x + w, y1: y + h },
+        color: unpack_rgba(c),
+    });
+    Word::T.raw()
+}
+
+/// `(%emit-stroke-oval x y w h thickness color)` — outlined ellipse.
+pub extern "C-unwind" fn emit_stroke_oval_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 6 {
+        panic!("%emit-stroke-oval: expected 6 args, got {n_args}");
+    }
+    let x = arg_fixnum(args, 0).expect("x") as f32;
+    let y = arg_fixnum(args, 1).expect("y") as f32;
+    let w = arg_fixnum(args, 2).expect("w") as f32;
+    let h = arg_fixnum(args, 3).expect("h") as f32;
+    let t = arg_fixnum(args, 4).expect("thickness") as f32;
+    let c = arg_fixnum(args, 5).expect("color");
+    batch_mod::push(SurfaceCmd::StrokeOval {
+        rect: Rect { x0: x, y0: y, x1: x + w, y1: y + h },
+        half_thickness: t * 0.5,
+        color: unpack_rgba(c),
+    });
+    Word::T.raw()
+}
+
+/// `(%emit-fill-circle cx cy radius color)` — filled circle from
+/// center + radius.
+pub extern "C-unwind" fn emit_fill_circle_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 4 {
+        panic!("%emit-fill-circle: expected 4 args, got {n_args}");
+    }
+    let cx = arg_fixnum(args, 0).expect("cx") as f32;
+    let cy = arg_fixnum(args, 1).expect("cy") as f32;
+    let r = arg_fixnum(args, 2).expect("radius") as f32;
+    let c = arg_fixnum(args, 3).expect("color");
+    batch_mod::push(SurfaceCmd::FillCircle {
+        center: Point { x: cx, y: cy },
+        radius: r,
+        color: unpack_rgba(c),
+    });
+    Word::T.raw()
+}
+
+/// `(%emit-stroke-circle cx cy radius thickness color)` — outlined circle.
+pub extern "C-unwind" fn emit_stroke_circle_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 5 {
+        panic!("%emit-stroke-circle: expected 5 args, got {n_args}");
+    }
+    let cx = arg_fixnum(args, 0).expect("cx") as f32;
+    let cy = arg_fixnum(args, 1).expect("cy") as f32;
+    let r = arg_fixnum(args, 2).expect("radius") as f32;
+    let t = arg_fixnum(args, 3).expect("thickness") as f32;
+    let c = arg_fixnum(args, 4).expect("color");
+    batch_mod::push(SurfaceCmd::StrokeCircle {
+        center: Point { x: cx, y: cy },
+        radius: r,
+        half_thickness: t * 0.5,
+        color: unpack_rgba(c),
+    });
+    Word::T.raw()
+}
+
+/// `(%emit-draw-arc cx cy radius rotation-deg aperture-deg thickness color)`
+/// — outlined circular arc. Angles are degrees (fixnums); we
+/// convert to radians here. `aperture-deg` is the FULL angular
+/// span; the underlying iGui takes a half-aperture, so we halve.
+pub extern "C-unwind" fn emit_draw_arc_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 7 {
+        panic!("%emit-draw-arc: expected 7 args, got {n_args}");
+    }
+    let cx = arg_fixnum(args, 0).expect("cx") as f32;
+    let cy = arg_fixnum(args, 1).expect("cy") as f32;
+    let r = arg_fixnum(args, 2).expect("radius") as f32;
+    let rot_deg = arg_fixnum(args, 3).expect("rotation-deg") as f32;
+    let aperture_deg = arg_fixnum(args, 4).expect("aperture-deg") as f32;
+    let t = arg_fixnum(args, 5).expect("thickness") as f32;
+    let c = arg_fixnum(args, 6).expect("color");
+    let to_rad = std::f32::consts::PI / 180.0;
+    batch_mod::push(SurfaceCmd::DrawArc {
+        center: Point { x: cx, y: cy },
+        radius: r,
+        rotation_rad: rot_deg * to_rad,
+        half_aperture_rad: aperture_deg * to_rad * 0.5,
+        half_thickness: t * 0.5,
+        color: unpack_rgba(c),
+    });
+    Word::T.raw()
+}
+
 /// `(%emit-draw-text x y text size color)` — render a string in
 /// the default UI font (Segoe UI, weight 400). The defaults cover
 /// the common case; users who need a different family / weight /

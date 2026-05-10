@@ -296,6 +296,16 @@ fn install_igui(coord: &Arc<GcCoordinator>, mutator: &mut MutatorState) {
                    ncl_runtime::emit_draw_line_shim, 6);
     install_native(coord, mutator, "%EMIT-DRAW-TEXT",
                    ncl_runtime::emit_draw_text_shim, 5);
+    install_native(coord, mutator, "%EMIT-FILL-OVAL",
+                   ncl_runtime::emit_fill_oval_shim, 5);
+    install_native(coord, mutator, "%EMIT-STROKE-OVAL",
+                   ncl_runtime::emit_stroke_oval_shim, 6);
+    install_native(coord, mutator, "%EMIT-FILL-CIRCLE",
+                   ncl_runtime::emit_fill_circle_shim, 4);
+    install_native(coord, mutator, "%EMIT-STROKE-CIRCLE",
+                   ncl_runtime::emit_stroke_circle_shim, 5);
+    install_native(coord, mutator, "%EMIT-DRAW-ARC",
+                   ncl_runtime::emit_draw_arc_shim, 7);
 
     // Log view bridge.
     install_native(coord, mutator, "LOG-WRITE",
