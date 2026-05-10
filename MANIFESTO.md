@@ -105,6 +105,14 @@ NewCormanLisp is **Rust-first**, **LLVM-based**, **64-bit-first**, and
 The GC design is pinned in [docs/GC.md](docs/GC.md), committed
 ahead of code. Headlines:
 
+- **Multi-threaded mutator, stop-the-world collector.** Multiple
+  Lisp threads run concurrently; each has its own TLAB
+  (thread-local allocation buffer) so the alloc fast path takes
+  no locks. GCs are cooperative stop-the-world: each mutator polls
+  a flag at safe points and parks voluntarily; the GC runs once
+  all mutators are parked. Modern hardware has 20 cores; this is
+  not optional. Matches Corman's design (verified in upstream
+  Gc.cpp).
 - **Generational copying**, two generations (young + old) plus a
   pinned static area for compiled code and the loaded image.
 - **3-bit pointer tagging**, 64-bit word, fixnum tag `000`, cons tag

@@ -50,7 +50,7 @@ Two GC-managed generations plus one pinned static area.
 
 Why two generations and not three: modern hardware removes the
 constraints (small caches, expensive tenured GC under
-page-protection barriers) that drove Roger's three-generation
+page-protection barriers) that drove three-generation
 design. A 16 MB young heap fits in L3 on every machine we care
 about, and a larger young heap kills more objects before promotion.
 If profiling later shows that REPL session bindings are pinning the
@@ -166,55 +166,99 @@ The code pointer points into the static area where the JIT emits
 machine code. Static-area code is never relocated, so the pointer is
 stable across GCs.
 
+## Multi-threading
+
+NewCormanLisp supports **multiple Lisp threads**, matching Corman.
+Multi-threading is a design constraint, not an optimisation: a
+20-core machine should be able to run 20 Lisp threads doing useful
+work concurrently, and the modern hardware case for multi-threaded
+Lisp is too strong to ignore. `(make-thread …)`, `mp:process-run-
+function`, `with-mutex`, `with-synchronization` — all work.
+
+Verified in upstream `cormanlisp/CormanLispServer/src/Gc.cpp`:
+Corman's GC wraps every allocation in `EnterGCCriticalSection`,
+keeps per-thread state via `TlsGetValue(Thread_Index)`, and runs a
+true stop-the-world by suspending and scanning every thread. We
+adopt the same shape with three modernisations:
+
+1. **TLABs (thread-local allocation buffers)** instead of a global
+   critical section on every allocation. Each Lisp thread has its
+   own slab of young-heap memory and bump-allocates within it
+   without locks. Slab refill is the only synchronised operation
+   and happens once per ~512 KB of allocation.
+2. **Cooperative stop-the-world** instead of preemptive thread
+   suspension. The GC sets a global stop flag; each mutator polls
+   the flag at safe points and parks itself voluntarily. The GC
+   runs after all mutators have parked, signals when done, mutators
+   unpark. No `SuspendThread`, no `pthread_kill`, no signal handlers
+   walking interrupted stacks — much simpler and Mac-portable.
+3. **`AtomicU64` symbol cells** for atomic `defun`. The function
+   cell is a single store-release; dispatch is a load-acquire. This
+   was already committed in our redefinition design and pays off
+   immediately under multi-threading.
+
+The thread-boundary rule still holds: OS-specific code lives only
+in the iGui shim. The UI thread remains distinct from all Lisp
+threads. What changes is the count of Lisp threads (was: 1; is now:
+N). The iGui mailbox is still the only path to/from the UI thread.
+
 ## Allocation
 
-The young heap is one semispace with a bump pointer. Allocation is
-inline:
+Each Lisp thread holds a `MutatorState` containing a TLAB. The TLAB
+is a contiguous slab of young-heap cells with its own bump pointer.
+Allocation is inline:
 
 ```
-fn alloc(size: usize) -> *mut HeapHeader {
-    let new_top = young.top - size;        // grows downward
-    if new_top < young.limit {
-        return alloc_slow(size);            // triggers minor GC
+fn alloc(mutator: &mut MutatorState, size: usize) -> *mut HeapHeader {
+    let new_top = mutator.tlab.top + size;
+    if new_top > mutator.tlab.limit {
+        return alloc_slow(mutator, size);   // refill TLAB or GC
     }
-    young.top = new_top;
-    new_top as *mut HeapHeader
+    let p = mutator.tlab.base.add(mutator.tlab.top);
+    mutator.tlab.top = new_top;
+    p as *mut HeapHeader
 }
 ```
 
-The compiler emits this fast path inline at every allocation site.
-Slow path triggers a minor GC, retries, and on persistent failure
-grows the young heap or aborts.
+No atomics on the fast path. Each thread bumps its own TLAB pointer.
+The slow path acquires the global heap lock to either refill the
+TLAB from young or trigger a GC.
 
-Allocation is on the Lisp thread only. The Lisp thread owns the
-heap; other threads talk to it through the iGui mailbox. This
-matches the thread-boundary rule and removes the cost of atomic
-ops on the bump pointer.
+TLAB refill is atomic CAS on the global young bump pointer: each
+thread grabs (say) 512 KB at a time. When young can't satisfy a
+refill, the requesting thread initiates stop-the-world and the GC
+runs after all mutators park.
 
 Cons-cell allocation is the hot of the hot path. The compiler
 recognises the pattern and emits a specialised inline allocation
 that skips the header write (because cons cells have no header).
+TLAB-bump is identical for cons; the size is just 2 cells.
 
 ## Minor GC: copying with forwarding pointers
 
 When the young heap fills:
 
-1. **Suspend Lisp thread** at a safe point. Compiler-emitted safe
-   points appear at every back-edge, every call, and every
-   allocation slow path.
+1. **Stop the world.** The thread that detected the OOM sets the
+   coordinator's stop flag. Every other Lisp thread polls the flag
+   at its next safe point and parks (saves its own context, signals
+   the coordinator, waits on a condvar). The GC runs only once all
+   mutators have parked.
 2. **Find roots.** Stack roots come from LLVM `gc.statepoint`-emitted
-   stack maps. Old-heap-into-young-heap roots come from the dirty
-   card table (see write barrier below). Static-into-young roots
-   come from a separate set kept by the static-area writer. Global
-   roots come from a registered global table (the package
-   registry, `*features*`, etc.).
+   stack maps **for each parked mutator** — N stacks, N stack-map
+   walks. Old-heap-into-young-heap roots come from the dirty card
+   table (see write barrier below). Static-into-young roots come
+   from a separate set kept by the static-area writer. Global roots
+   come from a registered global table (the package registry,
+   `*features*`, etc.).
 3. **Copy survivors.** Each live young object is copied to the old
    heap. The young location is overwritten with a `forward`-tagged
    pointer to the new location. References to the original location
-   are updated as they're encountered.
+   are updated as they're encountered. Each mutator's TLAB is
+   refilled (as a bump-pointer slab on the empty young).
 4. **Reset.** The young heap's bump pointer is reset; the dirty
    card table is cleared.
-5. **Resume.**
+5. **Resume.** The coordinator clears the stop flag and signals the
+   condvar; mutators unpark and continue.
 
 A young object that survives one minor GC is promoted directly to
 old. With a 16 MB young heap on modern hardware, the
@@ -227,12 +271,13 @@ shows otherwise, we add an intermediate generation later.
 Triggered when the old heap fills, or on explicit request
 (`(room t)`, scheduled idle GC, etc.):
 
-1. Suspend Lisp thread.
-2. Treat young as roots into old (along with the static-area roots
-   and global roots).
+1. Stop the world (cooperative, as in minor GC).
+2. Treat young as roots into old (along with the static-area roots,
+   global roots, and per-mutator stack roots from every parked
+   thread).
 3. Copy live old-heap objects from semi-A to semi-B.
 4. Swap A and B; the old A becomes the next "to" space.
-5. Reset card table; resume.
+5. Reset card table; refill mutator TLABs from the empty young; resume.
 
 The static area participates only as a root source. Code in the
 static area that's no longer reachable is *not* collected by the
@@ -292,27 +337,50 @@ registered in a `RootSet` walked at every GC.
 
 ## Cooperation: safe points
 
-The Lisp thread reaches a "safe point" wherever the GC may run.
+Every Lisp thread reaches a "safe point" wherever the GC may run.
 These are:
 
-- Allocation slow paths (we just triggered the GC; we're at one)
-- Function call boundaries
-- Loop back-edges
+- Allocation slow paths (TLAB refill — checks the stop flag)
+- Function call boundaries (compiler emits a flag check)
+- Loop back-edges (compiler emits a flag check)
 - Explicit `(gc)` calls
+- Explicit `safepoint()` runtime calls (used by hand-written
+  runtime helpers and tests)
 
-Compiled code doesn't poll for "should I pause for GC?" because
-this Lisp thread *is* the only mutator. There are no other Lisp
-threads to coordinate with. The GC runs synchronously when an
-allocation can't be satisfied.
+The check is cheap: one atomic load of the stop flag and a branch.
+Hot loops pay one extra load per iteration; this is the cost of
+admission for multi-threading.
 
-This is why the thread-boundary rule matters: the GC's life would
-be much harder if other threads could be mutating Lisp values.
-They can't.
+When a thread sees the stop flag set, it **parks**: it saves its
+register/stack context (or hands itself off via `gc.statepoint` for
+precise scanning), increments the parked counter, and waits on a
+condvar. The thread that triggered the GC waits until the parked
+counter equals the live-mutator count, then runs the GC. After the
+GC completes, the trigger thread clears the stop flag and signals
+the condvar; all parked threads wake up, refill their TLABs from
+the (now empty) young heap, and resume.
+
+This is **cooperative** stop-the-world: every thread voluntarily
+parks itself. We never use OS-level `SuspendThread` / signals /
+preemptive interrupts. Cooperative is simpler, more portable
+(Windows and macOS use the same code path), and has well-understood
+latency bounds (the longest pause is the worst-case time between
+two safe points in any thread, which the compiler's safe-point
+insertion policy controls).
+
+The thread-boundary rule still holds: the UI thread is NOT a Lisp
+thread and never participates in stop-the-world. Lisp threads talk
+to the UI thread through the iGui mailbox. Only Lisp threads
+allocate, only Lisp threads run JIT'd code, only Lisp threads carry
+GC roots.
 
 ## What's deliberately not in v1
 
-- **Concurrent GC.** Lisp thread is single. Stop-the-world is fine
-  because there's no world to stop except itself.
+- **Concurrent GC.** Stop-the-world only. Concurrent collectors
+  (mutators run during marking) are an order of magnitude more
+  complex and we don't need the latency wins they buy. With small
+  young heaps and TLABs, stop-the-world pause times are measured
+  in milliseconds.
 - **Hardware-assisted write barriers.** Software card-marking only.
   Adding HW barriers later is an opt-in optimisation.
 - **Generational beyond two generations.** We add an intermediate
@@ -345,8 +413,13 @@ They can't.
 2. `HeapHeader` + a single managed semispace + bump allocator.
 3. Forwarding-pointer-aware copy.
 4. Add the second old-semispace; full GC swaps A↔B.
-5. Card table + write barrier; minor GC scans dirty cards.
-6. Static area (pinned, separate page allocator).
-7. Symbol layout, allocation helpers.
-8. Stack-map root walking via `gc.statepoint` (drives the compiler
+5. **`MutatorState` + TLAB + cooperative stop-the-world coordinator.**
+   The single-threaded `Heap` becomes the global heap behind a lock;
+   each mutator pulls TLABs from it; safe-point polling drives
+   park/unpark. Verified with multiple OS threads allocating
+   concurrently.
+6. Card table + write barrier; minor GC scans dirty cards.
+7. Static area (pinned, separate page allocator).
+8. Symbol layout with `AtomicU64` cells, allocation helpers.
+9. Stack-map root walking via `gc.statepoint` (drives the compiler
    side too — needs Phase 3).
