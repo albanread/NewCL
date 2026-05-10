@@ -1,11 +1,26 @@
-//! redit — fail-safe Rust-based editor.
+//! ledit — fail-safe Lisp-aware editor.
 //!
-//! A minimal text editor that lives entirely on the UI thread of the
-//! iGui frame. It does not consume `SurfaceCmd` batches, does not
-//! touch the language-thread mailbox, and does not depend on any CP
-//! code being loaded. The point is that even when the rest of the
-//! NewCP environment has a fault, the editor remains responsive so
-//! the user can fix source files and reload them.
+//! A minimal text editor that lives entirely on the UI thread of
+//! the iGui frame. It does not consume `SurfaceCmd` batches, does
+//! not touch the language-thread mailbox, and does not depend on
+//! any Lisp code being loaded. The point is that even when the
+//! rest of NewCormanLisp has a fault, the editor remains
+//! responsive so the user can fix source files and reload them.
+//!
+//! Inherited verbatim from the sister NewCP repo's `redit` (which
+//! served the same role for Component Pascal). Renamed to ledit
+//! and growing a small set of Lisp-aware affordances:
+//!
+//!   - **auto-indent on Enter** — the new line gets the current
+//!     line's leading whitespace, plus an extra two spaces if the
+//!     cursor was preceded by an unmatched `(` on this line.
+//!   - **paren-balance in the status line** — a count of open vs
+//!     close parens so you can see at a glance whether an editing
+//!     buffer is well-formed.
+//!
+//! Real structural editing (slurp / barf / wrap / unwrap, balanced
+//! cursor motion, etc.) is deferred — it'll land as user-Lisp
+//! once we have enough of an editor API to drive from outside.
 //!
 //! Architecture: a single-instance MDI child with its own WndProc
 //! that handles WM_PAINT (Direct2D + DirectWrite, fixed grid) and
@@ -79,24 +94,24 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::renderer;
 
-/// WM_COMMAND id for the "Tools > redit" frame menu entry. Outside
+/// WM_COMMAND id for the "Tools > ledit" frame menu entry. Outside
 /// the user range (0x1000..=0x1FFF) and the MDI verb range
 /// (0x2000..=0x2010) so it can never collide with a language-thread
 /// menu spec.
 pub const MENU_CMD_ID: u16 = 0x3000;
 
-const REDIT_CLASS: PCWSTR = w!("NewCP.iGui.Redit");
-const TITLE_NEW: PCWSTR = w!("redit — untitled");
+const LEDIT_CLASS: PCWSTR = w!("NewCL.iGui.Ledit");
+const TITLE_NEW: PCWSTR = w!("ledit — untitled");
 
-/// HWND of the singleton redit MDI child, if one exists. Used to
+/// HWND of the singleton ledit MDI child, if one exists. Used to
 /// activate the existing instance instead of creating a second one.
-static REDIT_HWND: Mutex<Option<isize>> = Mutex::new(None);
+static LEDIT_HWND: Mutex<Option<isize>> = Mutex::new(None);
 
 // ─── Compile-check injection point ──────────────────────────────────
 //
 // The runtime crate sits below `newcp-parser` and `newcp-sema` in the
 // dependency graph, so it cannot import them directly. Instead the
-// driver (which already depends on both) hands redit a closure that
+// driver (which already depends on both) hands ledit a closure that
 // runs a check and returns diagnostics. This keeps the layering
 // clean and lets us swap in different checkers (e.g. a fast
 // parse-only check vs full semantic) later.
@@ -131,18 +146,18 @@ fn run_checker(source: &str) -> Option<Vec<Diagnostic>> {
 
 // ─── Public API ──────────────────────────────────────────────────────
 
-/// Register the redit MDI child WndClass. Called from
+/// Register the ledit MDI child WndClass. Called from
 /// `child::register_classes`.
 pub fn register_class() -> Result<(), super::IGuiError> {
     let h_instance = unsafe { GetModuleHandleW(None) }
-        .map_err(|e| super::IGuiError::Win32(format!("GetModuleHandleW (redit): {e}")))?
+        .map_err(|e| super::IGuiError::Win32(format!("GetModuleHandleW (ledit): {e}")))?
         .into();
     let cursor = unsafe { LoadCursorW(None, IDC_IBEAM) }
-        .map_err(|e| super::IGuiError::Win32(format!("LoadCursorW (redit): {e}")))?;
+        .map_err(|e| super::IGuiError::Win32(format!("LoadCursorW (ledit): {e}")))?;
     let cls = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         style: WNDCLASS_STYLES(0),
-        lpfnWndProc: Some(redit_wnd_proc),
+        lpfnWndProc: Some(ledit_wnd_proc),
         cbClsExtra: 0,
         cbWndExtra: 0,
         hInstance: h_instance,
@@ -150,7 +165,7 @@ pub fn register_class() -> Result<(), super::IGuiError> {
         hCursor: cursor,
         hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH(std::ptr::null_mut()),
         lpszMenuName: PCWSTR::null(),
-        lpszClassName: REDIT_CLASS,
+        lpszClassName: LEDIT_CLASS,
         hIconSm: Default::default(),
     };
     let _ = unsafe { RegisterClassExW(&cls) };
@@ -158,13 +173,13 @@ pub fn register_class() -> Result<(), super::IGuiError> {
 }
 
 // The Tools menu and frame accelerator table now live in
-// `tools_menu`, which knows about both redit and the log view.
+// `tools_menu`, which knows about both ledit and the log view.
 
-/// Open the redit child, or activate it if already open. Called from
+/// Open the ledit child, or activate it if already open. Called from
 /// the frame WndProc when the user picks the menu item or hits the
 /// shortcut. UI-thread only.
 pub fn open(frame: HWND, mdi_client: HWND) {
-    if let Some(raw) = *REDIT_HWND.lock().expect("REDIT_HWND poisoned") {
+    if let Some(raw) = *LEDIT_HWND.lock().expect("LEDIT_HWND poisoned") {
         let hwnd = HWND(raw as *mut _);
         if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
             unsafe {
@@ -183,12 +198,12 @@ pub fn open(frame: HWND, mdi_client: HWND) {
     let h_instance = match unsafe { GetModuleHandleW(None) } {
         Ok(h) => windows::Win32::Foundation::HANDLE(h.0),
         Err(e) => {
-            eprintln!("[redit] GetModuleHandleW: {e}");
+            eprintln!("[ledit] GetModuleHandleW: {e}");
             return;
         }
     };
     let create = MDICREATESTRUCTW {
-        szClass: REDIT_CLASS,
+        szClass: LEDIT_CLASS,
         szTitle: TITLE_NEW,
         hOwner: h_instance,
         x: CW_USEDEFAULT,
@@ -207,7 +222,7 @@ pub fn open(frame: HWND, mdi_client: HWND) {
         )
     };
     if result.0 == 0 {
-        eprintln!("[redit] WM_MDICREATE returned 0");
+        eprintln!("[ledit] WM_MDICREATE returned 0");
         return;
     }
     let _ = frame; // reserved for future use
@@ -302,7 +317,7 @@ struct ReditState {
 
     /// Per-line tokens for syntax highlighting. Lazily refreshed in
     /// paint() when `tokens_dirty` is set. Re-tokenizing the whole
-    /// buffer on every edit is fine for the sub-MB files redit is
+    /// buffer on every edit is fine for the sub-MB files ledit is
     /// designed to handle.
     tokens: Vec<Vec<Token>>,
     tokens_dirty: bool,
@@ -393,7 +408,7 @@ impl ReditState {
         };
         match target {
             Ok(t) => self.target = Some(t),
-            Err(e) => eprintln!("[redit] CreateHwndRenderTarget failed: {e}"),
+            Err(e) => eprintln!("[ledit] CreateHwndRenderTarget failed: {e}"),
         }
     }
 
@@ -731,7 +746,7 @@ impl ReditState {
     // ─── Compile check ───────────────────────────────────────────
 
     /// Run the installed checker (if any) against the current
-    /// buffer. No-op when no checker is installed — keeps redit
+    /// buffer. No-op when no checker is installed — keeps ledit
     /// useful as a plain editor in environments where the compiler
     /// hasn't been linked in.
     fn run_check(&mut self) {
@@ -1134,13 +1149,20 @@ impl ReditState {
             },
         };
 
+        let parens_segment = match self.paren_balance() {
+            0 => "()".to_string(),
+            n if n > 0 => format!("(+{n})"),
+            n => format!("({n})"),
+        };
+
         let status = format!(
-            " {dirty} {path}   Ln {row:4}, Col {col:2}   {nlines} lines   {diag}",
+            " {dirty} {path}   Ln {row:4}, Col {col:2}   {nlines} lines   {parens}   {diag}",
             dirty = dirty_mark,
             path = path_str,
             row = self.cursor_row + 1,
             col = self.cursor_col + 1,
             nlines = self.buffer.len(),
+            parens = parens_segment,
             diag = diag_segment,
         );
         if let (Some(brush), Ok(layout)) = (
@@ -1202,7 +1224,119 @@ impl ReditState {
     fn insert_newline(&mut self) {
         // Newline breaks the typing-coalesce chain so a subsequent
         // single-char insert starts a fresh undo entry.
-        self.do_insert("\n", None);
+        //
+        // Auto-indent: copy the current line's leading whitespace,
+        // and add two extra spaces if there's an unmatched `(` to
+        // the left of the cursor on this line. Cheap heuristic;
+        // good enough for hand-written Lisp without going through
+        // a full parser. Strings and `;` comments are skipped so
+        // parens inside them don't perturb the depth.
+        let indent = self.compute_auto_indent();
+        let mut text = String::with_capacity(1 + indent.len());
+        text.push('\n');
+        text.push_str(&indent);
+        self.do_insert(&text, None);
+    }
+
+    fn compute_auto_indent(&self) -> String {
+        if self.cursor_row >= self.buffer.len() {
+            return String::new();
+        }
+        let line = &self.buffer[self.cursor_row];
+        let leading: String = line
+            .chars()
+            .take_while(|&c| c == ' ' || c == '\t')
+            .collect();
+        let mut depth: i32 = 0;
+        let mut in_string = false;
+        let mut after_backslash = false;
+        let mut in_comment = false;
+        for (i, c) in line.chars().enumerate() {
+            if i >= self.cursor_col {
+                break;
+            }
+            if in_comment {
+                continue;
+            }
+            if after_backslash {
+                after_backslash = false;
+                continue;
+            }
+            if c == '\\' && in_string {
+                after_backslash = true;
+                continue;
+            }
+            if c == '"' {
+                in_string = !in_string;
+                continue;
+            }
+            if in_string {
+                continue;
+            }
+            if c == ';' {
+                in_comment = true;
+                continue;
+            }
+            if c == '(' {
+                depth += 1;
+            } else if c == ')' {
+                depth -= 1;
+            }
+        }
+        if depth > 0 {
+            // Capped at +2 — deeply-nested forms shouldn't blow out
+            // the indent column.
+            let mut s = leading;
+            s.push_str("  ");
+            s
+        } else {
+            leading
+        }
+    }
+
+    /// Buffer-wide paren count: opens minus closes, treating `;`
+    /// comments and `"…"` string literals as opaque. 0 = balanced;
+    /// positive = more opens than closes; negative = more closes
+    /// (likely an editing accident).
+    fn paren_balance(&self) -> i32 {
+        let mut depth: i32 = 0;
+        let mut in_string = false;
+        let mut after_backslash = false;
+        for line in &self.buffer {
+            let mut in_comment = false;
+            for c in line.chars() {
+                if in_comment {
+                    continue;
+                }
+                if after_backslash {
+                    after_backslash = false;
+                    continue;
+                }
+                if c == '\\' && in_string {
+                    after_backslash = true;
+                    continue;
+                }
+                if c == '"' {
+                    in_string = !in_string;
+                    continue;
+                }
+                if in_string {
+                    continue;
+                }
+                if c == ';' {
+                    in_comment = true;
+                    continue;
+                }
+                if c == '(' {
+                    depth += 1;
+                } else if c == ')' {
+                    depth -= 1;
+                }
+            }
+            // Newline ends a `;` comment but not a string literal —
+            // matches CL's reader semantics.
+        }
+        depth
     }
 
     fn insert_str(&mut self, text: &str) {
@@ -1571,7 +1705,7 @@ impl ReditState {
                 self.update_title();
                 self.invalidate();
             }
-            Err(e) => eprintln!("[redit] read {path:?} failed: {e}", path = self.file_path),
+            Err(e) => eprintln!("[ledit] read {path:?} failed: {e}", path = self.file_path),
         }
     }
 
@@ -1596,7 +1730,7 @@ impl ReditState {
                 true
             }
             Err(e) => {
-                eprintln!("[redit] save failed: {e}");
+                eprintln!("[ledit] save failed: {e}");
                 false
             }
         }
@@ -1610,7 +1744,7 @@ impl ReditState {
                 .unwrap_or_else(|| "<untitled>".to_string()),
             None => "<untitled>".to_string(),
         };
-        let title = format!("redit — {name}{star}", star = if self.dirty { " *" } else { "" });
+        let title = format!("ledit — {name}{star}", star = if self.dirty { " *" } else { "" });
         let mut w: Vec<u16> = title.encode_utf16().collect();
         w.push(0);
         unsafe {
@@ -1626,7 +1760,7 @@ impl ReditState {
 
 // ─── Win32 plumbing ──────────────────────────────────────────────────
 
-unsafe extern "system" fn redit_wnd_proc(
+unsafe extern "system" fn ledit_wnd_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
@@ -1636,7 +1770,7 @@ unsafe extern "system" fn redit_wnd_proc(
         let state = Box::new(ReditState::new(hwnd));
         let raw = Box::into_raw(state) as isize;
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw) };
-        if let Ok(mut slot) = REDIT_HWND.lock() {
+        if let Ok(mut slot) = LEDIT_HWND.lock() {
             *slot = Some(hwnd.0 as isize);
         }
         return unsafe { DefMDIChildProcW(hwnd, msg, wparam, lparam) };
@@ -1736,7 +1870,7 @@ unsafe extern "system" fn redit_wnd_proc(
             // Drop the heap state. Clear singleton slot if it matches.
             let _ = unsafe { Box::from_raw(state_ptr) };
             unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
-            if let Ok(mut slot) = REDIT_HWND.lock() {
+            if let Ok(mut slot) = LEDIT_HWND.lock() {
                 if matches!(*slot, Some(h) if h == hwnd.0 as isize) {
                     *slot = None;
                 }
@@ -2321,7 +2455,7 @@ fn clipboard_set(owner: HWND, text: &str) -> bool {
                     }
                 }
             }
-            Err(e) => eprintln!("[redit] GlobalAlloc failed: {e}"),
+            Err(e) => eprintln!("[ledit] GlobalAlloc failed: {e}"),
         }
         let _ = CloseClipboard();
     }

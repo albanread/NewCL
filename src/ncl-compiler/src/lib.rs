@@ -294,6 +294,10 @@ fn install_igui(coord: &Arc<GcCoordinator>, mutator: &mut MutatorState) {
                    ncl_runtime::emit_stroke_rect_shim, 6);
     install_native(coord, mutator, "%EMIT-DRAW-LINE",
                    ncl_runtime::emit_draw_line_shim, 6);
+
+    // Log view bridge.
+    install_native(coord, mutator, "LOG-WRITE",
+                   ncl_runtime::log_write_shim, 1);
 }
 
 fn install_native(

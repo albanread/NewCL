@@ -17,7 +17,7 @@
 //!     thread.
 //!   - `batch` queues `SurfaceCmd` draw operations for execution by
 //!     `executor` on the GUI thread.
-//!   - `redit` and `log_view` are built-in MDI children for an
+//!   - `ledit` and `log_view` are built-in MDI children for an
 //!     editor and a log overlay; `tools_menu` wires their menu and
 //!     accelerators into the frame.
 //!
@@ -42,7 +42,7 @@ mod font_metrics;
 pub mod lisp_shims;
 mod log_view;
 mod menu;
-pub(crate) mod redit;
+pub(crate) mod ledit;
 mod registry;
 mod renderer;
 mod replies;
@@ -50,7 +50,7 @@ mod tools_menu;
 pub mod system_colors;
 mod window;
 
-pub use redit::{install_checker, Diagnostic};
+pub use ledit::{install_checker, Diagnostic};
 pub use window::run;
 
 /// Errors surfaced from iGui startup. Phase 1 keeps this lossy on purpose;

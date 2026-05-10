@@ -29,7 +29,7 @@ use crate::GcCoordinator;
 use super::batch::{self as batch_mod, Point, Rect, Rgba, SurfaceCmd};
 use super::channels::{kind, IGuiEvent};
 use super::cp_exports::FRAME_HWND;
-use super::{channels, window};
+use super::{channels, log_view, window};
 
 /// JoinHandle for the GUI thread, taken on `(igui-wait)`. Tracking
 /// it here means the Lisp thread can block until the message pump
@@ -358,6 +358,29 @@ fn event_to_plist(
         acc = m.alloc_cons(k, acc);
     }
     acc
+}
+
+// -- Log view ----------------------------------------------------------------
+
+/// `(log-write s)` — append S as a new line to the iGui log
+/// overlay's ring buffer. The log_view child shows the buffer
+/// (Tools → Log, or Ctrl+Shift+L). Repeated identical lines
+/// coalesce: the count next to the line ticks up rather than
+/// pushing a fresh entry.
+pub extern "C-unwind" fn log_write_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("log-write: expected 1 arg (string), got {n_args}");
+    }
+    let Some(s) = arg_string(args, 0) else {
+        panic!("log-write: argument must be a string");
+    };
+    log_view::append(&s);
+    Word::T.raw()
 }
 
 // -- Drawing -----------------------------------------------------------------

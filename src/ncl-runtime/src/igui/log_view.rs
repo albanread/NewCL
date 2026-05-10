@@ -72,7 +72,7 @@ const LOG_LINE_MAX: usize = 256;
 /// 0x3000.
 pub const MENU_CMD_ID: u16 = 0x3001;
 
-const LOG_CLASS: PCWSTR = w!("NewCP.iGui.Log");
+const LOG_CLASS: PCWSTR = w!("NewCL.iGui.Log");
 const LOG_TITLE: PCWSTR = w!("Log");
 
 /// HWND of the singleton log MDI child, when one is open.

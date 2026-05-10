@@ -59,8 +59,8 @@ use super::renderer;
 use super::window;
 use super::IGuiError;
 
-pub(crate) const MDI_CHILD_CLASS: PCWSTR = w!("NewCP.iGui.Child");
-pub(crate) const RENDER_HOST_CLASS: PCWSTR = w!("NewCP.iGui.Render");
+pub(crate) const MDI_CHILD_CLASS: PCWSTR = w!("NewCL.iGui.Child");
+pub(crate) const RENDER_HOST_CLASS: PCWSTR = w!("NewCL.iGui.Render");
 
 // ─── ChildState lives on the render host ─────────────────────────────
 
@@ -1581,7 +1581,7 @@ pub fn register_classes() -> Result<(), IGuiError> {
     };
     let _ = unsafe { RegisterClassExW(&render) };
 
-    super::redit::register_class()?;
+    super::ledit::register_class()?;
     super::log_view::register_class()?;
 
     Ok(())

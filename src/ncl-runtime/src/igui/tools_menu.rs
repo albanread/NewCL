@@ -1,7 +1,7 @@
 //! Frame-level "Tools" menu and the keyboard accelerator table for
-//! redit's built-in tool windows.
+//! ledit's built-in tool windows.
 //!
-//! Both `redit` and `log_view` are always-available editor tools
+//! Both `ledit` and `log_view` are always-available editor tools
 //! that hang off a `Tools` submenu on the frame. Keeping their
 //! menu/accelerator wiring together here means the one-and-only
 //! Tools popup carries every entry, regardless of whether the
@@ -16,10 +16,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::log_view;
-use super::redit;
+use super::ledit;
 
 /// Append a `Tools` submenu to `bar` containing every built-in tool
-/// (currently redit and the log view). Called both from
+/// (currently ledit and the log view). Called both from
 /// `build_default_menu_bar` and from `menu::install_for_frame` so
 /// the tools stay reachable whatever the language thread does.
 pub fn append_tools_menu(bar: HMENU) {
@@ -31,16 +31,16 @@ pub fn append_tools_menu(bar: HMENU) {
         }
     };
 
-    let redit_item: Vec<u16> = "redit\tCtrl+Shift+E\0".encode_utf16().collect();
+    let ledit_item: Vec<u16> = "ledit\tCtrl+Shift+E\0".encode_utf16().collect();
     if let Err(e) = unsafe {
         AppendMenuW(
             popup,
             MF_STRING,
-            redit::MENU_CMD_ID as usize,
-            PCWSTR(redit_item.as_ptr()),
+            ledit::MENU_CMD_ID as usize,
+            PCWSTR(ledit_item.as_ptr()),
         )
     } {
-        eprintln!("[tools-menu] append redit: {e}");
+        eprintln!("[tools-menu] append ledit: {e}");
     }
 
     let log_item: Vec<u16> = "Log\tCtrl+Shift+L\0".encode_utf16().collect();
@@ -77,7 +77,7 @@ pub fn build_default_menu_bar() -> Option<HMENU> {
 }
 
 /// Frame-level accelerator table:
-///   Ctrl+Shift+E → redit
+///   Ctrl+Shift+E → ledit
 ///   Ctrl+Shift+L → log view
 /// Both dispatch via `WM_COMMAND` to their respective MENU_CMD_IDs,
 /// which the frame WndProc routes to the right `open` function.
@@ -86,7 +86,7 @@ pub fn build_accelerator_table() -> Option<HACCEL> {
         ACCEL {
             fVirt: FCONTROL | FSHIFT | FVIRTKEY,
             key: b'E' as u16,
-            cmd: redit::MENU_CMD_ID,
+            cmd: ledit::MENU_CMD_ID,
         },
         ACCEL {
             fVirt: FCONTROL | FSHIFT | FVIRTKEY,

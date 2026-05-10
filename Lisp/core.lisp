@@ -349,6 +349,14 @@
 (defun draw-line (x1 y1 x2 y2 thickness color)
   (%emit-draw-line x1 y1 x2 y2 thickness color))
 
+;; -- Log view ----------------------------------------------------------------
+
+(defun log (control &rest args)
+  "Format CONTROL with ARGS (same directives as `format`) and push
+   the result as a single line into the iGui log overlay. Open
+   the overlay via Tools → Log or Ctrl+Shift+L."
+  (log-write (apply #'format nil control args)))
+
 ;; -- File I/O ----------------------------------------------------------------
 ;;
 ;; The native primitives are:

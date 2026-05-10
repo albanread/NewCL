@@ -232,7 +232,7 @@ pub fn install_for_frame(frame: HWND, mdi_client: HWND, spec: &str) -> bool {
             return false;
         }
     };
-    // Always re-append the built-in tools (redit + log view) so they
+    // Always re-append the built-in tools (ledit + log view) so they
     // stay reachable regardless of what the language thread set.
     super::tools_menu::append_tools_menu(menu);
     let set_result = unsafe { SetMenu(frame, Some(menu)) };
