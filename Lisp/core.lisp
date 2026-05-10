@@ -226,6 +226,49 @@
 
 (defun abs (n) (if (< n 0) (- n) n))
 
+;; -- Loops -------------------------------------------------------------------
+;;
+;; (loop body...) repeats body forever; (return v) exits the
+;; immediately enclosing loop with value v. Both wrap the
+;; %native-loop / %loop-return primitives.
+;;
+;; CAVEAT: like (error ...), (return) doesn't unwind — code
+;; *after* the (return) call but still inside the same iteration
+;; body still runs. Idiomatic CL puts return at the end of a
+;; cond/case clause, which sidesteps this:
+;;
+;;   (loop (cond ((stop?) (return result))
+;;               (t (do-work))))
+;;
+;; works correctly. The dual-form
+;;
+;;   (loop (when (stop?) (return result))
+;;         (do-work))                      ; <-- still runs after return
+;;
+;; doesn't, because (do-work) is a sibling of (when ...) and
+;; runs once the when's expansion has stashed the return value.
+
+(defmacro loop (&rest body)
+  `(%native-loop (lambda () ,@body)))
+
+(defmacro return (&rest args)
+  ;; (return)   → exit with nil
+  ;; (return v) → exit with v
+  (cond
+    ((null args) `(%loop-return nil))
+    (t `(%loop-return ,(car args)))))
+
+;; -- Property lists ----------------------------------------------------------
+
+(defun getf (plist key)
+  "Walk PLIST, returning the value paired with KEY, or nil if not
+   found. The plist is a flat list of alternating keys and values:
+   (:a 1 :b 2 :c 3)."
+  (cond
+    ((null plist) nil)
+    ((eq (car plist) key) (car (cdr plist)))
+    (t (getf (cdr (cdr plist)) key))))
+
 ;; -- Conditions --------------------------------------------------------------
 ;;
 ;; (error condition-or-message) signals; (handler-case body

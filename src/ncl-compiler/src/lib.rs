@@ -250,6 +250,10 @@ fn install_native_functions(
                    ncl_runtime::error_shim, 1);
     install_native(coord, mutator, "%HANDLER-CASE",
                    ncl_runtime::handler_case_shim, 2);
+    install_native(coord, mutator, "%NATIVE-LOOP",
+                   ncl_runtime::native_loop_shim, 1);
+    install_native(coord, mutator, "%LOOP-RETURN",
+                   ncl_runtime::loop_return_shim, 1);
 
     // iGui (Windows only). Spawns the GUI thread and exposes the
     // window-management trio + event poll. Drawing primitives
@@ -2010,6 +2014,140 @@ mod end_to_end_tests {
         // &rest followed by multiple names.
         let r = eval_str("(defun f (a &rest r s) a)");
         assert!(r.is_err());
+    }
+
+    // -- loop / return / getf --------------------------------------------
+
+    #[test]
+    fn loop_with_return_exits() {
+        // (loop (return 42)) — first iteration returns.
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(loop (return 42))").unwrap(), "42");
+        // (return) with no value yields nil.
+        assert_eq!(s.eval("(loop (return))").unwrap(), "nil");
+    }
+
+    #[test]
+    fn loop_counts_via_mutable_local() {
+        // Classic "count to 5 then exit." Uses a mutable let-local
+        // for the counter, terminal return in a cond clause.
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval(
+                "(let ((i 0))
+                   (loop
+                     (cond
+                       ((= i 5) (return i))
+                       (t (setq i (+ i 1))))))",
+            )
+            .unwrap(),
+            "5",
+        );
+    }
+
+    #[test]
+    fn loop_accumulates() {
+        // Sum 1+2+...+10 via a counter and accumulator.
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval(
+                "(let ((i 0) (sum 0))
+                   (loop
+                     (cond
+                       ((> i 10) (return sum))
+                       (t (setq sum (+ sum i))
+                          (setq i (+ i 1))))))",
+            )
+            .unwrap(),
+            "55",
+        );
+    }
+
+    #[test]
+    fn nested_loops_each_have_own_break() {
+        // Inner return only exits the inner loop. Outer continues
+        // and exits via its own terminal return.
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval(
+                "(let ((outer 0))
+                   (loop
+                     (cond
+                       ((= outer 3) (return outer))
+                       (t (setq outer (+ outer 1))
+                          (loop (return :inner))))))",
+            )
+            .unwrap(),
+            "3",
+        );
+    }
+
+    #[test]
+    fn loop_return_value_can_be_anything() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(loop (return 'foo))").unwrap(), "FOO");
+        assert_eq!(s.eval("(loop (return '(1 2 3)))").unwrap(), "(1 2 3)");
+        assert_eq!(s.eval(r#"(loop (return "hello"))"#).unwrap(), r#""hello""#);
+    }
+
+    #[test]
+    fn getf_finds_value() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(getf '(:a 1 :b 2 :c 3) :b)").unwrap(),
+            "2",
+        );
+    }
+
+    #[test]
+    fn getf_returns_nil_when_not_found() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(getf '(:a 1 :b 2) :z)").unwrap(),
+            "nil",
+        );
+        assert_eq!(s.eval("(getf nil :a)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn getf_returns_first_match() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Duplicate keys: returns the first value found.
+        assert_eq!(
+            s.eval("(getf '(:a 1 :a 2 :a 3) :a)").unwrap(),
+            "1",
+        );
+    }
+
+    #[test]
+    fn loop_with_getf_event_pattern() {
+        // The event-loop idiom we'd actually write for the GUI:
+        // a loop that pulls items off a "queue" (here a list) and
+        // exits when it sees a sentinel kind.
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval("(defparameter *q* '((:kind :a :v 1) (:kind :b :v 2) (:kind :stop)))").unwrap();
+        s.eval(
+            "(defun next-item ()
+               (cond
+                 ((null *q*) nil)
+                 (t (let ((it (car *q*)))
+                      (setq *q* (cdr *q*))
+                      it))))",
+        )
+        .unwrap();
+        assert_eq!(
+            s.eval(
+                "(let ((collected nil))
+                   (loop
+                     (let ((ev (next-item)))
+                       (cond
+                         ((null ev) (return (reverse collected)))
+                         ((eq (getf ev :kind) :stop) (return (reverse collected)))
+                         (t (setq collected (cons (getf ev :v) collected)))))))",
+            )
+            .unwrap(),
+            "(1 2)",
+        );
     }
 
     // -- Conditions ------------------------------------------------------

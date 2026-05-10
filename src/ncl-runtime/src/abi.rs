@@ -482,6 +482,84 @@ pub extern "C-unwind" fn handler_case_shim(
     }
 }
 
+// ---- Loop / return ---------------------------------------------------------
+//
+// `loop` and `return` use the same thread-local-flag mechanism as
+// `error` / `handler-case` because we can't unwind through JIT
+// frames on Windows. `%native-loop` calls a thunk repeatedly,
+// checking `LOOP_BREAK_PENDING` after each iteration; `%loop-
+// return` sets the flag.
+//
+// Same limitation as error: code between `(return v)` and the end
+// of the iteration body still runs, since the JIT frames don't
+// know about the flag and just continue. Putting `return` in a
+// terminal position (the last form of a cond/case clause)
+// sidesteps the issue, matching idiomatic CL anyway.
+
+thread_local! {
+    static LOOP_BREAK_PENDING: Cell<bool> = const { Cell::new(false) };
+    static LOOP_BREAK_VALUE: Cell<u64> = const { Cell::new(0) };
+}
+
+/// `(%native-loop thunk)` — call `thunk` with no args repeatedly
+/// until `(%loop-return v)` is signalled. Returns `v`.
+///
+/// Saves and restores the outer LOOP_BREAK state so nested loops
+/// each have their own break.
+pub extern "C-unwind" fn native_loop_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("%native-loop expects 1 arg (thunk), got {n_args}");
+    }
+    let thunk = Word::from_raw(unsafe { *args });
+    if thunk.tag() != Tag::Function {
+        panic!("%native-loop: arg must be a function");
+    }
+
+    let saved_pending = LOOP_BREAK_PENDING.with(|p| p.replace(false));
+    let saved_value = LOOP_BREAK_VALUE.with(|v| v.replace(0));
+
+    let result = loop {
+        let env = crate::gc_function::env(thunk);
+        let code = crate::gc_function::code_ptr(thunk);
+        let f: crate::gc_function::LispCodeFn =
+            unsafe { std::mem::transmute(code) };
+        let _ = unsafe { f(mutator, env.raw(), std::ptr::null(), 0) };
+
+        if LOOP_BREAK_PENDING.with(|p| p.get()) {
+            break LOOP_BREAK_VALUE.with(|v| v.get());
+        }
+    };
+
+    LOOP_BREAK_PENDING.with(|p| p.set(saved_pending));
+    LOOP_BREAK_VALUE.with(|v| v.set(saved_value));
+    result
+}
+
+/// `(%loop-return value)` — signal that the current loop should
+/// exit with `value`. Returns NIL; the JIT frames between this
+/// call and the matching `%native-loop` see NIL and drain via
+/// normal returns.
+pub extern "C-unwind" fn loop_return_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    let value = if n_args >= 1 {
+        unsafe { *args }
+    } else {
+        Word::NIL.raw()
+    };
+    LOOP_BREAK_VALUE.with(|v| v.set(value));
+    LOOP_BREAK_PENDING.with(|p| p.set(true));
+    Word::NIL.raw()
+}
+
 // ---- File I/O shims --------------------------------------------------------
 //
 // Each shim has the standard JIT calling convention so it can be

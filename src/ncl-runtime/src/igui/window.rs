@@ -44,7 +44,7 @@ use super::renderer;
 use super::IGuiError;
 
 const FRAME_CHILD_ID: i64 = 1;
-const FRAME_CLASS: PCWSTR = w!("NewCP.iGui.Frame");
+const FRAME_CLASS: PCWSTR = w!("NewCL.iGui.Frame");
 
 // Private messages used to marshal language-thread calls onto the GUI
 // thread. lparam is the address of the corresponding *Request struct,
@@ -123,7 +123,7 @@ where
         CreateWindowExW(
             WS_EX_APPWINDOW,
             FRAME_CLASS,
-            w!("NewCP — iGui"),
+            w!("NewCL"),
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,

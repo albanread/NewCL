@@ -20,8 +20,8 @@
 use std::sync::Arc;
 
 use ncl_runtime::{
-    gc_function, gc_string, sym_names, symbol::Symbol, GcCoordinator, MutatorState,
-    Tag, Value, Word,
+    gc_function, gc_string, sym_names, symbol::Symbol, universe, GcCoordinator,
+    MutatorState, Tag, Value, Word,
 };
 
 use crate::EvalError;
@@ -77,7 +77,19 @@ pub fn word_to_value(w: Word) -> Result<Value, EvalError> {
             let name = sym_names::lookup(w.raw()).unwrap_or_else(|| {
                 Arc::from(format!("<sym {:#x}>", w.raw()).as_str())
             });
-            Value::Symbol(Symbol::fresh_uninterned(name))
+            // Keywords are interned with a colon prefix on the
+            // runtime side. When converting back to a Value we need
+            // to restore the KEYWORD home package, otherwise the
+            // lowering pass treats the result as a value-cell load
+            // of a symbol named ":FOO" instead of a self-evaluating
+            // keyword.
+            if let Some(stripped) = name.strip_prefix(':') {
+                let kw = universe().find_package("KEYWORD")
+                    .expect("KEYWORD package missing");
+                Value::Symbol(kw.intern_external(stripped))
+            } else {
+                Value::Symbol(Symbol::fresh_uninterned(name))
+            }
         }
         Tag::Immediate => match w.as_char() {
             Some(c) => Value::Char(c),
