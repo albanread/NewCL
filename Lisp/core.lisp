@@ -349,6 +349,12 @@
 (defun draw-line (x1 y1 x2 y2 thickness color)
   (%emit-draw-line x1 y1 x2 y2 thickness color))
 
+(defun draw-text (x y text size color)
+  "Render TEXT at (X, Y) in Segoe UI at SIZE px. Y is the
+   baseline-ish top of the text run. SIZE and coords are
+   fixnums for now (sub-pixel waits on float support)."
+  (%emit-draw-text x y text size color))
+
 ;; -- Log view ----------------------------------------------------------------
 
 (defun log (control &rest args)

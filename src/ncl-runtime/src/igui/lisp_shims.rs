@@ -26,7 +26,10 @@ use crate::gc_string;
 use crate::word::{Tag, Word};
 use crate::GcCoordinator;
 
-use super::batch::{self as batch_mod, Point, Rect, Rgba, SurfaceCmd};
+use super::batch::{
+    self as batch_mod, FontStretch, FontStyle, Point, Rect, Rgba, SurfaceCmd,
+    TextAlign, TextRun, TextTrimming,
+};
 use super::channels::{kind, IGuiEvent};
 use super::cp_exports::FRAME_HWND;
 use super::{channels, log_view, window};
@@ -507,6 +510,46 @@ pub extern "C-unwind" fn emit_stroke_rect_shim(
         corner_radius: 0.0,
         half_thickness: t * 0.5,
         color: unpack_rgba(c),
+    });
+    Word::T.raw()
+}
+
+/// `(%emit-draw-text x y text size color)` — render a string in
+/// the default UI font (Segoe UI, weight 400). The defaults cover
+/// the common case; users who need a different family / weight /
+/// style can call `%emit-draw-text-styled` (next slice).
+pub extern "C-unwind" fn emit_draw_text_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 5 {
+        panic!("%emit-draw-text: expected 5 args (x y text size color), got {n_args}");
+    }
+    let x = arg_fixnum(args, 0).expect("x") as f32;
+    let y = arg_fixnum(args, 1).expect("y") as f32;
+    let Some(text) = arg_string(args, 2) else {
+        panic!("%emit-draw-text: text must be a string");
+    };
+    let size = arg_fixnum(args, 3).expect("size") as f32;
+    let c = arg_fixnum(args, 4).expect("color");
+
+    batch_mod::push(SurfaceCmd::DrawTextRun {
+        run: TextRun {
+            text,
+            origin: Point { x, y },
+            family: "Segoe UI".to_string(),
+            size,
+            weight: 400, // DWRITE_FONT_WEIGHT_NORMAL
+            style: FontStyle::Normal,
+            stretch: FontStretch::Normal,
+            locale: "en-us".to_string(),
+            color: unpack_rgba(c),
+            max_width: None,
+            alignment: TextAlign::Leading,
+            trimming: TextTrimming::None,
+        },
     });
     Word::T.raw()
 }
