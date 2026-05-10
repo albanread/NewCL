@@ -10,11 +10,13 @@
 //! atomically swapped, retirement machinery is reserved for orphaned
 //! compiled code only.
 
+pub mod heap;
 pub mod symbol;
 pub mod universe;
 pub mod value;
 pub mod word;
 
+pub use heap::{GcBit, Heap, HeapHeader, HeapType, MAX_OBJECT_CELLS};
 pub use symbol::{Package, Symbol, Visibility};
 pub use universe::{pkg, universe, Universe};
 pub use value::{Cons, FfiBlock, Value};
