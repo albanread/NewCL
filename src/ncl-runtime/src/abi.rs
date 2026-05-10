@@ -1096,6 +1096,25 @@ pub extern "C-unwind" fn cdr_shim(
     ncl_cdr(unsafe { *args })
 }
 
+/// `(list e1 e2 …)` — Lisp-callable shim. LIST is a special
+/// form (desugars to nested cons in the JIT's lowering), but
+/// `#'list` needs a function value for things like
+/// `(mapcar #'list xs ys)`.
+pub extern "C-unwind" fn list_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    let m = unsafe { &mut *mutator };
+    let mut acc = Word::NIL;
+    for i in (0..n_args).rev() {
+        let elem = unsafe { *args.add(i as usize) };
+        acc = m.alloc_cons(Word::from_raw(elem), acc);
+    }
+    acc.raw()
+}
+
 /// `(cons a b)` — Lisp-callable shim.
 pub extern "C-unwind" fn cons_shim(
     mutator: *mut crate::mutator::MutatorState,

@@ -510,6 +510,15 @@
      (remove-if pred (cdr lst) :key key))
     (t (cons (car lst) (remove-if pred (cdr lst) :key key)))))
 
+(defun remove-if-not (pred lst &key (key #'identity))
+  "Return a fresh list of LST's elements for which (PRED (KEY
+   elem)) is TRUE — the keep-matching counterpart of remove-if."
+  (cond
+    ((null lst) nil)
+    ((funcall pred (funcall key (car lst)))
+     (cons (car lst) (remove-if-not pred (cdr lst) :key key)))
+    (t (remove-if-not pred (cdr lst) :key key))))
+
 (defun remove (item lst &key (test #'eql) (key #'identity))
   "Return a fresh list with all elements matching ITEM removed."
   (cond

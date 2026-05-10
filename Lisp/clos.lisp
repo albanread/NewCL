@@ -162,7 +162,7 @@
   "Like mapcar, but the per-call results are appended together.
    Standard Closette workhorse for flattening nested results."
   (cond
-    ((some #'null args) nil)
+    ((some (lambda (x) (null x)) args) nil)
     (t (append (apply fn (mapcar #'car args))
                (apply #'mapappend fn (mapcar #'cdr args))))))
 
@@ -343,10 +343,12 @@
 ;; bootstrap so we list them once explicitly.
 
 (defparameter *standard-class-slot-names*
-  '(name documentation direct-subclasses direct-superclasses
-    class-precedence-list direct-methods direct-slots
-    effective-slots shared-slot-definitions shared-slots
-    direct-default-initargs effective-default-initargs))
+  '(direct-slots effective-slots
+    shared-slot-definitions shared-slots
+    direct-default-initargs effective-default-initargs
+    direct-superclasses class-precedence-list direct-methods
+    direct-subclasses
+    name documentation))
 
 ;; the-class-standard-class is filled in by the bootstrap below.
 ;; the-slots-of-standard-class is the list of effective-slot-
@@ -354,20 +356,38 @@
 (defparameter the-slots-of-standard-class nil)
 (defparameter the-class-standard-class nil)
 
+;; SLOT ORDER MATTERS — must match what compute-slots will
+;; produce later when defclass standard-class re-creates the
+;; class. compute-slots walks CPL = [SC, CL, SP, FRC, MO, T]
+;; in order, gathering each class's direct-slots:
+;;   SC: direct-slots, effective-slots, shared-slot-definitions,
+;;       shared-slots, direct-default-initargs,
+;;       effective-default-initargs   (6)
+;;   CL: (none)
+;;   SP: direct-superclasses, class-precedence-list,
+;;       direct-methods                (3)
+;;   FRC: direct-subclasses             (1)
+;;   MO: name, documentation            (2)
+;; If the bootstrap-skeleton order doesn't match this, T's slot
+;; vector (filled in step 5 with the skeleton order) is
+;; misaligned after step 8 swaps T's class to the new
+;; standard-class — leading to e.g. T's slot 0 holding 'T (the
+;; class-name) being interpreted as direct-slots, which crashes
+;; the next mapappend.
 (defparameter the-defclass-standard-class
   '(defclass standard-class (class)
-     ((name :initarg :name)
-      (documentation :initform () :initarg :documentation)
-      (direct-subclasses :initform ())
-      (direct-superclasses :initarg :direct-superclasses)
-      (class-precedence-list)
-      (direct-methods :initform ())
-      (direct-slots)
+     ((direct-slots)
       (effective-slots)
       (shared-slot-definitions :initform ())
       (shared-slots :initform ())
       (direct-default-initargs :initform () :initarg :direct-default-initargs)
-      (effective-default-initargs :initform ()))))
+      (effective-default-initargs :initform ())
+      (direct-superclasses :initarg :direct-superclasses)
+      (class-precedence-list)
+      (direct-methods :initform ())
+      (direct-subclasses :initform ())
+      (name :initarg :name)
+      (documentation :initform () :initarg :documentation))))
 
 ;; -- Slot access ------------------------------------------------------------
 ;;
@@ -380,13 +400,15 @@
 (defun slot-location (class slot-name)
   "Return the index of SLOT-NAME within CLASS's instance-slot
    storage, or NIL if it's a shared slot or absent. Special case:
-   the lookup of 'effective-slots in standard-class returns 7 by
+   the lookup of 'effective-slots in standard-class returns 1 by
    construction — without this short-circuit, finding any slot in
-   standard-class would recurse infinitely."
+   standard-class would recurse infinitely. (Position 1 is determined
+   by the slot order produced by compute-slots walking standard-class's
+   CPL; see the-defclass-standard-class.)"
   (cond
     ((and (eq slot-name 'effective-slots)
           (eq class the-class-standard-class))
-     7)
+     1)
     (t
      (let ((slots (class-effective-slots class))
            (pos 0)
@@ -624,9 +646,371 @@
         (setf (class-shared-slots class) nil)
         class))
 
+;; ─── Stage C: defclass + finalize-inheritance + bootstrap rest ─────────────
+;;
+;; Defclass becomes a macro that calls ensure-class, which
+;; allocates a fresh class instance, fills in its slots, then
+;; finalizes inheritance (computes CPL + effective slots).
+;;
+;; Closette uses generic-function-based reader/writer methods
+;; (add-reader-method / add-writer-method) when slots have
+;; :reader / :writer / :accessor options. Those need Stage E's
+;; generic-function machinery, so we accept the option syntax
+;; but DROP the auto-generated accessors here. Stage F or G can
+;; revisit.
+
+;; -- canonicalisation helpers ----------------------------------------------
+
+(defun canonicalize-direct-slot (spec)
+  "Translate a slot-spec from defclass surface syntax into a
+   list-form that, when EVALuated, produces a property list
+   suitable for make-direct-slot-definition."
+  (cond
+    ((symbolp spec) `(list :name ',spec))
+    (t
+     (let ((name (car spec))
+           (initfunction nil)
+           (initform nil)
+           (initargs nil)
+           (readers nil)
+           (writers nil)
+           (other nil))
+       (let ((olist (cdr spec)))
+         (loop
+           (cond
+             ((null olist) (return nil))
+             (t (case (car olist)
+                  (:initform
+                   (setq initfunction `(function (lambda () ,(cadr olist))))
+                   (setq initform `',(cadr olist)))
+                  (:initarg
+                   (setq initargs (append initargs (list (cadr olist)))))
+                  (:reader
+                   (setq readers (append readers (list (cadr olist)))))
+                  (:writer
+                   (setq writers (append writers (list (cadr olist)))))
+                  (:accessor
+                   (setq readers (append readers (list (cadr olist))))
+                   (setq writers
+                         (append writers (list `(setf ,(cadr olist))))))
+                  (otherwise
+                   (setq other
+                         (append other
+                                 (list `',(car olist) `',(cadr olist))))))
+                (setq olist (cdr (cdr olist)))))))
+       `(list
+         :name ',name
+         ,@(when initfunction
+             `(:initform ,initform :initfunction ,initfunction))
+         ,@(when initargs `(:initargs ',initargs))
+         ,@(when readers `(:readers ',readers))
+         ,@(when writers `(:writers ',writers))
+         ,@other)))))
+
+(defun canonicalize-direct-slots (slot-definitions)
+  `(list ,@(mapcar #'canonicalize-direct-slot slot-definitions)))
+
+(defun canonicalize-direct-superclass (class-name)
+  `(find-class ',class-name))
+
+(defun canonicalize-direct-superclasses (direct-superclasses)
+  `(list ,@(mapcar #'canonicalize-direct-superclass direct-superclasses)))
+
+(defun canonicalize-defclass-option (option)
+  (case (car option)
+    (:metaclass
+     (list :metaclass `(find-class ',(cadr option))))
+    (:documentation
+     (list :documentation `',(cadr option)))
+    (:default-initargs
+     (list :direct-default-initargs
+           `(list ,@(mapplist
+                     (lambda (key value)
+                       `(list ',key ',value (function (lambda () ,value))))
+                     (cdr option)))))
+    (otherwise
+     (list `',(car option) `',(cdr option)))))
+
+(defun canonicalize-defclass-options (options)
+  (mapappend #'canonicalize-defclass-option options))
+
+;; -- defclass macro --------------------------------------------------------
+
+(defmacro defclass (name direct-superclasses slot-definitions &rest options)
+  `(ensure-class ',name
+                 :direct-superclasses
+                 ,(canonicalize-direct-superclasses direct-superclasses)
+                 :direct-slots
+                 ,(canonicalize-direct-slots slot-definitions)
+                 ,@(canonicalize-defclass-options options)))
+
+;; -- ensure-class ----------------------------------------------------------
+;;
+;; Closette's ensure-class accepts a :metaclass option and
+;; switches between make-instance-standard-class and the
+;; generic-function make-instance based on it. We only support
+;; the standard-class case at this stage.
+
+(defun ensure-class (name &rest all-keys
+                     &key (metaclass the-class-standard-class)
+                     &allow-other-keys)
+  (declare (ignore metaclass))
+  (let ((class (apply #'make-instance-standard-class
+                      the-class-standard-class
+                      :name name
+                      all-keys)))
+    (setf (find-class name) class)
+    class))
+
+(defun %setf-find-class (new-value name &rest rest)
+  (declare (ignore rest))
+  (setf (gethash name *clos-class-table*) new-value)
+  new-value)
+
+;; -- make-instance-standard-class ------------------------------------------
+;;
+;; Builds a class instance directly, bypassing the generic-
+;; function dispatch path (which doesn't exist yet). Closette's
+;; std-after-initialization-for-classes also wires up reader /
+;; writer methods if the slot specs request them — we skip that
+;; for now (stage E adds it back).
+
+(defun make-instance-standard-class (metaclass &key name direct-superclasses
+                                                    direct-slots
+                                               &allow-other-keys)
+  (declare (ignore metaclass))
+  (let ((class (std-allocate-instance the-class-standard-class)))
+    (setf (class-name class) name)
+    (setf (class-documentation class) nil)
+    (setf (class-direct-subclasses class) nil)
+    (setf (class-direct-methods class) nil)
+    (setf (slot-value class 'direct-default-initargs) nil)
+    (setf (slot-value class 'effective-default-initargs) nil)
+    (std-after-initialization-for-classes
+     class
+     :direct-superclasses direct-superclasses
+     :direct-slots direct-slots)
+    (std-finalize-inheritance class)
+    class))
+
+(defun std-after-initialization-for-classes (class &key direct-superclasses
+                                                        direct-slots
+                                                   &allow-other-keys)
+  ;; Update class hierarchy.
+  (let ((supers (or direct-superclasses
+                    (list (find-class 'standard-object nil)))))
+    (when (some (lambda (x) (null x)) supers)
+      (setq supers (list (find-class 't))))
+    (setf (class-direct-superclasses class) supers)
+    (dolist (super supers)
+      (let ((subs (class-direct-subclasses super)))
+        (unless (member class subs)
+          (setf (class-direct-subclasses super) (cons class subs))))))
+  (let ((slots (mapcar (lambda (props)
+                         (apply #'make-direct-slot-definition props))
+                       direct-slots)))
+    (setf (class-direct-slots class) slots))
+  nil)
+
+;; -- finalize-inheritance --------------------------------------------------
+
+(defun finalize-inheritance (class) (std-finalize-inheritance class))
+
+(defun std-finalize-inheritance (class)
+  (setf (class-precedence-list class) (compute-class-precedence-list class))
+  (let ((class-slots (compute-slots class)))
+    (setf (class-effective-slots class)
+          (remove-if-not #'instance-slot-p class-slots))
+    (setf (class-shared-slot-definitions class)
+          (remove-if #'instance-slot-p class-slots))
+    (setf (class-shared-slots class) nil))
+  nil)
+
+;; -- Class precedence list (CPL) ------------------------------------------
+
+(defun collect-superclasses* (class)
+  (labels ((walk (seen supers)
+             (let ((todo (set-difference supers seen)))
+               (cond
+                 ((null todo) supers)
+                 (t (let ((c (car todo)))
+                      (walk (cons c seen)
+                            (union (class-direct-superclasses c) supers))))))))
+    (walk nil (list class))))
+
+(defun local-precedence-ordering (class)
+  ;; Closette's version uses (mapcar #'list left right) to pair
+  ;; the parent chain. Our mapcar is single-list; we walk the
+  ;; supers list manually keeping the previous element as state.
+  (let ((supers (class-direct-superclasses class))
+        (prev class)
+        (result nil))
+    (dolist (super supers)
+      (setq result (cons (list prev super) result))
+      (setq prev super))
+    (nreverse result)))
+
+(defun std-tie-breaker-rule (minimal-elements cpl-so-far)
+  (block tb
+    (dolist (cpl-c (reverse cpl-so-far))
+      (let* ((supers (class-direct-superclasses cpl-c))
+             (common (intersection minimal-elements supers)))
+        (when common
+          (return-from tb (car common)))))))
+
+(defun topological-sort (elements constraints tie-breaker)
+  (block ts
+    (let ((rem-c constraints)
+          (rem-e elements)
+          (result nil))
+      (loop
+        (let ((minimal
+                (remove-if (lambda (c)
+                             (member c rem-c :key #'cadr))
+                           rem-e)))
+          (cond
+            ((null minimal)
+             (cond
+               ((null rem-e) (return-from ts result))
+               (t (error "Inconsistent precedence graph."))))
+            (t
+             (let ((choice (cond
+                             ((null (cdr minimal)) (car minimal))
+                             (t (funcall tie-breaker minimal result)))))
+               (setq result (append result (list choice)))
+               (setq rem-e (remove choice rem-e))
+               (setq rem-c (remove choice rem-c
+                                   :test (lambda (x pair)
+                                           (member x pair))))))))))))
+
+(defun compute-class-precedence-list (class)
+  (std-compute-class-precedence-list class))
+
+(defun std-compute-class-precedence-list (class)
+  (let ((classes (collect-superclasses* class)))
+    (topological-sort classes
+                      (remove-duplicates
+                       (mapappend #'local-precedence-ordering classes))
+                      #'std-tie-breaker-rule)))
+
+;; -- Slot inheritance (compute-slots) -------------------------------------
+
+(defun find-if-not (pred lst &key (key #'identity))
+  "Like find-if but for the negated predicate. Closette uses it
+   to find the first slot with a non-nil initfunction."
+  (find-if (complement pred) lst :key key))
+
+(defun compute-slots (class) (std-compute-slots class))
+
+(defun std-compute-slots (class)
+  (let* ((all-slots (mapappend #'class-direct-slots
+                               (class-precedence-list class)))
+         (all-names (remove-duplicates
+                     (mapcar #'slot-definition-name all-slots))))
+    (mapcar (lambda (name)
+              (compute-effective-slot-definition
+               class
+               (remove-if-not (lambda (s)
+                                (eq name (slot-definition-name s)))
+                              all-slots)))
+            all-names)))
+
+(defun compute-effective-slot-definition (class direct-slots)
+  (std-compute-effective-slot-definition class direct-slots))
+
+(defun std-compute-effective-slot-definition (class direct-slots)
+  (declare (ignore class))
+  (let* ((initer (find-if-not (lambda (x) (null x)) direct-slots
+                              :key #'slot-definition-initfunction))
+         (first-slot (car direct-slots))
+         (alloc (slot-definition-allocation first-slot)))
+    (make-effective-slot-definition
+     :name (slot-definition-name first-slot)
+     :initform (when initer (slot-definition-initform initer))
+     :initfunction (when initer (slot-definition-initfunction initer))
+     :initargs (remove-duplicates
+                (mapappend #'slot-definition-initargs direct-slots))
+     :allocation alloc)))
+
+;; ─── Bootstrap steps 6-9: defclass standard-object → all built-ins ─────────
+;;
+;; Closette steps 6-9 use defclass directly. The first one
+;; (standard-object) has T as a parent — and T is already in
+;; the table from stage B step 5. After that, the meta-classes
+;; chain up through metaobject / forward-referenced-class /
+;; specializer / class / standard-class. Step 8 then re-points
+;; every existing class's class-of link to the freshly-defclassed
+;; standard-class. Step 9 defclasses the built-in types so
+;; built-in-class-of finds them.
+
+;; Step 6: superclass tower for standard-class.
+(defclass standard-object (t) ())
+(defclass metaobject ()
+  ((name :initarg :name)
+   (documentation :initform nil :initarg :documentation)))
+(defclass forward-referenced-class (metaobject)
+  ((direct-subclasses :initform nil)))
+(defclass specializer (forward-referenced-class)
+  ((direct-superclasses :initarg :direct-superclasses)
+   class-precedence-list
+   (direct-methods :initform nil)))
+(defclass class (specializer) ())
+
+;; Step 7: define the full standard-class via defclass. Re-point
+;; the global the-class-standard-class to this new value, then
+;; (step 8) update every existing class's class-of link to it.
+(setq the-class-standard-class
+      (defclass standard-class (class)
+        (direct-slots
+         effective-slots
+         (shared-slot-definitions :initform nil)
+         (shared-slots :initform nil)
+         (direct-default-initargs
+          :initform nil :initarg :direct-default-initargs)
+         (effective-default-initargs :initform nil))))
+
+;; Step 8: every previously-allocated class instance still points
+;; at the SKELETON standard-class from stage B; rewrite each one
+;; to reference the new standard-class.
+(dolist (n '(t standard-object metaobject forward-referenced-class
+             specializer class standard-class))
+  (let ((c (find-class n nil)))
+    (when c
+      (setf (std-instance-class c) the-class-standard-class))))
+
+;; Step 9: defclass the built-in types so built-in-class-of can
+;; resolve them. Order matters where there's inheritance.
+(defclass symbol (t) ())
+(defclass sequence (t) ())
+(defclass array (t) ())
+(defclass number (t) ())
+(defclass character (t) ())
+(defclass function (t) ())
+(defclass package (t) ())
+(defclass pathname (t) ())
+(defclass readtable (t) ())
+(defclass stream (t) ())
+(defclass list (sequence) ())
+(defclass null (symbol list) ())
+(defclass cons (list) ())
+(defclass vector (array sequence) ())
+(defclass string (vector) ())
+(defclass integer (number) ())
+(defclass float (number) ())
+(defclass hash-table (t) ())
+
+;; Promote the predicates now that real classes exist. Each
+;; checks "is x a CLOS instance whose class IS standard-class"
+;; — which catches instances of standard-class itself and any
+;; user-defined subclass.
+(defun standard-class-p (x)
+  (and (clos-instance-p x)
+       (eq (class-of x) the-class-standard-class)))
+
+;; standard-generic-function-p is promoted in stage E once
+;; standard-generic-function exists.
+
 ;; Return a printable sentinel so Session::eval's last-value
-;; format_word doesn't try to render the circular T-class
-;; instance (the printer doesn't yet handle cycles). Stage I
-;; will introduce a print-object hook that breaks the cycle
-;; properly; until then, a leading-NIL works.
+;; format_word doesn't try to render a circular class instance
+;; (printer cycle handling lands in stage I).
 nil

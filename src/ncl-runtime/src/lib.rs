@@ -30,7 +30,7 @@ pub mod value;
 pub mod word;
 
 pub use abi::{
-    append_shim, car_shim, cdr_shim, close_stream_shim, cons_shim,
+    append_shim, car_shim, cdr_shim, close_stream_shim, cons_shim, list_shim,
     delete_file_shim, eq_shim, eql_shim,
     equal_shim, error_shim,
     fboundp_shim, file_exists_shim, file_length_shim, file_position_shim,

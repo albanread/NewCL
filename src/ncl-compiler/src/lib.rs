@@ -305,6 +305,8 @@ fn install_native_functions(
                    ncl_runtime::cdr_shim, 1);
     install_native(coord, mutator, "CONS",
                    ncl_runtime::cons_shim, 2);
+    install_native(coord, mutator, "LIST",
+                   ncl_runtime::list_shim, 0);
     install_native(coord, mutator, "EQ",
                    ncl_runtime::eq_shim, 2);
     install_native(coord, mutator, "EQL",
