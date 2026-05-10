@@ -123,6 +123,29 @@ pub fn macroexpand_all(
     if let Some(head_name) = head_symbol_name(v) {
         match &*head_name {
             "QUOTE" => return Ok(v.clone()),
+            "BACKQUOTE" => {
+                // ` form — desugar to a tree of cons/list/append/
+                // quote, then macroexpand the result (it may contain
+                // macros; e.g. `(when ,x ,@body) inside a defmacro).
+                let items = list_to_vec(v)?;
+                if items.len() != 2 {
+                    return Err(EvalError::Compile(
+                        crate::CompileError::NotImplemented(
+                            "backquote takes exactly one form".into(),
+                        ),
+                    ));
+                }
+                let desugared = expand_quasiquote(&items[1])?;
+                return macroexpand_all(&desugared, coord, mutator);
+            }
+            "UNQUOTE" | "UNQUOTE-SPLICING" | "UNQUOTE-NSPLICING" => {
+                return Err(EvalError::Compile(
+                    crate::CompileError::NotImplemented(format!(
+                        "{} only valid inside backquote",
+                        head_name
+                    )),
+                ));
+            }
             "DEFUN" | "DEFMACRO" => {
                 // (defun/defmacro NAME PARAMS body...) — leave name
                 // and params alone, expand body forms.
@@ -269,6 +292,139 @@ fn list_to_vec(v: &Value) -> Result<Vec<Value>, EvalError> {
             }
         }
     }
+}
+
+// ---- Backquote / quasiquote desugaring ------------------------------------
+//
+// Classical CL transformation: `body becomes a tree of cons / list /
+// append / quote calls that, when evaluated, reconstructs the body
+// with each `,x` replaced by x's value and each `,@x` spliced in.
+//
+//   `atom         → 'atom        (or self-quoting)
+//   `,x           → x
+//   `(a b ,c)     → (cons 'a (cons 'b (cons c nil)))
+//   `(a ,@xs b)   → (cons 'a (append xs (cons 'b nil)))
+//   `(,@xs . ys)  → (append xs ys)
+//
+// Nested backquotes are not supported in this slice — they require
+// a level counter and rules around how `, and `,@ behave at each
+// depth. Single-level covers the vast majority of macro-writing use
+// cases.
+
+/// Top-level entry: transform a `body` of `` `body `` into a form
+/// that, when evaluated, reconstructs `body` with unquoted parts
+/// substituted.
+fn expand_quasiquote(form: &Value) -> Result<Value, EvalError> {
+    match form {
+        // Self-quoting atoms — leave bare; they evaluate to themselves.
+        Value::Nil
+        | Value::Fixnum(_)
+        | Value::Char(_)
+        | Value::String(_)
+        | Value::Float(_) => Ok(form.clone()),
+        // T self-evaluates.
+        Value::Symbol(s) if &*s.name == "T" => Ok(form.clone()),
+        // Other symbols: '(quote sym).
+        Value::Symbol(_) => Ok(quote_form(form.clone())),
+        Value::Cons(_) => {
+            // Direct `,x → x.
+            if let Some(inner) = match_form(form, "UNQUOTE") {
+                return Ok(inner);
+            }
+            // Direct `,@x at top-level — error: splicing only valid in lists.
+            if match_form(form, "UNQUOTE-SPLICING").is_some() {
+                return Err(EvalError::Compile(
+                    crate::CompileError::NotImplemented(
+                        "unquote-splicing not allowed outside list".into(),
+                    ),
+                ));
+            }
+            if match_form(form, "BACKQUOTE").is_some() {
+                return Err(EvalError::Compile(
+                    crate::CompileError::NotImplemented(
+                        "nested backquote not yet supported".into(),
+                    ),
+                ));
+            }
+            // Otherwise it's a (possibly dotted) list — walk elements.
+            expand_quasiquote_list(form)
+        }
+        // Vectors etc. — not yet supported in backquote; quote them.
+        _ => Ok(quote_form(form.clone())),
+    }
+}
+
+/// Walk a cons structure cell-by-cell. The reader normalises
+/// `(a . (b c))` into `(a b c)`, so we can't distinguish a dotted
+/// tail at the surface level — but `(a . ,x)` is structurally
+/// `(a . (unquote x))`, and Steele's CLtL algorithm recognises that
+/// pattern by inspecting the cdr at each step:
+///
+///   if cdr matches (unquote x):  the dotted-tail expansion is x
+///   if cdr matches (unquote-splicing x): same idea (rare)
+///   otherwise: recurse on cdr
+///
+/// Combined with the splice-in-car case (which uses APPEND
+/// regardless of position), this gives the standard backquote
+/// behaviour including dotted unquotes.
+fn expand_quasiquote_list(form: &Value) -> Result<Value, EvalError> {
+    let Value::Cons(c) = form else {
+        return expand_quasiquote(form);
+    };
+    let car = &c.car;
+    let cdr = &c.cdr;
+
+    if let Some(spliced) = match_form(car, "UNQUOTE-SPLICING") {
+        let cdr_form = expand_quasiquote_cdr(cdr)?;
+        return Ok(mk_call("APPEND", vec![spliced, cdr_form]));
+    }
+    let car_expanded = if let Some(unquoted) = match_form(car, "UNQUOTE") {
+        unquoted
+    } else {
+        expand_quasiquote(car)?
+    };
+    let cdr_expanded = expand_quasiquote_cdr(cdr)?;
+    Ok(mk_call("CONS", vec![car_expanded, cdr_expanded]))
+}
+
+/// Expand the cdr position of a cons. Recognises `(unquote x)` in
+/// cdr position as a dotted unquote — meaning the cdr is the
+/// raw value of x, not a list ending with x.
+fn expand_quasiquote_cdr(cdr: &Value) -> Result<Value, EvalError> {
+    if let Some(unquoted) = match_form(cdr, "UNQUOTE") {
+        return Ok(unquoted);
+    }
+    if let Some(spliced) = match_form(cdr, "UNQUOTE-SPLICING") {
+        // `(... . ,@x) — uncommon but well-defined: cdr is x.
+        return Ok(spliced);
+    }
+    expand_quasiquote(cdr)
+}
+
+/// If `v` is `(name x)` for the given `name`, return `x`.
+fn match_form(v: &Value, name: &str) -> Option<Value> {
+    let Value::Cons(c) = v else { return None; };
+    let Value::Symbol(head) = &c.car else { return None; };
+    if &*head.name != name {
+        return None;
+    }
+    let Value::Cons(rest) = &c.cdr else { return None; };
+    if !matches!(rest.cdr, Value::Nil) {
+        return None;
+    }
+    Some(rest.car.clone())
+}
+
+fn quote_form(v: Value) -> Value {
+    mk_call("QUOTE", vec![v])
+}
+
+fn mk_call(head: &str, args: Vec<Value>) -> Value {
+    let head_sym = Value::Symbol(Symbol::fresh_uninterned(Arc::from(head)));
+    let mut all = Vec::with_capacity(args.len() + 1);
+    all.push(head_sym);
+    all.extend(args);
+    Value::list(all)
 }
 
 /// Walk a (possibly dotted) cons chain, collecting cars and

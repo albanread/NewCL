@@ -207,6 +207,11 @@ fn install_native_functions(
     mutator: &mut MutatorState,
 ) {
     install_native(coord, mutator, "FORMAT", ncl_runtime::format_shim, 2);
+    // APPEND (binary) is needed natively because backquote-splicing
+    // macros expand to `(append ... ...)`. Loading it here means
+    // backquote works in a bare Session, before any user-Lisp
+    // stdlib has been read.
+    install_native(coord, mutator, "APPEND", ncl_runtime::append_shim, 2);
 }
 
 fn install_native(
@@ -2069,6 +2074,133 @@ mod end_to_end_tests {
         assert_eq!(s.eval("(tag 5)").unwrap(), "(V1 5)");
         s.eval("(defmacro tag (x) (list 'list ''v2 x))").unwrap();
         assert_eq!(s.eval("(tag 5)").unwrap(), "(V2 5)");
+    }
+
+    // -- backquote / quasiquote ------------------------------------------
+
+    #[test]
+    fn backquote_atom_is_quoted() {
+        // `foo → 'foo → FOO at evaluation time.
+        assert_eq!(eval_str("`foo").unwrap(), "FOO");
+        // Numbers self-quote.
+        assert_eq!(eval_str("`42").unwrap(), "42");
+        // nil self-quotes.
+        assert_eq!(eval_str("`nil").unwrap(), "nil");
+        // Strings.
+        assert_eq!(eval_str(r#"`"hi""#).unwrap(), r#""hi""#);
+    }
+
+    #[test]
+    fn backquote_unquote_evaluates() {
+        // `,x → x.
+        let mut s = Session::new();
+        s.eval("(defparameter *v* 42)").unwrap();
+        assert_eq!(s.eval("`,*v*").unwrap(), "42");
+    }
+
+    #[test]
+    fn backquote_list_with_unquotes() {
+        // `(a ,b c) → (cons 'a (cons b (cons 'c nil))).
+        let mut s = Session::new();
+        s.eval("(defparameter *x* 99)").unwrap();
+        assert_eq!(
+            s.eval("`(a ,*x* c)").unwrap(),
+            "(A 99 C)",
+        );
+    }
+
+    #[test]
+    fn backquote_with_splice() {
+        // `(a ,@xs b) splices xs into the list.
+        let mut s = Session::new();
+        s.eval("(defparameter *xs* '(1 2 3))").unwrap();
+        assert_eq!(
+            s.eval("`(a ,@*xs* b)").unwrap(),
+            "(A 1 2 3 B)",
+        );
+        // Empty splice — disappears.
+        s.eval("(defparameter *empty* nil)").unwrap();
+        assert_eq!(
+            s.eval("`(a ,@*empty* b)").unwrap(),
+            "(A B)",
+        );
+    }
+
+    #[test]
+    fn backquote_only_splice() {
+        // `(,@xs) is just xs.
+        let mut s = Session::new();
+        s.eval("(defparameter *xs* '(1 2 3))").unwrap();
+        assert_eq!(s.eval("`(,@*xs*)").unwrap(), "(1 2 3)");
+    }
+
+    #[test]
+    fn backquote_dotted() {
+        // `(a . ,x) puts x in the cdr.
+        let mut s = Session::new();
+        s.eval("(defparameter *x* 5)").unwrap();
+        assert_eq!(s.eval("`(a . ,*x*)").unwrap(), "(A . 5)");
+    }
+
+    #[test]
+    fn backquote_in_macro_my_when() {
+        // The classic example: write `when` cleanly using backquote.
+        let mut s = Session::new();
+        s.eval(
+            "(defmacro my-when (test &rest body) \
+               `(if ,test (progn ,@body) nil))",
+        )
+        .unwrap();
+        assert_eq!(s.eval("(my-when t 1 2 3)").unwrap(), "3");
+        assert_eq!(s.eval("(my-when nil 1 2 3)").unwrap(), "nil");
+        assert_eq!(s.eval("(my-when (> 5 3) (+ 1 2) (+ 3 4))").unwrap(), "7");
+    }
+
+    #[test]
+    fn backquote_in_macro_unless() {
+        let mut s = Session::new();
+        s.eval(
+            "(defmacro my-unless (test &rest body) \
+               `(if ,test nil (progn ,@body)))",
+        )
+        .unwrap();
+        assert_eq!(s.eval("(my-unless nil 1 2 3)").unwrap(), "3");
+        assert_eq!(s.eval("(my-unless t 1 2 3)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn backquote_in_macro_with_splicing_body() {
+        // (let-1 var val body...) → (let ((var val)) body...)
+        let mut s = Session::new();
+        s.eval(
+            "(defmacro let-1 (var val &rest body) \
+               `(let ((,var ,val)) ,@body))",
+        )
+        .unwrap();
+        assert_eq!(s.eval("(let-1 x 10 (+ x 1))").unwrap(), "11");
+        assert_eq!(
+            s.eval("(let-1 x 10 (+ x 1) (* x 2))").unwrap(),
+            "20",
+        );
+    }
+
+    #[test]
+    fn backquote_nested_list_structure() {
+        // `((a ,x) (b ,y))
+        let mut s = Session::new();
+        s.eval("(defparameter *x* 1)").unwrap();
+        s.eval("(defparameter *y* 2)").unwrap();
+        assert_eq!(
+            s.eval("`((a ,*x*) (b ,*y*))").unwrap(),
+            "((A 1) (B 2))",
+        );
+    }
+
+    #[test]
+    fn backquote_unquote_outside_backquote_errors() {
+        // ,x at top level — not inside backquote.
+        let r = eval_str(",foo");
+        assert!(r.is_err());
     }
 
     #[test]

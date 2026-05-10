@@ -349,6 +349,43 @@ pub extern "C" fn ncl_set_cdr(
     new_value
 }
 
+/// Lisp-callable shim for `append`. Binary append — concatenates
+/// two lists; the second list's tail is shared (not copied). Used
+/// by backquote-splicing macros, so it has to be available before
+/// the user-Lisp stdlib loads. Variadic CL `append` lands when
+/// `&rest` argument unpacking does.
+pub extern "C" fn append_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("append: expected 2 args, got {n_args}");
+    }
+    let a = Word::from_raw(unsafe { *args });
+    let b = Word::from_raw(unsafe { *args.add(1) });
+    let m = unsafe { &mut *mutator };
+
+    // Walk `a`, collecting cars; then cons onto `b` right-to-left.
+    let mut cars: Vec<Word> = Vec::new();
+    let mut cur = a;
+    while !cur.is_nil() {
+        if cur.tag() != Tag::Cons {
+            panic!("append: first argument must be a proper list, got {cur:?}");
+        }
+        let p = cur.as_ptr::<u64>(Tag::Cons).expect("cons");
+        cars.push(Word::from_raw(unsafe { *p }));
+        cur = Word::from_raw(unsafe { *p.add(1) });
+    }
+
+    let mut result = b;
+    for car in cars.iter().rev() {
+        result = m.alloc_cons(*car, result);
+    }
+    result.raw()
+}
+
 /// Lisp-callable shim for `format`. Has the standard JIT function
 /// signature so it can be installed in a Symbol's function cell
 /// just like a defun'd function — making `format` a first-class
