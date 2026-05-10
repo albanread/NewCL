@@ -1,0 +1,13 @@
+[package]
+name = "ncl-loader"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+ncl-compiler = { path = "../ncl-compiler" }
+ncl-llvm = { path = "../ncl-llvm" }
+ncl-reader = { path = "../ncl-reader" }
+ncl-runtime = { path = "../ncl-runtime" }
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "ncl-corman-demos"
+version = "0.0.0"
+edition = "2024"
+
+# Faithful-tribute regression suite: run every Corman Lisp demo from
+# E:\CL\cormanlisp\examples end-to-end and compare against expected
+# output. Tests invoke the `ncl` binary as a subprocess (true
+# end-to-end) rather than linking it. Empty until Phase 3 lands the
+# first end-to-end pipeline.
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "ncl-compiler"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+ncl-ir = { path = "../ncl-ir" }
+ncl-reader = { path = "../ncl-reader" }
+
+[lints]
+workspace = true

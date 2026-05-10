@@ -1,0 +1,20 @@
+[package]
+name = "ncl-driver"
+version = "0.0.0"
+edition = "2024"
+
+[[bin]]
+name = "ncl"
+path = "src/main.rs"
+
+[dependencies]
+ncl-cl = { path = "../ncl-cl" }
+ncl-compiler = { path = "../ncl-compiler" }
+ncl-ir = { path = "../ncl-ir" }
+ncl-llvm = { path = "../ncl-llvm" }
+ncl-loader = { path = "../ncl-loader" }
+ncl-reader = { path = "../ncl-reader" }
+ncl-runtime = { path = "../ncl-runtime" }
+
+[lints]
+workspace = true

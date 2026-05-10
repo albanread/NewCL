@@ -1,0 +1,13 @@
+[package]
+name = "ncl-tests"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+ncl-compiler = { path = "../../src/ncl-compiler" }
+ncl-loader = { path = "../../src/ncl-loader" }
+ncl-reader = { path = "../../src/ncl-reader" }
+ncl-runtime = { path = "../../src/ncl-runtime" }
+
+[lints]
+workspace = true
