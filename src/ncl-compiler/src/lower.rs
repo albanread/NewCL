@@ -506,6 +506,11 @@ fn lower_call_in_mut(
         "AND" => lower_and(args, env, coord),
         "OR" => lower_or(args, env, coord),
         "COND" => lower_cond(args, env, coord),
+        // (when test body...) ≡ (if test (progn body...) nil)
+        // (unless test body...) ≡ (if test nil (progn body...))
+        // Implicit progn over body forms; empty body yields nil.
+        "WHEN" => lower_when(&head_name, args, env, coord, /*invert*/ false),
+        "UNLESS" => lower_when(&head_name, args, env, coord, /*invert*/ true),
         // Numeric comparisons. Binary only for now; CL allows
         // variadic with chained semantics ((< 1 2 3) = (and …))
         // — that lands when `and` does.
@@ -858,6 +863,40 @@ fn lower_cond(
     };
     let rest = lower_cond(&clauses[1..], env, coord)?;
     Ok(Expr::if_(test, body, rest))
+}
+
+fn lower_when(
+    head: &str,
+    args: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+    invert: bool,
+) -> Result<Expr, CompileError> {
+    if args.is_empty() {
+        return Err(CompileError::BadArity {
+            head: head.to_string(),
+            expected: "at least 1 (test)",
+            got: 0,
+        });
+    }
+    let test = lower_in_mut(&args[0], env, coord)?;
+    let body_forms = &args[1..];
+    let body = if body_forms.is_empty() {
+        Expr::Nil
+    } else if body_forms.len() == 1 {
+        lower_in_mut(&body_forms[0], env, coord)?
+    } else {
+        let lowered: Result<Vec<_>, _> = body_forms
+            .iter()
+            .map(|f| lower_in_mut(f, env, coord))
+            .collect();
+        Expr::progn(lowered?)
+    };
+    if invert {
+        Ok(Expr::if_(test, Expr::Nil, body))
+    } else {
+        Ok(Expr::if_(test, body, Expr::Nil))
+    }
 }
 
 fn lower_setq(

@@ -110,6 +110,32 @@ impl Default for Session {
     fn default() -> Self { Session::new() }
 }
 
+/// User-Lisp portion of the standard library. Embedded at compile
+/// time so the binary is self-contained — no filesystem lookup at
+/// runtime, no working-directory dependence in tests. The Rust-side
+/// glue (numeric primitives, condition machinery) lives in
+/// `ncl-cl`; everything written in Lisp lives here.
+const CORE_LISP_SOURCE: &str = include_str!("../../../Lisp/core.lisp");
+
+impl Session {
+    /// Read and evaluate the embedded core-stdlib source. Each defun
+    /// goes through the same JIT path as user code; the resulting
+    /// Function objects are installed in the symbols' function
+    /// cells. Idempotent only in the trivial sense — calling twice
+    /// re-defines every function.
+    pub fn load_core_stdlib(&mut self) -> Result<(), EvalError> {
+        self.eval(CORE_LISP_SOURCE)?;
+        Ok(())
+    }
+
+    /// Convenience: a session with the core stdlib pre-loaded.
+    pub fn with_stdlib() -> Result<Session, EvalError> {
+        let mut s = Session::new();
+        s.load_core_stdlib()?;
+        Ok(s)
+    }
+}
+
 /// Recognise `(defun name (params...) body...)`. Returns `Some` if
 /// the form is a defun. Implicit progn is supported — multiple body
 /// forms are returned as a Vec for the caller to wrap.
@@ -1621,6 +1647,204 @@ mod end_to_end_tests {
         )
         .unwrap();
         assert_eq!(result, "720");
+    }
+
+    // -- when / unless ----------------------------------------------------
+
+    #[test]
+    fn when_true_runs_body() {
+        assert_eq!(eval_str("(when t 1 2 3)").unwrap(), "3");
+    }
+
+    #[test]
+    fn when_false_returns_nil() {
+        assert_eq!(eval_str("(when nil 1 2 3)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn when_no_body_returns_nil() {
+        assert_eq!(eval_str("(when t)").unwrap(), "nil");
+        assert_eq!(eval_str("(when nil)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn unless_inverts_when() {
+        assert_eq!(eval_str("(unless nil 1 2 3)").unwrap(), "3");
+        assert_eq!(eval_str("(unless t 1 2 3)").unwrap(), "nil");
+    }
+
+    // -- Core stdlib (Lisp/core.lisp) -------------------------------------
+
+    #[test]
+    fn stdlib_loads_clean() {
+        // Smoke test: the file evaluates without error.
+        let mut s = Session::with_stdlib().expect("stdlib should load");
+        // Bonus: a defined function is callable.
+        assert_eq!(s.eval("(first '(1 2 3))").unwrap(), "1");
+    }
+
+    #[test]
+    fn stdlib_accessors() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(first '(a b c))").unwrap(), "A");
+        assert_eq!(s.eval("(rest '(a b c))").unwrap(), "(B C)");
+        assert_eq!(s.eval("(second '(1 2 3))").unwrap(), "2");
+        assert_eq!(s.eval("(third '(1 2 3 4))").unwrap(), "3");
+        assert_eq!(s.eval("(fourth '(1 2 3 4 5))").unwrap(), "4");
+        assert_eq!(s.eval("(cadr '(1 2 3))").unwrap(), "2");
+        assert_eq!(s.eval("(cddr '(1 2 3 4))").unwrap(), "(3 4)");
+    }
+
+    #[test]
+    fn stdlib_reverse() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(reverse '(1 2 3 4 5))").unwrap(), "(5 4 3 2 1)");
+        assert_eq!(s.eval("(reverse nil)").unwrap(), "nil");
+        assert_eq!(s.eval("(reverse '(a))").unwrap(), "(A)");
+    }
+
+    #[test]
+    fn stdlib_append() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(append '(1 2 3) '(4 5))").unwrap(),
+            "(1 2 3 4 5)",
+        );
+        assert_eq!(s.eval("(append nil '(a b))").unwrap(), "(A B)");
+        assert_eq!(s.eval("(append '(a b) nil)").unwrap(), "(A B)");
+    }
+
+    #[test]
+    fn stdlib_mapcar() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval("(defun double (x) (* x 2))").unwrap();
+        assert_eq!(
+            s.eval("(mapcar #'double '(1 2 3 4))").unwrap(),
+            "(2 4 6 8)",
+        );
+        // With a lambda.
+        assert_eq!(
+            s.eval("(mapcar (lambda (x) (+ x 10)) '(1 2 3))").unwrap(),
+            "(11 12 13)",
+        );
+        assert_eq!(s.eval("(mapcar #'double nil)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn stdlib_member() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(member 3 '(1 2 3 4 5))").unwrap(), "(3 4 5)");
+        assert_eq!(s.eval("(member 99 '(1 2 3))").unwrap(), "nil");
+        // member uses equal — finds string content match.
+        assert_eq!(
+            s.eval(r#"(member "b" '("a" "b" "c"))"#).unwrap(),
+            r#"("b" "c")"#,
+        );
+    }
+
+    #[test]
+    fn stdlib_position_and_find() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(position 'c '(a b c d))").unwrap(), "2");
+        assert_eq!(s.eval("(position 'z '(a b c))").unwrap(), "nil");
+        assert_eq!(s.eval("(find 3 '(1 2 3 4))").unwrap(), "3");
+        assert_eq!(s.eval("(find 99 '(1 2 3))").unwrap(), "nil");
+    }
+
+    #[test]
+    fn stdlib_assoc() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(assoc 'b '((a . 1) (b . 2) (c . 3)))").unwrap(),
+            "(B . 2)",
+        );
+        assert_eq!(
+            s.eval("(assoc 'z '((a . 1) (b . 2)))").unwrap(),
+            "nil",
+        );
+    }
+
+    #[test]
+    fn stdlib_nth_and_nthcdr() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(nth 0 '(a b c))").unwrap(), "A");
+        assert_eq!(s.eval("(nth 2 '(a b c))").unwrap(), "C");
+        assert_eq!(s.eval("(nthcdr 0 '(a b c))").unwrap(), "(A B C)");
+        assert_eq!(s.eval("(nthcdr 1 '(a b c))").unwrap(), "(B C)");
+        assert_eq!(s.eval("(nthcdr 3 '(a b c))").unwrap(), "nil");
+    }
+
+    #[test]
+    fn stdlib_last_returns_last_cons() {
+        let mut s = Session::with_stdlib().unwrap();
+        // CL: last returns the LAST CONS, not the last element.
+        assert_eq!(s.eval("(last '(1 2 3))").unwrap(), "(3)");
+        assert_eq!(s.eval("(last '(a))").unwrap(), "(A)");
+        assert_eq!(s.eval("(last nil)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn stdlib_butlast() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(butlast '(1 2 3 4))").unwrap(), "(1 2 3)");
+        assert_eq!(s.eval("(butlast '(1))").unwrap(), "nil");
+        assert_eq!(s.eval("(butlast nil)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn stdlib_every_some() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(every #'plusp '(1 2 3))").unwrap(), "T");
+        assert_eq!(s.eval("(every #'plusp '(1 -1 3))").unwrap(), "nil");
+        assert_eq!(s.eval("(every #'plusp nil)").unwrap(), "T");
+        assert_eq!(s.eval("(some #'minusp '(1 2 -3))").unwrap(), "T");
+        assert_eq!(s.eval("(some #'minusp '(1 2 3))").unwrap(), "nil");
+    }
+
+    #[test]
+    fn stdlib_numeric_helpers() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(zerop 0)").unwrap(), "T");
+        assert_eq!(s.eval("(zerop 5)").unwrap(), "nil");
+        assert_eq!(s.eval("(plusp 5)").unwrap(), "T");
+        assert_eq!(s.eval("(plusp -5)").unwrap(), "nil");
+        assert_eq!(s.eval("(minusp -5)").unwrap(), "T");
+        assert_eq!(s.eval("(1+ 41)").unwrap(), "42");
+        assert_eq!(s.eval("(1- 43)").unwrap(), "42");
+        assert_eq!(s.eval("(min2 3 7)").unwrap(), "3");
+        assert_eq!(s.eval("(max2 3 7)").unwrap(), "7");
+        assert_eq!(s.eval("(abs -5)").unwrap(), "5");
+        assert_eq!(s.eval("(abs 5)").unwrap(), "5");
+    }
+
+    #[test]
+    fn stdlib_copy_list_unshares() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval("(defparameter *a* '(1 2 3))").unwrap();
+        s.eval("(defparameter *b* (copy-list *a*))").unwrap();
+        // Same content...
+        assert_eq!(s.eval("(equal *a* *b*)").unwrap(), "T");
+        // ...but distinct conses.
+        assert_eq!(s.eval("(eq *a* *b*)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn stdlib_composes() {
+        // Build a non-trivial pipeline using stdlib functions.
+        let mut s = Session::with_stdlib().unwrap();
+        // Reverse, then mapcar 1+, then take last cons.
+        assert_eq!(
+            s.eval("(last (mapcar #'1+ (reverse '(1 2 3 4))))").unwrap(),
+            "(2)",
+        );
+    }
+
+    #[test]
+    fn stdlib_identity() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(identity 42)").unwrap(), "42");
+        assert_eq!(s.eval("(identity 'foo)").unwrap(), "FOO");
+        assert_eq!(s.eval("(mapcar #'identity '(1 2 3))").unwrap(), "(1 2 3)");
     }
 
     // -- Errors ------------------------------------------------------------
