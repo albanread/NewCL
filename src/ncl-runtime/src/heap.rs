@@ -175,6 +175,17 @@ impl Semispace {
         unsafe { NonNull::new_unchecked(p) }
     }
 
+    /// Try to allocate `cells` cells; returns `None` instead of
+    /// panicking on exhaustion. Used by the TLAB refill path.
+    pub fn try_alloc_cells(&mut self, cells: usize) -> Option<NonNull<u64>> {
+        if self.top + cells > self.cells.len() {
+            return None;
+        }
+        let p = unsafe { self.cells.as_mut_ptr().add(self.top) };
+        self.top += cells;
+        Some(unsafe { NonNull::new_unchecked(p) })
+    }
+
     pub fn alloc_cons(&mut self, car: Word, cdr: Word) -> Word {
         let p = self.alloc_cells(2);
         unsafe {
@@ -277,9 +288,17 @@ impl Heap {
     }
 
     pub fn young_used_bytes(&self) -> usize { self.young.used_bytes() }
+    pub fn young_free_cells(&self) -> usize { self.young.free_cells() }
     pub fn old_used_bytes(&self) -> usize { self.old.live().used_bytes() }
     pub fn used_bytes(&self) -> usize {
         self.young_used_bytes() + self.old_used_bytes()
+    }
+
+    /// Reserve a slab in young for a TLAB. Returns `None` if young
+    /// can't fit the slab. The caller (a `MutatorState`) bump-
+    /// allocates within the returned slab without locks.
+    pub fn young_try_alloc_slab(&mut self, cells: usize) -> Option<NonNull<u64>> {
+        self.young.try_alloc_cells(cells)
     }
 
     pub fn young_capacity_bytes(&self) -> usize { self.young.capacity_bytes() }
