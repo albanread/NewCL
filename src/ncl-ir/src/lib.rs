@@ -51,6 +51,23 @@ pub enum Expr {
     /// Object identity. Returns `t` if the two operands have the
     /// same Word bits, else `nil`.
     Eq(Box<Expr>, Box<Expr>),
+    /// Signed integer comparisons on tagged fixnums. `a < b` etc.
+    /// Both operands must already be tagged fixnums (low 3 bits 0);
+    /// the comparison is on the raw 64-bit values, which preserves
+    /// signed ordering of the un-tagged values because shifting both
+    /// by 3 doesn't change relative ordering.
+    Lt(Box<Expr>, Box<Expr>),
+    Gt(Box<Expr>, Box<Expr>),
+    Le(Box<Expr>, Box<Expr>),
+    Ge(Box<Expr>, Box<Expr>),
+    NumEq(Box<Expr>, Box<Expr>),
+    /// Type predicates. Each returns `t` (Word::T) or `nil`.
+    /// `null` checks `is x == nil`. `consp` / `atom` / `listp`
+    /// check the tag bits (atom = !cons; listp = nil or cons).
+    IsNull(Box<Expr>),
+    IsCons(Box<Expr>),
+    IsAtom(Box<Expr>),
+    IsListp(Box<Expr>),
     /// Conditional. If the first sub-expression evaluates to
     /// anything other than `nil`, evaluate the second; else the
     /// third.
@@ -70,6 +87,15 @@ impl Expr {
     pub fn car(x: Expr) -> Expr { Expr::Car(Box::new(x)) }
     pub fn cdr(x: Expr) -> Expr { Expr::Cdr(Box::new(x)) }
     pub fn eq(a: Expr, b: Expr) -> Expr { Expr::Eq(Box::new(a), Box::new(b)) }
+    pub fn lt(a: Expr, b: Expr) -> Expr { Expr::Lt(Box::new(a), Box::new(b)) }
+    pub fn gt(a: Expr, b: Expr) -> Expr { Expr::Gt(Box::new(a), Box::new(b)) }
+    pub fn le(a: Expr, b: Expr) -> Expr { Expr::Le(Box::new(a), Box::new(b)) }
+    pub fn ge(a: Expr, b: Expr) -> Expr { Expr::Ge(Box::new(a), Box::new(b)) }
+    pub fn num_eq(a: Expr, b: Expr) -> Expr { Expr::NumEq(Box::new(a), Box::new(b)) }
+    pub fn is_null(x: Expr) -> Expr { Expr::IsNull(Box::new(x)) }
+    pub fn is_cons(x: Expr) -> Expr { Expr::IsCons(Box::new(x)) }
+    pub fn is_atom(x: Expr) -> Expr { Expr::IsAtom(Box::new(x)) }
+    pub fn is_listp(x: Expr) -> Expr { Expr::IsListp(Box::new(x)) }
     pub fn if_(c: Expr, t: Expr, e: Expr) -> Expr {
         Expr::If(Box::new(c), Box::new(t), Box::new(e))
     }

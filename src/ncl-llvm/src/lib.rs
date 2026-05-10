@@ -24,7 +24,7 @@ use inkwell::module::{Linkage, Module};
 use inkwell::values::{FunctionValue, IntValue};
 
 use ncl_ir::Expr;
-use ncl_runtime::{ncl_alloc_cons, ncl_call, MutatorState, Word};
+use ncl_runtime::{ncl_alloc_cons, ncl_call, MutatorState, Tag, Word};
 
 // We leak each compilation's Context + Module + Engine so the
 // JIT'd code stays valid for the process lifetime. A real loader
@@ -215,6 +215,67 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     );
 }
 
+/// Convert an i1 comparison result to a tagged Word (T or NIL).
+fn emit_bool_select<'ctx>(
+    builder: &Builder<'ctx>,
+    cmp: IntValue<'ctx>,
+    i64_t: inkwell::types::IntType<'ctx>,
+) -> Result<IntValue<'ctx>, String> {
+    let t = i64_t.const_int(Word::T.raw(), false);
+    let nil = i64_t.const_int(Word::NIL.raw(), false);
+    builder
+        .build_select(cmp, t, nil, "bool_result")
+        .map_err(|e| format!("select: {e}"))
+        .map(|v| v.into_int_value())
+}
+
+/// Emit a binary integer comparison, return Word::T or Word::NIL.
+#[allow(clippy::too_many_arguments)]
+fn emit_cmp<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    arity: u32,
+    locals: &mut Vec<IntValue<'ctx>>,
+    a: &Expr,
+    b: &Expr,
+    pred: IntPredicate,
+) -> Result<IntValue<'ctx>, String> {
+    let lhs = emit_expr(context, builder, function, helpers, arity, locals, a)?;
+    let rhs = emit_expr(context, builder, function, helpers, arity, locals, b)?;
+    let cmp = builder
+        .build_int_compare(pred, lhs, rhs, "cmp")
+        .map_err(|e| format!("icmp: {e}"))?;
+    let i64_t = context.i64_type();
+    emit_bool_select(builder, cmp, i64_t)
+}
+
+/// Tag-equality predicate.
+#[allow(clippy::too_many_arguments)]
+fn emit_tag_eq<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    arity: u32,
+    locals: &mut Vec<IntValue<'ctx>>,
+    x: &Expr,
+    tag: Tag,
+) -> Result<IntValue<'ctx>, String> {
+    let i64_t = context.i64_type();
+    let v = emit_expr(context, builder, function, helpers, arity, locals, x)?;
+    let mask = i64_t.const_int(0b111, false);
+    let tag_bits = builder
+        .build_and(v, mask, "tag_bits")
+        .map_err(|e| format!("and: {e}"))?;
+    let expected = i64_t.const_int(tag as u64, false);
+    let cmp = builder
+        .build_int_compare(IntPredicate::EQ, tag_bits, expected, "tag_eq")
+        .map_err(|e| format!("icmp: {e}"))?;
+    emit_bool_select(builder, cmp, i64_t)
+}
+
 fn emit_expr<'ctx>(
     context: &'ctx Context,
     builder: &Builder<'ctx>,
@@ -357,18 +418,55 @@ fn emit_expr<'ctx>(
                 .map_err(|e| format!("load cdr: {e}"))?;
             Ok(loaded.into_int_value())
         }
-        Expr::Eq(a, b) => {
-            let lhs = emit_expr(context, builder, function, helpers, arity, locals, a)?;
-            let rhs = emit_expr(context, builder, function, helpers, arity, locals, b)?;
+        Expr::Eq(a, b) => emit_cmp(context, builder, function, helpers, arity, locals, a, b, IntPredicate::EQ),
+        Expr::Lt(a, b) => emit_cmp(context, builder, function, helpers, arity, locals, a, b, IntPredicate::SLT),
+        Expr::Gt(a, b) => emit_cmp(context, builder, function, helpers, arity, locals, a, b, IntPredicate::SGT),
+        Expr::Le(a, b) => emit_cmp(context, builder, function, helpers, arity, locals, a, b, IntPredicate::SLE),
+        Expr::Ge(a, b) => emit_cmp(context, builder, function, helpers, arity, locals, a, b, IntPredicate::SGE),
+        Expr::NumEq(a, b) => emit_cmp(context, builder, function, helpers, arity, locals, a, b, IntPredicate::EQ),
+        Expr::IsNull(x) => {
+            let v = emit_expr(context, builder, function, helpers, arity, locals, x)?;
+            let nil = i64_t.const_int(Word::NIL.raw(), false);
             let cmp = builder
-                .build_int_compare(IntPredicate::EQ, lhs, rhs, "eq_cmp")
+                .build_int_compare(IntPredicate::EQ, v, nil, "is_null")
                 .map_err(|e| format!("icmp: {e}"))?;
-            let t_word = i64_t.const_int(Word::T.raw(), false);
-            let nil_word = i64_t.const_int(Word::NIL.raw(), false);
-            let sel = builder
-                .build_select(cmp, t_word, nil_word, "eq_result")
-                .map_err(|e| format!("select: {e}"))?;
-            Ok(sel.into_int_value())
+            emit_bool_select(builder, cmp, i64_t)
+        }
+        Expr::IsCons(x) => emit_tag_eq(context, builder, function, helpers, arity, locals, x, Tag::Cons),
+        Expr::IsAtom(x) => {
+            let v = emit_expr(context, builder, function, helpers, arity, locals, x)?;
+            let mask = i64_t.const_int(0b111, false);
+            let tag_bits = builder
+                .build_and(v, mask, "tag_bits")
+                .map_err(|e| format!("and: {e}"))?;
+            let cons_tag = i64_t.const_int(Tag::Cons as u64, false);
+            let is_cons = builder
+                .build_int_compare(IntPredicate::EQ, tag_bits, cons_tag, "is_cons")
+                .map_err(|e| format!("icmp: {e}"))?;
+            let true_const = context.bool_type().const_int(1, false);
+            let is_atom = builder
+                .build_xor(is_cons, true_const, "is_atom")
+                .map_err(|e| format!("xor: {e}"))?;
+            emit_bool_select(builder, is_atom, i64_t)
+        }
+        Expr::IsListp(x) => {
+            let v = emit_expr(context, builder, function, helpers, arity, locals, x)?;
+            let nil = i64_t.const_int(Word::NIL.raw(), false);
+            let is_nil = builder
+                .build_int_compare(IntPredicate::EQ, v, nil, "is_nil")
+                .map_err(|e| format!("icmp: {e}"))?;
+            let mask = i64_t.const_int(0b111, false);
+            let tag_bits = builder
+                .build_and(v, mask, "tag_bits")
+                .map_err(|e| format!("and: {e}"))?;
+            let cons_tag = i64_t.const_int(Tag::Cons as u64, false);
+            let is_cons = builder
+                .build_int_compare(IntPredicate::EQ, tag_bits, cons_tag, "is_cons")
+                .map_err(|e| format!("icmp: {e}"))?;
+            let either = builder
+                .build_or(is_nil, is_cons, "is_listp")
+                .map_err(|e| format!("or: {e}"))?;
+            emit_bool_select(builder, either, i64_t)
         }
         Expr::If(cond, then_branch, else_branch) => {
             let cond_val = emit_expr(context, builder, function, helpers, arity, locals, cond)?;

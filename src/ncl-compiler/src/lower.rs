@@ -266,6 +266,22 @@ fn lower_call_in_mut(
                 args.iter().map(|a| lower_in_mut(a, env, coord)).collect();
             Ok(Expr::progn(lowered?))
         }
+        // Numeric comparisons. Binary only for now; CL allows
+        // variadic with chained semantics ((< 1 2 3) = (and …))
+        // — that lands when `and` does.
+        "<" => binary_op(&head_name, args, env, coord, Expr::lt),
+        ">" => binary_op(&head_name, args, env, coord, Expr::gt),
+        "<=" => binary_op(&head_name, args, env, coord, Expr::le),
+        ">=" => binary_op(&head_name, args, env, coord, Expr::ge),
+        "=" => binary_op(&head_name, args, env, coord, Expr::num_eq),
+        // Type predicates. Each takes one argument.
+        "NULL" => unary_op(&head_name, args, env, coord, Expr::is_null),
+        "CONSP" => unary_op(&head_name, args, env, coord, Expr::is_cons),
+        "ATOM" => unary_op(&head_name, args, env, coord, Expr::is_atom),
+        "LISTP" => unary_op(&head_name, args, env, coord, Expr::is_listp),
+        // EQL is currently the same as EQ — distinctions come
+        // when floats/chars/bignums need value-equality semantics.
+        "EQL" => binary_op(&head_name, args, env, coord, Expr::eq),
         "LET" => lower_let(args, env, coord),
         "DEFUN" => Err(CompileError::BadDefun(
             "(defun ...) is only allowed at top level".into(),
@@ -346,6 +362,43 @@ fn lower_let(
 
     env.restore(cp);
     Ok(Expr::let_(binding_exprs, body_expr))
+}
+
+fn binary_op(
+    head: &str,
+    args: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+    build: fn(Expr, Expr) -> Expr,
+) -> Result<Expr, CompileError> {
+    if args.len() != 2 {
+        return Err(CompileError::BadArity {
+            head: head.to_string(),
+            expected: "2",
+            got: args.len(),
+        });
+    }
+    Ok(build(
+        lower_in_mut(&args[0], env, coord)?,
+        lower_in_mut(&args[1], env, coord)?,
+    ))
+}
+
+fn unary_op(
+    head: &str,
+    args: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+    build: fn(Expr) -> Expr,
+) -> Result<Expr, CompileError> {
+    if args.len() != 1 {
+        return Err(CompileError::BadArity {
+            head: head.to_string(),
+            expected: "1",
+            got: args.len(),
+        });
+    }
+    Ok(build(lower_in_mut(&args[0], env, coord)?))
 }
 
 fn fold_arithmetic(

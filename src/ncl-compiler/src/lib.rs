@@ -508,6 +508,121 @@ mod end_to_end_tests {
         assert_eq!(eval_str("(let ((x 5)))").unwrap(), "nil");
     }
 
+    // -- Numeric comparisons -----------------------------------------------
+
+    #[test]
+    fn lt_works() {
+        assert_eq!(eval_str("(< 1 2)").unwrap(), "T");
+        assert_eq!(eval_str("(< 2 1)").unwrap(), "nil");
+        assert_eq!(eval_str("(< 1 1)").unwrap(), "nil");
+        assert_eq!(eval_str("(< -5 0)").unwrap(), "T");
+    }
+
+    #[test]
+    fn gt_works() {
+        assert_eq!(eval_str("(> 2 1)").unwrap(), "T");
+        assert_eq!(eval_str("(> 1 2)").unwrap(), "nil");
+        assert_eq!(eval_str("(> 1 1)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn le_ge_eq_work() {
+        assert_eq!(eval_str("(<= 1 1)").unwrap(), "T");
+        assert_eq!(eval_str("(<= 1 2)").unwrap(), "T");
+        assert_eq!(eval_str("(<= 2 1)").unwrap(), "nil");
+        assert_eq!(eval_str("(>= 1 1)").unwrap(), "T");
+        assert_eq!(eval_str("(>= 2 1)").unwrap(), "T");
+        assert_eq!(eval_str("(= 1 1)").unwrap(), "T");
+        assert_eq!(eval_str("(= 1 2)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn fibonacci_via_recursion() {
+        let result = eval_str(
+            "(defun fib (n)
+               (if (< n 2)
+                   n
+                   (+ (fib (- n 1)) (fib (- n 2)))))
+             (fib 10)",
+        )
+        .unwrap();
+        assert_eq!(result, "55"); // fib(10)
+    }
+
+    #[test]
+    fn fibonacci_15() {
+        let result = eval_str(
+            "(defun fib (n)
+               (if (< n 2)
+                   n
+                   (+ (fib (- n 1)) (fib (- n 2)))))
+             (fib 15)",
+        )
+        .unwrap();
+        assert_eq!(result, "610"); // fib(15)
+    }
+
+    // -- Type predicates ---------------------------------------------------
+
+    #[test]
+    fn null_predicate() {
+        assert_eq!(eval_str("(null nil)").unwrap(), "T");
+        assert_eq!(eval_str("(null 0)").unwrap(), "nil");
+        assert_eq!(eval_str("(null (cons 1 2))").unwrap(), "nil");
+        assert_eq!(eval_str("(null t)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn consp_predicate() {
+        assert_eq!(eval_str("(consp (cons 1 2))").unwrap(), "T");
+        assert_eq!(eval_str("(consp nil)").unwrap(), "nil");
+        assert_eq!(eval_str("(consp 0)").unwrap(), "nil");
+        assert_eq!(eval_str("(consp t)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn atom_predicate() {
+        assert_eq!(eval_str("(atom nil)").unwrap(), "T");
+        assert_eq!(eval_str("(atom 42)").unwrap(), "T");
+        assert_eq!(eval_str("(atom t)").unwrap(), "T");
+        assert_eq!(eval_str("(atom (cons 1 2))").unwrap(), "nil");
+    }
+
+    #[test]
+    fn listp_predicate() {
+        assert_eq!(eval_str("(listp nil)").unwrap(), "T");
+        assert_eq!(eval_str("(listp (cons 1 2))").unwrap(), "T");
+        assert_eq!(eval_str("(listp 42)").unwrap(), "nil");
+        assert_eq!(eval_str("(listp t)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn list_traversal_via_recursion() {
+        // Compute the length of a proper list using car/cdr/null.
+        let result = eval_str(
+            "(defun length (lst)
+               (if (null lst)
+                   0
+                   (+ 1 (length (cdr lst)))))
+             (length (cons 1 (cons 2 (cons 3 (cons 4 nil)))))",
+        )
+        .unwrap();
+        assert_eq!(result, "4");
+    }
+
+    #[test]
+    fn list_sum_via_recursion() {
+        let result = eval_str(
+            "(defun sum-list (lst)
+               (if (null lst)
+                   0
+                   (+ (car lst) (sum-list (cdr lst)))))
+             (sum-list (cons 1 (cons 2 (cons 3 (cons 4 (cons 5 nil))))))",
+        )
+        .unwrap();
+        assert_eq!(result, "15");
+    }
+
     #[test]
     fn let_with_recursive_call_in_body() {
         // (defun fact-via-let (n)
