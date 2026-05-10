@@ -411,10 +411,6 @@ impl Heap {
     /// Step 4 has no write barrier yet, so we full-scan `old.live`
     /// for young pointers. Step 5 narrows that to dirty cards.
     pub fn collect_minor(&mut self, mut visit_roots: impl FnMut(&mut RootScanner<'_, '_>)) {
-        // We need access to old's live semispace AND the card table.
-        // The card table is owned via Arc by the OldGen, and we
-        // clone the Arc up front so we can hold it across the
-        // borrow of `live_mut` below.
         let cards = Arc::clone(&self.old.cards);
         let live_base = self.old.live_base_ptr() as usize;
 
@@ -423,23 +419,49 @@ impl Heap {
             dest: self.old.live_mut(),
             queue: Vec::new(),
         };
-        // Phase 1: roots.
         {
             let mut scanner = RootScanner { state: ScanTarget::Minor(&mut state) };
             visit_roots(&mut scanner);
         }
-        // Phase 2: scan only DIRTY cards in old.live for young
-        // pointers. This is the card-based barrier replacing the
-        // step-4 full scan. Cleared cards are skipped entirely.
         state.scan_dirty_cards_for_young_pointers(&cards, live_base);
-        // Phase 3: drain the queue (transitively copy reachable
-        // young objects into dest).
         state.scan_to_completion();
-        // Phase 4: young is now garbage; reset it.
         self.young.reset();
-        // Phase 5: every dirty card we found has been processed.
-        // Clear the table so the next minor only scans new dirties.
         cards.clear_all();
+    }
+
+    /// Like `collect_minor` but also scans dirty cards in a static
+    /// area for static→young pointers. Used by the GcCoordinator at
+    /// runtime; tests that don't have a static area use the simpler
+    /// `collect_minor` above.
+    pub fn collect_minor_with_static(
+        &mut self,
+        static_cards: &CardTable,
+        static_base: *mut u64,
+        static_cells: usize,
+        mut visit_roots: impl FnMut(&mut RootScanner<'_, '_>),
+    ) {
+        let cards = Arc::clone(&self.old.cards);
+        let live_base = self.old.live_base_ptr() as usize;
+
+        let mut state = MinorState {
+            young: &mut self.young,
+            dest: self.old.live_mut(),
+            queue: Vec::new(),
+        };
+        {
+            let mut scanner = RootScanner { state: ScanTarget::Minor(&mut state) };
+            visit_roots(&mut scanner);
+        }
+        // Scan old.live's dirty cards.
+        state.scan_dirty_cards_for_young_pointers(&cards, live_base);
+        // Scan the static area's dirty cards. Static slots may now
+        // contain young pointers (placed there since the last GC);
+        // we promote those targets and update the slots in place.
+        state.scan_dirty_cards_in(static_cards, static_base, static_cells);
+        state.scan_to_completion();
+        self.young.reset();
+        cards.clear_all();
+        static_cards.clear_all();
     }
 
     /// Full GC. Copies everything reachable from roots into
@@ -488,25 +510,36 @@ impl<'a> MinorState<'a> {
     }
 
     /// Walk only DIRTY cards in `dest` (= old.live) looking for
-    /// pointers into `young`. Each dirty card covers `CARD_SIZE_CELLS`
-    /// cells (64); we read each as a candidate Word and let
-    /// `copy_into` filter non-pointers.
+    /// pointers into `young`.
     fn scan_dirty_cards_for_young_pointers(
         &mut self,
         cards: &CardTable,
         live_base: usize,
     ) {
-        let dest_limit_cells = self.dest.top;
         let dest_base = self.dest.cells.as_ptr() as usize;
         debug_assert_eq!(dest_base, live_base, "card table covers wrong space");
+        let dest_base_ptr = self.dest.cells.as_ptr() as *mut u64;
+        let dest_limit = self.dest.top;
+        self.scan_dirty_cards_in(cards, dest_base_ptr, dest_limit);
+    }
 
+    /// Generic dirty-card scan over a region. Used for both old.live
+    /// (during minor GC) and the static area (also during minor GC).
+    /// `region_base..region_base.add(region_cells)` must match the
+    /// area covered by `cards`.
+    fn scan_dirty_cards_in(
+        &mut self,
+        cards: &CardTable,
+        region_base: *mut u64,
+        region_cells: usize,
+    ) {
         for card in 0..cards.n_cards() {
             if !cards.is_dirty(card) { continue; }
-            let card_start_cell = card * CARD_SIZE_CELLS;
-            let card_end_cell = (card_start_cell + CARD_SIZE_CELLS).min(dest_limit_cells);
-            if card_start_cell >= dest_limit_cells { break; }
-            for i in card_start_cell..card_end_cell {
-                let raw = unsafe { *self.dest.cell_ptr(i) };
+            let card_start = card * CARD_SIZE_CELLS;
+            let card_end = (card_start + CARD_SIZE_CELLS).min(region_cells);
+            if card_start >= region_cells { break; }
+            for i in card_start..card_end {
+                let raw = unsafe { *region_base.add(i) };
                 let w = Word::from_raw(raw);
                 if let Some(new) = copy_into(
                     w,
@@ -514,7 +547,7 @@ impl<'a> MinorState<'a> {
                     self.dest,
                     &mut self.queue,
                 ) {
-                    unsafe { *self.dest.cell_ptr_mut(i) = new.raw(); }
+                    unsafe { region_base.add(i).write(new.raw()); }
                 }
             }
         }

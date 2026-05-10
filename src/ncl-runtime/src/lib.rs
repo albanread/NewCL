@@ -12,13 +12,18 @@
 
 pub mod heap;
 pub mod mutator;
+pub mod static_area;
 pub mod symbol;
 pub mod universe;
 pub mod value;
 pub mod word;
 
-pub use heap::{GcBit, Heap, HeapHeader, HeapType, MAX_OBJECT_CELLS};
+pub use heap::{
+    CardTable, GcBit, Heap, HeapHeader, HeapType, CARD_SIZE_BYTES, CARD_SIZE_CELLS,
+    MAX_OBJECT_CELLS,
+};
 pub use mutator::{GcConfig, GcCoordinator, MutatorHandle, MutatorState};
+pub use static_area::StaticArea;
 pub use symbol::{Package, Symbol, Visibility};
 pub use universe::{pkg, universe, Universe};
 pub use value::{Cons, FfiBlock, Value};

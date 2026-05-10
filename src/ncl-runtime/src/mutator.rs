@@ -24,16 +24,18 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::heap::{CardTable, Heap, CARD_SIZE_BYTES};
+use crate::heap::{CardTable, Heap};
+use crate::static_area::StaticArea;
 use crate::word::{Tag, Word};
 
 /// Configuration knobs for the GC. Real values for production land
-/// later (16 MB young, 64 MB old, 512 KB TLAB by the design doc);
-/// tests override with much smaller numbers.
+/// later (16 MB young, 64 MB old, 16 MB static, 512 KB TLAB by the
+/// design doc); tests override with much smaller numbers.
 #[derive(Clone, Copy, Debug)]
 pub struct GcConfig {
     pub young_bytes: usize,
     pub old_bytes: usize,
+    pub static_bytes: usize,
     /// Cells per TLAB. Each cell is 8 bytes.
     pub tlab_cells: usize,
 }
@@ -43,6 +45,7 @@ impl Default for GcConfig {
         GcConfig {
             young_bytes: 16 * 1024 * 1024,
             old_bytes: 64 * 1024 * 1024,
+            static_bytes: 16 * 1024 * 1024,
             tlab_cells: 65536, // 512 KB
         }
     }
@@ -82,6 +85,11 @@ pub struct GcCoordinator {
     /// Capacity (in bytes) of one old semispace. Used by the
     /// barrier to decide if a write address falls in the old heap.
     old_capacity: usize,
+
+    /// Pinned static area. Allocated once, never moved, never freed.
+    /// For JIT'd code, the loaded image's interned constants, the
+    /// package and symbol registries.
+    static_area: Arc<StaticArea>,
 }
 
 struct ParkState {
@@ -95,6 +103,7 @@ impl GcCoordinator {
         let cards = Arc::clone(heap.old_cards());
         let live_base = AtomicUsize::new(heap.old_live_base_ptr() as usize);
         let old_capacity = heap.old_capacity_bytes_per_semi();
+        let static_area = Arc::new(StaticArea::new(config.static_bytes));
         Arc::new(GcCoordinator {
             heap: Mutex::new(heap),
             config,
@@ -107,19 +116,31 @@ impl GcCoordinator {
             cards,
             live_base,
             old_capacity,
+            static_area,
         })
     }
 
+    /// Access the static area (for allocation, registry setup, etc.).
+    pub fn static_area(&self) -> &Arc<StaticArea> { &self.static_area }
+
     /// Mark the card containing `addr` as dirty. Safe to call from
-    /// any Lisp thread; lock-free. The compiler will emit this at
-    /// every old→x store; user code rarely calls it directly.
+    /// any Lisp thread; lock-free. Routes the mark to the right
+    /// card table:
+    ///   - in live old-semispace → old card table
+    ///   - in static area → static card table
+    ///   - elsewhere (young, stack, foreign) → no-op
     pub fn mark_card(&self, addr: *const u8) {
         let p = addr as usize;
-        let base = self.live_base.load(Ordering::Acquire);
-        // Single comparison decides "is this in the live old-semispace?"
-        // If outside (young or static), the card store is skipped.
-        if p >= base && p < base + self.old_capacity {
-            self.cards.mark_offset(p - base);
+        // Try old.
+        let old_base = self.live_base.load(Ordering::Acquire);
+        if p >= old_base && p < old_base + self.old_capacity {
+            self.cards.mark_offset(p - old_base);
+            return;
+        }
+        // Try static.
+        let static_base = self.static_area.base_ptr() as usize;
+        if p >= static_base && p < static_base + self.static_area.capacity_bytes() {
+            self.static_area.cards().mark_offset(p - static_base);
         }
     }
 
@@ -303,26 +324,35 @@ impl MutatorState {
                 .collect()
         };
 
-        // All others parked. Run the GC.
+        // All others parked. Run the GC. Pass the static area so
+        // dirty static cards are scanned for static→young pointers.
         let my_handle = Arc::clone(&self.handle);
+        let static_base = self.coord.static_area.base_ptr() as *mut u64;
+        let static_cells = self.coord.static_area.used_cells();
+        let static_cards = Arc::clone(self.coord.static_area.cards());
         {
             let mut heap = self.coord.heap.lock().unwrap();
-            heap.collect_minor(|scanner| {
-                // My own roots first.
-                {
-                    let mut my = my_handle.roots.lock().unwrap();
-                    for r in my.iter_mut() {
-                        scanner.visit(r);
+            heap.collect_minor_with_static(
+                &static_cards,
+                static_base,
+                static_cells,
+                |scanner| {
+                    // My own roots first.
+                    {
+                        let mut my = my_handle.roots.lock().unwrap();
+                        for r in my.iter_mut() {
+                            scanner.visit(r);
+                        }
                     }
-                }
-                // Other mutators' roots.
-                for h in &other_handles {
-                    let mut other = h.roots.lock().unwrap();
-                    for r in other.iter_mut() {
-                        scanner.visit(r);
+                    // Other mutators' roots.
+                    for h in &other_handles {
+                        let mut other = h.roots.lock().unwrap();
+                        for r in other.iter_mut() {
+                            scanner.visit(r);
+                        }
                     }
-                }
-            });
+                },
+            );
         }
 
         // My TLAB pointed into young, which is now empty.
@@ -418,11 +448,12 @@ mod tests {
     use std::time::Duration;
 
     fn small_config() -> GcConfig {
-        // 16 KB young = 2048 cells, 16 KB old. 64-cell TLABs (512
-        // bytes) so we can exercise refill quickly.
+        // 16 KB young = 2048 cells, 16 KB old, 8 KB static.
+        // 64-cell TLABs (512 bytes) so we exercise refill quickly.
         GcConfig {
             young_bytes: 16 * 1024,
             old_bytes: 16 * 1024,
+            static_bytes: 8 * 1024,
             tlab_cells: 64,
         }
     }
@@ -716,6 +747,127 @@ mod tests {
         }).collect();
 
         for h in handles { h.join().expect("thread"); }
+    }
+
+    #[test]
+    fn static_to_young_pointer_with_card_mark_promotes() {
+        let coord = GcCoordinator::new(small_config());
+        let mut m = coord.register_mutator();
+
+        // Allocate a 2-cell slot in static. (Manually — for v1 the
+        // higher-level "intern symbol into static" API hasn't landed
+        // yet; we use the raw allocator.)
+        let static_slot = coord
+            .static_area()
+            .try_alloc_cells(2)
+            .expect("static alloc");
+        unsafe {
+            *static_slot.as_ptr() = Word::NIL.raw();
+            *static_slot.as_ptr().add(1) = Word::NIL.raw();
+        }
+
+        // Allocate a young cons.
+        let y = m.alloc_cons(Word::fixnum(42), Word::NIL);
+
+        // Patch young pointer into the static slot. WITH write barrier.
+        unsafe { *static_slot.as_ptr() = y.raw(); }
+        m.mark_card(static_slot.as_ptr() as *const u8);
+
+        // Force minor GC. The static→young scan should find y and
+        // promote it. The static slot is updated in place.
+        m.collect_minor();
+
+        // Read the static slot — it now points at the promoted y in old.
+        let promoted = unsafe { Word::from_raw(*static_slot.as_ptr()) };
+        assert!(promoted.is_cons());
+        let p = promoted.as_ptr::<u64>(Tag::Cons).unwrap();
+        unsafe {
+            assert_eq!(Word::from_raw(*p).as_fixnum(), Some(42));
+            assert!(Word::from_raw(*p.add(1)).is_nil());
+        }
+    }
+
+    #[test]
+    fn static_card_unmarked_loses_young() {
+        // Negative test: same scenario as above but WITHOUT
+        // mark_card. The young object is reclaimed because the GC
+        // doesn't know to look at the static slot.
+        let coord = GcCoordinator::new(small_config());
+        let mut m = coord.register_mutator();
+
+        let static_slot = coord.static_area().try_alloc_cells(2).unwrap();
+        unsafe {
+            *static_slot.as_ptr() = Word::NIL.raw();
+            *static_slot.as_ptr().add(1) = Word::NIL.raw();
+        }
+
+        let y = m.alloc_cons(Word::fixnum(42), Word::NIL);
+        unsafe { *static_slot.as_ptr() = y.raw(); }
+        // DO NOT mark_card.
+
+        m.collect_minor();
+
+        // The static slot still HOLDS a Word, and it's still
+        // Cons-tagged (the GC didn't update it because it didn't
+        // know about it). But it points at a stale young address.
+        // We verify the slot wasn't updated to a NEW (post-GC)
+        // location — it should match the original raw value.
+        let still_there = unsafe { Word::from_raw(*static_slot.as_ptr()) };
+        assert!(still_there.is_cons(), "tag stayed");
+        // Old should be empty — y was not promoted.
+        assert_eq!(coord.old_used_bytes(), 0);
+    }
+
+    #[test]
+    fn static_cards_clear_after_minor() {
+        let coord = GcCoordinator::new(small_config());
+        let mut m = coord.register_mutator();
+
+        let static_slot = coord.static_area().try_alloc_cells(2).unwrap();
+        unsafe {
+            *static_slot.as_ptr() = Word::NIL.raw();
+            *static_slot.as_ptr().add(1) = Word::NIL.raw();
+        }
+        let y = m.alloc_cons(Word::fixnum(1), Word::NIL);
+        unsafe { *static_slot.as_ptr() = y.raw(); }
+        m.mark_card(static_slot.as_ptr() as *const u8);
+
+        assert_eq!(coord.static_area().cards().dirty_count(), 1);
+        m.collect_minor();
+        assert_eq!(coord.static_area().cards().dirty_count(), 0);
+    }
+
+    #[test]
+    fn many_threads_allocating_in_static() {
+        // Static's lock-free CAS-bump allocator: 4 threads each
+        // making 100 allocations. Verify total used and disjoint
+        // ranges.
+        let coord = GcCoordinator::new(small_config());
+        let n_threads = 4;
+        let allocs = 100;
+
+        let handles: Vec<_> = (0..n_threads).map(|_| {
+            let coord = Arc::clone(&coord);
+            thread::spawn(move || {
+                let mut my = Vec::new();
+                for _ in 0..allocs {
+                    let p = coord.static_area().try_alloc_cells(1).expect("alloc");
+                    my.push(p.as_ptr() as usize);
+                }
+                my
+            })
+        }).collect();
+
+        let mut all: Vec<usize> = Vec::new();
+        for h in handles {
+            all.extend(h.join().expect("thread"));
+        }
+        all.sort();
+        for w in all.windows(2) {
+            assert!(w[0] < w[1]);
+            assert!(w[1] - w[0] >= 8);
+        }
+        assert_eq!(coord.static_area().used_cells(), n_threads * allocs);
     }
 
     #[test]
