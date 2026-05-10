@@ -83,38 +83,51 @@
 
 ;; -- member, position, find, assoc -------------------------------------------
 
-(defun member (item lst)
-  ;; CL's `member` returns the tail of lst starting at the first
-  ;; match (or nil). Comparison uses equal — CL's default is eql,
-  ;; but until we have keyword args, equal is the more useful
-  ;; default.
+;; -- Sequence/list searches with :test and :key -----------------------------
+;;
+;; CL's family of search functions (member, find, position, assoc,
+;; ...) accept :test (the predicate, default eql) and :key (an
+;; accessor applied to each candidate before comparison, default
+;; identity). Closette uses both heavily — assoc with :key #'cadr
+;; for example. The implementations below desugar each candidate
+;; check to (funcall test item (funcall key elem)).
+
+(defun member (item lst &key (test #'eql) (key #'identity))
+  "Return the tail of LST starting at the first ELEM where
+   (funcall TEST ITEM (funcall KEY ELEM)) is true, or NIL."
   (cond
     ((null lst) nil)
-    ((equal item (car lst)) lst)
-    (t (member item (cdr lst)))))
+    ((funcall test item (funcall key (car lst))) lst)
+    (t (member item (cdr lst) :test test :key key))))
 
-(defun %position-from (item lst i)
+(defun find (item lst &key (test #'eql) (key #'identity))
+  "Return the first element of LST that matches ITEM under TEST
+   (after KEY is applied to the element), or NIL."
   (cond
     ((null lst) nil)
-    ((equal item (car lst)) i)
-    (t (%position-from item (cdr lst) (+ i 1)))))
+    ((funcall test item (funcall key (car lst))) (car lst))
+    (t (find item (cdr lst) :test test :key key))))
 
-(defun position (item lst)
-  (%position-from item lst 0))
+(defun position (item lst &key (test #'eql) (key #'identity))
+  "Return the index in LST of the first matching element, or NIL."
+  (%position-from item lst 0 test key))
 
-(defun find (item lst)
+(defun %position-from (item lst i test key)
   (cond
     ((null lst) nil)
-    ((equal item (car lst)) (car lst))
-    (t (find item (cdr lst)))))
+    ((funcall test item (funcall key (car lst))) i)
+    (t (%position-from item (cdr lst) (+ i 1) test key))))
 
-(defun assoc (key alist)
-  ;; Walk an alist; return the first entry whose car is `equal` to
-  ;; key, or nil.
+(defun assoc (item alist &key (test #'eql) (key #'identity))
+  "Walk ALIST; return the first entry whose CAR matches ITEM
+   under TEST (with KEY applied to the entry's car). Default
+   TEST is eql to match CL — earlier this was equal because we
+   didn't have keyword args; callers that relied on equal should
+   pass `:test #'equal`."
   (cond
     ((null alist) nil)
-    ((equal key (car (car alist))) (car alist))
-    (t (assoc key (cdr alist)))))
+    ((funcall test item (funcall key (car (car alist)))) (car alist))
+    (t (assoc item (cdr alist) :test test :key key))))
 
 ;; -- nth, nthcdr, last -------------------------------------------------------
 

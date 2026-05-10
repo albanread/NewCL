@@ -266,8 +266,20 @@ fn lower_in_mut(
             Ok(Expr::Word(w.raw()))
         }
         Value::Symbol(s) => {
-            // Local first (param/let/closure-capture), then T, then
-            // keyword (self-evaluating), then global value-cell load.
+            // Keyword check FIRST. Without this, a local variable
+            // named `test` (stored under name "TEST") would shadow
+            // the keyword `:test` (whose unprefixed name is also
+            // "TEST"), so `(call :test test)` inside `(defun foo
+            // (test) ...)` would compile both args as references
+            // to the local. A real subtle bug — caught while
+            // rewriting list helpers to use :test/:key keyword
+            // args. Keywords are package-qualified to KEYWORD;
+            // we trust that distinction over the env's name match.
+            if is_keyword(s) {
+                return Ok(Expr::Word(intern_value_symbol(coord, s).raw()));
+            }
+            // Local (param/let/closure-capture), then T, then
+            // global value-cell load.
             if let Some(b) = env.find_or_capture(&s.name) {
                 Ok(match b {
                     Binding::Param(i) => Expr::Param(i),
@@ -279,10 +291,6 @@ fn lower_in_mut(
                 })
             } else if &*s.name == "T" {
                 Ok(Expr::True)
-            } else if is_keyword(s) {
-                // Keywords self-evaluate — emit the symbol Word
-                // as a literal rather than a global value-cell load.
-                Ok(Expr::Word(intern_value_symbol(coord, s).raw()))
             } else {
                 let sym_word = coord.intern(&s.name);
                 Ok(Expr::load_global(sym_word.raw()))

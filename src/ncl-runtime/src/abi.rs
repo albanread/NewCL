@@ -1060,6 +1060,91 @@ pub extern "C-unwind" fn gensym_shim(
     m.coord().intern(&name).raw()
 }
 
+/// `(car x)` — Lisp-callable shim. CAR is a special form
+/// lowering to Expr::Car; this shim covers `#'car` for use
+/// with funcall / map / :key etc.
+pub extern "C-unwind" fn car_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("car: expected 1 arg, got {n_args}");
+    }
+    let w = Word::from_raw(unsafe { *args });
+    if w.is_nil() {
+        return Word::NIL.raw();
+    }
+    ncl_car(unsafe { *args })
+}
+
+/// `(cdr x)` — sibling shim for car. NIL is a fixed point.
+pub extern "C-unwind" fn cdr_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("cdr: expected 1 arg, got {n_args}");
+    }
+    let w = Word::from_raw(unsafe { *args });
+    if w.is_nil() {
+        return Word::NIL.raw();
+    }
+    ncl_cdr(unsafe { *args })
+}
+
+/// `(cons a b)` — Lisp-callable shim.
+pub extern "C-unwind" fn cons_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("cons: expected 2 args, got {n_args}");
+    }
+    let car = unsafe { *args };
+    let cdr = unsafe { *args.add(1) };
+    ncl_alloc_cons(mutator, car, cdr)
+}
+
+/// `(equal a b)` — Lisp-callable shim around `ncl_equal`. The
+/// EQUAL special form lowers directly to Expr::Equal; this shim
+/// is needed for `#'equal` (taking the function as a value, e.g.
+/// `(member item lst :test #'equal)`).
+pub extern "C-unwind" fn equal_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("equal: expected 2 args, got {n_args}");
+    }
+    let a = unsafe { *args };
+    let b = unsafe { *args.add(1) };
+    ncl_equal(a, b)
+}
+
+/// `(eq a b)` — Lisp-callable shim. EQ is also a special form;
+/// this is for `#'eq`.
+pub extern "C-unwind" fn eq_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("eq: expected 2 args, got {n_args}");
+    }
+    let a = unsafe { *args };
+    let b = unsafe { *args.add(1) };
+    if a == b { Word::T.raw() } else { Word::NIL.raw() }
+}
+
 /// `(eql a b)` — true if the two values are the same object, or
 /// (eventually) the same number / character of the same type and
 /// value. For the data types currently supported (fixnums, chars,

@@ -291,8 +291,21 @@ fn install_native_functions(
     // &optional lands in the compiler we'll declare it properly.)
     install_native(coord, mutator, "GENSYM",
                    ncl_runtime::gensym_shim, 0);
+    // CAR / CDR / CONS are special forms in lower.rs; these
+    // shims exist only so #'car / #'cdr / #'cons can be passed
+    // as function values (to mapcar, :key, etc.).
+    install_native(coord, mutator, "CAR",
+                   ncl_runtime::car_shim, 1);
+    install_native(coord, mutator, "CDR",
+                   ncl_runtime::cdr_shim, 1);
+    install_native(coord, mutator, "CONS",
+                   ncl_runtime::cons_shim, 2);
+    install_native(coord, mutator, "EQ",
+                   ncl_runtime::eq_shim, 2);
     install_native(coord, mutator, "EQL",
                    ncl_runtime::eql_shim, 2);
+    install_native(coord, mutator, "EQUAL",
+                   ncl_runtime::equal_shim, 2);
     install_native(coord, mutator, "TYPEP",
                    ncl_runtime::typep_shim, 2);
     // Multi-value support — `(values ...)` itself is a special form
