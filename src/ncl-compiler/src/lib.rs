@@ -1052,6 +1052,159 @@ mod end_to_end_tests {
         ));
     }
 
+    // -- Mutable lexical bindings ------------------------------------------
+
+    #[test]
+    fn setq_local_let_binding() {
+        // (let ((x 0)) (setq x 7) x) — the simplest case.
+        assert_eq!(eval_str("(let ((x 0)) (setq x 7) x)").unwrap(), "7");
+    }
+
+    #[test]
+    fn setf_local_let_binding() {
+        assert_eq!(eval_str("(let ((x 1)) (setf x 99) x)").unwrap(), "99");
+    }
+
+    #[test]
+    fn mutated_let_binding_starts_at_init() {
+        // The init value is observable before mutation.
+        assert_eq!(
+            eval_str("(let ((x 10)) (let ((y x)) (setq x 99) y))").unwrap(),
+            "10",
+        );
+    }
+
+    #[test]
+    fn mutated_let_in_function() {
+        let mut session = Session::new();
+        session
+            .eval(
+                "(defun count-to (n) \
+                   (let ((i 0)) \
+                     (if (= i n) i \
+                       (progn (setq i n) i))))",
+            )
+            .unwrap();
+        assert_eq!(session.eval("(count-to 5)").unwrap(), "5");
+    }
+
+    #[test]
+    fn nested_let_shadows_outer_mutation() {
+        // Inner setq targets inner x; outer x is untouched.
+        assert_eq!(
+            eval_str(
+                "(let ((x 1)) \
+                   (let ((x 100)) (setq x 200)) \
+                   x)"
+            )
+            .unwrap(),
+            "1",
+        );
+    }
+
+    #[test]
+    fn nested_let_can_mutate_outer() {
+        // Inner scope binds y but not x; setq targets outer x.
+        assert_eq!(
+            eval_str(
+                "(let ((x 1)) \
+                   (let ((y 2)) (setq x 99)) \
+                   x)"
+            )
+            .unwrap(),
+            "99",
+        );
+    }
+
+    #[test]
+    fn closure_captures_and_mutates() {
+        // The make-counter pattern: lambda captures a let-binding
+        // and mutates it. Each call increments and returns the new
+        // value.
+        let mut session = Session::new();
+        session
+            .eval(
+                "(defun make-counter () \
+                   (let ((n 0)) \
+                     (lambda () (setf n (+ n 1)) n)))",
+            )
+            .unwrap();
+        session.eval("(defparameter *c* (make-counter))").unwrap();
+        assert_eq!(session.eval("(funcall *c*)").unwrap(), "1");
+        assert_eq!(session.eval("(funcall *c*)").unwrap(), "2");
+        assert_eq!(session.eval("(funcall *c*)").unwrap(), "3");
+    }
+
+    #[test]
+    fn each_counter_has_its_own_state() {
+        // Two counters from the same factory share no state — each
+        // gets its own boxed cell.
+        let mut session = Session::new();
+        session
+            .eval(
+                "(defun make-counter () \
+                   (let ((n 0)) \
+                     (lambda () (setf n (+ n 1)) n)))",
+            )
+            .unwrap();
+        session.eval("(defparameter *c1* (make-counter))").unwrap();
+        session.eval("(defparameter *c2* (make-counter))").unwrap();
+        assert_eq!(session.eval("(funcall *c1*)").unwrap(), "1");
+        assert_eq!(session.eval("(funcall *c1*)").unwrap(), "2");
+        assert_eq!(session.eval("(funcall *c2*)").unwrap(), "1");
+        assert_eq!(session.eval("(funcall *c1*)").unwrap(), "3");
+    }
+
+    #[test]
+    fn closure_reads_outer_mutations() {
+        // The outer scope mutates n; the captured lambda sees the
+        // new value.
+        let mut session = Session::new();
+        session
+            .eval(
+                "(defun make-pair () \
+                   (let ((n 0)) \
+                     (cons (lambda () n) \
+                           (lambda (v) (setf n v)))))",
+            )
+            .unwrap();
+        session.eval("(defparameter *p* (make-pair))").unwrap();
+        assert_eq!(session.eval("(funcall (car *p*))").unwrap(), "0");
+        session.eval("(funcall (cdr *p*) 42)").unwrap();
+        assert_eq!(session.eval("(funcall (car *p*))").unwrap(), "42");
+    }
+
+    #[test]
+    fn unmutated_let_still_unboxed() {
+        // No setq in body — lowering takes the cheap path. We can't
+        // assert "no cons allocated" from outside but the test
+        // exercises the non-boxed path for coverage.
+        assert_eq!(
+            eval_str("(let ((a 1) (b 2)) (+ a b))").unwrap(),
+            "3",
+        );
+    }
+
+    #[test]
+    fn setq_of_param_still_errors() {
+        // Mutable function parameters aren't wired yet — boxing the
+        // param at function entry is future work.
+        let r = eval_str("((lambda (x) (setq x 1) x) 0)");
+        assert!(matches!(
+            r,
+            Err(EvalError::Compile(CompileError::NotImplemented(_))),
+        ));
+    }
+
+    #[test]
+    fn setq_unbound_local_falls_through_to_global() {
+        // No local x. setq targets global *g*. (Defparameter then setq.)
+        let mut session = Session::new();
+        session.eval("(defparameter *g* 0)").unwrap();
+        session.eval("(setq *g* 5)").unwrap();
+        assert_eq!(session.eval("*g*").unwrap(), "5");
+    }
+
     // -- defparameter / setq / global value cells --------------------------
 
     #[test]
@@ -1141,8 +1294,10 @@ mod end_to_end_tests {
     }
 
     #[test]
-    fn setq_of_local_errors() {
-        // Mutable locals not yet supported.
+    fn setq_of_param_errors() {
+        // Mutable function parameters not yet supported. (Mutable
+        // let-locals are — those are tested in the dedicated section
+        // above.)
         let r = eval_str(
             "(defun f (x) (setq x 99) x)
              (f 1)",

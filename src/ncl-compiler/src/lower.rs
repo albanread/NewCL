@@ -13,12 +13,21 @@
 //! special-cases `T`; anything else lowering as a function call
 //! against an unknown head goes through symbol intern + `Expr::Call`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use ncl_ir::Expr;
 use ncl_runtime::{GcCoordinator, Value, Word};
 
 /// A binding kind in the lexical environment.
+///
+/// The `*Cell` variants represent variables that have been boxed
+/// because they are the target of `setq`/`setf`. The slot itself
+/// holds a 1-cell cons (init . nil); reads emit `(car slot)` and
+/// writes emit `(rplaca slot new)`. Boxing is mandatory for any
+/// mutated binding because the same cell may be shared with an
+/// inner lambda's closure env — a non-boxed value would diverge
+/// across the inner/outer copies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Binding {
     /// Function parameter — read from the call's args[idx].
@@ -28,6 +37,16 @@ pub enum Binding {
     /// Closure reference — read from env[idx] in the current
     /// function's closure environment.
     ClosureRef(usize),
+    /// Function parameter, boxed for mutation. Reserved — the param
+    /// boxing prologue isn't wired yet, so mutating a param still
+    /// errors at compile time. Present so the binding-kind enum
+    /// covers the full design.
+    ParamCell(usize),
+    /// Let-bound local, boxed for mutation.
+    LocalCell(usize),
+    /// Closure-captured cell. The captured Word IS the cons; reads
+    /// auto-deref, writes go through SetCar.
+    ClosureRefCell(usize),
 }
 
 /// Lexical environment for lowering. Tracks names → bindings.
@@ -98,24 +117,30 @@ impl LocalEnv {
     /// Lookup, with capture from `capture_parent` if needed. May
     /// add to `captures` and `bindings` (returning the new
     /// ClosureRef). Used by `lower_in_mut` for symbol resolution.
+    ///
+    /// When the parent binding is a Cell variant, the captured slot
+    /// holds the cons (the box); the inner binding is a
+    /// `ClosureRefCell` so reads and writes auto-deref through it.
     pub fn find_or_capture(&mut self, name: &str) -> Option<Binding> {
         if let Some(b) = self.find_local(name) {
             return Some(b);
         }
         let parent = self.capture_parent.as_ref()?;
         let parent_b = parent.find_local(name)?;
-        // Add a capture entry.
         let idx = self.closure_count;
-        let outer_expr = match parent_b {
-            Binding::Param(i) => Expr::Param(i),
-            Binding::Local(i) => Expr::Local(i),
-            Binding::ClosureRef(i) => Expr::ClosureRef(i),
+        let (outer_expr, inner_binding) = match parent_b {
+            Binding::Param(i) => (Expr::Param(i), Binding::ClosureRef(idx)),
+            Binding::Local(i) => (Expr::Local(i), Binding::ClosureRef(idx)),
+            Binding::ClosureRef(i) => (Expr::ClosureRef(i), Binding::ClosureRef(idx)),
+            // Cell variants: capture the cons itself; inner sees a Cell.
+            Binding::ParamCell(i) => (Expr::Param(i), Binding::ClosureRefCell(idx)),
+            Binding::LocalCell(i) => (Expr::Local(i), Binding::ClosureRefCell(idx)),
+            Binding::ClosureRefCell(i) => (Expr::ClosureRef(i), Binding::ClosureRefCell(idx)),
         };
         self.captures.push(outer_expr);
-        self.bindings
-            .push((Arc::from(name), Binding::ClosureRef(idx)));
+        self.bindings.push((Arc::from(name), inner_binding));
         self.closure_count += 1;
-        Some(Binding::ClosureRef(idx))
+        Some(inner_binding)
     }
 
     /// Compatibility wrapper: callers that don't care about
@@ -127,6 +152,17 @@ impl LocalEnv {
     pub fn push_local(&mut self, name: Arc<str>) -> usize {
         let idx = self.local_count;
         self.bindings.push((name, Binding::Local(idx)));
+        self.local_count += 1;
+        idx
+    }
+
+    /// Push a let-binding that needs boxing (because it's a setq /
+    /// setf target somewhere in the body, possibly inside a captured
+    /// lambda). The slot is a `LocalCell`; the caller is expected to
+    /// have already wrapped the binding's init expression in a cons.
+    pub fn push_local_cell(&mut self, name: Arc<str>) -> usize {
+        let idx = self.local_count;
+        self.bindings.push((name, Binding::LocalCell(idx)));
         self.local_count += 1;
         idx
     }
@@ -206,6 +242,10 @@ fn lower_in_mut(
                     Binding::Param(i) => Expr::Param(i),
                     Binding::Local(i) => Expr::Local(i),
                     Binding::ClosureRef(i) => Expr::ClosureRef(i),
+                    // Cell variants auto-deref through (car cell).
+                    Binding::ParamCell(i) => Expr::car(Expr::Param(i)),
+                    Binding::LocalCell(i) => Expr::car(Expr::Local(i)),
+                    Binding::ClosureRefCell(i) => Expr::car(Expr::ClosureRef(i)),
                 })
             } else if &*s.name == "T" {
                 Ok(Expr::True)
@@ -509,6 +549,140 @@ fn lower_call_in_mut(
 /// `(let ((var val) ...) body...)`. Bindings evaluated in OUTER env
 /// (parallel let, not let*); body sees them as new Locals. Multiple
 /// body forms are wrapped in implicit progn.
+/// Walk a Value form and collect every name that appears as the
+/// target of a mutating special form. The `shadowed` set records
+/// names that have been re-bound by an enclosing scope inside the
+/// form being walked — those don't refer to the outer binding so
+/// their mutations don't count.
+///
+/// Recognised mutators:
+///   - `(setq sym v)`              — sym is a target
+///   - `(setf sym v)`              — sym is a target (place is a symbol)
+///
+/// Place-form setfs like `(setf (car x) v)` are NOT counted: those
+/// mutate the *contents* of x, not the binding x itself.
+///
+/// Recognised scoping forms (these extend `shadowed`):
+///   - `(let ((n1 v1) ...) body...)`
+///   - `(lambda (params) body...)`
+///   - `(defun name (params) body...)`
+///
+/// `(quote ...)` is skipped — quoted forms aren't evaluated.
+fn collect_mutations(
+    form: &Value,
+    shadowed: &HashSet<Arc<str>>,
+    into: &mut HashSet<Arc<str>>,
+) {
+    let items = match form {
+        Value::Cons(_) => match list_to_vec(form) {
+            Ok(v) => v,
+            Err(_) => return, // improper list — nothing to analyse
+        },
+        _ => return, // atoms have no mutating forms inside
+    };
+    let head_name = match items.first() {
+        Some(Value::Symbol(s)) => s.name.to_string(),
+        _ => {
+            for it in &items {
+                collect_mutations(it, shadowed, into);
+            }
+            return;
+        }
+    };
+    let args = &items[1..];
+
+    match head_name.as_str() {
+        "QUOTE" => {}
+        "SETQ" if args.len() == 2 => {
+            if let Value::Symbol(s) = &args[0] {
+                if !shadowed.contains(&s.name) {
+                    into.insert(Arc::clone(&s.name));
+                }
+            }
+            collect_mutations(&args[1], shadowed, into);
+        }
+        "SETF" if args.len() == 2 => {
+            if let Value::Symbol(s) = &args[0] {
+                if !shadowed.contains(&s.name) {
+                    into.insert(Arc::clone(&s.name));
+                }
+            } else {
+                // (setf (place ...) v) — recurse into both place
+                // sub-args and the new-value form.
+                collect_mutations(&args[0], shadowed, into);
+            }
+            collect_mutations(&args[1], shadowed, into);
+        }
+        "LET" if !args.is_empty() => {
+            if let Ok(bindings) = list_to_vec(&args[0]) {
+                let mut new_shadowed = shadowed.clone();
+                for binding in &bindings {
+                    if let Ok(pair) = list_to_vec(binding) {
+                        if pair.len() == 2 {
+                            // Init expr sees OUTER scope.
+                            collect_mutations(&pair[1], shadowed, into);
+                            if let Value::Symbol(s) = &pair[0] {
+                                new_shadowed.insert(Arc::clone(&s.name));
+                            }
+                        }
+                    }
+                }
+                for body_form in &args[1..] {
+                    collect_mutations(body_form, &new_shadowed, into);
+                }
+            }
+        }
+        "LAMBDA" if !args.is_empty() => {
+            let mut new_shadowed = shadowed.clone();
+            if let Ok(params) = list_to_vec(&args[0]) {
+                for param in &params {
+                    if let Value::Symbol(s) = param {
+                        new_shadowed.insert(Arc::clone(&s.name));
+                    }
+                }
+            }
+            for body_form in &args[1..] {
+                collect_mutations(body_form, &new_shadowed, into);
+            }
+        }
+        "DEFUN" if args.len() >= 2 => {
+            // (defun name (params) body...). Params shadow; defun's
+            // own name does not (it's a global side effect, not a
+            // lexical binding).
+            let mut new_shadowed = shadowed.clone();
+            if let Ok(params) = list_to_vec(&args[1]) {
+                for param in &params {
+                    if let Value::Symbol(s) = param {
+                        new_shadowed.insert(Arc::clone(&s.name));
+                    }
+                }
+            }
+            for body_form in &args[2..] {
+                collect_mutations(body_form, &new_shadowed, into);
+            }
+        }
+        _ => {
+            for it in args {
+                collect_mutations(it, shadowed, into);
+            }
+        }
+    }
+}
+
+/// Run `collect_mutations` over a slice of body forms, returning the
+/// union. Each form is analysed with the same starting shadowed set
+/// (no carry-over since these are siblings, not nested).
+fn mutated_in_body(
+    body_forms: &[Value],
+    shadowed: &HashSet<Arc<str>>,
+) -> HashSet<Arc<str>> {
+    let mut out = HashSet::new();
+    for f in body_forms {
+        collect_mutations(f, shadowed, &mut out);
+    }
+    out
+}
+
 fn lower_let(
     args: &[Value],
     env: &mut LocalEnv,
@@ -550,10 +724,31 @@ fn lower_let(
         binding_names.push(name);
     }
 
-    // Extend env with new locals, lower body, restore env.
+    // Determine which of OUR bindings are mutated anywhere reachable
+    // from the body — including from inside nested lambdas. Those
+    // names need boxing; init becomes (cons init nil) and the
+    // binding becomes a LocalCell.
+    let mutated = mutated_in_body(body_forms, &HashSet::new());
+    let needs_box: Vec<bool> = binding_names
+        .iter()
+        .map(|n| mutated.contains(n))
+        .collect();
+    for (i, b) in needs_box.iter().enumerate() {
+        if *b {
+            // Wrap init in (cons init nil) — the cell representation.
+            let init = std::mem::replace(&mut binding_exprs[i], Expr::Nil);
+            binding_exprs[i] = Expr::cons(init, Expr::Nil);
+        }
+    }
+
+    // Extend env with new locals (cell or plain), lower body, restore env.
     let cp = env.checkpoint();
-    for name in &binding_names {
-        env.push_local(Arc::clone(name));
+    for (i, name) in binding_names.iter().enumerate() {
+        if needs_box[i] {
+            env.push_local_cell(Arc::clone(name));
+        } else {
+            env.push_local(Arc::clone(name));
+        }
     }
 
     let body_expr = if body_forms.is_empty() {
@@ -686,14 +881,32 @@ fn lower_setq(
             )));
         }
     };
-    // `setq` of a local binding is "lexical assignment" — assigning
-    // to a let or function parameter. Without mutable locals (yet),
-    // this is rejected. The common case in early code is global
-    // assignment; anything that wants local mutation can defer.
-    if env.find(&name).is_some() {
-        return Err(CompileError::NotImplemented(format!(
-            "setq of a local binding: {name} (mutable locals not yet supported)"
-        )));
+    // Resolve to a local first. If it's already a Cell variant, the
+    // mutation analysis pass at the binding's declaration site has
+    // already arranged for boxing; we emit a write through the box.
+    // A non-cell local means the binding wasn't detected as mutated
+    // at its declaration — most often because the declaration is a
+    // function parameter (param boxing isn't wired yet). That's a
+    // compile error rather than a silent miscompile.
+    if let Some(b) = env.find_or_capture(&name) {
+        let value = lower_in_mut(&args[1], env, coord)?;
+        return match b {
+            Binding::LocalCell(i) => Ok(Expr::set_car(Expr::Local(i), value)),
+            Binding::ParamCell(i) => Ok(Expr::set_car(Expr::Param(i), value)),
+            Binding::ClosureRefCell(i) => {
+                Ok(Expr::set_car(Expr::ClosureRef(i), value))
+            }
+            Binding::Param(_) => Err(CompileError::NotImplemented(format!(
+                "setq of function parameter: {name} (mutable parameters not yet supported)"
+            ))),
+            Binding::Local(_) => Err(CompileError::NotImplemented(format!(
+                "internal: non-cell local {name} reached setq path \
+                 — mutation analysis missed this binding"
+            ))),
+            Binding::ClosureRef(_) => Err(CompileError::NotImplemented(format!(
+                "setq of captured non-cell variable: {name} (parent scope did not box)"
+            ))),
+        };
     }
     let sym_word = coord.intern(&name);
     let value = lower_in_mut(&args[1], env, coord)?;
