@@ -182,6 +182,19 @@ fn lower_in_mut(
     match v {
         Value::Fixnum(n) => Ok(Expr::Const(*n)),
         Value::Nil => Ok(Expr::Nil),
+        Value::Char(c) => Ok(Expr::Word(ncl_runtime::Word::char(*c).raw())),
+        Value::String(s) => {
+            let w = ncl_runtime::gc_string::alloc_string_in_static(
+                coord.static_area(),
+                s.as_str(),
+            )
+            .ok_or_else(|| {
+                CompileError::NotImplemented(
+                    "static area exhausted while allocating string literal".into(),
+                )
+            })?;
+            Ok(Expr::Word(w.raw()))
+        }
         Value::Symbol(s) => {
             // Local first (param/let/closure-capture), then T, then
             // global value-cell load. Capture happens lazily — if
@@ -251,6 +264,15 @@ fn build_quoted_word(
                 })
         }
         Value::Char(c) => Ok(Word::char(*c)),
+        Value::String(s) => ncl_runtime::gc_string::alloc_string_in_static(
+            coord.static_area(),
+            s.as_str(),
+        )
+        .ok_or_else(|| {
+            CompileError::NotImplemented(
+                "static area exhausted while allocating quoted string".into(),
+            )
+        }),
         other => Err(CompileError::NotImplemented(format!(
             "quoted sub-value: {other:?}"
         ))),
@@ -455,6 +477,13 @@ fn lower_call_in_mut(
         // EQL is currently the same as EQ — distinctions come
         // when floats/chars/bignums need value-equality semantics.
         "EQL" => binary_op(&head_name, args, env, coord, Expr::eq),
+        "LENGTH" => unary_op(&head_name, args, env, coord, Expr::length),
+        "STRING=" => binary_op(&head_name, args, env, coord, Expr::string_eq),
+        // (char s i) and (aref s i) for strings — until we have
+        // generic vectors, both forms route here.
+        "CHAR" | "STRING-CHAR" | "AREF" => {
+            binary_op(&head_name, args, env, coord, Expr::string_char)
+        }
         "LET" => lower_let(args, env, coord),
         "DEFUN" => Err(CompileError::BadDefun(
             "(defun ...) is only allowed at top level".into(),

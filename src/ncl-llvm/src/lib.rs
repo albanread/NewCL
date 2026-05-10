@@ -25,8 +25,9 @@ use inkwell::values::{FunctionValue, IntValue};
 
 use ncl_ir::Expr;
 use ncl_runtime::{
-    ncl_alloc_cons, ncl_call, ncl_funcall, ncl_load_function, ncl_load_value,
-    ncl_make_closure, ncl_store_value, MutatorState, Tag, Word,
+    ncl_alloc_cons, ncl_call, ncl_funcall, ncl_length, ncl_load_function,
+    ncl_load_value, ncl_make_closure, ncl_store_value, ncl_string_char,
+    ncl_string_eq, MutatorState, Tag, Word,
 };
 
 // We leak each compilation's Context + Module + Engine so the
@@ -194,6 +195,9 @@ struct Helpers<'ctx> {
     load_value: FunctionValue<'ctx>,
     load_function: FunctionValue<'ctx>,
     store_value: FunctionValue<'ctx>,
+    length: FunctionValue<'ctx>,
+    string_eq: FunctionValue<'ctx>,
+    string_char: FunctionValue<'ctx>,
 }
 
 fn declare_runtime_helpers<'ctx>(
@@ -268,6 +272,26 @@ fn declare_runtime_helpers<'ctx>(
         Some(Linkage::External),
     );
 
+    // ncl_length(w) -> u64
+    let unary_u64_type = i64_t.fn_type(&[i64_t.into()], false);
+    let length =
+        module.add_function("ncl_length", unary_u64_type, Some(Linkage::External));
+
+    // ncl_string_eq(a, b) -> u64
+    let binary_u64_type = i64_t.fn_type(&[i64_t.into(), i64_t.into()], false);
+    let string_eq = module.add_function(
+        "ncl_string_eq",
+        binary_u64_type,
+        Some(Linkage::External),
+    );
+
+    // ncl_string_char(s, i) -> u64  (i is a tagged fixnum)
+    let string_char = module.add_function(
+        "ncl_string_char",
+        binary_u64_type,
+        Some(Linkage::External),
+    );
+
     Helpers {
         alloc_cons,
         call_fn,
@@ -276,6 +300,9 @@ fn declare_runtime_helpers<'ctx>(
         load_value,
         load_function,
         store_value,
+        length,
+        string_eq,
+        string_char,
     }
 }
 
@@ -287,6 +314,9 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(&helpers.load_value, ncl_load_value as *const () as usize);
     engine.add_global_mapping(&helpers.load_function, ncl_load_function as *const () as usize);
     engine.add_global_mapping(&helpers.store_value, ncl_store_value as *const () as usize);
+    engine.add_global_mapping(&helpers.length, ncl_length as *const () as usize);
+    engine.add_global_mapping(&helpers.string_eq, ncl_string_eq as *const () as usize);
+    engine.add_global_mapping(&helpers.string_char, ncl_string_char as *const () as usize);
 }
 
 /// Convert an i1 comparison result to a tagged Word (T or NIL).
@@ -713,6 +743,39 @@ fn emit_expr<'ctx>(
             let call = builder
                 .build_call(helpers.load_function, &[sym_const.into()], "load_fn")
                 .map_err(|e| format!("build_call load_function: {e}"))?;
+            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+        }
+        Expr::Length(x) => {
+            let v = emit_expr(context, builder, function, helpers, arity, locals, x)?;
+            let call = builder
+                .build_call(helpers.length, &[v.into()], "length")
+                .map_err(|e| format!("build_call length: {e}"))?;
+            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+        }
+        Expr::StringEq(a, b) => {
+            let va = emit_expr(context, builder, function, helpers, arity, locals, a)?;
+            let vb = emit_expr(context, builder, function, helpers, arity, locals, b)?;
+            let call = builder
+                .build_call(helpers.string_eq, &[va.into(), vb.into()], "str_eq")
+                .map_err(|e| format!("build_call string_eq: {e}"))?;
+            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+        }
+        Expr::StringChar(s, i) => {
+            let vs = emit_expr(context, builder, function, helpers, arity, locals, s)?;
+            let vi_tagged = emit_expr(context, builder, function, helpers, arity, locals, i)?;
+            // The fixnum is tagged (n << 3); ncl_string_char expects
+            // the raw index, so untag with arithmetic shift right.
+            let three = i64_t.const_int(3, false);
+            let untagged = builder
+                .build_right_shift(vi_tagged, three, true, "untag_idx")
+                .map_err(|e| format!("ashr: {e}"))?;
+            let call = builder
+                .build_call(
+                    helpers.string_char,
+                    &[vs.into(), untagged.into()],
+                    "str_char",
+                )
+                .map_err(|e| format!("build_call string_char: {e}"))?;
             Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
         }
         Expr::StoreGlobal { sym_word, value } => {

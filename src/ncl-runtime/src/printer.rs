@@ -46,8 +46,22 @@ fn write_word(out: &mut String, w: Word) {
         },
         Tag::Vector => out.push_str("<vector>"),
         Tag::Function => out.push_str("<function>"),
-        Tag::String => out.push_str("<string>"),
+        Tag::String => write_string(out, w),
     }
+}
+
+/// Print a string in CL's escaped form — wrapped in double-quotes,
+/// with `\` and `"` escaped. Other characters (including control
+/// chars and Unicode) pass through unchanged.
+fn write_string(out: &mut String, w: Word) {
+    out.push('"');
+    for c in crate::gc_string::chars_of(w) {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
 }
 
 /// Print a cons cell as a CL list: `(a b c)` if proper, `(a b . c)`

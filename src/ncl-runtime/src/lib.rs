@@ -12,6 +12,7 @@
 
 pub mod abi;
 pub mod gc_function;
+pub mod gc_string;
 pub mod gc_symbol;
 pub mod heap;
 pub mod mutator;
@@ -25,8 +26,9 @@ pub mod value;
 pub mod word;
 
 pub use abi::{
-    ncl_alloc_cons, ncl_call, ncl_car, ncl_cdr, ncl_funcall, ncl_load_function,
-    ncl_load_value, ncl_make_closure, ncl_store_value,
+    ncl_alloc_cons, ncl_call, ncl_car, ncl_cdr, ncl_funcall, ncl_length,
+    ncl_load_function, ncl_load_value, ncl_make_closure, ncl_store_value,
+    ncl_string_char, ncl_string_eq,
 };
 pub use printer::format_word;
 

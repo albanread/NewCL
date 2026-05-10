@@ -100,6 +100,15 @@ pub enum Expr {
     /// function at the time of THIS lookup (atomic load_acquire on
     /// the symbol's function cell).
     LoadFunction(u64),
+    /// Polymorphic `(length s)` — works on strings (codepoint count)
+    /// and lists (cons-cell count). Calls `ncl_length`.
+    Length(Box<Expr>),
+    /// `(string= a b)` — both operands must be strings. Returns T
+    /// or NIL.
+    StringEq(Box<Expr>, Box<Expr>),
+    /// `(string-char s i)` or `(aref s i)` for strings — read the
+    /// i-th codepoint as a character.
+    StringChar(Box<Expr>, Box<Expr>),
     /// Lambda expression. JIT-compiles `body` as a separate function
     /// with the lambda's signature; at the construction site,
     /// evaluates each `captures[i]` in outer scope and packs the
@@ -146,6 +155,13 @@ impl Expr {
     }
     pub fn closure_ref(idx: usize) -> Expr { Expr::ClosureRef(idx) }
     pub fn load_function(sym_word: u64) -> Expr { Expr::LoadFunction(sym_word) }
+    pub fn length(x: Expr) -> Expr { Expr::Length(Box::new(x)) }
+    pub fn string_eq(a: Expr, b: Expr) -> Expr {
+        Expr::StringEq(Box::new(a), Box::new(b))
+    }
+    pub fn string_char(s: Expr, i: Expr) -> Expr {
+        Expr::StringChar(Box::new(s), Box::new(i))
+    }
     pub fn lambda(arity: u32, body: Expr, captures: Vec<Expr>) -> Expr {
         Expr::Lambda { arity, body: Box::new(body), captures }
     }

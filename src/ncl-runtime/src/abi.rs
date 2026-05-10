@@ -82,6 +82,68 @@ pub extern "C" fn ncl_store_value(
     new_value
 }
 
+/// Length of a String or proper list (in codepoints / cons cells).
+/// JIT'd `(length …)` lowers to a call here. Polymorphic on tag.
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_length(w: u64) -> u64 {
+    let word = Word::from_raw(w);
+    if word.is_nil() {
+        return Word::fixnum(0).raw();
+    }
+    match word.tag() {
+        Tag::String => Word::fixnum(crate::gc_string::char_count(word) as i64).raw(),
+        Tag::Cons => {
+            // Walk the cons spine.
+            let mut cur = word;
+            let mut count: i64 = 0;
+            while !cur.is_nil() {
+                if cur.tag() != Tag::Cons {
+                    panic!("length: improper list");
+                }
+                let p = cur.as_ptr::<u64>(Tag::Cons).expect("cons");
+                count += 1;
+                cur = Word::from_raw(unsafe { *p.add(1) });
+            }
+            Word::fixnum(count).raw()
+        }
+        _ => panic!("length: not a sequence: {word:?}"),
+    }
+}
+
+/// String equality. Both args must be Tag::String. Returns Word::T
+/// or Word::NIL.
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_string_eq(a: u64, b: u64) -> u64 {
+    let wa = Word::from_raw(a);
+    let wb = Word::from_raw(b);
+    if wa.tag() != Tag::String || wb.tag() != Tag::String {
+        panic!("string=: arguments must be strings");
+    }
+    if crate::gc_string::string_eq(wa, wb) {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
+/// Read the i-th codepoint of a string as a character Word.
+/// `(char s i)` and `(aref s i)` both lower here for strings.
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_string_char(s: u64, idx: u64) -> u64 {
+    let ws = Word::from_raw(s);
+    if ws.tag() != Tag::String {
+        panic!("string-char: argument must be a string");
+    }
+    let n = crate::gc_string::char_count(ws);
+    let i = idx as usize;
+    if i >= n {
+        panic!("string-char: index {i} out of bounds for length {n}");
+    }
+    let cp = crate::gc_string::codepoint_at(ws, i);
+    let c = char::from_u32(cp).expect("invalid codepoint in string");
+    Word::char(c).raw()
+}
+
 /// Load a Symbol's function cell with acquire semantics. JIT'd
 /// `#'name` (i.e. `(function name)`) lowers to a call here. Used
 /// to pass defun'd functions as first-class values to higher-order

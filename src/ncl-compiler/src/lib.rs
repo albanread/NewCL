@@ -698,6 +698,123 @@ mod end_to_end_tests {
         assert_eq!(result, "(5 6 7)");
     }
 
+    // -- Strings -----------------------------------------------------------
+
+    #[test]
+    fn ascii_string_round_trip() {
+        assert_eq!(eval_str(r#""hello""#).unwrap(), r#""hello""#);
+        assert_eq!(eval_str(r#""""#).unwrap(), r#""""#);
+        assert_eq!(eval_str(r#""a""#).unwrap(), r#""a""#);
+    }
+
+    #[test]
+    fn unicode_string_round_trip() {
+        // Codepoints preserved end-to-end.
+        assert_eq!(eval_str(r#""café""#).unwrap(), r#""café""#);
+        assert_eq!(eval_str(r#""日本""#).unwrap(), r#""日本""#);
+        assert_eq!(eval_str(r#""🦀""#).unwrap(), r#""🦀""#);
+    }
+
+    #[test]
+    fn string_length_in_codepoints() {
+        assert_eq!(eval_str(r#"(length "hello")"#).unwrap(), "5");
+        assert_eq!(eval_str(r#"(length "")"#).unwrap(), "0");
+        // Codepoints, NOT bytes — 日本 is 2 codepoints (not 6 UTF-8 bytes).
+        assert_eq!(eval_str(r#"(length "日本")"#).unwrap(), "2");
+        // 🦀 is 1 codepoint (U+1F980, outside BMP).
+        assert_eq!(eval_str(r#"(length "🦀")"#).unwrap(), "1");
+    }
+
+    #[test]
+    fn length_polymorphic_on_lists() {
+        // (length '(a b c)) — 3 cons cells.
+        assert_eq!(eval_str(r#"(length '(a b c))"#).unwrap(), "3");
+        assert_eq!(eval_str(r#"(length nil)"#).unwrap(), "0");
+        assert_eq!(eval_str(r#"(length '(1))"#).unwrap(), "1");
+    }
+
+    #[test]
+    fn string_eq_works() {
+        assert_eq!(eval_str(r#"(string= "foo" "foo")"#).unwrap(), "T");
+        assert_eq!(eval_str(r#"(string= "foo" "bar")"#).unwrap(), "nil");
+        assert_eq!(eval_str(r#"(string= "" "")"#).unwrap(), "T");
+        assert_eq!(eval_str(r#"(string= "café" "café")"#).unwrap(), "T");
+    }
+
+    #[test]
+    fn char_aref_on_string() {
+        // (char s i) reads the i-th codepoint as a character.
+        assert_eq!(eval_str(r#"(char "hello" 0)"#).unwrap(), "#\\h");
+        assert_eq!(eval_str(r#"(char "hello" 4)"#).unwrap(), "#\\o");
+        // aref is the same for strings.
+        assert_eq!(eval_str(r#"(aref "hello" 1)"#).unwrap(), "#\\e");
+        // Unicode: 4-byte codepoints work.
+        assert_eq!(eval_str(r#"(char "café" 3)"#).unwrap(), "#\\é");
+        assert_eq!(eval_str(r#"(char "🦀x" 0)"#).unwrap(), "#\\🦀");
+    }
+
+    #[test]
+    fn string_in_list_prints_correctly() {
+        // Strings in proper lists print as elements.
+        assert_eq!(eval_str(r#"(list "a" "b" "c")"#).unwrap(), r#"("a" "b" "c")"#);
+    }
+
+    #[test]
+    fn quoted_string_literal() {
+        // '"hello" reads as (quote "hello") and evaluates to "hello".
+        assert_eq!(eval_str(r#"'"hello""#).unwrap(), r#""hello""#);
+    }
+
+    #[test]
+    fn quoted_list_with_strings() {
+        assert_eq!(
+            eval_str(r#"'("hello" "world")"#).unwrap(),
+            r#"("hello" "world")"#,
+        );
+    }
+
+    #[test]
+    fn defparameter_holds_string() {
+        let mut session = Session::new();
+        session.eval(r#"(defparameter *greeting* "hello")"#).unwrap();
+        assert_eq!(session.eval("*greeting*").unwrap(), r#""hello""#);
+        assert_eq!(
+            session.eval(r#"(string= *greeting* "hello")"#).unwrap(),
+            "T",
+        );
+    }
+
+    #[test]
+    fn string_with_escapes_round_trips() {
+        // "she said \"hi\"" — the inner quotes need escaping in the
+        // printed form too.
+        assert_eq!(
+            eval_str(r#""she said \"hi\"""#).unwrap(),
+            r#""she said \"hi\"""#,
+        );
+        // Backslash escapes itself.
+        assert_eq!(eval_str(r#""back\\slash""#).unwrap(), r#""back\\slash""#);
+    }
+
+    #[test]
+    fn strings_are_not_eq_even_when_equal() {
+        // Each "foo" literal allocates fresh static storage; two
+        // distinct strings with the same content are NOT eq.
+        assert_eq!(eval_str(r#"(eq "foo" "foo")"#).unwrap(), "nil");
+        // string= is the right predicate for content equality.
+        assert_eq!(eval_str(r#"(string= "foo" "foo")"#).unwrap(), "T");
+    }
+
+    #[test]
+    fn function_can_take_string_arg() {
+        let mut session = Session::new();
+        session
+            .eval(r#"(defun greet (name) (string= name "alice"))"#)
+            .unwrap();
+        assert_eq!(session.eval(r#"(greet "alice")"#).unwrap(), "T");
+        assert_eq!(session.eval(r#"(greet "bob")"#).unwrap(), "nil");
+    }
+
     // -- defparameter / setq / global value cells --------------------------
 
     #[test]
