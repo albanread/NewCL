@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 ncl-ir = { path = "../ncl-ir" }
 ncl-reader = { path = "../ncl-reader" }
+ncl-runtime = { path = "../ncl-runtime" }
+ncl-llvm = { path = "../ncl-llvm" }
 
 [lints]
 workspace = true

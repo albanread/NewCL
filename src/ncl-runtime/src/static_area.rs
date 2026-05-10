@@ -82,7 +82,9 @@ impl StaticArea {
     }
 
     /// Pointer to the cell at index `idx`. Caller must ensure
-    /// `idx < capacity_cells()`.
+    /// `idx < capacity_cells()`. Used by the GC scanner; allowed to
+    /// be dead in some configurations.
+    #[allow(dead_code)]
     pub(crate) fn cell_ptr(&self, idx: usize) -> *mut u64 {
         debug_assert!(idx < self.cells.len());
         unsafe { (self.cells.as_ptr() as *mut u64).add(idx) }

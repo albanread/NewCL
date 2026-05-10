@@ -10,14 +10,31 @@ fn main() -> ExitCode {
             println!("NewCormanLisp {VERSION}");
             ExitCode::SUCCESS
         }
+        Some("--eval") | Some("-e") => {
+            let Some(src) = args.next() else {
+                eprintln!("ncl: --eval requires a source string");
+                eprintln!("usage: ncl --eval \"(+ 1 2)\"");
+                return ExitCode::from(2);
+            };
+            match ncl_compiler::eval_str(&src) {
+                Ok(n) => {
+                    println!("{n}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("ncl: {e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
         Some(cmd) => {
             eprintln!("ncl: unknown command '{cmd}'");
-            eprintln!("(no commands are wired yet — see MANIFESTO.md)");
+            eprintln!("usage: ncl [--version | --eval <source>]");
             ExitCode::from(2)
         }
         None => {
-            println!("NewCormanLisp {VERSION} — pre-bootstrap.");
-            println!("See MANIFESTO.md for the plan.");
+            println!("NewCormanLisp {VERSION}");
+            println!("Try: ncl --eval \"(+ 1 2)\"");
             ExitCode::SUCCESS
         }
     }
