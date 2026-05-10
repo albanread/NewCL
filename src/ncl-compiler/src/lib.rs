@@ -774,6 +774,14 @@ fn install_native(
 /// `ncl-cl`; everything written in Lisp lives here.
 const CORE_LISP_SOURCE: &str = include_str!("../../../Lisp/core.lisp");
 
+/// Closette CLOS port — staged Lisp source. Loaded after the
+/// core stdlib because it depends on every primitive (vectors,
+/// hash tables, defstruct, &key, multiple values, block /
+/// return-from, compile, flet/labels, the lot). See the staging
+/// plan in the commit log for which sections cover which
+/// chunks.
+const CLOS_LISP_SOURCE: &str = include_str!("../../../Lisp/clos.lisp");
+
 impl Session {
     /// Read and evaluate the embedded core-stdlib source. Each defun
     /// goes through the same JIT path as user code; the resulting
@@ -785,10 +793,20 @@ impl Session {
         Ok(())
     }
 
-    /// Convenience: a session with the core stdlib pre-loaded.
+    /// Load Closette on top of the core stdlib. Order matters —
+    /// CLOS uses everything in core (defstruct, hash tables, &key,
+    /// labels, etc.). Idempotent in the same trivial sense as
+    /// `load_core_stdlib`.
+    pub fn load_clos(&mut self) -> Result<(), EvalError> {
+        self.eval(CLOS_LISP_SOURCE)?;
+        Ok(())
+    }
+
+    /// Convenience: a session with the core stdlib + CLOS pre-loaded.
     pub fn with_stdlib() -> Result<Session, EvalError> {
         let mut s = Session::new();
         s.load_core_stdlib()?;
+        s.load_clos()?;
         Ok(s)
     }
 }
