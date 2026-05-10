@@ -1120,26 +1120,17 @@ fn lower_lambda(
             got: 0,
         });
     }
-    let (required, rest_opt) = parse_param_list_lambda(&args[0])?;
+    let params = crate::parse_param_list_inner(&args[0])
+        .map_err(CompileError::NotImplemented)?;
     let body_forms = &args[1..];
 
     // Inner env starts with required params at Param(0..N) and a
     // capture parent pointing at the outer env (clone — we only
-    // read from it during lookup_or_capture). If a rest parameter
-    // is present, push it as a let-style local (boxed if mutated).
-    let mut inner_env = LocalEnv::for_lambda(&required, outer_env.clone());
-    let rest_is_mutated = if let Some(rest_name) = &rest_opt {
-        let body_mutations = mutated_in_body(body_forms, &HashSet::new());
-        let m = body_mutations.contains(rest_name);
-        if m {
-            inner_env.push_local_cell(Arc::clone(rest_name));
-        } else {
-            inner_env.push_local(Arc::clone(rest_name));
-        }
-        m
-    } else {
-        false
-    };
+    // read from it during lookup_or_capture). Optionals, the rest
+    // binding, and keys are then layered on as let-locals via the
+    // shared prologue helper.
+    let mut inner_env = LocalEnv::for_lambda(&params.required, outer_env.clone());
+    let prologue = build_arglist_prologue(&params, body_forms, &mut inner_env, coord)?;
 
     let lowered_body = if body_forms.is_empty() {
         Expr::Nil
@@ -1153,70 +1144,97 @@ fn lower_lambda(
         Expr::progn(lowered?)
     };
 
-    let body_expr = if rest_opt.is_some() {
-        let start = required.len() as u32;
-        let init = if rest_is_mutated {
-            Expr::cons(Expr::bind_rest(start), Expr::Nil)
-        } else {
-            Expr::bind_rest(start)
-        };
-        Expr::let_(vec![init], lowered_body)
-    } else {
+    let body_expr = if prologue.is_empty() {
         lowered_body
+    } else {
+        Expr::let_(prologue, lowered_body)
     };
 
     let captures = inner_env.take_captures();
-    Ok(Expr::lambda(required.len() as u32, body_expr, captures))
+    Ok(Expr::lambda(params.required.len() as u32, body_expr, captures))
 }
 
-/// Parse a lambda parameter list. Returns the required params plus
-/// the optional `&rest` name. Same surface shape as the defun-side
-/// `parse_param_list` in lib.rs — kept separate because the error
-/// types differ (CompileError vs EvalError).
-fn parse_param_list_lambda(
-    v: &Value,
-) -> Result<(Vec<Arc<str>>, Option<Arc<str>>), CompileError> {
-    let mut required = Vec::new();
-    let mut rest: Option<Arc<str>> = None;
-    let mut cur = v.clone();
-    loop {
-        match cur {
-            Value::Nil => return Ok((required, rest)),
-            Value::Cons(c) => {
-                let Value::Symbol(s) = &c.car else {
-                    return Err(CompileError::NotImplemented(format!(
-                        "lambda parameter must be a symbol, got {:?}", c.car,
-                    )));
-                };
-                if &*s.name == "&REST" {
-                    let after = c.cdr.clone();
-                    let Value::Cons(rc) = after else {
-                        return Err(CompileError::NotImplemented(
-                            "&rest must be followed by a name".into(),
-                        ));
-                    };
-                    let Value::Symbol(rs) = &rc.car else {
-                        return Err(CompileError::NotImplemented(format!(
-                            "&rest's name must be a symbol, got {:?}", rc.car,
-                        )));
-                    };
-                    rest = Some(Arc::clone(&rs.name));
-                    if !matches!(rc.cdr, Value::Nil) {
-                        return Err(CompileError::NotImplemented(
-                            "extra parameters after &rest's name".into(),
-                        ));
-                    }
-                    return Ok((required, rest));
-                }
-                required.push(Arc::clone(&s.name));
-                cur = c.cdr.clone();
-            }
-            other => {
-                return Err(CompileError::NotImplemented(format!(
-                    "lambda param list must be a proper list, got {other:?}"
-                )));
-            }
+/// Build the entry-block let-bindings that materialise &optional,
+/// &rest, and &key parameters. Pushes locals into `env` in the
+/// order they're produced (optionals first, then rest, then keys),
+/// returns the corresponding initialiser exprs in the same order.
+/// The returned Vec is suitable as the bindings of an `Expr::Let`
+/// wrapping the function body.
+///
+/// Default forms (for optionals and keys) are lowered against `env`
+/// at the moment of binding, so each default sees all earlier
+/// required params + earlier optionals/keys but not later ones.
+/// Matches CL semantics.
+///
+/// Used by both the lambda lowerer here and `compile_function` over
+/// in lib.rs (which pulls it in via `lower::build_arglist_prologue`).
+pub(crate) fn build_arglist_prologue(
+    params: &crate::ParamSpec,
+    body_forms: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Vec<Expr>, CompileError> {
+    let mut bindings: Vec<Expr> = Vec::new();
+    let body_mutations = mutated_in_body(body_forms, &HashSet::new());
+    let req_n = params.required.len() as u32;
+
+    // Optionals are positional: arg index = required + i.
+    for (i, opt) in params.optionals.iter().enumerate() {
+        let default_expr = match &opt.default {
+            Some(form) => lower_in_mut(form, env, coord)?,
+            None => Expr::Nil,
+        };
+        let init = Expr::opt_arg(req_n + i as u32, default_expr);
+        push_param_local(env, &opt.name, init, &body_mutations, &mut bindings);
+    }
+
+    // Rest binding (if present) follows optionals. The rest list
+    // captures everything from `required + optionals` to `n_args`.
+    if let Some(rest_name) = &params.rest {
+        let start = req_n + params.optionals.len() as u32;
+        let init = Expr::bind_rest(start);
+        push_param_local(env, rest_name, init, &body_mutations, &mut bindings);
+    }
+
+    // Keys: scan args[required+optional..] for matching keywords.
+    // The interleaved (kw, value) pairs that follow the
+    // required+optional region are also (per CL) included in the
+    // rest list above — independent views of the same range.
+    if !params.keys.is_empty() {
+        let key_start = req_n + params.optionals.len() as u32;
+        for key in &params.keys {
+            let kw_word = coord.intern(&key.keyword).raw();
+            let default_expr = match &key.default {
+                Some(form) => lower_in_mut(form, env, coord)?,
+                None => Expr::Nil,
+            };
+            let init = Expr::key_arg(kw_word, key_start, default_expr);
+            push_param_local(env, &key.name, init, &body_mutations, &mut bindings);
         }
+    }
+
+    Ok(bindings)
+}
+
+/// Push a name into `env` as either a plain local or a one-cell
+/// box (if the body mutates it), and append the matching
+/// initialiser to `bindings`. Boxing happens in lockstep so the
+/// binding form stays consistent with what `(setq name ...)` will
+/// expand to inside the body.
+fn push_param_local(
+    env: &mut LocalEnv,
+    name: &Arc<str>,
+    init: Expr,
+    body_mutations: &HashSet<Arc<str>>,
+    bindings: &mut Vec<Expr>,
+) {
+    let mutated = body_mutations.contains(name);
+    if mutated {
+        env.push_local_cell(Arc::clone(name));
+        bindings.push(Expr::cons(init, Expr::Nil));
+    } else {
+        env.push_local(Arc::clone(name));
+        bindings.push(init);
     }
 }
 

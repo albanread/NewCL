@@ -27,7 +27,8 @@ use inkwell::values::{FunctionValue, IntValue};
 use ncl_ir::Expr;
 use ncl_runtime::{
     ncl_alloc_cons, ncl_apply, ncl_build_rest_list, ncl_call, ncl_equal, ncl_funcall,
-    ncl_length, ncl_load_function, ncl_load_value, ncl_make_closure, ncl_set_car,
+    ncl_length, ncl_load_function, ncl_load_value, ncl_lookup_keyword,
+    ncl_make_closure, ncl_set_car,
     ncl_set_cdr, ncl_store_value, ncl_string_char, ncl_string_eq, ncl_string_set,
     MutatorState, Tag, Word,
 };
@@ -216,6 +217,7 @@ struct Helpers<'ctx> {
     string_set: FunctionValue<'ctx>,
     build_rest_list: FunctionValue<'ctx>,
     apply: FunctionValue<'ctx>,
+    lookup_keyword: FunctionValue<'ctx>,
 }
 
 fn declare_runtime_helpers<'ctx>(
@@ -362,6 +364,17 @@ fn declare_runtime_helpers<'ctx>(
     let apply =
         module.add_function("ncl_apply", apply_type, Some(Linkage::External));
 
+    // ncl_lookup_keyword(args_ptr, key_start, n_args, keyword) -> u64
+    let lookup_keyword_type = i64_t.fn_type(
+        &[ptr_t.into(), i64_t.into(), i64_t.into(), i64_t.into()],
+        false,
+    );
+    let lookup_keyword = module.add_function(
+        "ncl_lookup_keyword",
+        lookup_keyword_type,
+        Some(Linkage::External),
+    );
+
     Helpers {
         alloc_cons,
         call_fn,
@@ -379,6 +392,7 @@ fn declare_runtime_helpers<'ctx>(
         string_set,
         build_rest_list,
         apply,
+        lookup_keyword,
     }
 }
 
@@ -399,6 +413,7 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(&helpers.string_set, ncl_string_set as *const () as usize);
     engine.add_global_mapping(&helpers.build_rest_list, ncl_build_rest_list as *const () as usize);
     engine.add_global_mapping(&helpers.apply, ncl_apply as *const () as usize);
+    engine.add_global_mapping(&helpers.lookup_keyword, ncl_lookup_keyword as *const () as usize);
 }
 
 /// Convert an i1 comparison result to a tagged Word (T or NIL).
@@ -552,6 +567,115 @@ fn emit_expr<'ctx>(
                 )
                 .map_err(|e| format!("build_call build_rest_list: {e}"))?;
             Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+        }
+        Expr::OptArg { idx, default } => {
+            // if (n_args > idx) args[idx] else <default>
+            let n_args = function.get_nth_param(3).unwrap().into_int_value();
+            let args_ptr = function.get_nth_param(2).unwrap().into_pointer_value();
+            let idx_const = i64_t.const_int(*idx as u64, false);
+            let cond = builder
+                .build_int_compare(
+                    IntPredicate::UGT,
+                    n_args,
+                    idx_const,
+                    "opt_present",
+                )
+                .map_err(|e| format!("opt cmp: {e}"))?;
+            let then_bb = context.append_basic_block(*function, "opt_supplied");
+            let else_bb = context.append_basic_block(*function, "opt_default");
+            let cont_bb = context.append_basic_block(*function, "opt_cont");
+            builder
+                .build_conditional_branch(cond, then_bb, else_bb)
+                .map_err(|e| format!("opt br: {e}"))?;
+            // then: load args[idx]
+            builder.position_at_end(then_bb);
+            let elem_ptr = unsafe {
+                builder
+                    .build_in_bounds_gep(i64_t, args_ptr, &[idx_const], "opt_arg_ptr")
+                    .map_err(|e| format!("opt gep: {e}"))?
+            };
+            let supplied = builder
+                .build_load(i64_t, elem_ptr, "opt_arg")
+                .map_err(|e| format!("opt load: {e}"))?
+                .into_int_value();
+            let then_end = builder.get_insert_block().unwrap();
+            builder
+                .build_unconditional_branch(cont_bb)
+                .map_err(|e| format!("opt then br: {e}"))?;
+            // else: lower the default expression
+            builder.position_at_end(else_bb);
+            let defaulted = emit_expr(
+                context, builder, function, helpers, arity, locals, default,
+            )?;
+            let else_end = builder.get_insert_block().unwrap();
+            builder
+                .build_unconditional_branch(cont_bb)
+                .map_err(|e| format!("opt else br: {e}"))?;
+            // continuation: phi
+            builder.position_at_end(cont_bb);
+            let phi = builder
+                .build_phi(i64_t, "opt_phi")
+                .map_err(|e| format!("opt phi: {e}"))?;
+            phi.add_incoming(&[(&supplied, then_end), (&defaulted, else_end)]);
+            Ok(phi.as_basic_value().into_int_value())
+        }
+        Expr::KeyArg { keyword_word, key_start, default } => {
+            // v = ncl_lookup_keyword(args, key_start, n_args, keyword)
+            // if (v == UNBOUND) <default> else v
+            let args_ptr = function.get_nth_param(2).unwrap();
+            let n_args = function.get_nth_param(3).unwrap();
+            let key_start_const = i64_t.const_int(*key_start as u64, false);
+            let kw_const = i64_t.const_int(*keyword_word, false);
+            let call = builder
+                .build_call(
+                    helpers.lookup_keyword,
+                    &[
+                        args_ptr.into(),
+                        key_start_const.into(),
+                        n_args.into(),
+                        kw_const.into(),
+                    ],
+                    "key_lookup",
+                )
+                .map_err(|e| format!("key lookup call: {e}"))?;
+            let raw = call.try_as_basic_value().unwrap_basic().into_int_value();
+            let unbound = i64_t.const_int(Word::UNBOUND.raw(), false);
+            let cond = builder
+                .build_int_compare(
+                    IntPredicate::EQ,
+                    raw,
+                    unbound,
+                    "key_missing",
+                )
+                .map_err(|e| format!("key cmp: {e}"))?;
+            let then_bb = context.append_basic_block(*function, "key_default");
+            let else_bb = context.append_basic_block(*function, "key_supplied");
+            let cont_bb = context.append_basic_block(*function, "key_cont");
+            builder
+                .build_conditional_branch(cond, then_bb, else_bb)
+                .map_err(|e| format!("key br: {e}"))?;
+            // then: lower the default expression
+            builder.position_at_end(then_bb);
+            let defaulted = emit_expr(
+                context, builder, function, helpers, arity, locals, default,
+            )?;
+            let then_end = builder.get_insert_block().unwrap();
+            builder
+                .build_unconditional_branch(cont_bb)
+                .map_err(|e| format!("key then br: {e}"))?;
+            // else: use the supplied raw value
+            builder.position_at_end(else_bb);
+            let else_end = builder.get_insert_block().unwrap();
+            builder
+                .build_unconditional_branch(cont_bb)
+                .map_err(|e| format!("key else br: {e}"))?;
+            // continuation: phi
+            builder.position_at_end(cont_bb);
+            let phi = builder
+                .build_phi(i64_t, "key_phi")
+                .map_err(|e| format!("key phi: {e}"))?;
+            phi.add_incoming(&[(&defaulted, then_end), (&raw, else_end)]);
+            Ok(phi.as_basic_value().into_int_value())
         }
         Expr::ClosureRef(idx) => {
             // env (function param 1) is a Vector-tagged Word. Untag,

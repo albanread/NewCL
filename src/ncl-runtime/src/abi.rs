@@ -1115,6 +1115,36 @@ fn is_keyword(w: Word) -> bool {
         .unwrap_or(false)
 }
 
+/// `ncl_lookup_keyword(args, key_start, n_args, keyword) -> value`.
+///
+/// Scan `args[key_start..n_args]` in steps of 2. If `args[i]`
+/// matches `keyword`, return `args[i+1]`. If no match (or the
+/// trailing slot has no following value), return `Word::UNBOUND`
+/// — the IR's `KeyArg` lowering branches on that to evaluate the
+/// default form.
+///
+/// JIT-callable. The compiler emits a call to this for every `&key`
+/// parameter at function entry.
+///
+/// SAFETY: `args` must point to at least `n_args` valid `u64`s.
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_lookup_keyword(
+    args: *const u64,
+    key_start: u64,
+    n_args: u64,
+    keyword: u64,
+) -> u64 {
+    let mut i = key_start;
+    while i + 1 < n_args {
+        let here = unsafe { *args.add(i as usize) };
+        if here == keyword {
+            return unsafe { *args.add((i + 1) as usize) };
+        }
+        i += 2;
+    }
+    Word::UNBOUND.raw()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

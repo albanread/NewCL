@@ -31,6 +31,23 @@ pub enum Expr {
     /// of variadic functions to bind the rest parameter. The
     /// allocation lives in the calling thread's young heap.
     BindRest(u32),
+    /// `&optional` accessor: if `n_args > idx`, return args[idx];
+    /// otherwise evaluate `default` and return its value. Generated
+    /// at the entry of functions that declare optional parameters.
+    /// `default` is lowered in an env that has all earlier required
+    /// and optional params already bound, so CL's
+    /// `(defun foo (a &optional (b (* a 2))))` semantics work.
+    OptArg { idx: u32, default: Box<Expr> },
+    /// `&key` accessor: scan `args[key_start..n_args]` for a pair
+    /// whose first element `eq`s `keyword_word` (a tagged Symbol);
+    /// if found, return the following arg. If not found, evaluate
+    /// `default` and return its value. The runtime helper does the
+    /// scan; LLVM emits the absent-then-default branch.
+    KeyArg {
+        keyword_word: u64,
+        key_start: u32,
+        default: Box<Expr>,
+    },
     /// Reference to the Nth let-bound local. Indexed in the order
     /// the let bindings were entered (per nested let scopes), reset
     /// when the let scope exits.
@@ -236,6 +253,16 @@ impl Expr {
     }
     pub fn param(idx: usize) -> Expr { Expr::Param(idx) }
     pub fn bind_rest(start: u32) -> Expr { Expr::BindRest(start) }
+    pub fn opt_arg(idx: u32, default: Expr) -> Expr {
+        Expr::OptArg { idx, default: Box::new(default) }
+    }
+    pub fn key_arg(keyword_word: u64, key_start: u32, default: Expr) -> Expr {
+        Expr::KeyArg {
+            keyword_word,
+            key_start,
+            default: Box::new(default),
+        }
+    }
     pub fn local(idx: usize) -> Expr { Expr::Local(idx) }
     pub fn progn(forms: Vec<Expr>) -> Expr { Expr::Progn(forms) }
     pub fn let_(bindings: Vec<Expr>, body: Expr) -> Expr {

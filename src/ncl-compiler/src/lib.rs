@@ -154,24 +154,17 @@ impl Session {
             expanded_body.push(macroexpand_all(form, &self.coord, &mut self.mutator)?);
         }
 
-        // Build the env. Required params at Param(0..N); the rest
-        // binding (if any) is a let-style local at Local(0).
+        // Build the env. Required params first at Param(0..N); the
+        // shared prologue helper then layers optionals/rest/keys on
+        // as let-locals (boxed if the body mutates them).
         let mut env = LocalEnv::with_params(&params.required);
-        let rest_is_mutated = if let Some(rest_name) = &params.rest {
-            let body_mutations = lower::mutated_in_body(
-                &expanded_body,
-                &std::collections::HashSet::new(),
-            );
-            let m = body_mutations.contains(rest_name);
-            if m {
-                env.push_local_cell(Arc::clone(rest_name));
-            } else {
-                env.push_local(Arc::clone(rest_name));
-            }
-            m
-        } else {
-            false
-        };
+        let prologue = lower::build_arglist_prologue(
+            params,
+            &expanded_body,
+            &mut env,
+            &self.coord,
+        )
+        .map_err(EvalError::Compile)?;
 
         // Implicit progn over body forms.
         let lowered_body = if expanded_body.len() == 1 {
@@ -185,18 +178,10 @@ impl Session {
             ncl_ir::Expr::progn(lowered.map_err(EvalError::Compile)?)
         };
 
-        // If we have a rest param, wrap the body in a let that
-        // binds it to BindRest(required_count). Box if mutated.
-        let body_expr = if params.rest.is_some() {
-            let start = params.required.len() as u32;
-            let init = if rest_is_mutated {
-                ncl_ir::Expr::cons(ncl_ir::Expr::bind_rest(start), ncl_ir::Expr::Nil)
-            } else {
-                ncl_ir::Expr::bind_rest(start)
-            };
-            ncl_ir::Expr::let_(vec![init], lowered_body)
-        } else {
+        let body_expr = if prologue.is_empty() {
             lowered_body
+        } else {
+            ncl_ir::Expr::let_(prologue, lowered_body)
         };
 
         let arity = params.required.len() as u32;
@@ -652,63 +637,197 @@ fn match_defun_like(
     Ok(Some((name, params, body_forms)))
 }
 
-/// Parsed parameter list. Required-positional parameters first;
-/// `rest` holds the `&rest` binding if present. Common Lisp's
-/// `&optional`, `&key`, etc. are deferred — only required and
-/// `&rest` are recognised here.
+/// Parsed parameter list. CL canonical order: required, optional,
+/// rest, key. Each later category may be empty; the only currently
+/// unsupported feature is `&aux` (post-key let-bindings) and the
+/// optional/key supplied-p flag (`(name default supplied-p)`).
 #[derive(Debug, Clone)]
 pub struct ParamSpec {
     pub required: Vec<Arc<str>>,
+    pub optionals: Vec<OptParam>,
     pub rest: Option<Arc<str>>,
+    pub keys: Vec<KeyParam>,
+}
+
+/// One `&optional` parameter. `default` is the raw form the user
+/// wrote (or None for no default — implicit NIL); the lowering pass
+/// evaluates it lazily, only when the caller didn't supply this
+/// argument. The default form is lowered in an env that has the
+/// required params and all earlier optionals already bound, so
+/// `(defun f (a &optional (b (* a 2))))` works.
+#[derive(Debug, Clone)]
+pub struct OptParam {
+    pub name: Arc<str>,
+    pub default: Option<Value>,
+}
+
+/// One `&key` parameter. `keyword` is the colon-prefixed name used
+/// by callers (e.g. `:FAMILY`); `name` is the binding name inside
+/// the body. CL allows `((:other-name name) default)` to decouple
+/// them; for now we only support the common case where keyword
+/// equals `:NAME`. `default` lazily evaluated, same shape as for
+/// optionals.
+#[derive(Debug, Clone)]
+pub struct KeyParam {
+    pub name: Arc<str>,
+    pub keyword: Arc<str>,
+    pub default: Option<Value>,
+}
+
+/// Parsing state machine for an arglist. Steps strictly through
+/// `&optional` -> `&rest`/`&body` -> `&key` in that order; an
+/// out-of-order marker is a hard error.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArglistMode {
+    Required,
+    Optional,
+    Rest,
+    Key,
 }
 
 fn parse_param_list(v: &Value) -> Result<ParamSpec, EvalError> {
-    let mut required = Vec::new();
+    parse_param_list_inner(v).map_err(|s| {
+        EvalError::Compile(CompileError::BadDefun(s))
+    })
+}
+
+/// Internal parse with String errors — used by both the defun-side
+/// (lib.rs) and lambda-side (lower.rs) entry points so the shape
+/// stays identical between them.
+pub(crate) fn parse_param_list_inner(v: &Value) -> Result<ParamSpec, String> {
+    let mut required: Vec<Arc<str>> = Vec::new();
+    let mut optionals: Vec<OptParam> = Vec::new();
     let mut rest: Option<Arc<str>> = None;
+    let mut keys: Vec<KeyParam> = Vec::new();
+    let mut mode = ArglistMode::Required;
     let mut cur = v.clone();
     loop {
         match cur {
-            Value::Nil => return Ok(ParamSpec { required, rest }),
+            Value::Nil => break,
             Value::Cons(c) => {
-                let Value::Symbol(s) = &c.car else {
-                    return Err(EvalError::Compile(CompileError::BadDefun(format!(
-                        "param list element must be a symbol, got {:?}",
-                        c.car
-                    ))));
-                };
-                if &*s.name == "&REST" {
-                    // Expect exactly one more symbol, then end-of-list.
-                    let after = c.cdr.clone();
-                    let Value::Cons(rest_cons) = after else {
-                        return Err(EvalError::Compile(CompileError::BadDefun(
-                            "&rest must be followed by a name".into(),
-                        )));
-                    };
-                    let Value::Symbol(rest_sym) = &rest_cons.car else {
-                        return Err(EvalError::Compile(CompileError::BadDefun(
-                            format!(
-                                "&rest's name must be a symbol, got {:?}",
-                                rest_cons.car
-                            ),
-                        )));
-                    };
-                    rest = Some(Arc::clone(&rest_sym.name));
-                    if !matches!(rest_cons.cdr, Value::Nil) {
-                        return Err(EvalError::Compile(CompileError::BadDefun(
-                            "extra parameters after &rest's name".into(),
-                        )));
-                    }
-                    return Ok(ParamSpec { required, rest });
-                }
-                required.push(Arc::clone(&s.name));
+                let head = c.car.clone();
                 cur = c.cdr.clone();
+                // Lambda-list keyword?
+                if let Value::Symbol(s) = &head {
+                    match &*s.name {
+                        "&OPTIONAL" => {
+                            if mode != ArglistMode::Required {
+                                return Err(format!(
+                                    "&OPTIONAL out of order in arglist"
+                                ));
+                            }
+                            mode = ArglistMode::Optional;
+                            continue;
+                        }
+                        "&REST" | "&BODY" => {
+                            if matches!(mode, ArglistMode::Rest | ArglistMode::Key) {
+                                return Err(format!(
+                                    "&REST/&BODY out of order in arglist"
+                                ));
+                            }
+                            // Take exactly one symbol.
+                            let Value::Cons(rc) = cur.clone() else {
+                                return Err(
+                                    "&REST/&BODY must be followed by a name".into(),
+                                );
+                            };
+                            let Value::Symbol(rs) = &rc.car else {
+                                return Err(format!(
+                                    "&REST/&BODY name must be a symbol, got {:?}",
+                                    rc.car
+                                ));
+                            };
+                            rest = Some(Arc::clone(&rs.name));
+                            cur = rc.cdr.clone();
+                            mode = ArglistMode::Rest;
+                            continue;
+                        }
+                        "&KEY" => {
+                            if mode == ArglistMode::Key {
+                                return Err("duplicate &KEY in arglist".into());
+                            }
+                            mode = ArglistMode::Key;
+                            continue;
+                        }
+                        "&AUX" => {
+                            return Err("&AUX is not yet supported".into());
+                        }
+                        _ => {}
+                    }
+                }
+                // Non-keyword entry — interpret per current mode.
+                match mode {
+                    ArglistMode::Required => {
+                        let Value::Symbol(s) = &head else {
+                            return Err(format!(
+                                "required parameter must be a symbol, got {head:?}"
+                            ));
+                        };
+                        required.push(Arc::clone(&s.name));
+                    }
+                    ArglistMode::Optional => {
+                        let (name, default) = parse_init_form(&head)?;
+                        optionals.push(OptParam { name, default });
+                    }
+                    ArglistMode::Rest => {
+                        return Err(format!(
+                            "extra parameter after &REST: {head:?}"
+                        ));
+                    }
+                    ArglistMode::Key => {
+                        let (name, default) = parse_init_form(&head)?;
+                        // Convention: the matching keyword is `:NAME`.
+                        let kw_name = format!(":{}", name);
+                        keys.push(KeyParam {
+                            name,
+                            keyword: Arc::from(kw_name.as_str()),
+                            default,
+                        });
+                    }
+                }
             }
             other => {
-                return Err(EvalError::Compile(CompileError::BadDefun(format!(
+                return Err(format!(
                     "param list must be a proper list, got {other:?}"
-                ))));
+                ));
             }
         }
+    }
+    Ok(ParamSpec { required, optionals, rest, keys })
+}
+
+/// Parse one entry of the form `name`, `(name)`, or `(name
+/// default)`. Returns the name and the optional default form. The
+/// 3-element `(name default supplied-p)` shape is rejected for now
+/// — Closette doesn't use it widely; can grow later.
+fn parse_init_form(v: &Value) -> Result<(Arc<str>, Option<Value>), String> {
+    match v {
+        Value::Symbol(s) => Ok((Arc::clone(&s.name), None)),
+        Value::Cons(c) => {
+            let Value::Symbol(s) = &c.car else {
+                return Err(format!(
+                    "init-form name must be a symbol, got {:?}", c.car
+                ));
+            };
+            let name = Arc::clone(&s.name);
+            match &c.cdr {
+                Value::Nil => Ok((name, None)),
+                Value::Cons(c2) => {
+                    if !matches!(c2.cdr, Value::Nil) {
+                        return Err(
+                            "init-form may have at most (name default); supplied-p flag not yet supported".into(),
+                        );
+                    }
+                    Ok((name, Some(c2.car.clone())))
+                }
+                other => Err(format!(
+                    "init-form tail must be a list, got {other:?}"
+                )),
+            }
+        }
+        other => Err(format!(
+            "init-form must be a symbol or a list, got {other:?}"
+        )),
     }
 }
 
