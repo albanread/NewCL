@@ -13,6 +13,7 @@
 pub mod gc_symbol;
 pub mod heap;
 pub mod mutator;
+pub mod stack_map;
 pub mod static_area;
 pub mod symbol;
 pub mod universe;
@@ -24,6 +25,7 @@ pub use heap::{
     MAX_OBJECT_CELLS,
 };
 pub use mutator::{GcConfig, GcCoordinator, MutatorHandle, MutatorState};
+pub use stack_map::{LiveSlot, ParkedFrame, StackMap, StackMapEntry, walk_parked_frame};
 pub use static_area::StaticArea;
 pub use symbol::{Package, Symbol, Visibility};
 pub use universe::{pkg, universe, Universe};
