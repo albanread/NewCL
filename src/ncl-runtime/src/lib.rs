@@ -31,8 +31,10 @@ pub mod word;
 
 pub use abi::{
     append_shim, close_stream_shim, delete_file_shim, eql_shim, error_shim,
-    file_exists_shim, file_length_shim, file_position_shim, format_shim,
-    gensym_shim, handler_case_shim,
+    fboundp_shim, file_exists_shim, file_length_shim, file_position_shim,
+    fmakunbound_shim, format_shim,
+    gensym_shim, handler_case_shim, intern_shim,
+    set_symbol_function_shim, symbol_function_shim,
     loop_return_shim, make_array_shim, multiple_value_list_of_shim, mv_clear_shim,
     native_loop_shim,
     ncl_alloc_cons, ncl_apply, ncl_aref_generic, ncl_aset_generic,

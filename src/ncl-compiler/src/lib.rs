@@ -101,6 +101,19 @@ impl Session {
         }
         // Otherwise: macroexpand fully, then compile.
         let expanded = macroexpand_all(v, &self.coord, &mut self.mutator)?;
+        // CL convention: `(progn …)` at top level treats each body
+        // form as itself a top-level form. This is what lets a
+        // macro expand into multiple top-level definitions (e.g.
+        // defstruct emits `(progn (defun make-x …) (defun x-y …)
+        // (defun %setf-x-y …) …)`). Recurse into eval_value so each
+        // body form re-runs the defun/defmacro recognisers.
+        if let Some(body_forms) = match_top_level_progn(&expanded) {
+            let mut last = Word::NIL;
+            for form in body_forms {
+                last = self.eval_value(&form)?;
+            }
+            return Ok(last);
+        }
         let expr = lower(&expanded, &self.coord).map_err(EvalError::Compile)?;
         let mutator_ptr = &mut *self.mutator as *mut _;
         ncl_llvm::jit_eval(&expr, mutator_ptr).map_err(EvalError::Jit)
@@ -299,6 +312,20 @@ fn install_native_functions(
                    ncl_runtime::vector_shim, 0);
     install_native(coord, mutator, "%WORD-HASH",
                    ncl_runtime::word_hash_shim, 1);
+    // Symbol function-cell access. SYMBOL-FUNCTION reads,
+    // %SET-SYMBOL-FUNCTION is the target of the
+    // (setf (symbol-function ...) ...) lowering, FMAKUNBOUND
+    // clears, FBOUNDP probes.
+    install_native(coord, mutator, "SYMBOL-FUNCTION",
+                   ncl_runtime::symbol_function_shim, 1);
+    install_native(coord, mutator, "%SET-SYMBOL-FUNCTION",
+                   ncl_runtime::set_symbol_function_shim, 2);
+    install_native(coord, mutator, "FMAKUNBOUND",
+                   ncl_runtime::fmakunbound_shim, 1);
+    install_native(coord, mutator, "FBOUNDP",
+                   ncl_runtime::fboundp_shim, 1);
+    install_native(coord, mutator, "INTERN",
+                   ncl_runtime::intern_shim, 1);
 
     install_native(coord, mutator, "STRING-SPLIT-NEWLINES",
                    string_split_newlines_shim, 1);
@@ -614,6 +641,18 @@ fn match_defun(
     v: &Value,
 ) -> Result<Option<(String, ParamSpec, Vec<Value>)>, EvalError> {
     match_defun_like(v, "DEFUN")
+}
+
+/// Recognise `(progn body...)` so top-level progn can splice its
+/// body forms back into the top-level recogniser. Returns the
+/// body as a Vec of Values, or None if the form isn't a progn.
+fn match_top_level_progn(v: &Value) -> Option<Vec<Value>> {
+    let Value::Cons(c) = v else { return None };
+    let Value::Symbol(head) = &c.car else { return None };
+    if &*head.name != "PROGN" {
+        return None;
+    }
+    list_to_vec_of_value(&c.cdr).ok()
 }
 
 /// Recognise `(defmacro name (params...) body...)`. Same shape as

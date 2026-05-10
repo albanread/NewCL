@@ -284,6 +284,132 @@
 ;; passed to error — typically a string. Conditions as typed
 ;; objects with class hierarchies wait on CLOS.
 
+;; -- Type predicates ---------------------------------------------------------
+;;
+;; Each is a one-line wrapper around (typep x 'KIND). We could
+;; install them as native shims for speed, but most callers are
+;; already inside Lisp-level code paths and the indirection is
+;; cheap. Direct calls to (typep x 'foo) work too — these are
+;; just the conventional CL spellings.
+
+(defun symbolp (x) (typep x 'symbol))
+(defun stringp (x) (typep x 'string))
+(defun vectorp (x) (typep x 'vector))
+(defun listp (x) (typep x 'list))
+(defun consp (x) (typep x 'cons))
+(defun integerp (x) (typep x 'integer))
+(defun numberp (x) (typep x 'number))
+(defun characterp (x) (typep x 'character))
+(defun functionp (x) (typep x 'function))
+
+;; -- defstruct ---------------------------------------------------------------
+;;
+;; A struct instance is laid out as a Vector with the type tag in
+;; slot 0 and the user slots in slots 1..N. Each (defstruct NAME
+;; (slot1 default1) (slot2 default2) ...) generates:
+;;
+;;   - constructor:  (make-NAME &key slot1 slot2 ...) returning an
+;;                   instance with the given inits (or defaults).
+;;   - predicate:    (NAME-p obj) → T iff obj is a vector tagged
+;;                   with 'NAME at slot 0.
+;;   - accessors:    (NAME-slot1 obj), (NAME-slot2 obj), ...
+;;   - setf-accessors: (%setf-NAME-slot1 val obj), ...
+;;     reached via the generic (setf (NAME-slot1 obj) val) lowering
+;;     in the compiler.
+;;
+;; This is enough for Closette's `method-table` defstruct. Things
+;; not yet supported: :type / :include / :print-function /
+;; :predicate / :constructor options, BOA-style positional
+;; constructors, and the (slot default :type T :read-only T)
+;; per-slot keyword args.
+
+(defun defstruct-slot-name (spec)
+  (cond
+    ((symbolp spec) spec)
+    (t (car spec))))
+
+(defun defstruct-slot-default (spec)
+  (cond
+    ((symbolp spec) nil)
+    ((null (cdr spec)) nil)
+    (t (car (cdr spec)))))
+
+(defun defstruct-symbol (prefix name)
+  "Intern a fresh symbol whose name is PREFIX concatenated with
+   NAME's printer text. Used by the defstruct macro to build the
+   constructor / accessor / setter symbols at expansion time."
+  (intern (format nil "~A~A" prefix name)))
+
+(defun defstruct-build-constructor (name slots)
+  (let ((ctor (defstruct-symbol "MAKE-" name))
+        (n-slots (length slots)))
+    `(defun ,ctor (&key
+                    ,@(mapcar (lambda (s)
+                                (list (defstruct-slot-name s)
+                                      (defstruct-slot-default s)))
+                              slots))
+       ;; Allocate length n-slots+1 (1 extra cell for the type tag).
+       (let ((__v (make-array ,(+ n-slots 1) :initial-element nil)))
+         (setf (svref __v 0) ',name)
+         ,@(defstruct-build-init-stmts slots 1)
+         __v))))
+
+(defun defstruct-build-init-stmts (slots i)
+  "Emit a list of (setf (svref __v i) slot-name) forms, one per
+   slot, with i counting up from 1. Recursive walk so we don't
+   need a multi-list mapcar."
+  (cond
+    ((null slots) nil)
+    (t (cons `(setf (svref __v ,i) ,(defstruct-slot-name (car slots)))
+             (defstruct-build-init-stmts (cdr slots) (+ i 1))))))
+
+(defun defstruct-build-predicate (name)
+  (let ((pred (defstruct-symbol "" (format nil "~A-P" name))))
+    `(defun ,pred (obj)
+       (and (vectorp obj)
+            (eq (svref obj 0) ',name)))))
+
+(defun defstruct-build-accessors (name slots)
+  (defstruct-build-accessors-iter name slots 1))
+
+(defun defstruct-build-accessors-iter (name slots i)
+  (cond
+    ((null slots) nil)
+    (t
+     (let* ((slot (defstruct-slot-name (car slots)))
+            (acc (defstruct-symbol (format nil "~A-" name) slot)))
+       (cons `(defun ,acc (obj) (svref obj ,i))
+             (defstruct-build-accessors-iter name (cdr slots) (+ i 1)))))))
+
+(defun defstruct-build-setters (name slots)
+  (defstruct-build-setters-iter name slots 1))
+
+(defun defstruct-build-setters-iter (name slots i)
+  (cond
+    ((null slots) nil)
+    (t
+     (let* ((slot (defstruct-slot-name (car slots)))
+            (acc-name (format nil "~A-~A" name slot))
+            (setter (intern (format nil "%SETF-~A" acc-name))))
+       (cons `(defun ,setter (val obj)
+                (setf (svref obj ,i) val)
+                val)
+             (defstruct-build-setters-iter name (cdr slots) (+ i 1)))))))
+
+(defmacro defstruct (name &rest slots)
+  "Define a struct type NAME with the given SLOTS (each a symbol
+   or a (name default) list). Generates a make-NAME constructor
+   that takes the slot names as &key args, a NAME-P type
+   predicate, and per-slot accessors NAME-SLOT plus matching
+   setf-accessors %SETF-NAME-SLOT (the latter reached via the
+   generic (setf (NAME-SLOT obj) val) lowering)."
+  `(progn
+     ,(defstruct-build-constructor name slots)
+     ,(defstruct-build-predicate name)
+     ,@(defstruct-build-accessors name slots)
+     ,@(defstruct-build-setters name slots)
+     ',name))
+
 ;; -- Hash tables -------------------------------------------------------------
 ;;
 ;; A hash table is a Vector laid out as:

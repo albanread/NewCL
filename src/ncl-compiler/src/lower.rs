@@ -1128,9 +1128,37 @@ fn lower_setf(
             let sym = coord.intern("%HASH-SET");
             Ok(Expr::call(sym.raw(), vec![ht, key, val]))
         }
-        other => Err(CompileError::NotImplemented(format!(
-            "setf place not yet supported: ({other} ...)"
-        ))),
+        "SYMBOL-FUNCTION" => {
+            if place_args.len() != 1 {
+                return Err(CompileError::BadArity {
+                    head: format!("setf {place_head}"),
+                    expected: "(symbol-function sym)",
+                    got: place_args.len(),
+                });
+            }
+            // (setf (symbol-function S) F) → (%set-symbol-function S F).
+            let sym_arg = lower_in_mut(&place_args[0], env, coord)?;
+            let val = lower_in_mut(value_form, env, coord)?;
+            let setter_sym = coord.intern("%SET-SYMBOL-FUNCTION");
+            Ok(Expr::call(setter_sym.raw(), vec![sym_arg, val]))
+        }
+        // Generic fallback: any unrecognised setf place is rewritten
+        // as a call to the function named by mangling the place's
+        // head. (setf (FOO arg1 ... argN) val) → (%setf-FOO val arg1
+        // ... argN). Lets defstruct generate auto-setf-accessors by
+        // simply (defun %setf-NAME-SLOT (val obj) ...). User code
+        // can opt in by following the same naming convention.
+        head => {
+            let setter_name = format!("%SETF-{head}");
+            let setter_sym = coord.intern(&setter_name);
+            let val = lower_in_mut(value_form, env, coord)?;
+            let mut call_args = Vec::with_capacity(1 + place_args.len());
+            call_args.push(val);
+            for a in place_args {
+                call_args.push(lower_in_mut(a, env, coord)?);
+            }
+            Ok(Expr::call(setter_sym.raw(), call_args))
+        }
     }
 }
 

@@ -1253,6 +1253,134 @@ pub extern "C-unwind" fn multiple_value_list_of_shim(
 }
 
 // ───────────────────────────────────────────────────────────────────
+// symbol-function — read / write / unbind a symbol's function cell.
+//
+// Closette installs JIT-generated discriminating functions into
+// each generic function's symbol cell via (setf (symbol-function
+// name) ...). These shims expose the existing function-cell API
+// (gc_symbol::function_acquire / mutator::set_symbol_function) to
+// Lisp.
+// ───────────────────────────────────────────────────────────────────
+
+/// `(intern name)` — intern NAME (a string) as a symbol and
+/// return it. NAME is used verbatim — it's not upcased or
+/// touched. Defstruct uses this from its macro expansion to
+/// build constructor / accessor / setter symbol names from the
+/// struct's name.
+pub extern "C-unwind" fn intern_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("intern: expected 1 arg (string), got {n_args}");
+    }
+    let w = Word::from_raw(unsafe { *args });
+    if w.tag() != Tag::String {
+        panic!("intern: argument must be a string, got {w:?}");
+    }
+    let name: String = crate::gc_string::chars_of(w).collect();
+    let m = unsafe { &mut *mutator };
+    m.coord().intern(&name).raw()
+}
+
+/// `(symbol-function sym)` — return the function bound to SYM, or
+/// signal an error (panic for now) if the cell is unbound.
+pub extern "C-unwind" fn symbol_function_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("symbol-function: expected 1 arg (symbol), got {n_args}");
+    }
+    let sym = Word::from_raw(unsafe { *args });
+    if sym.tag() != Tag::Symbol {
+        panic!("symbol-function: argument must be a symbol, got {sym:?}");
+    }
+    let f = crate::gc_symbol::function_acquire(sym);
+    if f.is_unbound() {
+        let name = crate::sym_names::lookup(sym.raw())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        panic!("symbol-function: undefined function: {name}");
+    }
+    f.raw()
+}
+
+/// `(%set-symbol-function sym fn)` — install FN as the function
+/// bound to SYM. The setf-symbol-function lowering rewrites
+/// `(setf (symbol-function s) f)` into a call to this. Returns
+/// the new function value.
+pub extern "C-unwind" fn set_symbol_function_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("%set-symbol-function: expected 2 args (sym fn), got {n_args}");
+    }
+    let sym = Word::from_raw(unsafe { *args });
+    let new_fn = Word::from_raw(unsafe { *args.add(1) });
+    if sym.tag() != Tag::Symbol {
+        panic!("%set-symbol-function: first arg must be a symbol, got {sym:?}");
+    }
+    if new_fn.tag() != Tag::Function {
+        panic!(
+            "%set-symbol-function: second arg must be a function, got {new_fn:?}"
+        );
+    }
+    let m = unsafe { &mut *mutator };
+    m.set_symbol_function(sym, new_fn);
+    new_fn.raw()
+}
+
+/// `(fmakunbound sym)` — clear SYM's function cell. Returns SYM.
+pub extern "C-unwind" fn fmakunbound_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("fmakunbound: expected 1 arg (symbol), got {n_args}");
+    }
+    let sym = Word::from_raw(unsafe { *args });
+    if sym.tag() != Tag::Symbol {
+        panic!("fmakunbound: argument must be a symbol, got {sym:?}");
+    }
+    let m = unsafe { &mut *mutator };
+    m.set_symbol_function(sym, Word::UNBOUND);
+    sym.raw()
+}
+
+/// `(fboundp sym)` — return T if SYM has a function cell bound,
+/// NIL otherwise.
+pub extern "C-unwind" fn fboundp_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("fboundp: expected 1 arg (symbol), got {n_args}");
+    }
+    let sym = Word::from_raw(unsafe { *args });
+    if sym.tag() != Tag::Symbol {
+        return Word::NIL.raw();
+    }
+    let f = crate::gc_symbol::function_acquire(sym);
+    if f.is_unbound() {
+        Word::NIL.raw()
+    } else {
+        Word::T.raw()
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
 // Hash function — bit-mix on a Word's raw bits.
 //
 // The Lisp hash-table layer is built on top of Vectors and cons
