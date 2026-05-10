@@ -82,6 +82,24 @@ pub extern "C" fn ncl_store_value(
     new_value
 }
 
+/// Load a Symbol's function cell with acquire semantics. JIT'd
+/// `#'name` (i.e. `(function name)`) lowers to a call here. Used
+/// to pass defun'd functions as first-class values to higher-order
+/// code. Panics on unbound — distinct from unbound *variable*
+/// because here we know it's a function lookup.
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_load_function(sym_word: u64) -> u64 {
+    let sym = Word::from_raw(sym_word);
+    let fn_value = crate::gc_symbol::function_acquire(sym);
+    if fn_value.is_unbound() {
+        let name = crate::sym_names::lookup(sym_word)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{sym_word:#x}"));
+        panic!("undefined function: {name}");
+    }
+    fn_value.raw()
+}
+
 /// Dispatch a function call through a Symbol's function cell.
 /// JIT'd `(name arg1 arg2 ...)` lowers to a call here.
 ///

@@ -25,8 +25,8 @@ use inkwell::values::{FunctionValue, IntValue};
 
 use ncl_ir::Expr;
 use ncl_runtime::{
-    ncl_alloc_cons, ncl_call, ncl_funcall, ncl_load_value, ncl_make_closure,
-    ncl_store_value, MutatorState, Tag, Word,
+    ncl_alloc_cons, ncl_call, ncl_funcall, ncl_load_function, ncl_load_value,
+    ncl_make_closure, ncl_store_value, MutatorState, Tag, Word,
 };
 
 // We leak each compilation's Context + Module + Engine so the
@@ -192,6 +192,7 @@ struct Helpers<'ctx> {
     funcall_fn: FunctionValue<'ctx>,
     make_closure: FunctionValue<'ctx>,
     load_value: FunctionValue<'ctx>,
+    load_function: FunctionValue<'ctx>,
     store_value: FunctionValue<'ctx>,
 }
 
@@ -259,12 +260,21 @@ fn declare_runtime_helpers<'ctx>(
         Some(Linkage::External),
     );
 
+    // ncl_load_function(sym_word) -> u64
+    let load_function_type = i64_t.fn_type(&[i64_t.into()], false);
+    let load_function = module.add_function(
+        "ncl_load_function",
+        load_function_type,
+        Some(Linkage::External),
+    );
+
     Helpers {
         alloc_cons,
         call_fn,
         funcall_fn,
         make_closure,
         load_value,
+        load_function,
         store_value,
     }
 }
@@ -275,6 +285,7 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(&helpers.funcall_fn, ncl_funcall as *const () as usize);
     engine.add_global_mapping(&helpers.make_closure, ncl_make_closure as *const () as usize);
     engine.add_global_mapping(&helpers.load_value, ncl_load_value as *const () as usize);
+    engine.add_global_mapping(&helpers.load_function, ncl_load_function as *const () as usize);
     engine.add_global_mapping(&helpers.store_value, ncl_store_value as *const () as usize);
 }
 
@@ -695,6 +706,13 @@ fn emit_expr<'ctx>(
             let call = builder
                 .build_call(helpers.load_value, &[sym_const.into()], "load_value")
                 .map_err(|e| format!("build_call load_value: {e}"))?;
+            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+        }
+        Expr::LoadFunction(sym_word) => {
+            let sym_const = i64_t.const_int(*sym_word, false);
+            let call = builder
+                .build_call(helpers.load_function, &[sym_const.into()], "load_fn")
+                .map_err(|e| format!("build_call load_function: {e}"))?;
             Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
         }
         Expr::StoreGlobal { sym_word, value } => {

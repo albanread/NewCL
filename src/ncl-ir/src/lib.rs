@@ -94,6 +94,12 @@ pub enum Expr {
     /// argument. Only valid inside a lambda body that has at least
     /// `i+1` captures.
     ClosureRef(usize),
+    /// Load a Symbol's function cell as a first-class Function
+    /// value. The lowered form of `#'name` and `(function name)`.
+    /// Calling the returned Word with `funcall` invokes the named
+    /// function at the time of THIS lookup (atomic load_acquire on
+    /// the symbol's function cell).
+    LoadFunction(u64),
     /// Lambda expression. JIT-compiles `body` as a separate function
     /// with the lambda's signature; at the construction site,
     /// evaluates each `captures[i]` in outer scope and packs the
@@ -139,6 +145,7 @@ impl Expr {
         Expr::StoreGlobal { sym_word, value: Box::new(value) }
     }
     pub fn closure_ref(idx: usize) -> Expr { Expr::ClosureRef(idx) }
+    pub fn load_function(sym_word: u64) -> Expr { Expr::LoadFunction(sym_word) }
     pub fn lambda(arity: u32, body: Expr, captures: Vec<Expr>) -> Expr {
         Expr::Lambda { arity, body: Box::new(body), captures }
     }

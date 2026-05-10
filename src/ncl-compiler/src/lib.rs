@@ -615,6 +615,75 @@ mod end_to_end_tests {
         assert_eq!(result, "1024");
     }
 
+    // -- #' (function) — first-class defun'd function values ------------
+
+    #[test]
+    fn function_quote_loads_defun_function() {
+        let mut session = Session::new();
+        session.eval("(defun square (x) (* x x))").unwrap();
+        // #'square reads the function cell.
+        // Use funcall to invoke it.
+        assert_eq!(session.eval("(funcall #'square 9)").unwrap(), "81");
+    }
+
+    #[test]
+    fn function_quote_long_form() {
+        let mut session = Session::new();
+        session.eval("(defun cube (x) (* x x x))").unwrap();
+        assert_eq!(session.eval("(funcall (function cube) 3)").unwrap(), "27");
+    }
+
+    #[test]
+    fn map_list_with_defun_via_function_quote() {
+        let result = eval_str(
+            "(defun square (x) (* x x))
+             (defun map-list (f lst)
+               (if (null lst) nil
+                   (cons (funcall f (car lst)) (map-list f (cdr lst)))))
+             (map-list #'square '(1 2 3 4 5))",
+        )
+        .unwrap();
+        assert_eq!(result, "(1 4 9 16 25)");
+    }
+
+    #[test]
+    fn compose_defun_with_lambda() {
+        let result = eval_str(
+            "(defun double (x) (+ x x))
+             (defun succ (x) (+ x 1))
+             (defun compose (f g)
+               (lambda (x) (funcall f (funcall g x))))
+             (funcall (compose #'double #'succ) 5)",
+        )
+        .unwrap();
+        // compose(double, succ)(5) = double(succ(5)) = double(6) = 12
+        assert_eq!(result, "12");
+    }
+
+    #[test]
+    fn function_quote_redefinition_visibility() {
+        let mut session = Session::new();
+        session.eval("(defun id (x) x)").unwrap();
+        // #'id loads at the time of evaluation. Storing it now
+        // captures the CURRENT id; later redefinition is NOT seen
+        // by an already-captured #' value.
+        session.eval("(defparameter *f* #'id)").unwrap();
+        session.eval("(defun id (x) (+ x 100))").unwrap();
+        // *f* still refers to the old id (its function-cell value
+        // at the time of #'id).
+        // Wait — actually no. #'id returns the Function-tagged
+        // Word, which IS in the symbol's function cell. The cell
+        // got overwritten by the redefinition. The old Function
+        // object is now garbage.
+        // Hmm, actually the previous Function is in static (never
+        // collected). The symbol's cell now points at the new
+        // Function. *f* still points at the OLD Function. So
+        // (funcall *f* 5) calls the old id which returns 5.
+        assert_eq!(session.eval("(funcall *f* 5)").unwrap(), "5");
+        // (id 5) goes through the symbol cell — calls the new id.
+        assert_eq!(session.eval("(id 5)").unwrap(), "105");
+    }
+
     #[test]
     fn closure_filter_with_predicate() {
         let result = eval_str(

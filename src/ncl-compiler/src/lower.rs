@@ -299,6 +299,27 @@ fn lower_call_in_mut(
         }
         "LAMBDA" => lower_lambda(args, env, coord),
         "FUNCALL" => lower_funcall(args, env, coord),
+        // (function name)  — equivalent to #'name in source. Loads
+        // the symbol's function cell as a first-class value.
+        "FUNCTION" => {
+            if args.len() != 1 {
+                return Err(CompileError::BadArity {
+                    head: head_name,
+                    expected: "1",
+                    got: args.len(),
+                });
+            }
+            let name = match &args[0] {
+                Value::Symbol(s) => Arc::clone(&s.name),
+                other => {
+                    return Err(CompileError::NotImplemented(format!(
+                        "(function …) requires a symbol, got {other:?}"
+                    )));
+                }
+            };
+            let sym_word = coord.intern(&name);
+            Ok(Expr::load_function(sym_word.raw()))
+        }
         // (setq name value)  — assign the value cell of `name`. CL
         // also allows (setq a 1 b 2 …) for parallel assignments;
         // v1 supports the binary form only.
