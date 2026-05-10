@@ -10,6 +10,7 @@
 //! atomically swapped, retirement machinery is reserved for orphaned
 //! compiled code only.
 
+pub mod gc_symbol;
 pub mod heap;
 pub mod mutator;
 pub mod static_area;

@@ -408,6 +408,62 @@ impl MutatorState {
         self.coord.mark_card(addr);
     }
 
+    // -- Symbol API (the load-bearing redefinition path) --------------------
+
+    /// Allocate a fresh symbol in the static area. Returns a
+    /// Symbol-tagged Word, or `None` if static is exhausted. The
+    /// intern table that maps `(name, package)` → existing-Symbol
+    /// lands later; this is the raw constructor.
+    pub fn alloc_symbol(&self, name: Word, package: Word) -> Option<Word> {
+        crate::gc_symbol::alloc_symbol_in_static(&self.coord.static_area, name, package)
+    }
+
+    /// Read a symbol's function cell with **acquire** semantics.
+    /// This is the dispatch path of every function call in v1.
+    pub fn symbol_function(&self, sym: Word) -> Word {
+        crate::gc_symbol::function_acquire(sym)
+    }
+
+    /// Atomically install a new function in a symbol's function cell.
+    /// **This is `defun` at the runtime level.** Single store-release
+    /// + a card mark on the static cell containing the function slot,
+    /// so a subsequent minor GC sees any young/old pointer just
+    /// stored.
+    pub fn set_symbol_function(&self, sym: Word, new_fn: Word) {
+        crate::gc_symbol::set_function_release(sym, new_fn);
+        self.mark_card(crate::gc_symbol::function_cell_addr(sym));
+    }
+
+    /// CAS the function cell. Returns `Ok(())` on success, or
+    /// `Err(observed)` on mismatch. Card marked unconditionally
+    /// (false positive cards are fine).
+    pub fn cas_symbol_function(
+        &self,
+        sym: Word,
+        expected: Word,
+        new_fn: Word,
+    ) -> Result<(), Word> {
+        let res = crate::gc_symbol::cas_function(sym, expected, new_fn);
+        if res.is_ok() {
+            self.mark_card(crate::gc_symbol::function_cell_addr(sym));
+        }
+        res
+    }
+
+    /// Read a symbol's value cell with **acquire** semantics. This
+    /// is the dynamic-variable lookup path.
+    pub fn symbol_value(&self, sym: Word) -> Word {
+        crate::gc_symbol::value_acquire(sym)
+    }
+
+    /// Atomically install a new value in a symbol's value cell.
+    /// `defparameter` and `(setq foo …)` for special variables go
+    /// through this.
+    pub fn set_symbol_value(&self, sym: Word, new_val: Word) {
+        crate::gc_symbol::set_value_release(sym, new_val);
+        self.mark_card(crate::gc_symbol::value_cell_addr(sym));
+    }
+
     // -- Roots API (explicit for v1; replaced by stack maps later) ----------
 
     pub fn push_root(&self, w: Word) -> usize {
@@ -868,6 +924,175 @@ mod tests {
             assert!(w[1] - w[0] >= 8);
         }
         assert_eq!(coord.static_area().used_cells(), n_threads * allocs);
+    }
+
+    // -- Symbol API tests ---------------------------------------------------
+
+    #[test]
+    fn alloc_symbol_returns_symbol_tagged_word() {
+        let coord = GcCoordinator::new(small_config());
+        let m = coord.register_mutator();
+        let sym = m.alloc_symbol(Word::fixnum(7), Word::NIL).expect("alloc");
+        assert_eq!(sym.tag(), Tag::Symbol);
+        assert!(coord.static_area().contains_ptr(sym.as_ptr::<u8>(Tag::Symbol).unwrap()));
+        assert!(m.symbol_function(sym).is_unbound());
+        assert!(m.symbol_value(sym).is_unbound());
+    }
+
+    #[test]
+    fn defun_via_set_symbol_function_round_trips() {
+        let coord = GcCoordinator::new(small_config());
+        let m = coord.register_mutator();
+        let sym = m.alloc_symbol(Word::NIL, Word::NIL).unwrap();
+
+        m.set_symbol_function(sym, Word::fixnum(42));
+        assert_eq!(m.symbol_function(sym).as_fixnum(), Some(42));
+
+        // Redefine.
+        m.set_symbol_function(sym, Word::fixnum(99));
+        assert_eq!(m.symbol_function(sym).as_fixnum(), Some(99));
+    }
+
+    #[test]
+    fn cas_symbol_function_replaces_only_on_match() {
+        let coord = GcCoordinator::new(small_config());
+        let m = coord.register_mutator();
+        let sym = m.alloc_symbol(Word::NIL, Word::NIL).unwrap();
+        m.set_symbol_function(sym, Word::fixnum(1));
+
+        // Wrong expected → fails.
+        let r = m.cas_symbol_function(sym, Word::fixnum(99), Word::fixnum(2));
+        assert!(matches!(r, Err(observed) if observed.as_fixnum() == Some(1)));
+        assert_eq!(m.symbol_function(sym).as_fixnum(), Some(1));
+
+        // Correct expected → succeeds.
+        m.cas_symbol_function(sym, Word::fixnum(1), Word::fixnum(3)).unwrap();
+        assert_eq!(m.symbol_function(sym).as_fixnum(), Some(3));
+    }
+
+    #[test]
+    fn symbol_address_stable_across_gc() {
+        let coord = GcCoordinator::new(small_config());
+        let mut m = coord.register_mutator();
+
+        let sym = m.alloc_symbol(Word::NIL, Word::NIL).unwrap();
+        let addr_before = sym.as_ptr::<u8>(Tag::Symbol).unwrap() as usize;
+
+        // Lots of allocation pressure to force GCs.
+        for _ in 0..2000 {
+            m.alloc_cons(Word::fixnum(0), Word::fixnum(0));
+        }
+
+        // Symbol still at the same address; static doesn't move.
+        assert_eq!(sym.as_ptr::<u8>(Tag::Symbol).unwrap() as usize, addr_before);
+        // Still a symbol; layout intact.
+        assert_eq!(crate::gc_symbol::header(sym).ty(), crate::HeapType::Symbol);
+    }
+
+    #[test]
+    fn function_cell_with_young_target_promotes_via_card() {
+        // The full vertical: store a young pointer into a symbol's
+        // function cell, GC, verify the cell now points at the
+        // promoted location in old. This exercises the entire
+        // step-7 + step-8 chain (static → young promotion via card
+        // table, plus the symbol-cell's atomic store).
+        let coord = GcCoordinator::new(small_config());
+        let mut m = coord.register_mutator();
+
+        let sym = m.alloc_symbol(Word::NIL, Word::NIL).unwrap();
+        // Stash sym as a root so the symbol-pointer Word survives.
+        // (The Symbol itself doesn't move, but the Word value we hold
+        // is what gets visited; the visit is a no-op for static-
+        // pointing words because copy_into rejects non-young/old
+        // sources.)
+        let _idx = m.push_root(sym);
+
+        // Allocate young object that we'll point the function cell at.
+        let young_fn = m.alloc_cons(Word::fixnum(123), Word::NIL);
+        m.set_symbol_function(sym, young_fn);
+
+        // Verify the function cell currently points at young.
+        let stored = m.symbol_function(sym);
+        assert!(coord.static_area().contains_ptr(
+            crate::gc_symbol::function_cell_addr(sym)
+        ));
+        let target = stored.as_ptr::<u8>(Tag::Cons).unwrap();
+        assert!(!coord.static_area().contains_ptr(target),
+            "young_fn should be in young, not static");
+
+        // Force minor GC.
+        m.collect_minor();
+
+        // Function cell now holds the promoted location. Read it
+        // back and verify the data is intact.
+        let promoted = m.symbol_function(sym);
+        assert!(promoted.is_cons());
+        let pp = promoted.as_ptr::<u64>(Tag::Cons).unwrap();
+        unsafe {
+            assert_eq!(Word::from_raw(*pp).as_fixnum(), Some(123));
+        }
+    }
+
+    #[test]
+    fn concurrent_defun_no_torn_reads() {
+        // Two threads racing on set_symbol_function; a third reads.
+        // Barrier syncs starts so no writer is starved; reader exits
+        // early once both values have been observed.
+        use std::sync::Barrier;
+        let coord = GcCoordinator::new(small_config());
+        let m = coord.register_mutator();
+        let sym = m.alloc_symbol(Word::NIL, Word::NIL).unwrap();
+        m.set_symbol_function(sym, Word::fixnum(1));
+        drop(m);
+
+        let v1 = Word::fixnum(1);
+        let v2 = Word::fixnum(2);
+        let barrier = Arc::new(Barrier::new(3));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let coord1 = Arc::clone(&coord);
+        let coord2 = Arc::clone(&coord);
+        let coord3 = Arc::clone(&coord);
+        let bar1 = Arc::clone(&barrier);
+        let bar2 = Arc::clone(&barrier);
+        let stop1 = Arc::clone(&stop);
+        let stop2 = Arc::clone(&stop);
+        let sym_raw = sym.raw();
+
+        let w1 = thread::spawn(move || {
+            let m = coord1.register_mutator();
+            bar1.wait();
+            let sym = Word::from_raw(sym_raw);
+            while !stop1.load(Ordering::Relaxed) {
+                m.set_symbol_function(sym, v1);
+            }
+        });
+        let w2 = thread::spawn(move || {
+            let m = coord2.register_mutator();
+            bar2.wait();
+            let sym = Word::from_raw(sym_raw);
+            while !stop2.load(Ordering::Relaxed) {
+                m.set_symbol_function(sym, v2);
+            }
+        });
+
+        let m = coord3.register_mutator();
+        barrier.wait();
+        let sym = Word::from_raw(sym_raw);
+        let mut saw_v1 = 0u64;
+        let mut saw_v2 = 0u64;
+        for _ in 0..1_000_000 {
+            let f = m.symbol_function(sym);
+            if f.raw() == v1.raw() { saw_v1 += 1; }
+            else if f.raw() == v2.raw() { saw_v2 += 1; }
+            else { panic!("torn read: {f:?}"); }
+            if saw_v1 > 0 && saw_v2 > 0 { break; }
+        }
+        stop.store(true, Ordering::Relaxed);
+        w1.join().unwrap();
+        w2.join().unwrap();
+        assert!(saw_v1 > 0);
+        assert!(saw_v2 > 0);
     }
 
     #[test]
