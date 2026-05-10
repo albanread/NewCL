@@ -28,13 +28,14 @@ pub mod value;
 pub mod word;
 
 pub use abi::{
-    append_shim, close_stream_shim, delete_file_shim, file_exists_shim,
-    file_length_shim, file_position_shim, format_shim, ncl_alloc_cons, ncl_apply,
-    ncl_build_rest_list, ncl_call, ncl_car, ncl_cdr, ncl_equal, ncl_funcall,
-    ncl_length, ncl_load_function, ncl_load_value, ncl_make_closure, ncl_set_car,
-    ncl_set_cdr, ncl_store_value, ncl_string_char, ncl_string_eq, ncl_string_set,
-    open_append_file_shim, open_input_file_shim, open_output_file_shim,
-    read_char_from_shim, read_line_shim, write_string_to_shim,
+    append_shim, close_stream_shim, delete_file_shim, error_shim, file_exists_shim,
+    file_length_shim, file_position_shim, format_shim, handler_case_shim,
+    ncl_alloc_cons, ncl_apply, ncl_build_rest_list, ncl_call, ncl_car, ncl_cdr,
+    ncl_equal, ncl_funcall, ncl_length, ncl_load_function, ncl_load_value,
+    ncl_make_closure, ncl_set_car, ncl_set_cdr, ncl_store_value, ncl_string_char,
+    ncl_string_eq, ncl_string_set, open_append_file_shim, open_input_file_shim,
+    open_output_file_shim, read_char_from_shim, read_line_shim, write_string_to_shim,
+    NclCondition,
 };
 pub use printer::{format_word, format_word_aesthetic};
 

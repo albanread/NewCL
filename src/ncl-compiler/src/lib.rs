@@ -239,13 +239,24 @@ fn install_native_functions(
                    ncl_runtime::file_exists_shim, 1);
     install_native(coord, mutator, "DELETE-FILE",
                    ncl_runtime::delete_file_shim, 1);
+
+    // Conditions. ERROR signals; %HANDLER-CASE is the primitive
+    // behind the handler-case macro (Lisp/core.lisp). Condition
+    // unwinding goes through Rust's catch_unwind, which works
+    // because every Rust function on the active call chain (and
+    // the LispCodeFn type) is declared `extern "C-unwind"` so
+    // panics aren't aborted at the boundary.
+    install_native(coord, mutator, "ERROR",
+                   ncl_runtime::error_shim, 1);
+    install_native(coord, mutator, "%HANDLER-CASE",
+                   ncl_runtime::handler_case_shim, 2);
 }
 
 fn install_native(
     coord: &Arc<GcCoordinator>,
     mutator: &mut MutatorState,
     name: &str,
-    code: extern "C" fn(*mut MutatorState, u64, *const u64, u64) -> u64,
+    code: extern "C-unwind" fn(*mut MutatorState, u64, *const u64, u64) -> u64,
     arity: u32,
 ) {
     let sym_word = coord.intern(name);
@@ -1975,6 +1986,124 @@ mod end_to_end_tests {
         // &rest followed by multiple names.
         let r = eval_str("(defun f (a &rest r s) a)");
         assert!(r.is_err());
+    }
+
+    // -- Conditions ------------------------------------------------------
+
+    #[test]
+    fn handler_case_no_signal_returns_body_value() {
+        // When the body completes normally, handler-case returns
+        // the body's value.
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(handler-case 42 (error (c) (+ 100 0)))").unwrap(),
+            "42",
+        );
+    }
+
+    #[test]
+    fn error_signals_handler_runs() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval(r#"(handler-case (error "boom") (error (c) c))"#).unwrap(),
+            r#""boom""#,
+        );
+    }
+
+    #[test]
+    fn handler_returns_replacement_value() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Handler can compute a replacement value of any type.
+        assert_eq!(
+            s.eval(r#"(handler-case (error "x") (error (c) 99))"#).unwrap(),
+            "99",
+        );
+    }
+
+    #[test]
+    fn handler_can_use_condition_value() {
+        // The handler can format the condition into a message.
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval(
+                r#"(handler-case (error "thing failed")
+                     (error (c) (format nil "caught: ~A" c)))"#,
+            )
+            .unwrap(),
+            r#""caught: thing failed""#,
+        );
+    }
+
+    #[test]
+    fn nested_handler_case_inner_catches() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Inner handler catches; outer never sees it.
+        assert_eq!(
+            s.eval(
+                r#"(handler-case
+                     (handler-case (error "inner")
+                       (error (c) "inner caught"))
+                     (error (c) "outer caught"))"#,
+            )
+            .unwrap(),
+            r#""inner caught""#,
+        );
+    }
+
+    #[test]
+    fn nested_handler_case_outer_catches_when_inner_skips() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Inner doesn't run; outer handler catches the rethrown.
+        assert_eq!(
+            s.eval(
+                r#"(handler-case
+                     (progn (handler-case 1 (error (c) c))
+                            (error "from outer body"))
+                     (error (c) c))"#,
+            )
+            .unwrap(),
+            r#""from outer body""#,
+        );
+    }
+
+    #[test]
+    fn error_unwinds_through_user_frames() {
+        // (error) deep inside a call chain is caught by the outer
+        // handler-case — proving panic propagation crosses JIT
+        // frames cleanly.
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(r#"(defun deep () (error "from deep"))"#).unwrap();
+        s.eval("(defun mid () (deep))").unwrap();
+        s.eval("(defun top () (mid))").unwrap();
+        assert_eq!(
+            s.eval("(handler-case (top) (error (c) c))").unwrap(),
+            r#""from deep""#,
+        );
+    }
+
+    #[test]
+    fn condition_value_can_be_any_type() {
+        // The condition isn't required to be a string. Any Word
+        // works — here we pass a list.
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(handler-case (error '(:bad 42)) (error (c) c))").unwrap(),
+            "(:BAD 42)",
+        );
+    }
+
+    #[test]
+    fn handler_case_in_let_body() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval(
+                r#"(let ((x 10))
+                     (handler-case (progn (error "oops") x)
+                       (error (c) (+ x 1))))"#,
+            )
+            .unwrap(),
+            "11",
+        );
     }
 
     // -- Keywords --------------------------------------------------------

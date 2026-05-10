@@ -21,6 +21,7 @@ use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::execution_engine::{ExecutionEngine, JitFunction};
 use inkwell::module::{Linkage, Module};
+use inkwell::attributes::AttributeLoc;
 use inkwell::values::{FunctionValue, IntValue};
 
 use ncl_ir::Expr;
@@ -155,6 +156,15 @@ fn build_lisp_function(body: &Expr, arity: u32) -> Result<usize, String> {
         false,
     );
     let function = module.add_function("the_fn", fn_type, None);
+    // `uwtable` tells the backend to emit unwind tables for this
+    // function. On Windows we need them so a Rust panic raised in
+    // a runtime helper (e.g. `error_shim`) can unwind back through
+    // the JIT frame to the matching `handler-case`. Without this
+    // the unwinder hits the JIT frame and the panic escapes to the
+    // OS (MSVC SEH 0xe06d7363 = "C++ exception not caught").
+    let kind_id = inkwell::attributes::Attribute::get_named_enum_kind_id("uwtable");
+    let attr = context.create_enum_attribute(kind_id, 1);
+    function.add_attribute(AttributeLoc::Function, attr);
     let entry_block = context.append_basic_block(function, "entry");
     builder.position_at_end(entry_block);
 

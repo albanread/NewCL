@@ -226,6 +226,32 @@
 
 (defun abs (n) (if (< n 0) (- n) n))
 
+;; -- Conditions --------------------------------------------------------------
+;;
+;; (error condition-or-message) signals; (handler-case body
+;; (error (var) recovery)) catches. The condition is whatever was
+;; passed to error — typically a string. Conditions as typed
+;; objects with class hierarchies wait on CLOS.
+
+(defmacro handler-case (body-form &rest clauses)
+  "(handler-case body
+      (error (var) recovery))
+   For now only the ERROR clause is supported. The single-clause
+   form is enough to demonstrate the unwind-and-bind mechanism;
+   typed condition dispatch lands when CLOS does."
+  (cond
+    ((null clauses)
+     ;; No clauses — the body's value is just returned.
+     body-form)
+    (t
+     (let ((clause (car clauses)))
+       (let ((var-list (car (cdr clause)))
+             (handler-body (cdr (cdr clause))))
+         (let ((var (car var-list)))
+           `(%handler-case
+              (lambda () ,body-form)
+              (lambda (,var) ,@handler-body))))))))
+
 ;; -- File I/O ----------------------------------------------------------------
 ;;
 ;; The native primitives are:

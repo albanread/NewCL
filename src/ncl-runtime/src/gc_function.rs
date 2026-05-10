@@ -104,7 +104,15 @@ pub fn header(fn_word: Word) -> HeapHeader {
 /// `extern "C" fn(*mut MutatorState, env: u64, *const u64, u64) -> u64`,
 /// `args` must hold `n_args` valid `Word`s. Used by the dispatch
 /// helpers in `abi.rs`.
-pub type LispCodeFn = unsafe extern "C" fn(
+/// We use `extern "C-unwind"` so Rust panics can propagate through
+/// JIT-compiled function frames. This is required for `error` /
+/// `handler-case` — `error` panics with a condition payload, the
+/// panic walks back up through the active Lisp call chain (each
+/// frame is a function with this type), and the catch_unwind in
+/// the handler-case shim catches it. With plain `extern "C"`,
+/// Rust 1.71+ would abort the process when the panic tried to
+/// cross the boundary.
+pub type LispCodeFn = unsafe extern "C-unwind" fn(
     mutator: *mut crate::mutator::MutatorState,
     env: u64,
     args: *const u64,

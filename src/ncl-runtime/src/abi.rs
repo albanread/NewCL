@@ -210,7 +210,7 @@ pub extern "C" fn ncl_load_function(sym_word: u64) -> u64 {
 ///   `code(mutator, env, args, n_args)`.
 /// Panics if the cell is unbound.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_call(
+pub extern "C-unwind" fn ncl_call(
     mutator: *mut crate::mutator::MutatorState,
     sym_word: u64,
     args: *const u64,
@@ -237,7 +237,7 @@ pub extern "C" fn ncl_call(
 /// Call a Function value directly (no symbol lookup). Used by
 /// `funcall` and by code that has a first-class Function value.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_funcall(
+pub extern "C-unwind" fn ncl_funcall(
     mutator: *mut crate::mutator::MutatorState,
     fn_word: u64,
     args: *const u64,
@@ -349,6 +349,139 @@ pub extern "C" fn ncl_set_cdr(
     new_value
 }
 
+// ---- Conditions: error / handler-case --------------------------------------
+//
+// The control-transfer mechanism is intentionally NOT panic-based.
+// Rust panics work cleanly between Rust frames, but propagating
+// them through LLVM-MCJIT-emitted Lisp frames on Windows requires
+// SEH .pdata tables that MCJIT doesn't reliably register — the
+// process aborts with code 0xe06d7363 ("C++ exception not caught")
+// when the unwinder hits a JIT frame.
+//
+// Instead we use a thread-local condition slot + handler-depth
+// counter:
+//
+//   - `error` checks the depth. If zero (no handler installed),
+//     it prints the message and aborts. If non-zero, it stores
+//     the condition in the slot and returns NIL — allowing the
+//     JIT frames above to drain naturally up the stack.
+//   - `handler-case` increments the depth, clears the slot, runs
+//     the body, decrements the depth, then inspects the slot. If
+//     set, it dispatches to the handler.
+//
+// Limitation: between `error` and the matching handler-case, the
+// JIT code unwinds via *normal returns*. If those frames perform
+// trapping operations on the body's return value (e.g.
+// `(car (error ...))` would call `car` on the NIL return) the
+// trap fires before the handler sees the condition. In practice
+// `error` is overwhelmingly the last thing in its branch, so this
+// is rarely observable. A proper unwinding mechanism (ORC JIT or
+// custom SEH registration) lands later.
+
+use std::cell::Cell;
+
+thread_local! {
+    /// The condition value set by `error`, cleared by
+    /// `handler-case` on entry, read by `handler-case` on exit.
+    static CONDITION_SLOT: Cell<u64> = const { Cell::new(0) };
+    /// Set if a condition has been signalled and not yet handled.
+    /// Distinct from CONDITION_SLOT==0 because nil is a legal
+    /// condition value.
+    static CONDITION_PENDING: Cell<bool> = const { Cell::new(false) };
+    /// Nesting depth of active `handler-case` invocations.
+    /// `error` aborts the process when this is zero.
+    static HANDLER_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Convenience wrapper kept around for FFI symmetry — exposes the
+/// condition payload type to callers that want to manipulate it
+/// programmatically. Currently empty since the pending-condition
+/// state lives in thread-locals.
+#[derive(Debug, Clone)]
+pub struct NclCondition {
+    pub value: u64,
+}
+
+/// `(error condition-or-message)` — signal a condition. With a
+/// matching `handler-case` on the stack, returns NIL after stashing
+/// the condition; the unwind happens through normal stack returns.
+/// With no handler active, prints the message and aborts the
+/// process — matches CL's "unhandled condition enters the
+/// debugger; here we just abort" simplification.
+pub extern "C-unwind" fn error_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    let cond = if n_args < 1 {
+        Word::NIL.raw()
+    } else {
+        unsafe { *args }
+    };
+    if HANDLER_DEPTH.with(|d| d.get()) == 0 {
+        // No handler — render the condition and abort.
+        let w = Word::from_raw(cond);
+        let msg = crate::printer::format_word_aesthetic(w);
+        eprintln!("unhandled condition: {msg}");
+        std::process::abort();
+    }
+    CONDITION_SLOT.with(|s| s.set(cond));
+    CONDITION_PENDING.with(|p| p.set(true));
+    Word::NIL.raw()
+}
+
+/// `(%handler-case body-thunk handler-fn)` — internal primitive
+/// behind the `handler-case` macro. Calls `body-thunk` with no
+/// args; if a condition was signalled during the body, invokes
+/// `handler-fn` with the condition as its single argument and
+/// returns the handler's value. Otherwise returns the body's
+/// result.
+pub extern "C-unwind" fn handler_case_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("handler-case expects 2 args (body-thunk, handler-fn), got {n_args}");
+    }
+    let body_word = Word::from_raw(unsafe { *args });
+    let handler_word = Word::from_raw(unsafe { *args.add(1) });
+    if body_word.tag() != Tag::Function || handler_word.tag() != Tag::Function {
+        panic!("handler-case: both args must be functions");
+    }
+
+    // Save the outer handler's pending state — we want a handler
+    // entered while another is unhandled to start clean and not
+    // accidentally catch the outer's condition.
+    let saved_slot = CONDITION_SLOT.with(|s| s.get());
+    let saved_pending = CONDITION_PENDING.with(|p| p.replace(false));
+    HANDLER_DEPTH.with(|d| d.set(d.get() + 1));
+
+    let body_result = {
+        let env = crate::gc_function::env(body_word);
+        let code = crate::gc_function::code_ptr(body_word);
+        let f: crate::gc_function::LispCodeFn =
+            unsafe { std::mem::transmute(code) };
+        unsafe { f(mutator, env.raw(), std::ptr::null(), 0) }
+    };
+
+    HANDLER_DEPTH.with(|d| d.set(d.get() - 1));
+    let was_pending = CONDITION_PENDING.with(|p| p.replace(saved_pending));
+    let cond = CONDITION_SLOT.with(|s| s.replace(saved_slot));
+
+    if was_pending {
+        let env = crate::gc_function::env(handler_word);
+        let code = crate::gc_function::code_ptr(handler_word);
+        let f: crate::gc_function::LispCodeFn =
+            unsafe { std::mem::transmute(code) };
+        unsafe { f(mutator, env.raw(), &cond as *const u64, 1) }
+    } else {
+        body_result
+    }
+}
+
 // ---- File I/O shims --------------------------------------------------------
 //
 // Each shim has the standard JIT calling convention so it can be
@@ -365,7 +498,7 @@ fn arg_fixnum(args: *const u64, i: u64) -> Option<i64> {
 }
 
 /// (open-input-file path) → handle (fixnum) or 0
-pub extern "C" fn open_input_file_shim(
+pub extern "C-unwind" fn open_input_file_shim(
     _mutator: *mut crate::mutator::MutatorState,
     _env: u64,
     args: *const u64,
@@ -379,7 +512,7 @@ pub extern "C" fn open_input_file_shim(
 }
 
 /// (open-output-file path) → handle (truncates existing)
-pub extern "C" fn open_output_file_shim(
+pub extern "C-unwind" fn open_output_file_shim(
     _mutator: *mut crate::mutator::MutatorState,
     _env: u64,
     args: *const u64,
@@ -393,7 +526,7 @@ pub extern "C" fn open_output_file_shim(
 }
 
 /// (open-append-file path) → handle (creates or appends)
-pub extern "C" fn open_append_file_shim(
+pub extern "C-unwind" fn open_append_file_shim(
     _mutator: *mut crate::mutator::MutatorState,
     _env: u64,
     args: *const u64,
@@ -407,7 +540,7 @@ pub extern "C" fn open_append_file_shim(
 }
 
 /// (close-stream handle) → t
-pub extern "C" fn close_stream_shim(
+pub extern "C-unwind" fn close_stream_shim(
     _mutator: *mut crate::mutator::MutatorState,
     _env: u64,
     args: *const u64,
@@ -422,7 +555,7 @@ pub extern "C" fn close_stream_shim(
 }
 
 /// (read-line handle) → string or nil (EOF)
-pub extern "C" fn read_line_shim(
+pub extern "C-unwind" fn read_line_shim(
     mutator: *mut crate::mutator::MutatorState,
     _env: u64,
     args: *const u64,
@@ -442,7 +575,7 @@ pub extern "C" fn read_line_shim(
 }
 
 /// (read-char-from handle) → char or nil (EOF)
-pub extern "C" fn read_char_from_shim(
+pub extern "C-unwind" fn read_char_from_shim(
     _mutator: *mut crate::mutator::MutatorState,
     _env: u64,
     args: *const u64,
@@ -459,7 +592,7 @@ pub extern "C" fn read_char_from_shim(
 }
 
 /// (write-string-to handle string) → string
-pub extern "C" fn write_string_to_shim(
+pub extern "C-unwind" fn write_string_to_shim(
     _mutator: *mut crate::mutator::MutatorState,
     _env: u64,
     args: *const u64,
@@ -479,7 +612,7 @@ pub extern "C" fn write_string_to_shim(
 }
 
 /// (file-position handle) → fixnum or -1
-pub extern "C" fn file_position_shim(
+pub extern "C-unwind" fn file_position_shim(
     _mutator: *mut crate::mutator::MutatorState,
     _env: u64,
     args: *const u64,
@@ -493,7 +626,7 @@ pub extern "C" fn file_position_shim(
 }
 
 /// (file-length handle) → fixnum or -1
-pub extern "C" fn file_length_shim(
+pub extern "C-unwind" fn file_length_shim(
     _mutator: *mut crate::mutator::MutatorState,
     _env: u64,
     args: *const u64,
@@ -507,7 +640,7 @@ pub extern "C" fn file_length_shim(
 }
 
 /// (file-exists path) → t or nil
-pub extern "C" fn file_exists_shim(
+pub extern "C-unwind" fn file_exists_shim(
     _mutator: *mut crate::mutator::MutatorState,
     _env: u64,
     args: *const u64,
@@ -524,7 +657,7 @@ pub extern "C" fn file_exists_shim(
 }
 
 /// (delete-file path) → t or nil
-pub extern "C" fn delete_file_shim(
+pub extern "C-unwind" fn delete_file_shim(
     _mutator: *mut crate::mutator::MutatorState,
     _env: u64,
     args: *const u64,
@@ -545,7 +678,7 @@ pub extern "C" fn delete_file_shim(
 /// by backquote-splicing macros, so it has to be available before
 /// the user-Lisp stdlib loads. Variadic CL `append` lands when
 /// `&rest` argument unpacking does.
-pub extern "C" fn append_shim(
+pub extern "C-unwind" fn append_shim(
     mutator: *mut crate::mutator::MutatorState,
     _env: u64,
     args: *const u64,
@@ -585,7 +718,7 @@ pub extern "C" fn append_shim(
 /// Arity is "at least 2" (dest + control); subsequent args become
 /// the rest list, which `run_format` consumes one-by-one as
 /// directives are processed.
-pub extern "C" fn format_shim(
+pub extern "C-unwind" fn format_shim(
     mutator: *mut crate::mutator::MutatorState,
     _env: u64,
     args: *const u64,
@@ -620,7 +753,7 @@ pub extern "C" fn format_shim(
 /// Empty prefix (just `(apply f lst)`) is supported by passing
 /// `n_prefix = 0` and a null `prefix` pointer.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_apply(
+pub extern "C-unwind" fn ncl_apply(
     mutator: *mut crate::mutator::MutatorState,
     fn_word: u64,
     prefix: *const u64,
