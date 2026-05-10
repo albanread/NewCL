@@ -17,7 +17,32 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use ncl_ir::Expr;
-use ncl_runtime::{GcCoordinator, Value, Word};
+use ncl_runtime::{symbol::Symbol, GcCoordinator, Value, Word};
+
+/// Is `s` a keyword? A keyword is a symbol whose home package is
+/// `KEYWORD`. The reader does the home-package assignment; the
+/// compiler just needs to recognise the result.
+pub fn is_keyword(s: &std::sync::Arc<Symbol>) -> bool {
+    match &s.home {
+        Some(pkg) => &*pkg.name == "KEYWORD",
+        None => false,
+    }
+}
+
+/// Intern a Value-level symbol into the runtime symbol table.
+/// Keywords get a `:` prefix on their interned name so the printer
+/// can render them as `:FOO` rather than `FOO`. Regular symbols
+/// pass through unchanged.
+pub fn intern_value_symbol(coord: &GcCoordinator, s: &std::sync::Arc<Symbol>) -> Word {
+    if is_keyword(s) {
+        let mut prefixed = String::with_capacity(s.name.len() + 1);
+        prefixed.push(':');
+        prefixed.push_str(&s.name);
+        coord.intern(&prefixed)
+    } else {
+        coord.intern(&s.name)
+    }
+}
 
 /// A binding kind in the lexical environment.
 ///
@@ -233,22 +258,22 @@ fn lower_in_mut(
         }
         Value::Symbol(s) => {
             // Local first (param/let/closure-capture), then T, then
-            // global value-cell load. Capture happens lazily — if
-            // we're inside a lambda body and the name resolves in
-            // the parent env, find_or_capture adds it as a closure
-            // capture and returns ClosureRef.
+            // keyword (self-evaluating), then global value-cell load.
             if let Some(b) = env.find_or_capture(&s.name) {
                 Ok(match b {
                     Binding::Param(i) => Expr::Param(i),
                     Binding::Local(i) => Expr::Local(i),
                     Binding::ClosureRef(i) => Expr::ClosureRef(i),
-                    // Cell variants auto-deref through (car cell).
                     Binding::ParamCell(i) => Expr::car(Expr::Param(i)),
                     Binding::LocalCell(i) => Expr::car(Expr::Local(i)),
                     Binding::ClosureRefCell(i) => Expr::car(Expr::ClosureRef(i)),
                 })
             } else if &*s.name == "T" {
                 Ok(Expr::True)
+            } else if is_keyword(s) {
+                // Keywords self-evaluate — emit the symbol Word
+                // as a literal rather than a global value-cell load.
+                Ok(Expr::Word(intern_value_symbol(coord, s).raw()))
             } else {
                 let sym_word = coord.intern(&s.name);
                 Ok(Expr::load_global(sym_word.raw()))
@@ -290,7 +315,7 @@ fn build_quoted_word(
         Value::Fixnum(n) => Ok(Word::fixnum(*n)),
         Value::Nil => Ok(Word::NIL),
         Value::Symbol(s) if &*s.name == "T" => Ok(Word::T),
-        Value::Symbol(s) => Ok(coord.intern(&s.name)),
+        Value::Symbol(s) => Ok(intern_value_symbol(coord, s)),
         Value::Cons(c) => {
             let car_word = build_quoted_word(&c.car, coord)?;
             let cdr_word = build_quoted_word(&c.cdr, coord)?;

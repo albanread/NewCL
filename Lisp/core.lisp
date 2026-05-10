@@ -252,8 +252,7 @@
 
 (defmacro with-open-file (binding-and-mode &rest body)
   "(with-open-file (var path direction) body...)
-   Direction is one of the bare symbols INPUT, OUTPUT, APPEND.
-   (Once the keyword package is wired we'll switch to :input etc.)
+   Direction is one of the keywords :input, :output, :append.
    Opens path, binds the handle to var, evaluates body, and closes
    the handle on the way out. (Without conditions we can't yet
    guarantee close on non-local exit; the body just isn't allowed
@@ -261,12 +260,12 @@
   (let ((var (car binding-and-mode))
         (path (car (cdr binding-and-mode)))
         (direction (car (cdr (cdr binding-and-mode)))))
-    ;; Dispatch at macro-expansion time: compare the symbol the
-    ;; user passed against the literal direction symbols.
+    ;; Dispatch at macro-expansion time: compare the keyword the
+    ;; user passed against the literal direction keywords.
     (let ((open-fn (cond
-                     ((eq direction 'input)  'open-input-file)
-                     ((eq direction 'output) 'open-output-file)
-                     ((eq direction 'append) 'open-append-file)
+                     ((eq direction ':input)  'open-input-file)
+                     ((eq direction ':output) 'open-output-file)
+                     ((eq direction ':append) 'open-append-file)
                      (t 'open-input-file))))
       `(let ((,var (,open-fn ,path)))
          (let ((result (progn ,@body)))

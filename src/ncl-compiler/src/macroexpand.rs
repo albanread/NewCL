@@ -40,7 +40,7 @@ pub fn value_to_word(
         Value::Fixnum(n) => Word::fixnum(*n),
         Value::Char(c) => Word::char(*c),
         Value::Symbol(s) if &*s.name == "T" => Word::T,
-        Value::Symbol(s) => coord.intern(&s.name),
+        Value::Symbol(s) => crate::lower::intern_value_symbol(coord, s),
         Value::String(s) => gc_string::alloc_string_in_young(m, s.as_str()),
         Value::Cons(c) => {
             let car = value_to_word(&c.car, m, coord)?;

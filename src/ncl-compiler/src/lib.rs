@@ -1977,6 +1977,87 @@ mod end_to_end_tests {
         assert!(r.is_err());
     }
 
+    // -- Keywords --------------------------------------------------------
+
+    #[test]
+    fn keyword_self_evaluates() {
+        // :foo evaluates to the symbol :FOO.
+        assert_eq!(eval_str(":foo").unwrap(), ":FOO");
+        assert_eq!(eval_str(":input").unwrap(), ":INPUT");
+    }
+
+    #[test]
+    fn keyword_eq_to_itself() {
+        // The same keyword is eq to itself (interned).
+        assert_eq!(eval_str("(eq :foo :foo)").unwrap(), "T");
+        assert_eq!(eval_str("(eq :foo :bar)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn keyword_distinct_from_symbol() {
+        // :foo and 'foo are different symbols.
+        assert_eq!(eval_str("(eq :foo 'foo)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn keyword_in_quoted_list() {
+        // Quoted lists containing keywords preserve them.
+        assert_eq!(
+            eval_str("'(:input :output :append)").unwrap(),
+            "(:INPUT :OUTPUT :APPEND)",
+        );
+    }
+
+    #[test]
+    fn keyword_as_arg() {
+        // Pass keywords to functions — they evaluate to themselves
+        // and travel through the call without ceremony.
+        let mut s = Session::new();
+        s.eval("(defun classify (k) (cond ((eq k :input) 1) ((eq k :output) 2) (t 0)))").unwrap();
+        assert_eq!(s.eval("(classify :input)").unwrap(), "1");
+        assert_eq!(s.eval("(classify :output)").unwrap(), "2");
+        assert_eq!(s.eval("(classify :other)").unwrap(), "0");
+    }
+
+    #[test]
+    fn keyword_in_macro_dispatch() {
+        // A macro that compares against keyword literals at expansion
+        // time (the with-open-file pattern).
+        let mut s = Session::new();
+        s.eval(
+            "(defmacro pick (k) \
+               (cond \
+                 ((eq k :a) ''first) \
+                 ((eq k :b) ''second) \
+                 (t ''other)))",
+        )
+        .unwrap();
+        assert_eq!(s.eval("(pick :a)").unwrap(), "FIRST");
+        assert_eq!(s.eval("(pick :b)").unwrap(), "SECOND");
+        assert_eq!(s.eval("(pick :z)").unwrap(), "OTHER");
+    }
+
+    #[test]
+    fn keyword_through_format() {
+        // Keywords print with the colon under both ~A and ~S.
+        assert_eq!(
+            eval_str(r#"(format nil "~A" :hello)"#).unwrap(),
+            r#"":HELLO""#,
+        );
+        assert_eq!(
+            eval_str(r#"(format nil "~S" :hello)"#).unwrap(),
+            r#"":HELLO""#,
+        );
+    }
+
+    #[test]
+    fn keyword_through_apply() {
+        let mut s = Session::new();
+        s.eval("(defun marker-of (k) (cond ((eq k :red) 1) (t 0)))").unwrap();
+        assert_eq!(s.eval("(apply #'marker-of '(:red))").unwrap(), "1");
+        assert_eq!(s.eval("(apply #'marker-of '(:blue))").unwrap(), "0");
+    }
+
     // -- File I/O --------------------------------------------------------
 
     fn temp_path(name: &str) -> String {
@@ -2033,16 +2114,16 @@ mod end_to_end_tests {
         let path = temp_path("with_open.txt");
         s.eval(&format!(r#"(defparameter *p* "{}")"#, path.replace('\\', "\\\\")))
             .unwrap();
-        // Write via with-open-file.
+        // Write via with-open-file (using real CL keywords).
         s.eval(
-            "(with-open-file (out *p* output) \
+            "(with-open-file (out *p* :output) \
                (write-line out \"line 1\") \
                (write-line out \"line 2\"))",
         )
         .unwrap();
         // Read back via with-open-file.
         assert_eq!(
-            s.eval("(with-open-file (in *p* input) (read-line in))").unwrap(),
+            s.eval("(with-open-file (in *p* :input) (read-line in))").unwrap(),
             r#""line 1""#,
         );
         s.eval("(delete-file *p*)").unwrap();
@@ -2073,7 +2154,7 @@ mod end_to_end_tests {
         s.eval(r#"(write-file-string *p* "first")"#).unwrap();
         // Append more.
         s.eval(
-            "(with-open-file (out *p* append) (write-string-to out \"-second\"))",
+            "(with-open-file (out *p* :append) (write-string-to out \"-second\"))",
         )
         .unwrap();
         assert_eq!(
