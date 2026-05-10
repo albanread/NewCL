@@ -453,6 +453,165 @@
 ;; passed to error — typically a string. Conditions as typed
 ;; objects with class hierarchies wait on CLOS.
 
+;; -- Tier-2 utilities (chunk 12) ---------------------------------------------
+;;
+;; A pile of small CL functions Closette pulls in. None need new
+;; compiler or runtime support; each is a thin wrapper over
+;; primitives we already have.
+
+(defun third (x) (car (cdr (cdr x))))
+
+(defun complement (pred)
+  "Return a predicate that negates PRED. PRED is currently
+   assumed unary; CL allows variadic but Closette only uses
+   the unary case."
+  (lambda (x) (not (funcall pred x))))
+
+(defun fdefinition (name)
+  "Return the function bound to NAME. Same as `symbol-function`
+   for plain symbols; CL also accepts (setf NAME) function-name
+   lists which we don't yet support."
+  (symbol-function name))
+
+(defun make-symbol (name)
+  "Return a fresh symbol whose name is NAME. CL's make-symbol
+   produces an UNINTERNED symbol; we don't have uninterned
+   symbols, so this just calls intern on a uniqued name and
+   returns. Same compromise as gensym."
+  (intern (format nil "~A~A" name (gensym ""))))
+
+(defun nreverse (lst)
+  "Same as REVERSE for now. CL nreverse is allowed to mutate
+   LST's cons cells; we just allocate fresh — slower but
+   semantically equivalent for non-shared lists. Closette
+   doesn't depend on the destructive behaviour."
+  (reverse lst))
+
+(defun nconc (&rest lists)
+  "Concatenate LISTS. CL nconc destructively splices each
+   non-last list's tail; we use append* (allocating). Closette
+   doesn't depend on the destructive behaviour."
+  (apply #'append* lists))
+
+(defun find-if (pred lst &key (key #'identity))
+  "Return the first element of LST for which (PRED (KEY elem))
+   is true, or NIL."
+  (cond
+    ((null lst) nil)
+    ((funcall pred (funcall key (car lst))) (car lst))
+    (t (find-if pred (cdr lst) :key key))))
+
+(defun remove-if (pred lst &key (key #'identity))
+  "Return a fresh list of LST's elements for which (PRED (KEY
+   elem)) is FALSE. Order preserved."
+  (cond
+    ((null lst) nil)
+    ((funcall pred (funcall key (car lst)))
+     (remove-if pred (cdr lst) :key key))
+    (t (cons (car lst) (remove-if pred (cdr lst) :key key)))))
+
+(defun remove (item lst &key (test #'eql) (key #'identity))
+  "Return a fresh list with all elements matching ITEM removed."
+  (cond
+    ((null lst) nil)
+    ((funcall test item (funcall key (car lst)))
+     (remove item (cdr lst) :test test :key key))
+    (t (cons (car lst) (remove item (cdr lst) :test test :key key)))))
+
+(defun remove-duplicates (lst &key (test #'eql) (key #'identity))
+  "Return a fresh list with duplicates removed. CL default
+   drops the EARLIER occurrence of any pair of matches, so the
+   LAST occurrence wins. (Pass :from-end to invert — not yet
+   supported here.)"
+  (cond
+    ((null lst) nil)
+    ((member (funcall key (car lst)) (cdr lst) :test test :key key)
+     (remove-duplicates (cdr lst) :test test :key key))
+    (t (cons (car lst)
+             (remove-duplicates (cdr lst) :test test :key key)))))
+
+(defun set-difference (xs ys &key (test #'eql) (key #'identity))
+  "Elements of XS not in YS (under TEST + KEY). Order preserved."
+  (cond
+    ((null xs) nil)
+    ((member (funcall key (car xs)) ys :test test :key key)
+     (set-difference (cdr xs) ys :test test :key key))
+    (t (cons (car xs)
+             (set-difference (cdr xs) ys :test test :key key)))))
+
+(defun intersection (xs ys &key (test #'eql) (key #'identity))
+  "Elements of XS that are also in YS."
+  (cond
+    ((null xs) nil)
+    ((member (funcall key (car xs)) ys :test test :key key)
+     (cons (car xs)
+           (intersection (cdr xs) ys :test test :key key)))
+    (t (intersection (cdr xs) ys :test test :key key))))
+
+(defun union (xs ys &key (test #'eql) (key #'identity))
+  "Union as a fresh list — XS first (with duplicates removed
+   relative to YS), then YS."
+  (cond
+    ((null xs) ys)
+    ((member (funcall key (car xs)) ys :test test :key key)
+     (union (cdr xs) ys :test test :key key))
+    (t (cons (car xs)
+             (union (cdr xs) ys :test test :key key)))))
+
+(defun subseq (seq start &optional end)
+  "Substring/sublist from START (inclusive) to END (exclusive,
+   defaults to length of seq). Works on strings (delegates to
+   substring) and lists; vectors not yet."
+  (cond
+    ((stringp seq)
+     (substring seq start (cond ((null end) (length seq)) (t end))))
+    ((listp seq)
+     (let ((lst (nthcdr start seq))
+           (n (cond ((null end) nil) (t (- end start)))))
+       (cond
+         ((null n) (copy-list lst))
+         (t (subseq-take lst n)))))
+    (t (error "subseq: unsupported sequence type: ~A" seq))))
+
+(defun subseq-take (lst n)
+  (cond
+    ((or (null lst) (<= n 0)) nil)
+    (t (cons (car lst) (subseq-take (cdr lst) (- n 1))))))
+
+(defun coerce (object result-type)
+  "Limited coerce: list <-> simple list/vector identity-ish;
+   STRING from a list of characters; LIST from a string. CL's
+   full coerce is overloaded — we cover what Closette uses.
+   RESULT-TYPE is a symbol."
+  (cond
+    ((eq result-type 'list)
+     (cond
+       ((listp object) object)
+       ((stringp object) (coerce-string-to-list object 0 (length object)))
+       (t (error "coerce: cannot coerce ~A to LIST" object))))
+    ((eq result-type 'string)
+     (cond
+       ((stringp object) object)
+       ((listp object) (coerce-list-to-string object))
+       (t (error "coerce: cannot coerce ~A to STRING" object))))
+    ((or (eq result-type 'vector) (eq result-type 'simple-vector))
+     (cond
+       ((vectorp object) object)
+       ((listp object) (apply #'vector object))
+       (t (error "coerce: cannot coerce ~A to VECTOR" object))))
+    (t (error "coerce: unsupported result-type ~A" result-type))))
+
+(defun coerce-string-to-list (s i n)
+  (cond
+    ((>= i n) nil)
+    (t (cons (char s i) (coerce-string-to-list s (+ i 1) n)))))
+
+(defun coerce-list-to-string (chars)
+  (cond
+    ((null chars) "")
+    (t (string-concat (string-append-char "" (car chars))
+                       (coerce-list-to-string (cdr chars))))))
+
 ;; -- Type predicates ---------------------------------------------------------
 ;;
 ;; Each is a one-line wrapper around (typep x 'KIND). We could

@@ -972,6 +972,15 @@ pub(crate) fn parse_param_list_inner(v: &Value) -> Result<ParamSpec, String> {
                         "&AUX" => {
                             return Err("&AUX is not yet supported".into());
                         }
+                        "&ALLOW-OTHER-KEYS" => {
+                            // ncl_lookup_keyword silently ignores
+                            // unknown keywords already, so this
+                            // marker is a no-op for us. Accept it
+                            // so Closette code that uses it (e.g.
+                            // initialize-instance dispatching to
+                            // shared-initialize) parses.
+                            continue;
+                        }
                         _ => {}
                     }
                 }
