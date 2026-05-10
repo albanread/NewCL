@@ -158,6 +158,15 @@ pub enum Expr {
         fn_expr: Box<Expr>,
         args: Vec<Expr>,
     },
+    /// `(apply fn prefix... tail-list)` — call `fn` with the
+    /// prefix args followed by the spread elements of `tail-list`.
+    /// `prefix` may be empty. The runtime helper builds the
+    /// combined args buffer and dispatches through `ncl_funcall`.
+    Apply {
+        fn_expr: Box<Expr>,
+        prefix: Vec<Expr>,
+        tail: Box<Expr>,
+    },
 }
 
 impl Expr {
@@ -217,6 +226,13 @@ impl Expr {
     }
     pub fn funcall(fn_expr: Expr, args: Vec<Expr>) -> Expr {
         Expr::Funcall { fn_expr: Box::new(fn_expr), args }
+    }
+    pub fn apply(fn_expr: Expr, prefix: Vec<Expr>, tail: Expr) -> Expr {
+        Expr::Apply {
+            fn_expr: Box::new(fn_expr),
+            prefix,
+            tail: Box::new(tail),
+        }
     }
     pub fn param(idx: usize) -> Expr { Expr::Param(idx) }
     pub fn bind_rest(start: u32) -> Expr { Expr::BindRest(start) }

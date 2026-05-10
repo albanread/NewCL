@@ -349,6 +349,60 @@ pub extern "C" fn ncl_set_cdr(
     new_value
 }
 
+/// `(apply fn prefix-arg-1 ... prefix-arg-N tail-list)` —
+/// call `fn` with the prefix args followed by the spread elements
+/// of `tail-list`. The compiler emits a call here with the prefix
+/// already packed into a stack buffer; we walk the list to count
+/// it, allocate one combined args buffer, copy the prefix in,
+/// splat the list, and dispatch through `ncl_funcall`.
+///
+/// Empty prefix (just `(apply f lst)`) is supported by passing
+/// `n_prefix = 0` and a null `prefix` pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_apply(
+    mutator: *mut crate::mutator::MutatorState,
+    fn_word: u64,
+    prefix: *const u64,
+    n_prefix: u64,
+    tail_list: u64,
+) -> u64 {
+    let f_word = Word::from_raw(fn_word);
+    if f_word.tag() != Tag::Function {
+        panic!("apply: not a function: {f_word:?}");
+    }
+
+    // Walk tail_list to count its length, then build a combined
+    // args buffer of n_prefix + tail_len Words.
+    let mut tail_len: usize = 0;
+    let mut cur = Word::from_raw(tail_list);
+    while !cur.is_nil() {
+        if cur.tag() != Tag::Cons {
+            panic!("apply: tail argument must be a proper list, got {cur:?}");
+        }
+        tail_len += 1;
+        let p = cur.as_ptr::<u64>(Tag::Cons).expect("cons");
+        cur = Word::from_raw(unsafe { *p.add(1) });
+    }
+
+    let total = n_prefix as usize + tail_len;
+    let mut buf: Vec<u64> = Vec::with_capacity(total);
+    for i in 0..n_prefix {
+        buf.push(unsafe { *prefix.add(i as usize) });
+    }
+    let mut cur = Word::from_raw(tail_list);
+    while !cur.is_nil() {
+        let p = cur.as_ptr::<u64>(Tag::Cons).expect("cons");
+        buf.push(unsafe { *p });
+        cur = Word::from_raw(unsafe { *p.add(1) });
+    }
+
+    let env = crate::gc_function::env(f_word);
+    let code = crate::gc_function::code_ptr(f_word);
+    let f: crate::gc_function::LispCodeFn =
+        unsafe { std::mem::transmute(code) };
+    unsafe { f(mutator, env.raw(), buf.as_ptr(), total as u64) }
+}
+
 /// Build a freshly-allocated list of `args[start..n_args]` in
 /// order. The variadic function-entry prologue calls this to bind
 /// `&rest` parameters. If `n_args <= start`, returns NIL.

@@ -1844,6 +1844,76 @@ mod end_to_end_tests {
         assert!(r.is_err());
     }
 
+    // -- apply -----------------------------------------------------------
+
+    #[test]
+    fn apply_simple() {
+        // (apply f lst) — splat lst as args to f.
+        let mut s = Session::new();
+        s.eval("(defun add3 (a b c) (+ a b c))").unwrap();
+        assert_eq!(s.eval("(apply #'add3 '(1 2 3))").unwrap(), "6");
+    }
+
+    #[test]
+    fn apply_with_prefix() {
+        // (apply f a b lst) — prefix a, b followed by lst.
+        let mut s = Session::new();
+        s.eval("(defun add4 (a b c d) (+ a b c d))").unwrap();
+        assert_eq!(s.eval("(apply #'add4 1 '(2 3 4))").unwrap(), "10");
+        assert_eq!(s.eval("(apply #'add4 1 2 '(3 4))").unwrap(), "10");
+        assert_eq!(s.eval("(apply #'add4 1 2 3 '(4))").unwrap(), "10");
+    }
+
+    #[test]
+    fn apply_with_empty_tail() {
+        let mut s = Session::new();
+        s.eval("(defun add2 (a b) (+ a b))").unwrap();
+        assert_eq!(s.eval("(apply #'add2 1 2 nil)").unwrap(), "3");
+    }
+
+    #[test]
+    fn apply_to_variadic() {
+        // The classic apply use case: pass a list to a &rest-taking
+        // function so it sees the elements as separate args.
+        let mut s = Session::new();
+        s.eval("(defun all (&rest r) r)").unwrap();
+        assert_eq!(s.eval("(apply #'all '(1 2 3 4))").unwrap(), "(1 2 3 4)");
+        assert_eq!(s.eval("(apply #'all 0 '(1 2 3))").unwrap(), "(0 1 2 3)");
+    }
+
+    #[test]
+    fn apply_with_lambda() {
+        let mut s = Session::new();
+        assert_eq!(
+            s.eval("(apply (lambda (a b) (* a b)) '(7 6))").unwrap(),
+            "42",
+        );
+    }
+
+    #[test]
+    fn apply_to_stdlib_min() {
+        // Use stdlib's variadic `min` via apply.
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(apply #'min '(3 1 4 1 5 9 2 6))").unwrap(), "1");
+        assert_eq!(s.eval("(apply #'max '(3 1 4 1 5 9 2 6))").unwrap(), "9");
+    }
+
+    #[test]
+    fn apply_arity_too_few_errors_at_compile() {
+        // (apply) and (apply f) — both lack the tail list.
+        let r = eval_str("(apply)");
+        assert!(r.is_err());
+        let r = eval_str("(apply #'+)");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn apply_returns_value() {
+        let mut s = Session::new();
+        s.eval("(defun double (x) (* x 2))").unwrap();
+        assert_eq!(s.eval("(apply #'double '(21))").unwrap(), "42");
+    }
+
     // -- truncate / rem (integer division primitives) ---------------------
 
     #[test]

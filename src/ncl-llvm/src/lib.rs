@@ -25,10 +25,10 @@ use inkwell::values::{FunctionValue, IntValue};
 
 use ncl_ir::Expr;
 use ncl_runtime::{
-    ncl_alloc_cons, ncl_build_rest_list, ncl_call, ncl_equal, ncl_funcall, ncl_length,
-    ncl_load_function, ncl_load_value, ncl_make_closure, ncl_set_car, ncl_set_cdr,
-    ncl_store_value, ncl_string_char, ncl_string_eq, ncl_string_set, MutatorState,
-    Tag, Word,
+    ncl_alloc_cons, ncl_apply, ncl_build_rest_list, ncl_call, ncl_equal, ncl_funcall,
+    ncl_length, ncl_load_function, ncl_load_value, ncl_make_closure, ncl_set_car,
+    ncl_set_cdr, ncl_store_value, ncl_string_char, ncl_string_eq, ncl_string_set,
+    MutatorState, Tag, Word,
 };
 
 // We leak each compilation's Context + Module + Engine so the
@@ -205,6 +205,7 @@ struct Helpers<'ctx> {
     set_cdr: FunctionValue<'ctx>,
     string_set: FunctionValue<'ctx>,
     build_rest_list: FunctionValue<'ctx>,
+    apply: FunctionValue<'ctx>,
 }
 
 fn declare_runtime_helpers<'ctx>(
@@ -337,6 +338,20 @@ fn declare_runtime_helpers<'ctx>(
         Some(Linkage::External),
     );
 
+    // ncl_apply(mutator, fn_word, prefix_ptr, n_prefix, tail_list) -> u64
+    let apply_type = i64_t.fn_type(
+        &[
+            ptr_t.into(),
+            i64_t.into(),
+            ptr_t.into(),
+            i64_t.into(),
+            i64_t.into(),
+        ],
+        false,
+    );
+    let apply =
+        module.add_function("ncl_apply", apply_type, Some(Linkage::External));
+
     Helpers {
         alloc_cons,
         call_fn,
@@ -353,6 +368,7 @@ fn declare_runtime_helpers<'ctx>(
         set_cdr,
         string_set,
         build_rest_list,
+        apply,
     }
 }
 
@@ -372,6 +388,7 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(&helpers.set_cdr, ncl_set_cdr as *const () as usize);
     engine.add_global_mapping(&helpers.string_set, ncl_string_set as *const () as usize);
     engine.add_global_mapping(&helpers.build_rest_list, ncl_build_rest_list as *const () as usize);
+    engine.add_global_mapping(&helpers.apply, ncl_apply as *const () as usize);
 }
 
 /// Convert an i1 comparison result to a tagged Word (T or NIL).
@@ -646,6 +663,59 @@ fn emit_expr<'ctx>(
                     "funcall_result",
                 )
                 .map_err(|e| format!("build_call funcall: {e}"))?;
+            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+        }
+        Expr::Apply { fn_expr, prefix, tail } => {
+            let fn_val =
+                emit_expr(context, builder, function, helpers, arity, locals, fn_expr)?;
+            let prefix_vals: Vec<IntValue> = prefix
+                .iter()
+                .map(|a| emit_expr(context, builder, function, helpers, arity, locals, a))
+                .collect::<Result<_, _>>()?;
+            let tail_val =
+                emit_expr(context, builder, function, helpers, arity, locals, tail)?;
+            let n = prefix_vals.len();
+            // Allocate even when n=0, but use a single-slot dummy
+            // — the runtime ignores prefix when n_prefix=0, so the
+            // pointer doesn't matter. Pass the address anyway, it's
+            // simpler than branching on emptiness.
+            let arr_type = i64_t.array_type(n.max(1) as u32);
+            let arr_alloca = builder
+                .build_alloca(arr_type, "apply_prefix")
+                .map_err(|e| format!("alloca: {e}"))?;
+            for (i, val) in prefix_vals.iter().enumerate() {
+                let elem = unsafe {
+                    builder
+                        .build_in_bounds_gep(
+                            arr_type,
+                            arr_alloca,
+                            &[
+                                i64_t.const_int(0, false),
+                                i64_t.const_int(i as u64, false),
+                            ],
+                            "ap_slot",
+                        )
+                        .map_err(|e| format!("gep ap: {e}"))?
+                };
+                builder
+                    .build_store(elem, *val)
+                    .map_err(|e| format!("store ap: {e}"))?;
+            }
+            let mutator_arg = function.get_nth_param(0).unwrap();
+            let n_const = i64_t.const_int(n as u64, false);
+            let call = builder
+                .build_call(
+                    helpers.apply,
+                    &[
+                        mutator_arg.into(),
+                        fn_val.into(),
+                        arr_alloca.into(),
+                        n_const.into(),
+                        tail_val.into(),
+                    ],
+                    "apply_result",
+                )
+                .map_err(|e| format!("build_call apply: {e}"))?;
             Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
         }
         Expr::Add(a, b) => {

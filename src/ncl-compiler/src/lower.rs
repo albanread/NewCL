@@ -367,6 +367,10 @@ fn lower_call_in_mut(
         }
         "LAMBDA" => lower_lambda(args, env, coord),
         "FUNCALL" => lower_funcall(args, env, coord),
+        // (apply fn arg1 ... argN tail-list) — last arg is the
+        // splatted list; everything between fn and the last arg
+        // is the prefix. Requires at least 2 args.
+        "APPLY" => lower_apply(args, env, coord),
         // (function name)  — equivalent to #'name in source. Loads
         // the symbol's function cell as a first-class value.
         "FUNCTION" => {
@@ -1189,6 +1193,31 @@ fn parse_param_list_lambda(
             }
         }
     }
+}
+
+/// `(apply fn arg1 arg2 ... tail-list)` — call `fn` with `arg1
+/// arg2 …` as the prefix and the elements of `tail-list` spread as
+/// additional args. Requires at least 2 args (fn + tail).
+fn lower_apply(
+    args: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
+    if args.len() < 2 {
+        return Err(CompileError::BadArity {
+            head: "APPLY".into(),
+            expected: "at least 2 (function and tail list)",
+            got: args.len(),
+        });
+    }
+    let fn_expr = lower_in_mut(&args[0], env, coord)?;
+    let last_idx = args.len() - 1;
+    let prefix: Result<Vec<_>, _> = args[1..last_idx]
+        .iter()
+        .map(|a| lower_in_mut(a, env, coord))
+        .collect();
+    let tail = lower_in_mut(&args[last_idx], env, coord)?;
+    Ok(Expr::apply(fn_expr, prefix?, tail))
 }
 
 /// `(funcall fn arg1 arg2 ...)` — call an arbitrary function value.
