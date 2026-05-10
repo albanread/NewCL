@@ -281,6 +281,11 @@ fn install_native_functions(
     // Self-eval bridge: lets Lisp code re-enter the compiler.
     install_native(coord, mutator, "EVAL-STRING",
                    eval_string_shim, 1);
+    // (compile name '(lambda (params) body)) — JIT a lambda form
+    // at runtime and (optionally) install in name's function cell.
+    // Closette uses this to install its discriminating functions.
+    install_native(coord, mutator, "COMPILE",
+                   compile_shim, 2);
     install_native(coord, mutator, "PARSE-COMPLETE?",
                    parse_complete_shim, 1);
     install_native(coord, mutator, "SUBSTRING",
@@ -397,6 +402,140 @@ extern "C-unwind" fn eval_string_shim(
         }
         Err(e) => ncl_runtime::abi::signal_condition_string(mutator, &format!("{e}")),
     }
+}
+
+/// `(compile name definition)` — compile DEFINITION (a `(lambda
+/// (params…) body…)` form) into a function. If NAME is non-NIL,
+/// install the compiled function in NAME's function cell. Always
+/// returns the compiled function value as primary.
+///
+/// CL's compile is heavily overloaded — the no-definition form
+/// recompiles an existing function-cell entry, the no-name form
+/// just returns the compiled function, with secondary values for
+/// warnings / failure status. Closette only uses the
+/// `(compile NAME '(lambda …))` shape, which is what this
+/// supports. The other shapes can grow when needed.
+extern "C-unwind" fn compile_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        return ncl_runtime::abi::signal_condition_string(
+            mutator,
+            "compile: expected 2 args (name definition)",
+        );
+    }
+    let name_word = Word::from_raw(unsafe { *args });
+    let def_word = Word::from_raw(unsafe { *args.add(1) });
+
+    // Convert the runtime cons-cell tree back into a Value tree
+    // the compiler can chew on. macroexpand exposes this bridge
+    // already (used by EVAL-STRING).
+    let def_value = match word_to_value(def_word) {
+        Ok(v) => v,
+        Err(e) => {
+            return ncl_runtime::abi::signal_condition_string(
+                mutator,
+                &format!("compile: cannot convert definition: {e}"),
+            );
+        }
+    };
+
+    // Parse `(lambda (params...) body...)`.
+    let (params_value, body_forms) = match &def_value {
+        ncl_runtime::Value::Cons(c) => {
+            let ncl_runtime::Value::Symbol(head) = &c.car else {
+                return ncl_runtime::abi::signal_condition_string(
+                    mutator,
+                    "compile: definition must start with the LAMBDA symbol",
+                );
+            };
+            if &*head.name != "LAMBDA" {
+                return ncl_runtime::abi::signal_condition_string(
+                    mutator,
+                    &format!(
+                        "compile: definition must be a (lambda …) form, got ({} …)",
+                        head.name
+                    ),
+                );
+            }
+            // c.cdr is (params body...). Walk it as a proper list.
+            let parts = match list_to_vec_of_value(&c.cdr) {
+                Ok(v) => v,
+                Err(e) => {
+                    return ncl_runtime::abi::signal_condition_string(
+                        mutator,
+                        &format!("compile: malformed lambda form: {e}"),
+                    );
+                }
+            };
+            if parts.is_empty() {
+                return ncl_runtime::abi::signal_condition_string(
+                    mutator,
+                    "compile: lambda must have a parameter list",
+                );
+            }
+            (parts[0].clone(), parts[1..].to_vec())
+        }
+        _ => {
+            return ncl_runtime::abi::signal_condition_string(
+                mutator,
+                "compile: definition must be a (lambda …) form",
+            );
+        }
+    };
+
+    let params = match parse_param_list(&params_value) {
+        Ok(p) => p,
+        Err(e) => {
+            return ncl_runtime::abi::signal_condition_string(
+                mutator,
+                &format!("compile: bad lambda list: {e}"),
+            );
+        }
+    };
+
+    let session_ptr = ACTIVE_SESSION.with(|c| c.get());
+    if session_ptr.is_null() {
+        return ncl_runtime::abi::signal_condition_string(
+            mutator,
+            "compile: no active session (call Session::activate first)",
+        );
+    }
+    let session = unsafe { &mut *session_ptr };
+
+    // Use the name (or a placeholder for the no-name case) as the
+    // compiled function's debug-display name. Doesn't affect the
+    // installation decision below.
+    let display_name: String = if name_word.is_nil() {
+        "<compiled>".to_string()
+    } else if name_word.tag() == ncl_runtime::Tag::Symbol {
+        ncl_runtime::sym_names::lookup(name_word.raw())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string())
+    } else {
+        return ncl_runtime::abi::signal_condition_string(
+            mutator,
+            "compile: name must be a symbol or NIL",
+        );
+    };
+
+    let fn_word = match session.compile_function(&display_name, &params, &body_forms) {
+        Ok(w) => w,
+        Err(e) => {
+            return ncl_runtime::abi::signal_condition_string(
+                mutator,
+                &format!("compile: {e}"),
+            );
+        }
+    };
+
+    if !name_word.is_nil() {
+        session.mutator.set_symbol_function(name_word, fn_word);
+    }
+    fn_word.raw()
 }
 
 /// `(parse-complete? s)` — T iff S parses fully (no trailing
