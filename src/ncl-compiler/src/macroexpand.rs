@@ -170,10 +170,14 @@ pub fn macroexpand_all(
                 let items = list_to_vec(v)?;
                 return rebuild_with_body_skip(&items, 2, coord, mutator);
             }
-            "LET" | "LET*" => {
+            "LET" => {
                 // (let BINDINGS body...). BINDINGS is a list of
                 // (name init) pairs; we expand each init but leave
-                // the binding names alone.
+                // the binding names alone. `let*` is a user-Lisp
+                // macro (in core.lisp) that desugars to nested
+                // `let`s, so we don't need a special case for it
+                // here — it'll fall through to the macro-lookup
+                // branch below.
                 let items = list_to_vec(v)?;
                 return rebuild_let(&items, coord, mutator);
             }

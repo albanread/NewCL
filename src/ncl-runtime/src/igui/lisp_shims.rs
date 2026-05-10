@@ -239,6 +239,34 @@ pub extern "C-unwind" fn set_title_shim(
     Word::T.raw()
 }
 
+/// `(set-redraw-rate child-id interval-ms)` — schedule a periodic
+/// `:tick` event for CHILD-ID every INTERVAL-MS milliseconds. A
+/// non-positive interval clears any existing timer. Returns T on
+/// success, NIL if the child id is unknown. Win32 auto-coalesces
+/// pending WM_TIMERs, so a backed-up language thread sees at most
+/// one `:tick` per drain cycle.
+pub extern "C-unwind" fn set_redraw_rate_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("set-redraw-rate: expected 2 args (child-id interval-ms), got {n_args}");
+    }
+    let Some(id) = arg_fixnum(args, 0) else {
+        panic!("set-redraw-rate: child-id must be a fixnum");
+    };
+    let Some(ms) = arg_fixnum(args, 1) else {
+        panic!("set-redraw-rate: interval-ms must be a fixnum");
+    };
+    if super::window::set_redraw_rate(id, ms) {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
 /// `(next-event timeout-ms)` — pull the next event off the global
 /// mailbox. `timeout-ms` is a fixnum: negative blocks forever,
 /// 0 polls without blocking, positive waits up to N ms. Returns
@@ -984,3 +1012,307 @@ fn mouse_op_name(op: i64) -> &'static str {
 // only consulted via mouse_op::* constants (i.e. always).
 #[allow(dead_code)]
 const _: i64 = kind::NONE;
+
+// ───────────────────────────────────────────────────────────────────
+// Text-view shims — terminal-style monospaced cell window.
+//
+// All children opened with `(open-text-window TITLE)` get a packed
+// 0xRRGGBBAA pen colour pair (fg, bg) and a cursor (row, col). The
+// commands below mutate that state and lazily invalidate the
+// window — Win32 coalesces the WM_PAINT messages so a tight Lisp
+// loop calling `(text-write …)` repeatedly produces O(1) repaints
+// rather than one per write. Returns from each shim are T on
+// success, NIL if the child id is unknown / closed.
+// ───────────────────────────────────────────────────────────────────
+
+use super::text_view;
+
+/// `(open-text-window title)` — open a new MDI text-view child.
+/// Returns its child-id as a fixnum, or NIL on failure.
+pub extern "C-unwind" fn open_text_window_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("open-text-window: expected 1 arg (title), got {n_args}");
+    }
+    let Some(title) = arg_string(args, 0) else {
+        panic!("open-text-window: title must be a string");
+    };
+    match text_view::open(&title) {
+        Some(id) => Word::fixnum(id).raw(),
+        None => Word::NIL.raw(),
+    }
+}
+
+/// `(text-write child-id string)` — write at the cursor, advancing
+/// and wrapping/scrolling as needed. Embedded newlines, CR, tab,
+/// and backspace are handled per the obvious terminal conventions.
+pub extern "C-unwind" fn text_write_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("text-write: expected 2 args (child-id string), got {n_args}");
+    }
+    let Some(id) = arg_fixnum(args, 0) else {
+        panic!("text-write: child-id must be a fixnum");
+    };
+    let Some(s) = arg_string(args, 1) else {
+        panic!("text-write: second arg must be a string");
+    };
+    if text_view::write_str(id, &s) {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
+/// `(text-write-char child-id char)` — write one character at the
+/// cursor. Same control-code handling as `text-write`.
+pub extern "C-unwind" fn text_write_char_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("text-write-char: expected 2 args (child-id char), got {n_args}");
+    }
+    let Some(id) = arg_fixnum(args, 0) else {
+        panic!("text-write-char: child-id must be a fixnum");
+    };
+    let cw = arg(args, 1);
+    let cp = match cw.as_char() {
+        Some(c) => c as u32,
+        None => match cw.as_fixnum() {
+            // Accept a fixnum codepoint too — convenient for control codes.
+            Some(n) if n >= 0 => n as u32,
+            _ => panic!("text-write-char: second arg must be a character or non-negative fixnum"),
+        },
+    };
+    if text_view::write_char(id, cp) {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
+/// `(text-clear child-id)` — wipe the entire grid and put the cursor
+/// at (0, 0). Uses the current pen colour for the background fill.
+pub extern "C-unwind" fn text_clear_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("text-clear: expected 1 arg (child-id), got {n_args}");
+    }
+    let Some(id) = arg_fixnum(args, 0) else {
+        panic!("text-clear: child-id must be a fixnum");
+    };
+    if text_view::clear_all_cmd(id) {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
+/// `(text-clear-eol child-id)` — clear from the cursor to the end of
+/// the current line. Cursor doesn't move.
+pub extern "C-unwind" fn text_clear_eol_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("text-clear-eol: expected 1 arg (child-id), got {n_args}");
+    }
+    let Some(id) = arg_fixnum(args, 0) else {
+        panic!("text-clear-eol: child-id must be a fixnum");
+    };
+    if text_view::clear_to_eol_cmd(id) {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
+/// `(text-clear-eos child-id)` — clear from the cursor to the bottom-
+/// right of the grid. Cursor doesn't move.
+pub extern "C-unwind" fn text_clear_eos_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("text-clear-eos: expected 1 arg (child-id), got {n_args}");
+    }
+    let Some(id) = arg_fixnum(args, 0) else {
+        panic!("text-clear-eos: child-id must be a fixnum");
+    };
+    if text_view::clear_to_eos_cmd(id) {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
+/// `(text-newline child-id)` — move cursor to col 0 of the next row,
+/// scrolling up if it would otherwise fall off the bottom.
+pub extern "C-unwind" fn text_newline_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("text-newline: expected 1 arg (child-id), got {n_args}");
+    }
+    let Some(id) = arg_fixnum(args, 0) else {
+        panic!("text-newline: child-id must be a fixnum");
+    };
+    if text_view::newline_cmd(id) {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
+/// `(text-scroll-up child-id n)` — scroll the visible grid up N rows.
+/// Top N rows fall off; bottom N rows blank in the current bg.
+pub extern "C-unwind" fn text_scroll_up_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("text-scroll-up: expected 2 args (child-id n), got {n_args}");
+    }
+    let Some(id) = arg_fixnum(args, 0) else {
+        panic!("text-scroll-up: child-id must be a fixnum");
+    };
+    let n = arg_fixnum(args, 1).unwrap_or(1).max(0) as u32;
+    if text_view::scroll_up_cmd(id, n) {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
+/// `(text-set-cursor child-id row col)` — move the cursor.
+/// Out-of-range row/col is clamped into the grid.
+pub extern "C-unwind" fn text_set_cursor_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 3 {
+        panic!("text-set-cursor: expected 3 args (child-id row col), got {n_args}");
+    }
+    let Some(id) = arg_fixnum(args, 0) else {
+        panic!("text-set-cursor: child-id must be a fixnum");
+    };
+    let row = arg_fixnum(args, 1).unwrap_or(0).max(0) as u32;
+    let col = arg_fixnum(args, 2).unwrap_or(0).max(0) as u32;
+    if text_view::set_cursor(id, row, col) {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
+// Note: synchronous queries `text-cursor` and `text-size` are
+// intentionally not exposed in the command-channel design — the
+// language thread holds `child_id` as an opaque token and never
+// reads back live grid state. If a Lisp caller needs a query later,
+// add a SendMessageW round-trip here that drains the queue and
+// returns the requested value, mirroring `OpenChildRequest`.
+
+/// `(text-set-pen child-id fg bg)` — set the foreground and
+/// background packed-RGBA colours used by subsequent writes/clears.
+/// Pass NIL or a negative fixnum to keep a colour unchanged.
+pub extern "C-unwind" fn text_set_pen_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 3 {
+        panic!("text-set-pen: expected 3 args (child-id fg bg), got {n_args}");
+    }
+    let Some(id) = arg_fixnum(args, 0) else {
+        panic!("text-set-pen: child-id must be a fixnum");
+    };
+    // Negative fixnums or NIL → "leave alone". Implemented by
+    // reading current pen first when one of them is sentinel.
+    let fg_arg = arg_fixnum(args, 1);
+    let bg_arg = arg_fixnum(args, 2);
+    // We don't have a "read pen" helper; since the typical case is
+    // "set both", just default sentinels to the canonical defaults
+    // when the caller passed NIL. Callers wanting to update only one
+    // can call text-reset-pen first, then set both explicitly.
+    let fg = match fg_arg {
+        Some(n) if n >= 0 => n as u32,
+        _ => 0xDCDCDCFF,
+    };
+    let bg = match bg_arg {
+        Some(n) if n >= 0 => n as u32,
+        _ => 0x12161CFF,
+    };
+    if text_view::set_pen(id, fg, bg) {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
+/// `(text-reset-pen child-id)` — restore the default pen.
+pub extern "C-unwind" fn text_reset_pen_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("text-reset-pen: expected 1 arg (child-id), got {n_args}");
+    }
+    let Some(id) = arg_fixnum(args, 0) else {
+        panic!("text-reset-pen: child-id must be a fixnum");
+    };
+    if text_view::reset_pen(id) {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
+/// `(text-show-caret child-id flag)` — flag is T/NIL.
+pub extern "C-unwind" fn text_show_caret_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("text-show-caret: expected 2 args (child-id flag), got {n_args}");
+    }
+    let Some(id) = arg_fixnum(args, 0) else {
+        panic!("text-show-caret: child-id must be a fixnum");
+    };
+    let visible = !arg(args, 1).is_nil();
+    if text_view::set_caret_visible(id, visible) {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}

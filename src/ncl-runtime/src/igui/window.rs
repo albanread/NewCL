@@ -26,7 +26,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefFrameProcW, DispatchMessageW, GetClientRect, GetMessageTime,
-    GetMessageW, LoadCursorW, PostQuitMessage, RegisterClassExW, SendMessageW, ShowWindow,
+    GetMessageW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW,
+    ShowWindow,
     TranslateAcceleratorW, TranslateMessage, CLIENTCREATESTRUCT, CW_USEDEFAULT, HACCEL,
     IDC_ARROW, MDICREATESTRUCTW, MSG, SW_SHOW, WHEEL_DELTA, WM_CHAR, WM_CLOSE, WM_COMMAND,
     WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
@@ -55,6 +56,18 @@ const WM_IGUI_CLOSE_CHILD: u32 = WM_USER + 2;
 const WM_IGUI_SET_TITLE: u32 = WM_USER + 3;
 const WM_IGUI_SET_MENU: u32 = WM_USER + 4;
 const WM_IGUI_MDI_VERB: u32 = WM_USER + 5;
+/// Open a built-in text-view MDI child. Like WM_IGUI_OPEN_CHILD but
+/// the child class is `text_view`'s, with its own WndProc + grid
+/// state. Routed through the frame so the WM_MDICREATE call lands
+/// on the GUI thread.
+const WM_IGUI_OPEN_TEXT: u32 = WM_USER + 7;
+/// Drain the pending text-command queue for a text-view child onto
+/// its grid, then invalidate. wparam carries the child_id. Both
+/// queue-drain and InvalidateRect run on the GUI thread inside the
+/// frame's WndProc — the language thread sees nothing past `child_id`
+/// as an opaque token. Posted (not sent) so a tight write loop
+/// doesn't block on the GUI thread.
+const WM_IGUI_TEXT_FLUSH: u32 = WM_USER + 8;
 /// Sent from the language thread to a render-host HWND to install
 /// or clear a Win32 timer driving `EvTick` events.
 /// `wparam` carries the interval in ms (0 = clear), `lparam` is unused.
@@ -244,6 +257,21 @@ unsafe extern "system" fn frame_wnd_proc(
                 let req = unsafe { &mut *req_ptr };
                 req.out = handle_open_child(req);
             }
+            LRESULT(0)
+        }
+        WM_IGUI_OPEN_TEXT => {
+            let req_ptr = lparam.0 as *mut OpenTextRequest;
+            if !req_ptr.is_null() {
+                let req = unsafe { &mut *req_ptr };
+                if let Some(mdi_client) = mdi_client_hwnd() {
+                    req.out = super::text_view::create_on_gui_thread(mdi_client, &req.title);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_IGUI_TEXT_FLUSH => {
+            let child_id = wparam.0 as i64;
+            super::text_view::flush_on_gui_thread(child_id);
             LRESULT(0)
         }
         WM_IGUI_CLOSE_CHILD => {
@@ -544,6 +572,11 @@ pub(crate) struct OpenChildRequest {
     pub out: Option<i64>,
 }
 
+pub(crate) struct OpenTextRequest {
+    pub title: Vec<u16>,
+    pub out: Option<i64>,
+}
+
 pub(crate) struct CloseChildRequest {
     pub child_id: i64,
     pub ok: bool,
@@ -597,6 +630,29 @@ pub fn open_child(title: &str) -> Option<i64> {
         SendMessageW(
             frame,
             WM_IGUI_OPEN_CHILD,
+            Some(WPARAM(0)),
+            Some(LPARAM(&mut req as *mut _ as isize)),
+        )
+    };
+    req.out
+}
+
+/// Called from the language thread. Same SendMessageW marshalling
+/// as `open_child`, but routes to the text-view class on the GUI
+/// thread (where state allocation + WM_MDICREATE happen safely).
+pub fn open_text_child(title: &str) -> Option<i64> {
+    let frame_raw = *FRAME_HWND.get()?;
+    let frame = HWND(frame_raw as *mut _);
+    let mut title_w: Vec<u16> = title.encode_utf16().collect();
+    title_w.push(0);
+    let mut req = OpenTextRequest {
+        title: title_w,
+        out: None,
+    };
+    unsafe {
+        SendMessageW(
+            frame,
+            WM_IGUI_OPEN_TEXT,
             Some(WPARAM(0)),
             Some(LPARAM(&mut req as *mut _ as isize)),
         )
@@ -663,6 +719,27 @@ pub fn set_redraw_rate(child_id: i64, interval_ms: i64) -> bool {
         )
     };
     true
+}
+
+/// Post a "drain the text-view command queue and repaint" message
+/// at the frame. Frame WndProc dispatches to text_view's flush
+/// handler on the GUI thread, which applies queued commands to the
+/// child's grid and then InvalidateRects the child window. The
+/// language thread never touches a child HWND. Posted (not sent)
+/// so a tight write loop doesn't block on the GUI thread.
+pub(crate) fn post_text_flush(child_id: i64) {
+    let Some(frame_raw) = FRAME_HWND.get() else {
+        return;
+    };
+    let frame = HWND(*frame_raw as *mut _);
+    let _ = unsafe {
+        PostMessageW(
+            Some(frame),
+            WM_IGUI_TEXT_FLUSH,
+            WPARAM(child_id as usize),
+            LPARAM(0),
+        )
+    };
 }
 
 /// Marshal an MDI verb to the GUI thread for execution.

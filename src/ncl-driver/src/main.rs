@@ -35,6 +35,10 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // Park the Session at a stable address so `(eval-string ...)` can
+    // route into it from inside Lisp.
+    let mut session = Box::new(session);
+    session.activate();
 
     let mut last_output: Option<String> = None;
     let mut args = raw_args.into_iter().peekable();

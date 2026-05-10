@@ -48,6 +48,7 @@ mod renderer;
 mod replies;
 mod tools_menu;
 pub mod system_colors;
+pub(crate) mod text_view;
 mod window;
 
 pub use ledit::{install_checker, Diagnostic};

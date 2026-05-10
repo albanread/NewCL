@@ -258,6 +258,14 @@
     ((null args) `(%loop-return nil))
     (t `(%loop-return ,(car args)))))
 
+(defmacro let* (bindings &rest body)
+  "Sequential let — each binding sees the earlier bindings.
+   Expands to nested `let` forms."
+  (cond
+    ((null bindings) `(progn ,@body))
+    (t `(let (,(car bindings))
+          (let* ,(cdr bindings) ,@body)))))
+
 ;; -- Property lists ----------------------------------------------------------
 
 (defun getf (plist key)
@@ -407,6 +415,54 @@
    the result as a single line into the iGui log overlay. Open
    the overlay via Tools → Log or Ctrl+Shift+L."
   (log-write (apply #'format nil control args)))
+
+;; -- Text-view (terminal-style monospaced child) -----------------------------
+;;
+;; The native text-window primitives, rolled up into one place:
+;;   open-text-window TITLE       → child-id (fixnum) or NIL
+;;   text-write ID STRING         → write at cursor (handles \n \r \t \b)
+;;   text-write-char ID CHAR      → single-char convenience
+;;   text-clear ID                → wipe whole grid, cursor → (0,0)
+;;   text-clear-eol ID            → clear cursor → end of line
+;;   text-clear-eos ID            → clear cursor → bottom-right
+;;   text-newline ID              → CR + LF, scroll if at bottom
+;;   text-scroll-up ID N          → scroll grid up N rows
+;;   text-set-cursor ID ROW COL   → move cursor (clamped)
+;;   text-set-pen ID FG BG        → packed-RGBA colours
+;;   text-reset-pen ID            → restore defaults
+;;   text-show-caret ID FLAG      → caret visibility
+;;
+;; Colours are packed fixnums via (rgb r g b) / (rgba r g b a),
+;; same encoding the geometry primitives use.
+
+(defun text-format (id control &rest args)
+  "Format CONTROL with ARGS (using `format` directives) and write
+   the result into text window ID at the cursor. Returns T."
+  (text-write id (apply #'format nil control args)))
+
+(defun text-print (id obj)
+  "Write OBJ's printed form into text window ID at the cursor."
+  (text-write id (format nil "~A" obj)))
+
+(defun text-println (id obj)
+  "Like `text-print` but also issues a newline."
+  (text-write id (format nil "~A" obj))
+  (text-newline id))
+
+;; -- String helpers ----------------------------------------------------------
+
+(defun string-concat (a b)
+  "Return a fresh string with B appended to A."
+  (format nil "~A~A" a b))
+
+(defun string-append-char (s c)
+  "Return a fresh string with C appended to S."
+  (format nil "~A~A" s c))
+
+(defun string-without-last (s)
+  "Return S with its last codepoint removed; empty string stays empty."
+  (let ((n (length s)))
+    (if (zerop n) s (substring s 0 (- n 1)))))
 
 ;; -- File I/O ----------------------------------------------------------------
 ;;

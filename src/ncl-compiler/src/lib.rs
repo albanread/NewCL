@@ -10,6 +10,7 @@
 //! coordinator, the mutator, defun'd functions — lives in a
 //! `Session`.
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 use ncl_runtime::{
@@ -18,6 +19,16 @@ use ncl_runtime::{
 
 pub mod lower;
 pub mod macroexpand;
+
+thread_local! {
+    /// Pointer to the active Session for this thread. Set by
+    /// `Session::activate()` and read by `eval_string_shim` so a
+    /// Lisp call to `(eval-string ...)` can route into the running
+    /// session's eval. Null when no Session has been activated;
+    /// the shim returns a Lisp error in that case.
+    static ACTIVE_SESSION: Cell<*mut Session> =
+        const { Cell::new(std::ptr::null_mut()) };
+}
 
 pub use lower::{lower, lower_in, CompileError, LocalEnv};
 pub use macroexpand::{macroexpand_all, value_to_word, word_to_value};
@@ -44,6 +55,15 @@ impl Session {
     }
 
     pub fn coord(&self) -> &Arc<GcCoordinator> { &self.coord }
+
+    /// Register this Session as the active one for the current
+    /// thread, so `(eval-string ...)` from Lisp can route into it.
+    /// Call this once after the Session is in its final memory
+    /// location (Box, top-level let, etc.); calling before the
+    /// final placement leaves a stale pointer behind.
+    pub fn activate(&mut self) {
+        ACTIVE_SESSION.with(|c| c.set(self as *mut Session));
+    }
 
     /// Read every form in `src`, evaluate them in sequence, return
     /// the printed representation of the last value (or `nil` on
@@ -255,11 +275,202 @@ fn install_native_functions(
     install_native(coord, mutator, "%LOOP-RETURN",
                    ncl_runtime::loop_return_shim, 1);
 
+    // Self-eval bridge: lets Lisp code re-enter the compiler.
+    install_native(coord, mutator, "EVAL-STRING",
+                   eval_string_shim, 1);
+    install_native(coord, mutator, "PARSE-COMPLETE?",
+                   parse_complete_shim, 1);
+    install_native(coord, mutator, "SUBSTRING",
+                   substring_shim, 3);
+    // CLOS port prerequisites — foundation utilities.
+    // GENSYM accepts an optional prefix; we register it as a 1-arg
+    // shim and tolerate no-arg calls inside the shim body. (When
+    // &optional lands in the compiler we'll declare it properly.)
+    install_native(coord, mutator, "GENSYM",
+                   ncl_runtime::gensym_shim, 0);
+    install_native(coord, mutator, "EQL",
+                   ncl_runtime::eql_shim, 2);
+    install_native(coord, mutator, "TYPEP",
+                   ncl_runtime::typep_shim, 2);
+
+    install_native(coord, mutator, "STRING-SPLIT-NEWLINES",
+                   string_split_newlines_shim, 1);
+
     // iGui (Windows only). Spawns the GUI thread and exposes the
     // window-management trio + event poll. Drawing primitives
     // come in a follow-up commit.
     #[cfg(windows)]
     install_igui(coord, mutator);
+}
+
+/// `(eval-string s)` — feed S into the active Session, return the
+/// printed result of the last form. Signals on parse / eval errors.
+/// Requires `Session::activate()` to have been called by the host.
+extern "C-unwind" fn eval_string_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        return ncl_runtime::abi::signal_condition_string(
+            mutator,
+            "eval-string: expected 1 arg",
+        );
+    }
+    let src_word = Word::from_raw(unsafe { *args });
+    if src_word.tag() != ncl_runtime::Tag::String {
+        return ncl_runtime::abi::signal_condition_string(
+            mutator,
+            "eval-string: argument must be a string",
+        );
+    }
+    let src: String = ncl_runtime::gc_string::chars_of(src_word).collect();
+
+    let session_ptr = ACTIVE_SESSION.with(|c| c.get());
+    if session_ptr.is_null() {
+        return ncl_runtime::abi::signal_condition_string(
+            mutator,
+            "eval-string: no active session (call Session::activate first)",
+        );
+    }
+    let session = unsafe { &mut *session_ptr };
+
+    match session.eval(&src) {
+        Ok(printed) => {
+            let m = unsafe { &mut *mutator };
+            ncl_runtime::gc_string::alloc_string_in_young(m, &printed).raw()
+        }
+        Err(e) => ncl_runtime::abi::signal_condition_string(mutator, &format!("{e}")),
+    }
+}
+
+/// `(parse-complete? s)` — T iff S parses fully (no trailing
+/// open-paren / open-string / dangling unquote). NIL if more input
+/// is expected. Used by the in-GUI REPL widget to decide whether
+/// to accumulate or evaluate.
+extern "C-unwind" fn parse_complete_shim(
+    _mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        return Word::NIL.raw();
+    }
+    let src_word = Word::from_raw(unsafe { *args });
+    if src_word.tag() != ncl_runtime::Tag::String {
+        return Word::NIL.raw();
+    }
+    let src: String = ncl_runtime::gc_string::chars_of(src_word).collect();
+    if src.trim().is_empty() {
+        // Empty input is "complete" in the trivial sense (no
+        // pending form).
+        return Word::T.raw();
+    }
+    match ncl_reader::read_all(&src) {
+        Ok(_) => Word::T.raw(),
+        Err(e) => match e.kind {
+            ncl_reader::ReaderErrorKind::UnexpectedEof(_) => Word::NIL.raw(),
+            ncl_reader::ReaderErrorKind::Lex(
+                ncl_reader::LexErrorKind::UnexpectedEof(_),
+            ) => Word::NIL.raw(),
+            // Any other parse error means the input is malformed,
+            // not incomplete — call it "complete enough to
+            // attempt eval, which will then fail informatively."
+            _ => Word::T.raw(),
+        },
+    }
+}
+
+/// `(string-split-newlines s)` — split S on each `\n`, returning a
+/// fresh list of (fresh) strings. A trailing newline produces a
+/// final empty string in the list. Used by the GUI REPL to render
+/// multi-line input correctly.
+extern "C-unwind" fn string_split_newlines_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        return ncl_runtime::abi::signal_condition_string(
+            mutator,
+            "string-split-newlines: expected 1 arg",
+        );
+    }
+    let src_word = Word::from_raw(unsafe { *args });
+    if src_word.tag() != ncl_runtime::Tag::String {
+        return ncl_runtime::abi::signal_condition_string(
+            mutator,
+            "string-split-newlines: argument must be a string",
+        );
+    }
+    let s: String = ncl_runtime::gc_string::chars_of(src_word).collect();
+    // Use split('\n') so a trailing \n produces a final empty
+    // string — matches the user's mental model when the cursor is
+    // sitting on a fresh line.
+    let m = unsafe { &mut *mutator };
+    let parts: Vec<Word> = s
+        .split('\n')
+        .map(|p| ncl_runtime::gc_string::alloc_string_in_young(m, p))
+        .collect();
+    let mut acc = Word::NIL;
+    for p in parts.iter().rev() {
+        acc = m.alloc_cons(*p, acc);
+    }
+    acc.raw()
+}
+
+/// `(substring s start end)` — return a fresh string holding
+/// codepoints S[start..end]. Bounds are clamped: negative start
+/// becomes 0, end past the end becomes the length.
+extern "C-unwind" fn substring_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 3 {
+        return ncl_runtime::abi::signal_condition_string(
+            mutator,
+            "substring: expected 3 args (string, start, end)",
+        );
+    }
+    let src_word = Word::from_raw(unsafe { *args });
+    if src_word.tag() != ncl_runtime::Tag::String {
+        return ncl_runtime::abi::signal_condition_string(
+            mutator,
+            "substring: first arg must be a string",
+        );
+    }
+    let start_w = Word::from_raw(unsafe { *args.add(1) });
+    let end_w = Word::from_raw(unsafe { *args.add(2) });
+    let Some(start) = start_w.as_fixnum() else {
+        return ncl_runtime::abi::signal_condition_string(
+            mutator,
+            "substring: start must be a fixnum",
+        );
+    };
+    let Some(end) = end_w.as_fixnum() else {
+        return ncl_runtime::abi::signal_condition_string(
+            mutator,
+            "substring: end must be a fixnum",
+        );
+    };
+    let n = ncl_runtime::gc_string::char_count(src_word) as i64;
+    let s = start.max(0).min(n) as usize;
+    let e = end.max(0).min(n) as usize;
+    if s >= e {
+        let m = unsafe { &mut *mutator };
+        return ncl_runtime::gc_string::alloc_string_in_young(m, "").raw();
+    }
+    let chars: String = ncl_runtime::gc_string::chars_of(src_word)
+        .skip(s)
+        .take(e - s)
+        .collect();
+    let m = unsafe { &mut *mutator };
+    ncl_runtime::gc_string::alloc_string_in_young(m, &chars).raw()
 }
 
 #[cfg(windows)]
@@ -278,6 +489,8 @@ fn install_igui(coord: &Arc<GcCoordinator>, mutator: &mut MutatorState) {
                    ncl_runtime::set_title_shim, 2);
     install_native(coord, mutator, "NEXT-EVENT",
                    ncl_runtime::next_event_shim, 1);
+    install_native(coord, mutator, "SET-REDRAW-RATE",
+                   ncl_runtime::set_redraw_rate_shim, 2);
 
     // Drawing primitives. The user-Lisp `with-batch` macro wraps
     // begin/submit; the emit-* helpers push commands onto the
@@ -314,6 +527,32 @@ fn install_igui(coord: &Arc<GcCoordinator>, mutator: &mut MutatorState) {
     // Log view bridge.
     install_native(coord, mutator, "LOG-WRITE",
                    ncl_runtime::log_write_shim, 1);
+
+    // Text-view (terminal-style monospaced child).
+    install_native(coord, mutator, "OPEN-TEXT-WINDOW",
+                   ncl_runtime::open_text_window_shim, 1);
+    install_native(coord, mutator, "TEXT-WRITE",
+                   ncl_runtime::text_write_shim, 2);
+    install_native(coord, mutator, "TEXT-WRITE-CHAR",
+                   ncl_runtime::text_write_char_shim, 2);
+    install_native(coord, mutator, "TEXT-CLEAR",
+                   ncl_runtime::text_clear_shim, 1);
+    install_native(coord, mutator, "TEXT-CLEAR-EOL",
+                   ncl_runtime::text_clear_eol_shim, 1);
+    install_native(coord, mutator, "TEXT-CLEAR-EOS",
+                   ncl_runtime::text_clear_eos_shim, 1);
+    install_native(coord, mutator, "TEXT-NEWLINE",
+                   ncl_runtime::text_newline_shim, 1);
+    install_native(coord, mutator, "TEXT-SCROLL-UP",
+                   ncl_runtime::text_scroll_up_shim, 2);
+    install_native(coord, mutator, "TEXT-SET-CURSOR",
+                   ncl_runtime::text_set_cursor_shim, 3);
+    install_native(coord, mutator, "TEXT-SET-PEN",
+                   ncl_runtime::text_set_pen_shim, 3);
+    install_native(coord, mutator, "TEXT-RESET-PEN",
+                   ncl_runtime::text_reset_pen_shim, 1);
+    install_native(coord, mutator, "TEXT-SHOW-CARET",
+                   ncl_runtime::text_show_caret_shim, 2);
 }
 
 fn install_native(

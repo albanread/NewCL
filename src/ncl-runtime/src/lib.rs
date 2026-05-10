@@ -30,14 +30,16 @@ pub mod value;
 pub mod word;
 
 pub use abi::{
-    append_shim, close_stream_shim, delete_file_shim, error_shim, file_exists_shim,
-    file_length_shim, file_position_shim, format_shim, handler_case_shim,
+    append_shim, close_stream_shim, delete_file_shim, eql_shim, error_shim,
+    file_exists_shim, file_length_shim, file_position_shim, format_shim,
+    gensym_shim, handler_case_shim,
     loop_return_shim, native_loop_shim, ncl_alloc_cons, ncl_apply,
     ncl_build_rest_list, ncl_call, ncl_car, ncl_cdr, ncl_equal, ncl_funcall,
     ncl_length, ncl_load_function, ncl_load_value, ncl_make_closure, ncl_set_car,
     ncl_set_cdr, ncl_store_value, ncl_string_char, ncl_string_eq, ncl_string_set,
     open_append_file_shim, open_input_file_shim, open_output_file_shim,
-    read_char_from_shim, read_line_shim, write_string_to_shim, NclCondition,
+    read_char_from_shim, read_line_shim, typep_shim, write_string_to_shim,
+    NclCondition,
 };
 
 #[cfg(windows)]
@@ -48,7 +50,11 @@ pub use igui::lisp_shims::{
     emit_fill_oval_shim, emit_fill_rect_shim, emit_stroke_circle_shim,
     emit_stroke_oval_shim, emit_stroke_rect_shim, igui_quit_shim,
     igui_start_shim, igui_wait_shim, log_write_shim, measure_text_shim,
-    next_event_shim, open_child_shim, set_title_shim, submit_batch_shim,
+    next_event_shim, open_child_shim, open_text_window_shim, set_redraw_rate_shim,
+    set_title_shim, submit_batch_shim, text_clear_eol_shim, text_clear_eos_shim, text_clear_shim,
+    text_newline_shim, text_reset_pen_shim, text_scroll_up_shim,
+    text_set_cursor_shim, text_set_pen_shim, text_show_caret_shim,
+    text_write_char_shim, text_write_shim,
 };
 pub use printer::{format_word, format_word_aesthetic};
 

@@ -1587,6 +1587,7 @@ pub fn register_classes() -> Result<(), IGuiError> {
 
     super::ledit::register_class()?;
     super::log_view::register_class()?;
+    super::text_view::register_class()?;
 
     Ok(())
 }
@@ -1788,6 +1789,12 @@ unsafe extern "system" fn render_host_wnd_proc(
                 if let Err(err) = state.handle_resize(w, h) {
                     eprintln!("[igui-render] resize error: {err}");
                 }
+                // TODO: pushing IGuiEvent::Resize from here so the
+                // language thread can re-layout against the actual
+                // child size triggered a crash during initial paint
+                // (probably reentrancy with the in-flight measure-
+                // text reply path). For now Lisp uses a polled
+                // (child-size id) primitive instead.
             }
             LRESULT(0)
         }

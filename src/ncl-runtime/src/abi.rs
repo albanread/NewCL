@@ -966,6 +966,155 @@ pub extern "C" fn ncl_string_set(s: u64, idx: u64, ch: u64) -> u64 {
     ch
 }
 
+// ───────────────────────────────────────────────────────────────────
+// Foundation utilities for CLOS port: gensym, eql, typep.
+//
+// These are deliberately small. `gensym` and `eql` are essentially
+// one-liners on top of existing primitives; `typep` dispatches on
+// the Word tag plus a few keyword type names. Together they're the
+// first prerequisite chunk for porting Closette.
+// ───────────────────────────────────────────────────────────────────
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic counter for gensym names. Reset would defeat the
+/// purpose (the symbols are interned by their generated name) so
+/// we never reset it. AtomicU64 is sufficient — 2^64 gensyms is
+/// not a realistic concern.
+static GENSYM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// `(gensym)` / `(gensym prefix)` — return a freshly interned
+/// symbol whose name is `prefix` followed by an unused decimal
+/// integer. Default prefix is "G". CL's gensym returns an
+/// uninterned symbol; we don't have uninterned symbols yet, so
+/// we intern a name guaranteed never to collide with anything
+/// the user has typed (the counter only goes up).
+pub extern "C-unwind" fn gensym_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    let prefix = if n_args >= 1 {
+        let w = Word::from_raw(unsafe { *args });
+        if w.tag() == Tag::String {
+            crate::gc_string::chars_of(w).collect::<String>()
+        } else {
+            "G".to_string()
+        }
+    } else {
+        "G".to_string()
+    };
+    let n = GENSYM_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = format!("{prefix}{n}");
+    let m = unsafe { &mut *mutator };
+    m.coord().intern(&name).raw()
+}
+
+/// `(eql a b)` — true if the two values are the same object, or
+/// (eventually) the same number / character of the same type and
+/// value. For the data types currently supported (fixnums, chars,
+/// symbols, NIL, T, immediate Words, plus identity-compared
+/// strings/cons/functions), `eql` is exactly `eq` because:
+///
+///   - Fixnums and chars are stored fully in the Word's bits, so
+///     two equal-valued ones compare bit-equal.
+///   - Symbols are interned, so equal-named ones share a Word.
+///   - NIL / T / unbound markers are unique constant Words.
+///   - Strings / conses / functions get identity (CL allows that).
+///
+/// When floats and bignums land, this shim has to grow value
+/// comparisons for those — that's the only behavioral change.
+pub extern "C-unwind" fn eql_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("eql: expected 2 args, got {n_args}");
+    }
+    let a = unsafe { *args };
+    let b = unsafe { *args.add(1) };
+    if a == b {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
+/// `(typep object type-spec)` — true if `object` belongs to the
+/// CL type named by `type-spec`. `type-spec` is a symbol; compound
+/// type specs like `(integer 0 100)` are not yet supported.
+///
+/// Recognised type names (case-insensitive comparison via the
+/// printer name): T, NIL, NULL, ATOM, CONS, LIST, SYMBOL, KEYWORD,
+/// FIXNUM, INTEGER, NUMBER, RATIONAL, REAL, STRING, SIMPLE-STRING,
+/// CHARACTER, FUNCTION, VECTOR, SIMPLE-VECTOR, ARRAY, SEQUENCE,
+/// HASH-TABLE, STANDARD-OBJECT.
+///
+/// Types we don't yet have storage for (vectors, arrays, hash
+/// tables, standard objects) always return NIL; they'll start
+/// returning T once the relevant chunks land.
+pub extern "C-unwind" fn typep_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("typep: expected 2 args (object type), got {n_args}");
+    }
+    let obj = Word::from_raw(unsafe { *args });
+    let type_w = Word::from_raw(unsafe { *args.add(1) });
+    if type_w.tag() != Tag::Symbol {
+        // Compound specs — `(integer ...)`, `(or ...)`, etc.
+        // — fall through as "unsupported, returns NIL" for now.
+        return Word::NIL.raw();
+    }
+    let name = match crate::sym_names::lookup(type_w.raw()) {
+        Some(n) => n,
+        None => return Word::NIL.raw(),
+    };
+    let matches = match name.as_ref() {
+        "T" => true,
+        "NIL" | "NULL" => obj.is_nil(),
+        "ATOM" => obj.tag() != Tag::Cons,
+        "CONS" => obj.tag() == Tag::Cons,
+        "LIST" => obj.is_nil() || obj.tag() == Tag::Cons,
+        "SYMBOL" => obj.tag() == Tag::Symbol || obj.is_nil(),
+        "KEYWORD" => is_keyword(obj),
+        "FIXNUM" | "INTEGER" | "RATIONAL" | "REAL" | "NUMBER" => {
+            obj.tag() == Tag::Fixnum
+        }
+        "STRING" | "SIMPLE-STRING" => obj.tag() == Tag::String,
+        "CHARACTER" => obj.as_char().is_some(),
+        "FUNCTION" => obj.tag() == Tag::Function,
+        "VECTOR" | "SIMPLE-VECTOR" | "ARRAY" => obj.tag() == Tag::Vector,
+        "SEQUENCE" => {
+            obj.is_nil()
+                || obj.tag() == Tag::Cons
+                || obj.tag() == Tag::String
+                || obj.tag() == Tag::Vector
+        }
+        "HASH-TABLE" => false, // future
+        "STANDARD-OBJECT" => false, // future
+        _ => false,
+    };
+    if matches { Word::T.raw() } else { Word::NIL.raw() }
+}
+
+/// Keywords are symbols whose printer name starts with `:` (the
+/// reader interns them with the leading colon).
+fn is_keyword(w: Word) -> bool {
+    if w.tag() != Tag::Symbol {
+        return false;
+    }
+    crate::sym_names::lookup(w.raw())
+        .map(|n| n.starts_with(':'))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
