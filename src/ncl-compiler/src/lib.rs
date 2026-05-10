@@ -326,6 +326,13 @@ fn install_native_functions(
                    ncl_runtime::fboundp_shim, 1);
     install_native(coord, mutator, "INTERN",
                    ncl_runtime::intern_shim, 1);
+    // block / return-from — non-local exit via setjmp/longjmp
+    // through JIT frames. Lisp-side macros in core.lisp wrap
+    // the body in a thunk and call %native-block.
+    install_native(coord, mutator, "%NATIVE-BLOCK",
+                   ncl_runtime::native_block_shim, 2);
+    install_native(coord, mutator, "%RETURN-FROM",
+                   ncl_runtime::return_from_shim, 2);
 
     install_native(coord, mutator, "STRING-SPLIT-NEWLINES",
                    string_split_newlines_shim, 1);

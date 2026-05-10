@@ -1253,6 +1253,154 @@ pub extern "C-unwind" fn multiple_value_list_of_shim(
 }
 
 // ───────────────────────────────────────────────────────────────────
+// block / return-from — named non-local exits.
+//
+// CL `(block NAME body)` establishes a named exit point;
+// `(return-from NAME val)` returns VAL from the matching block.
+//
+// Implementation mirrors the existing error / handler-case flag
+// mechanism: a thread-local "abort pending" slot per active
+// block. return-from sets the slot; block on its way out checks
+// the slot and either returns the captured value (matching
+// name) or leaves the slot set so a surrounding block (or
+// no-block-at-all panic) sees it.
+//
+// Trade-off shared with handler-case: the flag doesn't abort
+// the body's execution. Code after a (return-from N V) call
+// runs to completion before block reads the flag. For tail-
+// position return-from this is fine; for non-tail uses inside
+// a do-loop with code after the loop, the trailing code runs.
+// (See setf-getf* in Closette for the worst-case shape.)
+// Promoting to call-site instrumentation lands when handler-
+// case grows the same.
+// ───────────────────────────────────────────────────────────────────
+
+struct BlockFrame {
+    name: u64,
+    value: u64,
+}
+
+thread_local! {
+    /// Stack of active block frames in dynamic-extent order.
+    /// Innermost is at the back. Each (block N body) pushes a
+    /// frame on entry and pops on exit; (return-from N val)
+    /// walks the stack for matching name, sets value on the
+    /// frame, and signals "abort pending."
+    static BLOCK_STACK: RefCell<Vec<BlockFrame>> = const { RefCell::new(Vec::new()) };
+
+    /// Set by return-from, cleared by the matching block on
+    /// exit. While true, every (block …) on the way out
+    /// inspects BLOCK_TARGET to decide whether the abort is
+    /// theirs.
+    static BLOCK_ABORT_PENDING: Cell<bool> = const { Cell::new(false) };
+
+    /// Name (raw symbol Word) of the block return-from is
+    /// targeting. Only meaningful when BLOCK_ABORT_PENDING is
+    /// true.
+    static BLOCK_TARGET: Cell<u64> = const { Cell::new(0) };
+}
+
+/// `(%native-block NAME THUNK)` — the primitive behind the
+/// `block` macro. Pushes a frame, invokes the body thunk, then
+/// inspects the abort-pending flag: if set and targeting our
+/// name, consume it and return the frame's value; otherwise
+/// pass the body's value through (or leave the abort pending
+/// for a surrounding block to catch).
+pub extern "C-unwind" fn native_block_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("%native-block: expected 2 args (name thunk), got {n_args}");
+    }
+    let name = unsafe { *args };
+    let thunk = Word::from_raw(unsafe { *args.add(1) });
+    if thunk.tag() != Tag::Function {
+        panic!("%native-block: thunk must be a function, got {thunk:?}");
+    }
+
+    BLOCK_STACK.with(|s| {
+        s.borrow_mut().push(BlockFrame {
+            name,
+            value: Word::NIL.raw(),
+        });
+    });
+
+    let body_result = {
+        let env = crate::gc_function::env(thunk);
+        let code = crate::gc_function::code_ptr(thunk);
+        let f: crate::gc_function::LispCodeFn =
+            unsafe { std::mem::transmute(code) };
+        unsafe { f(mutator, env.raw(), std::ptr::null(), 0) }
+    };
+
+    // Pop our frame and decide what to do based on the abort flag.
+    let our_frame_value = BLOCK_STACK.with(|s| {
+        s.borrow_mut()
+            .pop()
+            .expect("BLOCK_STACK underflow at native-block exit")
+            .value
+    });
+
+    let pending = BLOCK_ABORT_PENDING.with(|p| p.get());
+    if pending {
+        let target = BLOCK_TARGET.with(|t| t.get());
+        if target == name {
+            // The abort targets us — consume it and return the
+            // value the matching return-from stashed on our frame.
+            BLOCK_ABORT_PENDING.with(|p| p.set(false));
+            BLOCK_TARGET.with(|t| t.set(0));
+            return our_frame_value;
+        }
+        // Not our abort — leave the flag pending so a surrounding
+        // block (or the unbound-block panic in return_from_shim)
+        // catches it. Drop body_result.
+    }
+    body_result
+}
+
+/// `(%return-from NAME VALUE)` — find the topmost matching block
+/// on BLOCK_STACK, write VALUE into its frame, set the abort
+/// flag. Returns NIL (the body keeps running until natural exit;
+/// see module docstring for the trade-off). Panics if no
+/// matching block is currently active.
+pub extern "C-unwind" fn return_from_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("%return-from: expected 2 args (name value), got {n_args}");
+    }
+    let name = unsafe { *args };
+    let val = unsafe { *args.add(1) };
+
+    let found = BLOCK_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        let pos = stack.iter().rposition(|f| f.name == name);
+        match pos {
+            Some(i) => {
+                stack[i].value = val;
+                true
+            }
+            None => false,
+        }
+    });
+    if !found {
+        let sym_name = crate::sym_names::lookup(name)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        panic!("return-from: no enclosing block named {sym_name}");
+    }
+    BLOCK_ABORT_PENDING.with(|p| p.set(true));
+    BLOCK_TARGET.with(|t| t.set(name));
+    Word::NIL.raw()
+}
+
+// ───────────────────────────────────────────────────────────────────
 // symbol-function — read / write / unbind a symbol's function cell.
 //
 // Closette installs JIT-generated discriminating functions into

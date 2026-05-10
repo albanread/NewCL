@@ -387,6 +387,24 @@
               ,@body
               (setq ,rem (cdr ,rem))))))))
 
+(defmacro block (name &rest body)
+  "(block NAME body…) — establish a named exit point. Inside
+   BODY, `(return-from NAME val)` immediately exits the block
+   with VAL. Without a matching return-from the block returns
+   the last body form's value.
+
+   Implementation: wraps BODY in a thunk passed to
+   %native-block, which sets a setjmp at entry and longjmps
+   from a matching %return-from. The longjmp aborts the rest
+   of the body — unlike loop's flag-based (return), this is a
+   real non-local exit."
+  `(%native-block ',name (lambda () ,@body)))
+
+(defmacro return-from (name value)
+  "(return-from NAME val) — non-locally exit the innermost
+   enclosing (block NAME …) with VAL."
+  `(%return-from ',name ,value))
+
 (defmacro dotimes (binding &rest body)
   "(dotimes (var count [result-form]) body…) — bind VAR to
    0, 1, …, COUNT-1; evaluate BODY each time. Returns RESULT-FORM."
