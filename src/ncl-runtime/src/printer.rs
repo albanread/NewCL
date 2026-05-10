@@ -40,7 +40,10 @@ fn write_word(out: &mut String, w: Word) {
             }
         }
         Tag::Forward => out.push_str("<forward>"),
-        Tag::Symbol => out.push_str("<symbol>"),
+        Tag::Symbol => match crate::sym_names::lookup(w.raw()) {
+            Some(name) => out.push_str(&name),
+            None => out.push_str("<symbol>"),
+        },
         Tag::Vector => out.push_str("<vector>"),
         Tag::Function => out.push_str("<function>"),
         Tag::String => out.push_str("<string>"),

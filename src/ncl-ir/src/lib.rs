@@ -13,6 +13,11 @@
 pub enum Expr {
     /// An immediate fixnum.
     Const(i64),
+    /// A pre-tagged raw Word constant. Used for symbol references,
+    /// statically-allocated quoted lists, and other compile-time-
+    /// resolved values whose tagged bit pattern is known. Emitted
+    /// as a single i64 constant.
+    Word(u64),
     /// The literal `nil`.
     Nil,
     /// The truth value `t`.

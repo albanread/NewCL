@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use ncl_ir::Expr;
-use ncl_runtime::{GcCoordinator, Value};
+use ncl_runtime::{GcCoordinator, Value, Word};
 
 /// A binding kind in the lexical environment. Parameters live in
 /// the function's args array (Param(idx)); let-bound locals live
@@ -133,16 +133,53 @@ fn lower_in_mut(
     }
 }
 
-/// Lower a quoted form `(quote x)`. Most kinds need symbol
-/// resolution or compile-time heap allocation; for v1 we support
-/// only the literal kinds that map cleanly to existing IR.
-fn lower_quoted(v: &Value) -> Result<Expr, CompileError> {
+/// Lower a quoted form `(quote x)`. Symbols are interned in the
+/// coordinator's static area (returning a stable Symbol-tagged
+/// Word). Cons-shaped data is built recursively in static at
+/// compile time — each cons cell allocated via
+/// `static_area.try_alloc_cons`. This means a `'(1 2 3)` literal
+/// lives forever and is shared across all references; no GC
+/// pressure, and `(eq '(1 2 3) '(1 2 3))` may even be true if the
+/// compiler shares them (it doesn't yet, but could).
+fn lower_quoted(v: &Value, coord: &Arc<GcCoordinator>) -> Result<Expr, CompileError> {
+    let word = build_quoted_word(v, coord)?;
+    // Specialise the IR variant where it's cleaner; otherwise emit
+    // a raw Word constant.
+    Ok(match word {
+        w if w.is_nil() => Expr::Nil,
+        w if w.is_t() => Expr::True,
+        w if w.is_fixnum() => Expr::Const(w.as_fixnum().unwrap()),
+        w => Expr::Word(w.raw()),
+    })
+}
+
+/// Build a Word for a quoted Value, allocating compound structure
+/// in the coordinator's static area as needed. Recurses into cons
+/// cells.
+fn build_quoted_word(
+    v: &Value,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Word, CompileError> {
     match v {
-        Value::Fixnum(n) => Ok(Expr::Const(*n)),
-        Value::Nil => Ok(Expr::Nil),
-        Value::Symbol(s) if &*s.name == "T" => Ok(Expr::True),
+        Value::Fixnum(n) => Ok(Word::fixnum(*n)),
+        Value::Nil => Ok(Word::NIL),
+        Value::Symbol(s) if &*s.name == "T" => Ok(Word::T),
+        Value::Symbol(s) => Ok(coord.intern(&s.name)),
+        Value::Cons(c) => {
+            let car_word = build_quoted_word(&c.car, coord)?;
+            let cdr_word = build_quoted_word(&c.cdr, coord)?;
+            coord
+                .static_area()
+                .try_alloc_cons(car_word, cdr_word)
+                .ok_or_else(|| {
+                    CompileError::NotImplemented(
+                        "static area exhausted while building quoted list".into(),
+                    )
+                })
+        }
+        Value::Char(c) => Ok(Word::char(*c)),
         other => Err(CompileError::NotImplemented(format!(
-            "quoted {other:?}"
+            "quoted sub-value: {other:?}"
         ))),
     }
 }
@@ -175,7 +212,17 @@ fn lower_call_in_mut(
                     got: args.len(),
                 });
             }
-            lower_quoted(&args[0])
+            lower_quoted(&args[0], coord)
+        }
+        "LIST" => {
+            // (list a b c) ≡ (cons a (cons b (cons c nil)))
+            // Pure source-level desugaring.
+            let mut result = Expr::Nil;
+            for arg in args.iter().rev() {
+                let lowered = lower_in_mut(arg, env, coord)?;
+                result = Expr::cons(lowered, result);
+            }
+            Ok(result)
         }
         "EQ" => {
             if args.len() != 2 {

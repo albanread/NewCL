@@ -18,6 +18,7 @@ pub mod mutator;
 pub mod printer;
 pub mod stack_map;
 pub mod static_area;
+pub mod sym_names;
 pub mod symbol;
 pub mod universe;
 pub mod value;

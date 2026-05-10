@@ -123,6 +123,21 @@ impl StaticArea {
         unsafe { *p.as_ptr() = HeapHeader::new(ty, length_cells).raw(); }
         Some(unsafe { NonNull::new_unchecked(p.as_ptr() as *mut HeapHeader) })
     }
+
+    /// Allocate a headerless cons cell in static. Used for quoted
+    /// list literals, which the compiler builds at lower time.
+    /// Returns a Cons-tagged Word.
+    pub fn try_alloc_cons(&self, car: crate::word::Word, cdr: crate::word::Word) -> Option<crate::word::Word> {
+        let p = self.try_alloc_cells(2)?;
+        unsafe {
+            *p.as_ptr() = car.raw();
+            *p.as_ptr().add(1) = cdr.raw();
+        }
+        Some(crate::word::Word::from_ptr(
+            p.as_ptr() as *const u8,
+            crate::word::Tag::Cons,
+        ))
+    }
 }
 
 #[cfg(test)]

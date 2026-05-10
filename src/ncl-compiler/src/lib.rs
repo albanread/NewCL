@@ -508,6 +508,90 @@ mod end_to_end_tests {
         assert_eq!(eval_str("(let ((x 5)))").unwrap(), "nil");
     }
 
+    // -- list, quoted symbols, quoted lists --------------------------------
+
+    #[test]
+    fn list_builds_proper_lists() {
+        assert_eq!(eval_str("(list)").unwrap(), "nil");
+        assert_eq!(eval_str("(list 1)").unwrap(), "(1)");
+        assert_eq!(eval_str("(list 1 2 3)").unwrap(), "(1 2 3)");
+        assert_eq!(
+            eval_str("(list (+ 1 1) (* 3 4) (- 10 1))").unwrap(),
+            "(2 12 9)",
+        );
+    }
+
+    #[test]
+    fn quoted_symbol_prints_as_name() {
+        assert_eq!(eval_str("'foo").unwrap(), "FOO");
+        assert_eq!(eval_str("(quote bar)").unwrap(), "BAR");
+        // Case-folding: lowercase source becomes upper-case symbol.
+        assert_eq!(eval_str("'Hello").unwrap(), "HELLO");
+    }
+
+    #[test]
+    fn quoted_symbols_are_eq_when_same_name() {
+        // Interning means two `'foo` references resolve to the same
+        // Word — `eq` returns T.
+        assert_eq!(eval_str("(eq 'foo 'foo)").unwrap(), "T");
+        assert_eq!(eval_str("(eq 'foo 'bar)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn quoted_list_literal() {
+        assert_eq!(eval_str("'(1 2 3)").unwrap(), "(1 2 3)");
+        assert_eq!(eval_str("'(a b c)").unwrap(), "(A B C)");
+        assert_eq!(eval_str("'(1 . 2)").unwrap(), "(1 . 2)");
+        assert_eq!(eval_str("'((1 2) (3 4))").unwrap(), "((1 2) (3 4))");
+    }
+
+    #[test]
+    fn quoted_list_with_mixed_atoms() {
+        // Mix fixnums, symbols, nested lists.
+        assert_eq!(
+            eval_str("'(name 42 (a b) nil)").unwrap(),
+            "(NAME 42 (A B) nil)",
+        );
+    }
+
+    #[test]
+    fn quoted_lists_share_static_storage() {
+        // Two references to '(1 2 3) intern as the same symbol-
+        // table entries, but each `quote` form allocates its own
+        // cons chain (we don't yet share). They are distinct cons
+        // cells, so eq is nil.
+        assert_eq!(eval_str("(eq '(1 2) '(1 2))").unwrap(), "nil");
+    }
+
+    #[test]
+    fn cond_with_quoted_symbol_branches() {
+        let result = eval_str(
+            "(defun classify (n)
+               (cond ((< n 0) 'negative)
+                     ((= n 0) 'zero)
+                     (t 'positive)))
+             (list (classify -3) (classify 0) (classify 5))",
+        )
+        .unwrap();
+        assert_eq!(result, "(NEGATIVE ZERO POSITIVE)");
+    }
+
+    #[test]
+    fn member_via_recursion() {
+        // (defun member (x lst) ...)  classic CL pattern, manual
+        // implementation since `member` isn't a builtin yet.
+        let result = eval_str(
+            "(defun my-member (x lst)
+               (cond ((null lst) nil)
+                     ((eq x (car lst)) lst)
+                     (t (my-member x (cdr lst)))))
+             (my-member 'b '(a b c d))",
+        )
+        .unwrap();
+        // Returns the tail starting with the match.
+        assert_eq!(result, "(B C D)");
+    }
+
     // -- Numeric comparisons -----------------------------------------------
 
     #[test]

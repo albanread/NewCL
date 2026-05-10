@@ -289,6 +289,7 @@ fn emit_expr<'ctx>(
     let ptr_t = context.ptr_type(AddressSpace::default());
     match expr {
         Expr::Const(n) => Ok(i64_t.const_int(Word::fixnum(*n).raw(), false)),
+        Expr::Word(w) => Ok(i64_t.const_int(*w, false)),
         Expr::Nil => Ok(i64_t.const_int(Word::NIL.raw(), false)),
         Expr::True => Ok(i64_t.const_int(Word::T.raw(), false)),
         Expr::Local(idx) => {

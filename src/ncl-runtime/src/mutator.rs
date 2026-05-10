@@ -132,7 +132,9 @@ impl GcCoordinator {
     /// Intern a symbol by name. Returns the same Symbol-tagged Word
     /// every time the same name is looked up — symbols allocated in
     /// the static area never move. The first lookup allocates; later
-    /// ones hit the table.
+    /// ones hit the table. The name is also recorded in the global
+    /// `sym_names` registry so the printer can render symbol Words
+    /// as their names.
     pub fn intern(&self, name: &str) -> Word {
         let mut table = self.intern_table.lock().unwrap();
         if let Some(&raw) = table.get(name) {
@@ -140,11 +142,12 @@ impl GcCoordinator {
         }
         let sym = crate::gc_symbol::alloc_symbol_in_static(
             &self.static_area,
-            Word::NIL, // proper name-string allocation lands later
-            Word::NIL, // proper package wiring lands later
+            Word::NIL,
+            Word::NIL,
         )
         .expect("static area exhausted during intern");
         let key: Arc<str> = Arc::from(name);
+        crate::sym_names::register(sym.raw(), Arc::clone(&key));
         table.insert(key, sym.raw());
         sym
     }
