@@ -266,6 +266,144 @@
     (t `(let (,(car bindings))
           (let* ,(cdr bindings) ,@body)))))
 
+;; -- Tier 1 macros (chunk 7) -------------------------------------------------
+;;
+;; CL forms Closette uses heavily. None of these need new compiler
+;; or runtime machinery — every expansion lands on something that
+;; already exists.
+
+(defmacro declare (&rest decls)
+  "No-op. CL `(declare …)` carries metadata for the compiler
+   (ignore, type, dynamic-extent, …). We don't act on any of it
+   yet, so the form just expands to NIL — sufficient because
+   declarations always appear in implicit-progn position and a
+   stray NIL there is harmless."
+  nil)
+
+(defmacro prog1 (first &rest rest)
+  "Evaluate FIRST, save its value, then evaluate REST in order
+   and return FIRST's value."
+  (let ((r (gensym "PROG1")))
+    `(let ((,r ,first))
+       ,@rest
+       ,r)))
+
+(defmacro prog2 (first second &rest rest)
+  "Evaluate the three sections, return SECOND's value."
+  `(progn ,first (prog1 ,second ,@rest)))
+
+(defmacro defvar (name &rest rest)
+  "Declare a special variable. CL distinguishes defvar (assign
+   only if currently unbound) from defparameter (always assign);
+   without a boundp primitive yet we treat them identically.
+   Closette's defvars are at file load time and aren't reset
+   later, so this is safe."
+  (cond
+    ((null rest) `(defparameter ,name nil))
+    (t `(defparameter ,name ,(car rest)))))
+
+(defmacro push (value place)
+  "Prepend VALUE to the list stored at PLACE. PLACE is evaluated
+   twice — fine for symbol or simple-accessor places (which is
+   what Closette uses) but not safe for places with side effects.
+   A proper get-setf-expansion-based version lands when we have
+   one."
+  `(setf ,place (cons ,value ,place)))
+
+(defmacro pop (place)
+  "Remove and return the head of the list at PLACE. Same
+   double-evaluation caveat as `push`."
+  `(prog1 (car ,place) (setf ,place (cdr ,place))))
+
+(defmacro case (keyform &rest clauses)
+  "(case KEY (KEYS body…) (KEYS body…) …) — dispatch on KEY.
+   KEYS is either a symbol/atom matched with EQL, a list of
+   atoms (matches if KEY EQL any of them), or T / OTHERWISE for
+   the catch-all clause."
+  (let ((k (gensym "CASE-KEY")))
+    `(let ((,k ,keyform))
+       (cond
+         ,@(mapcar (lambda (clause)
+                     (case-clause-expand clause k))
+                   clauses)))))
+
+(defun case-clause-expand (clause keyvar)
+  "Helper for the CASE macro. Builds one cond-clause from a
+   case-clause."
+  (let ((keys (car clause))
+        (body (cdr clause)))
+    (cond
+      ((or (eq keys 'otherwise) (eq keys 't))
+       `(t ,@body))
+      ((listp keys)
+       `((or ,@(mapcar (lambda (key) `(eql ,keyvar ',key)) keys))
+         ,@body))
+      (t `((eql ,keyvar ',keys) ,@body)))))
+
+(defmacro ecase (keyform &rest clauses)
+  "Like CASE but with no fall-through — signals an error if no
+   clause matches. No OTHERWISE clause expected."
+  (let ((k (gensym "ECASE-KEY")))
+    `(let ((,k ,keyform))
+       (cond
+         ,@(mapcar (lambda (clause)
+                     (case-clause-expand clause k))
+                   clauses)
+         (t (error "ecase: no matching clause for ~A" ,k))))))
+
+(defmacro typecase (keyform &rest clauses)
+  "(typecase KEY (TYPE body…) …) — clause matches if KEY is of
+   TYPE per `typep`. T matches anything (catch-all)."
+  (let ((k (gensym "TYPECASE-KEY")))
+    `(let ((,k ,keyform))
+       (cond
+         ,@(mapcar (lambda (clause)
+                     (typecase-clause-expand clause k))
+                   clauses)))))
+
+(defun typecase-clause-expand (clause keyvar)
+  (let ((type (car clause))
+        (body (cdr clause)))
+    (cond
+      ((eq type 't) `(t ,@body))
+      (t `((typep ,keyvar ',type) ,@body)))))
+
+(defmacro dolist (binding &rest body)
+  "(dolist (var list [result-form]) body…) — bind VAR to each
+   element of LIST in turn, evaluate BODY. Returns RESULT-FORM
+   (or NIL if absent)."
+  (let* ((var (car binding))
+         (list-form (car (cdr binding)))
+         (result-form (cond
+                        ((null (cdr (cdr binding))) nil)
+                        (t (car (cdr (cdr binding))))))
+         (rem (gensym "DOLIST-REM")))
+    `(let ((,rem ,list-form)
+           (,var nil))
+       (loop
+         (cond
+           ((null ,rem) (return ,result-form))
+           (t (setq ,var (car ,rem))
+              ,@body
+              (setq ,rem (cdr ,rem))))))))
+
+(defmacro dotimes (binding &rest body)
+  "(dotimes (var count [result-form]) body…) — bind VAR to
+   0, 1, …, COUNT-1; evaluate BODY each time. Returns RESULT-FORM."
+  (let* ((var (car binding))
+         (count-form (car (cdr binding)))
+         (result-form (cond
+                        ((null (cdr (cdr binding))) nil)
+                        (t (car (cdr (cdr binding))))))
+         (limit (gensym "DOTIMES-LIMIT")))
+    `(let ((,var 0)
+           (,limit ,count-form))
+       (loop
+         (cond
+           ((>= ,var ,limit) (return ,result-form))
+           (t ,@body
+              (setq ,var (+ ,var 1))))))))
+
 ;; -- Property lists ----------------------------------------------------------
 
 (defun getf (plist key)
