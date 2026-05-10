@@ -70,9 +70,16 @@ impl Universe {
         cl.intern_external("NIL");
         cl.intern_external("T");
         // QUOTE/FUNCTION are needed by the reader to build `'x` and
-        // `#'x` forms.
+        // `#'x` forms. BACKQUOTE/UNQUOTE/UNQUOTE-SPLICING/
+        // UNQUOTE-NSPLICING are non-standard but conventional names
+        // for the backquote family — kept in CL so reader output is
+        // package-stable.
         cl.intern_external("QUOTE");
         cl.intern_external("FUNCTION");
+        cl.intern_external("BACKQUOTE");
+        cl.intern_external("UNQUOTE");
+        cl.intern_external("UNQUOTE-SPLICING");
+        cl.intern_external("UNQUOTE-NSPLICING");
 
         let mut table = self.packages.lock().unwrap();
         for p in [&keyword, &cl, &corman, &user] {

@@ -3,5 +3,8 @@ name = "ncl-reader"
 version = "0.0.0"
 edition = "2024"
 
+[dependencies]
+ncl-runtime = { path = "../ncl-runtime" }
+
 [lints]
 workspace = true

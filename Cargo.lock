@@ -58,6 +58,9 @@ dependencies = [
 [[package]]
 name = "ncl-reader"
 version = "0.0.0"
+dependencies = [
+ "ncl-runtime",
+]
 
 [[package]]
 name = "ncl-runtime"
