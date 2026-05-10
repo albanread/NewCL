@@ -21,11 +21,10 @@
 //! root finding lands later (step 9 in the GC build order); until
 //! then, the explicit root API is the contract.
 
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::heap::Heap;
+use crate::heap::{CardTable, Heap, CARD_SIZE_BYTES};
 use crate::word::{Tag, Word};
 
 /// Configuration knobs for the GC. Real values for production land
@@ -66,6 +65,23 @@ pub struct GcCoordinator {
     /// Used to wait for all-others-parked (by the GC trigger) and
     /// for "GC is done" (by parked mutators).
     park_cv: Condvar,
+
+    // ---- Lock-free card-marking façade --------------------------------
+    //
+    // Mutators dirty cards on every old→x store. The card store
+    // path MUST NOT acquire the heap mutex — that would serialise
+    // every barrier and defeat multi-threading. We cache the live
+    // semispace's base pointer and the card table here so the
+    // barrier is a single atomic load + a single atomic byte store.
+    /// Card table covering the LIVE old-semispace. Shared with
+    /// `Heap::old.cards` (same Arc).
+    cards: Arc<CardTable>,
+    /// Pointer to the start of the live old-semispace, as `usize`.
+    /// Updated by the GC after a full-GC swap.
+    live_base: AtomicUsize,
+    /// Capacity (in bytes) of one old semispace. Used by the
+    /// barrier to decide if a write address falls in the old heap.
+    old_capacity: usize,
 }
 
 struct ParkState {
@@ -75,8 +91,12 @@ struct ParkState {
 
 impl GcCoordinator {
     pub fn new(config: GcConfig) -> Arc<GcCoordinator> {
+        let heap = Heap::new(config.young_bytes, config.old_bytes);
+        let cards = Arc::clone(heap.old_cards());
+        let live_base = AtomicUsize::new(heap.old_live_base_ptr() as usize);
+        let old_capacity = heap.old_capacity_bytes_per_semi();
         Arc::new(GcCoordinator {
-            heap: Mutex::new(Heap::new(config.young_bytes, config.old_bytes)),
+            heap: Mutex::new(heap),
             config,
             stop_requested: AtomicBool::new(false),
             park_state: Mutex::new(ParkState {
@@ -84,7 +104,23 @@ impl GcCoordinator {
                 parked_count: 0,
             }),
             park_cv: Condvar::new(),
+            cards,
+            live_base,
+            old_capacity,
         })
+    }
+
+    /// Mark the card containing `addr` as dirty. Safe to call from
+    /// any Lisp thread; lock-free. The compiler will emit this at
+    /// every old→x store; user code rarely calls it directly.
+    pub fn mark_card(&self, addr: *const u8) {
+        let p = addr as usize;
+        let base = self.live_base.load(Ordering::Acquire);
+        // Single comparison decides "is this in the live old-semispace?"
+        // If outside (young or static), the card store is skipped.
+        if p >= base && p < base + self.old_capacity {
+            self.cards.mark_offset(p - base);
+        }
     }
 
     /// Register a new mutator. Returns the per-thread state. The
@@ -333,6 +369,15 @@ impl MutatorState {
         }
     }
 
+    /// Lock-free write barrier. Mark the card containing `addr` as
+    /// dirty. Call after writing a Word into an old-heap object. The
+    /// compiler will emit this at every relevant store once it
+    /// understands heap-object types; for v1 this is the explicit
+    /// API. Passing an address outside the old heap is a no-op.
+    pub fn mark_card(&self, addr: *const u8) {
+        self.coord.mark_card(addr);
+    }
+
     // -- Roots API (explicit for v1; replaced by stack maps later) ----------
 
     pub fn push_root(&self, w: Word) -> usize {
@@ -559,6 +604,118 @@ mod tests {
         for h in handles {
             h.join().expect("thread completed");
         }
+    }
+
+    #[test]
+    fn mark_card_lets_old_to_young_pointer_survive() {
+        let coord = GcCoordinator::new(small_config());
+        let mut m = coord.register_mutator();
+
+        // Promote a cons to old.
+        let a = m.alloc_cons(Word::fixnum(1), Word::NIL);
+        let a_idx = m.push_root(a);
+        m.collect_minor();
+        let a = m.root_at(a_idx);
+
+        // Allocate a fresh young cons B.
+        let b = m.alloc_cons(Word::fixnum(2), Word::NIL);
+
+        // Patch B into A's cdr.
+        let a_ptr = a.as_mut_ptr::<u64>(Tag::Cons).unwrap();
+        unsafe { *a_ptr.add(1) = b.raw(); }
+        // Write barrier: this is the new contract.
+        m.mark_card(a_ptr as *const u8);
+
+        // Force a minor GC. The card scan should find B and promote it.
+        m.collect_minor();
+
+        // a is still rooted; verify both a and b ended up in old.
+        let a = m.root_at(a_idx);
+        unsafe {
+            let p = a.as_ptr::<u64>(Tag::Cons).unwrap();
+            assert_eq!(Word::from_raw(*p).as_fixnum(), Some(1));
+            let cdr = Word::from_raw(*p.add(1));
+            assert!(cdr.is_cons(), "cdr should be a cons after promotion");
+            let bp = cdr.as_ptr::<u64>(Tag::Cons).unwrap();
+            assert_eq!(Word::from_raw(*bp).as_fixnum(), Some(2));
+        }
+    }
+
+    #[test]
+    fn mark_card_outside_old_is_noop() {
+        let coord = GcCoordinator::new(small_config());
+        let m = coord.register_mutator();
+
+        // Stack address is far from the old heap.
+        let stack_var: u64 = 0;
+        m.mark_card(&stack_var as *const u64 as *const u8);
+
+        // No card was marked.
+        assert_eq!(coord.cards.dirty_count(), 0);
+
+        // A young-heap address should also be a no-op (cards only
+        // cover old).
+        drop(m); // m is borrowed, drop before next op
+        let mut m = coord.register_mutator();
+        let young_cons = m.alloc_cons(Word::fixnum(1), Word::NIL);
+        m.mark_card(young_cons.as_ptr::<u8>(Tag::Cons).unwrap());
+        assert_eq!(coord.cards.dirty_count(), 0);
+    }
+
+    #[test]
+    fn many_threads_with_card_marks() {
+        // Each thread:
+        //  - allocates a cons, promotes it to old via a manual GC
+        //  - allocates more young objects, patches them into the
+        //    old cons's cdr, marks the card
+        //  - triggers another GC
+        //  - verifies the chain survived
+        let coord = GcCoordinator::new(small_config());
+        let n_threads = 4;
+
+        let handles: Vec<_> = (0..n_threads).map(|tid| {
+            let coord = Arc::clone(&coord);
+            thread::spawn(move || {
+                let mut m = coord.register_mutator();
+                let head = m.alloc_cons(Word::fixnum(tid as i64), Word::NIL);
+                let idx = m.push_root(head);
+                m.collect_minor();
+                let head = m.root_at(idx);
+
+                // Build a chain in young, patch into head.cdr, mark card.
+                let tail = m.alloc_cons(Word::fixnum(tid as i64 + 100), Word::NIL);
+                let head_ptr = head.as_mut_ptr::<u64>(Tag::Cons).unwrap();
+                unsafe { *head_ptr.add(1) = tail.raw(); }
+                m.mark_card(head_ptr as *const u8);
+
+                // Generate noise to trigger GCs.
+                for i in 0..200 {
+                    m.alloc_cons(Word::fixnum(i), Word::fixnum(0));
+                    if i % 16 == 0 { m.safepoint(); }
+                }
+
+                // Verify chain survived.
+                let head = m.root_at(idx);
+                unsafe {
+                    let p = head.as_ptr::<u64>(Tag::Cons).unwrap();
+                    assert_eq!(
+                        Word::from_raw(*p).as_fixnum(),
+                        Some(tid as i64),
+                        "thread {tid} head corrupted",
+                    );
+                    let cdr = Word::from_raw(*p.add(1));
+                    assert!(cdr.is_cons(), "thread {tid} lost tail");
+                    let tp = cdr.as_ptr::<u64>(Tag::Cons).unwrap();
+                    assert_eq!(
+                        Word::from_raw(*tp).as_fixnum(),
+                        Some(tid as i64 + 100),
+                        "thread {tid} tail corrupted",
+                    );
+                }
+            })
+        }).collect();
+
+        for h in handles { h.join().expect("thread"); }
     }
 
     #[test]

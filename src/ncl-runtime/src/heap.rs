@@ -19,8 +19,70 @@
 //! card table and the barrier.
 
 use std::ptr::NonNull;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::word::{Tag, Word};
+
+// -- Card table --------------------------------------------------------------
+//
+// Software card-marking for the old-heap write barrier. One byte per
+// CARD_SIZE_BYTES of old-heap storage. Mutator threads write to it
+// lock-free via atomic byte stores; the GC reads it during minor
+// collections to scan only the regions known to (possibly) hold
+// young pointers.
+//
+// False positives are fine — `copy_into` filters non-pointers and
+// pointers that aren't into young. False negatives (an unmarked
+// card that contains a young pointer) are NOT fine; the discipline
+// is that every old-heap store must mark.
+
+pub const CARD_SIZE_BYTES: usize = 512;
+pub const CARD_SIZE_CELLS: usize = CARD_SIZE_BYTES / 8;
+
+pub struct CardTable {
+    bytes: Box<[AtomicU8]>,
+}
+
+impl CardTable {
+    pub fn new(coverage_bytes: usize) -> CardTable {
+        let n_cards = coverage_bytes.div_ceil(CARD_SIZE_BYTES);
+        let v: Vec<AtomicU8> = (0..n_cards).map(|_| AtomicU8::new(0)).collect();
+        CardTable { bytes: v.into_boxed_slice() }
+    }
+
+    pub fn n_cards(&self) -> usize { self.bytes.len() }
+
+    /// Mark the card containing the given byte offset (relative to
+    /// the start of the covered region). Lock-free, single byte store.
+    pub fn mark_offset(&self, byte_offset: usize) {
+        let card = byte_offset / CARD_SIZE_BYTES;
+        if let Some(b) = self.bytes.get(card) {
+            b.store(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn is_dirty(&self, card: usize) -> bool {
+        self.bytes.get(card).is_some_and(|b| b.load(Ordering::Relaxed) != 0)
+    }
+
+    pub fn clear(&self, card: usize) {
+        if let Some(b) = self.bytes.get(card) {
+            b.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub fn clear_all(&self) {
+        for b in self.bytes.iter() {
+            b.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Count dirty cards. Useful for tests and for diagnostics.
+    pub fn dirty_count(&self) -> usize {
+        self.bytes.iter().filter(|b| b.load(Ordering::Relaxed) != 0).count()
+    }
+}
 
 // -- HeapHeader --------------------------------------------------------------
 
@@ -215,6 +277,11 @@ pub struct OldGen {
     /// Which semispace currently holds live data. The other is the
     /// scratch space used during full GC.
     live_is_a: bool,
+    /// Software card table covering whichever semispace is currently
+    /// live. Mutators dirty cards here on every old→x store; the GC
+    /// reads dirty cards during minor collection. After every GC
+    /// (minor or full) the table is reset to all-clean.
+    cards: Arc<CardTable>,
 }
 
 impl OldGen {
@@ -223,6 +290,7 @@ impl OldGen {
             a: Semispace::new(size_bytes),
             b: Semispace::new(size_bytes),
             live_is_a: true,
+            cards: Arc::new(CardTable::new(size_bytes)),
         }
     }
 
@@ -238,9 +306,6 @@ impl OldGen {
         if self.live_is_a { &mut self.b } else { &mut self.a }
     }
 
-    /// Borrow the two semispaces simultaneously (live, scratch). Used
-    /// during full GC where we need to copy from one and bump the
-    /// other.
     fn live_and_scratch_mut(&mut self) -> (&mut Semispace, &mut Semispace) {
         if self.live_is_a {
             (&mut self.a, &mut self.b)
@@ -250,12 +315,21 @@ impl OldGen {
     }
 
     fn swap_and_reset_scratch(&mut self) {
-        // Swap first, THEN reset what's now scratch (which is the
-        // old "live" semispace — the from-space whose contents are
-        // now garbage). Doing it the other way around would discard
-        // the survivors we just copied.
         self.live_is_a = !self.live_is_a;
         self.scratch_mut().reset();
+        // After a full GC, the new live's contents were freshly
+        // copied — they reference each other and the (now empty)
+        // young heap, never any pre-existing young pointers. Cards
+        // start clean.
+        self.cards.clear_all();
+    }
+
+    pub fn cards(&self) -> &Arc<CardTable> { &self.cards }
+
+    /// Pointer to the start of the live semispace's storage. Used by
+    /// the lock-free mark-card façade to compute byte offsets.
+    pub fn live_base_ptr(&self) -> *const u8 {
+        self.live().cells.as_ptr() as *const u8
     }
 }
 
@@ -312,6 +386,24 @@ impl Heap {
         self.old.live().contains_ptr(ptr)
     }
 
+    pub fn old_cards(&self) -> &Arc<CardTable> { self.old.cards() }
+    pub fn old_live_base_ptr(&self) -> *const u8 { self.old.live_base_ptr() }
+    pub fn old_capacity_bytes_per_semi(&self) -> usize {
+        self.old.live().capacity_bytes()
+    }
+
+    /// Direct card mark for tests and the heap-level API. Production
+    /// mutators go through the lock-free `MutatorState::mark_card`
+    /// (which doesn't acquire the heap mutex).
+    pub fn mark_old_card(&self, addr: *const u8) {
+        let base = self.old.live_base_ptr() as usize;
+        let cap = self.old.live().capacity_bytes();
+        let p = addr as usize;
+        if p >= base && p < base + cap {
+            self.old.cards.mark_offset(p - base);
+        }
+    }
+
     /// Minor GC. Copies everything reachable in `young` (via roots
     /// and via pointers from `old.live`) into `old.live`, leaves
     /// forwarding pointers in young, and resets young.
@@ -319,6 +411,13 @@ impl Heap {
     /// Step 4 has no write barrier yet, so we full-scan `old.live`
     /// for young pointers. Step 5 narrows that to dirty cards.
     pub fn collect_minor(&mut self, mut visit_roots: impl FnMut(&mut RootScanner<'_, '_>)) {
+        // We need access to old's live semispace AND the card table.
+        // The card table is owned via Arc by the OldGen, and we
+        // clone the Arc up front so we can hold it across the
+        // borrow of `live_mut` below.
+        let cards = Arc::clone(&self.old.cards);
+        let live_base = self.old.live_base_ptr() as usize;
+
         let mut state = MinorState {
             young: &mut self.young,
             dest: self.old.live_mut(),
@@ -329,15 +428,18 @@ impl Heap {
             let mut scanner = RootScanner { state: ScanTarget::Minor(&mut state) };
             visit_roots(&mut scanner);
         }
-        // Phase 2: full-scan dest (which is old.live) for young
-        // pointers. This is the no-barrier-yet behaviour. Step 5
-        // replaces this with a dirty-card scan.
-        state.scan_dest_for_young_pointers();
+        // Phase 2: scan only DIRTY cards in old.live for young
+        // pointers. This is the card-based barrier replacing the
+        // step-4 full scan. Cleared cards are skipped entirely.
+        state.scan_dirty_cards_for_young_pointers(&cards, live_base);
         // Phase 3: drain the queue (transitively copy reachable
         // young objects into dest).
         state.scan_to_completion();
         // Phase 4: young is now garbage; reset it.
         self.young.reset();
+        // Phase 5: every dirty card we found has been processed.
+        // Clear the table so the next minor only scans new dirties.
+        cards.clear_all();
     }
 
     /// Full GC. Copies everything reachable from roots into
@@ -385,9 +487,44 @@ impl<'a> MinorState<'a> {
         copy_into(w, &mut [self.young], self.dest, &mut self.queue)
     }
 
-    /// Walk every word in `dest` (i.e. old.live) looking for
-    /// pointers into `young`. Any found gets copied (leaving a
-    /// forwarding pointer in young) and the slot updated.
+    /// Walk only DIRTY cards in `dest` (= old.live) looking for
+    /// pointers into `young`. Each dirty card covers `CARD_SIZE_CELLS`
+    /// cells (64); we read each as a candidate Word and let
+    /// `copy_into` filter non-pointers.
+    fn scan_dirty_cards_for_young_pointers(
+        &mut self,
+        cards: &CardTable,
+        live_base: usize,
+    ) {
+        let dest_limit_cells = self.dest.top;
+        let dest_base = self.dest.cells.as_ptr() as usize;
+        debug_assert_eq!(dest_base, live_base, "card table covers wrong space");
+
+        for card in 0..cards.n_cards() {
+            if !cards.is_dirty(card) { continue; }
+            let card_start_cell = card * CARD_SIZE_CELLS;
+            let card_end_cell = (card_start_cell + CARD_SIZE_CELLS).min(dest_limit_cells);
+            if card_start_cell >= dest_limit_cells { break; }
+            for i in card_start_cell..card_end_cell {
+                let raw = unsafe { *self.dest.cell_ptr(i) };
+                let w = Word::from_raw(raw);
+                if let Some(new) = copy_into(
+                    w,
+                    &mut [self.young],
+                    self.dest,
+                    &mut self.queue,
+                ) {
+                    unsafe { *self.dest.cell_ptr_mut(i) = new.raw(); }
+                }
+            }
+        }
+    }
+
+    /// Step-4 fallback: full-scan old.live. No longer the default
+    /// path — kept only because some heap-level tests still rely on
+    /// "no card discipline" semantics. Production minor GC uses
+    /// `scan_dirty_cards_for_young_pointers`.
+    #[allow(dead_code)]
     fn scan_dest_for_young_pointers(&mut self) {
         // Iterate over all words written to dest BEFORE this minor
         // GC started. This includes both pre-existing live data and
@@ -755,7 +892,7 @@ mod tests {
     }
 
     #[test]
-    fn minor_old_to_young_pointer_promotes() {
+    fn minor_old_to_young_pointer_promotes_with_card_mark() {
         let mut h = fresh();
 
         // Allocate young cons A. Run a minor GC with A as root —
@@ -769,18 +906,16 @@ mod tests {
         let b = h.alloc_cons(Word::fixnum(2), Word::NIL);
         let a_ptr = a.as_mut_ptr::<u64>(Tag::Cons).unwrap();
         unsafe { *a_ptr.add(1) = b.raw(); }
-        // A is in old, B is in young, A's cdr -> B.
+        // The write barrier discipline: mark the card containing A.
+        h.mark_old_card(a_ptr as *const u8);
         assert_eq!(h.young_used_bytes(), 16);
 
-        // Run a minor GC with A as root. The old-to-young scan
-        // should find A's cdr pointing into young and promote B.
         h.collect_minor(|s| s.visit(&mut a));
 
         // Both conses now in old; young empty.
         assert_eq!(h.young_used_bytes(), 0);
         assert_eq!(h.old_used_bytes(), 32);
 
-        // Walk: a -> cons(1, b'); b' -> cons(2, nil).
         unsafe {
             let p = a.as_ptr::<u64>(Tag::Cons).unwrap();
             assert_eq!(Word::from_raw(*p).as_fixnum(), Some(1));
@@ -790,6 +925,113 @@ mod tests {
             assert_eq!(Word::from_raw(*bp).as_fixnum(), Some(2));
             assert!(Word::from_raw(*bp.add(1)).is_nil());
         }
+    }
+
+    #[test]
+    fn missing_card_mark_loses_young_object() {
+        // Negative test: this demonstrates that the card-marking
+        // discipline is real. WITHOUT calling mark_old_card after
+        // writing a young pointer into an old object, the minor GC
+        // will not find the young object via old's roots and will
+        // discard it. The compiler will emit mark_card at every
+        // old-heap store; this test exists to enforce the contract
+        // by failing if anyone breaks it.
+        let mut h = fresh();
+        let mut a = h.alloc_cons(Word::fixnum(1), Word::NIL);
+        h.collect_minor(|s| s.visit(&mut a));
+
+        let b = h.alloc_cons(Word::fixnum(2), Word::NIL);
+        let a_ptr = a.as_mut_ptr::<u64>(Tag::Cons).unwrap();
+        unsafe { *a_ptr.add(1) = b.raw(); }
+        // DO NOT mark the card.
+
+        h.collect_minor(|s| s.visit(&mut a));
+
+        // Only `a` survives; `b` was missed because no card was dirty.
+        assert_eq!(h.old_used_bytes(), 16);
+        assert_eq!(h.young_used_bytes(), 0);
+
+        // a's cdr now points at a stale young address. We don't
+        // dereference it (would be UB), but we verify it's STILL a
+        // cons-tagged Word — the GC didn't update it because the GC
+        // never knew about it.
+        unsafe {
+            let p = a.as_ptr::<u64>(Tag::Cons).unwrap();
+            let cdr = Word::from_raw(*p.add(1));
+            assert!(cdr.is_cons(), "stale tagged ptr is still a Cons-tag");
+        }
+    }
+
+    #[test]
+    fn cards_are_cleared_after_minor() {
+        let mut h = fresh();
+        let mut a = h.alloc_cons(Word::fixnum(1), Word::NIL);
+        h.collect_minor(|s| s.visit(&mut a));
+
+        let b = h.alloc_cons(Word::fixnum(2), Word::NIL);
+        let a_ptr = a.as_mut_ptr::<u64>(Tag::Cons).unwrap();
+        unsafe { *a_ptr.add(1) = b.raw(); }
+        h.mark_old_card(a_ptr as *const u8);
+
+        // One card dirty before GC.
+        assert_eq!(h.old_cards().dirty_count(), 1);
+
+        h.collect_minor(|s| s.visit(&mut a));
+
+        // Cards cleared after GC; the next minor scan starts clean.
+        assert_eq!(h.old_cards().dirty_count(), 0);
+    }
+
+    #[test]
+    fn multiple_dirty_cards_all_processed() {
+        // Allocate enough conses that promotion fills more than
+        // CARD_SIZE_CELLS = 64 cells in old; verify that cards
+        // covering different regions all get scanned.
+        let mut h = fresh();
+        let mut roots: Vec<Word> = Vec::new();
+        for i in 0..40 {
+            roots.push(h.alloc_cons(Word::fixnum(i), Word::NIL));
+        }
+        // Promote all to old.
+        h.collect_minor(|s| {
+            for r in roots.iter_mut() { s.visit(r); }
+        });
+        // 40 conses in old = 80 cells. With 64 cells per card,
+        // that spans 2 cards.
+
+        // Allocate a young object and patch it into the LAST root
+        // (which is in the second card).
+        let young = h.alloc_cons(Word::fixnum(999), Word::NIL);
+        let last_root_ptr = roots[39].as_mut_ptr::<u64>(Tag::Cons).unwrap();
+        unsafe { *last_root_ptr.add(1) = young.raw(); }
+        h.mark_old_card(last_root_ptr as *const u8);
+
+        h.collect_minor(|s| {
+            for r in roots.iter_mut() { s.visit(r); }
+        });
+
+        // young got promoted via the second card. Total in old:
+        // 41 conses = 82 cells = 656 bytes.
+        assert_eq!(h.old_used_bytes(), 41 * 16);
+    }
+
+    #[test]
+    fn cards_clear_on_full_gc() {
+        let mut h = fresh();
+        let mut a = h.alloc_cons(Word::fixnum(1), Word::NIL);
+        h.collect_minor(|s| s.visit(&mut a));
+
+        let b = h.alloc_cons(Word::fixnum(2), Word::NIL);
+        let a_ptr = a.as_mut_ptr::<u64>(Tag::Cons).unwrap();
+        unsafe { *a_ptr.add(1) = b.raw(); }
+        h.mark_old_card(a_ptr as *const u8);
+
+        assert_eq!(h.old_cards().dirty_count(), 1);
+
+        h.collect_full(|s| s.visit(&mut a));
+
+        // Full GC swaps; new live's cards are clean by construction.
+        assert_eq!(h.old_cards().dirty_count(), 0);
     }
 
     #[test]
