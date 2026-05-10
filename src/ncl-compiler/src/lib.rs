@@ -596,6 +596,100 @@ mod end_to_end_tests {
         assert_eq!(eval_str("(listp t)").unwrap(), "nil");
     }
 
+    // -- not / and / or / cond ---------------------------------------------
+
+    #[test]
+    fn not_inverts_truthy_and_nil() {
+        assert_eq!(eval_str("(not nil)").unwrap(), "T");
+        assert_eq!(eval_str("(not t)").unwrap(), "nil");
+        assert_eq!(eval_str("(not 0)").unwrap(), "nil"); // 0 is truthy in CL
+        assert_eq!(eval_str("(not (cons 1 2))").unwrap(), "nil");
+    }
+
+    #[test]
+    fn and_returns_last_or_nil() {
+        // CL: (and) → t
+        assert_eq!(eval_str("(and)").unwrap(), "T");
+        // (and x) → x
+        assert_eq!(eval_str("(and 5)").unwrap(), "5");
+        // (and a b) → b if a is non-nil
+        assert_eq!(eval_str("(and t 7)").unwrap(), "7");
+        // (and a b) → nil if a is nil
+        assert_eq!(eval_str("(and nil 7)").unwrap(), "nil");
+        // Multi-arg
+        assert_eq!(eval_str("(and 1 2 3 4 5)").unwrap(), "5");
+        assert_eq!(eval_str("(and 1 2 nil 4 5)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn or_returns_first_non_nil_or_nil() {
+        assert_eq!(eval_str("(or)").unwrap(), "nil");
+        assert_eq!(eval_str("(or 5)").unwrap(), "5");
+        assert_eq!(eval_str("(or nil 7)").unwrap(), "7");
+        assert_eq!(eval_str("(or 7 nil)").unwrap(), "7");
+        assert_eq!(eval_str("(or nil nil 9)").unwrap(), "9");
+        assert_eq!(eval_str("(or nil nil nil)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn or_short_circuits_on_first_truthy() {
+        // First non-nil wins. (- 5 5) is fixnum 0, which is TRUTHY
+        // in CL — only nil is false — so this returns 0, not the
+        // cons. Tests that 0 is truthy AND that or short-circuits.
+        assert_eq!(eval_str("(or (- 5 5) (cons 1 2))").unwrap(), "0");
+        // With a real nil first, the cons is reached.
+        assert_eq!(eval_str("(or nil (cons 1 2))").unwrap(), "(1 . 2)");
+    }
+
+    #[test]
+    fn cond_picks_first_matching_clause() {
+        assert_eq!(eval_str("(cond (t 1))").unwrap(), "1");
+        assert_eq!(eval_str("(cond (nil 1) (t 2))").unwrap(), "2");
+        assert_eq!(eval_str("(cond (nil 1) (nil 2) (t 3))").unwrap(), "3");
+        assert_eq!(eval_str("(cond ((eq 1 2) 10) ((eq 1 1) 20))").unwrap(), "20");
+    }
+
+    #[test]
+    fn cond_with_no_match_returns_nil() {
+        assert_eq!(eval_str("(cond (nil 1) (nil 2))").unwrap(), "nil");
+    }
+
+    #[test]
+    fn cond_implicit_progn_in_clause() {
+        // Multi-form body in a clause uses implicit progn.
+        assert_eq!(eval_str("(cond (t 1 2 3))").unwrap(), "3");
+    }
+
+    #[test]
+    fn boolean_combinations() {
+        // (and (or nil 5) (not nil) 7) → 7
+        assert_eq!(eval_str("(and (or nil 5) (not nil) 7)").unwrap(), "7");
+        // (or (and t nil) 99) → 99
+        assert_eq!(eval_str("(or (and t nil) 99)").unwrap(), "99");
+    }
+
+    #[test]
+    fn cond_with_recursion() {
+        // Classic FizzBuzz-style multi-branch. Just two branches
+        // for now since we don't have mod yet — return "low",
+        // "mid", "high" via fixnums 1/2/3.
+        let result = eval_str(
+            "(defun classify (n)
+               (cond ((< n 0) -1)
+                     ((= n 0) 0)
+                     ((< n 10) 1)
+                     ((< n 100) 2)
+                     (t 3)))
+             (cons (classify -5)
+                   (cons (classify 0)
+                         (cons (classify 7)
+                               (cons (classify 42)
+                                     (cons (classify 1000) nil)))))",
+        )
+        .unwrap();
+        assert_eq!(result, "(-1 0 1 2 3)");
+    }
+
     #[test]
     fn list_traversal_via_recursion() {
         // Compute the length of a proper list using car/cdr/null.

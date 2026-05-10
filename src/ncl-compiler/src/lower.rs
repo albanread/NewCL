@@ -266,6 +266,26 @@ fn lower_call_in_mut(
                 args.iter().map(|a| lower_in_mut(a, env, coord)).collect();
             Ok(Expr::progn(lowered?))
         }
+        // Boolean operators desugar to existing IR (if + let). No
+        // new Expr variants, no LLVM changes — pure lowering.
+        "NOT" => {
+            if args.len() != 1 {
+                return Err(CompileError::BadArity {
+                    head: head_name,
+                    expected: "1",
+                    got: args.len(),
+                });
+            }
+            // (not x) ≡ (if x nil t)
+            Ok(Expr::if_(
+                lower_in_mut(&args[0], env, coord)?,
+                Expr::Nil,
+                Expr::True,
+            ))
+        }
+        "AND" => lower_and(args, env, coord),
+        "OR" => lower_or(args, env, coord),
+        "COND" => lower_cond(args, env, coord),
         // Numeric comparisons. Binary only for now; CL allows
         // variadic with chained semantics ((< 1 2 3) = (and …))
         // — that lands when `and` does.
@@ -362,6 +382,99 @@ fn lower_let(
 
     env.restore(cp);
     Ok(Expr::let_(binding_exprs, body_expr))
+}
+
+/// `(and)` → `t`. `(and x)` → `x`. `(and a b c)` short-circuits:
+/// if `a` is nil, return nil; else if `b` is nil, return nil; else
+/// return `c` (evaluated). Each form evaluated at most once.
+///
+/// Desugars to nested `if`. No `let` needed because each form
+/// appears exactly once in the lowered tree.
+fn lower_and(
+    args: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
+    if args.is_empty() {
+        return Ok(Expr::True);
+    }
+    if args.len() == 1 {
+        return lower_in_mut(&args[0], env, coord);
+    }
+    let first = lower_in_mut(&args[0], env, coord)?;
+    let rest = lower_and(&args[1..], env, coord)?;
+    Ok(Expr::if_(first, rest, Expr::Nil))
+}
+
+/// `(or)` → nil. `(or x)` → `x`. `(or a b c)` returns the first
+/// non-nil value, or nil if none are. Each form evaluated at most
+/// once — that means we can't write `(if a a (or b c))` (would
+/// evaluate `a` twice if non-nil); we use `let` to bind the result
+/// of evaluating the head.
+fn lower_or(
+    args: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
+    if args.is_empty() {
+        return Ok(Expr::Nil);
+    }
+    if args.len() == 1 {
+        return lower_in_mut(&args[0], env, coord);
+    }
+    // Lower head in OUTER env first.
+    let first = lower_in_mut(&args[0], env, coord)?;
+    // Push a synthetic local for the head's value, lower the rest
+    // with the local in scope, then restore.
+    let cp = env.checkpoint();
+    let tmp_idx = env.push_local(std::sync::Arc::from("__or_tmp__"));
+    let rest = lower_or(&args[1..], env, coord)?;
+    env.restore(cp);
+    // (let ((tmp first)) (if tmp tmp rest))
+    Ok(Expr::let_(
+        vec![first],
+        Expr::if_(Expr::Local(tmp_idx), Expr::Local(tmp_idx), rest),
+    ))
+}
+
+/// `(cond)` → nil. Each clause is `(test form...)`. The first
+/// clause whose test evaluates to non-nil has its body forms
+/// evaluated as an implicit progn; the value of the last form is
+/// the cond's result. If no test matches, the result is nil.
+fn lower_cond(
+    clauses: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
+    if clauses.is_empty() {
+        return Ok(Expr::Nil);
+    }
+    let clause = list_to_vec(&clauses[0])?;
+    if clause.is_empty() {
+        return Err(CompileError::NotImplemented(
+            "cond clause must have at least a test".to_string(),
+        ));
+    }
+    let test = lower_in_mut(&clause[0], env, coord)?;
+    // Body: implicit progn of forms after the test.
+    // CL's `(test)` (clause with only a test) would return test's
+    // value if non-nil; defer that case.
+    let body = if clause.len() == 1 {
+        return Err(CompileError::NotImplemented(
+            "cond clause with only a test (no body) not yet supported"
+                .to_string(),
+        ));
+    } else if clause.len() == 2 {
+        lower_in_mut(&clause[1], env, coord)?
+    } else {
+        let lowered: Result<Vec<_>, _> = clause[1..]
+            .iter()
+            .map(|f| lower_in_mut(f, env, coord))
+            .collect();
+        Expr::progn(lowered?)
+    };
+    let rest = lower_cond(&clauses[1..], env, coord)?;
+    Ok(Expr::if_(test, body, rest))
 }
 
 fn binary_op(
