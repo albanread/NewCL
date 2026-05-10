@@ -26,6 +26,7 @@ use crate::gc_string;
 use crate::word::{Tag, Word};
 use crate::GcCoordinator;
 
+use super::batch::{self as batch_mod, Point, Rect, Rgba, SurfaceCmd};
 use super::channels::{kind, IGuiEvent};
 use super::cp_exports::FRAME_HWND;
 use super::{channels, window};
@@ -92,7 +93,16 @@ pub extern "C-unwind" fn igui_start_shim(
     // calling next-event, open-child, etc. against the still-alive
     // FRAME_HWND.
     let handle = std::thread::spawn(|| {
-        let _ = super::run(None::<fn()>);
+        match super::run(None::<fn()>) {
+            Ok(code) => {
+                if code != 0 {
+                    eprintln!("[igui] message pump exited with code {code}");
+                }
+            }
+            Err(e) => {
+                eprintln!("[igui] startup failed: {e}");
+            }
+        }
     });
     {
         let mut guard = slot.lock().unwrap();
@@ -348,6 +358,159 @@ fn event_to_plist(
         acc = m.alloc_cons(k, acc);
     }
     acc
+}
+
+// -- Drawing -----------------------------------------------------------------
+//
+// Each call site looks like
+//
+//   (with-batch CHILD-ID
+//     (clear (rgb 30 30 50))
+//     (fill-rect 10 10 100 50 (rgb 200 50 50)))
+//
+// where `with-batch` is a macro wrapping `(%begin-batch ...)` ...
+// `(%submit-batch)`. The drawing primitives below assume an active
+// batch (thread-local) and just push commands onto it.
+//
+// Color is a packed fixnum: 0xRRGGBBAA, one byte per channel.
+// `(rgb r g b)` and `(rgba r g b a)` are user-Lisp constructors.
+
+fn unpack_rgba(packed: i64) -> Rgba {
+    let bits = packed as u64;
+    let r = ((bits >> 24) & 0xFF) as f32 / 255.0;
+    let g = ((bits >> 16) & 0xFF) as f32 / 255.0;
+    let b = ((bits >> 8) & 0xFF) as f32 / 255.0;
+    let a = (bits & 0xFF) as f32 / 255.0;
+    Rgba { r, g, b, a }
+}
+
+/// `(%begin-batch child-id)` — start building a new batch for the
+/// given child. Subsequent emit calls push onto it; `(%submit-batch)`
+/// hands it to the GUI thread.
+pub extern "C-unwind" fn begin_batch_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("%begin-batch: expected 1 arg (child-id), got {n_args}");
+    }
+    let Some(id) = arg_fixnum(args, 0) else {
+        panic!("%begin-batch: child-id must be a fixnum");
+    };
+    batch_mod::begin(id);
+    Word::T.raw()
+}
+
+/// `(%submit-batch)` — hand the in-flight batch to the GUI thread.
+/// Returns T on success, NIL if no batch is in flight or the
+/// child-id no longer exists.
+pub extern "C-unwind" fn submit_batch_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    _args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    let Some(batch) = batch_mod::finish() else {
+        return Word::NIL.raw();
+    };
+    if batch_mod::submit(batch) {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
+/// `(%emit-clear color)` — fill the entire client area with `color`.
+pub extern "C-unwind" fn emit_clear_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("%emit-clear: expected 1 arg (color), got {n_args}");
+    }
+    let Some(c) = arg_fixnum(args, 0) else {
+        panic!("%emit-clear: color must be a fixnum");
+    };
+    batch_mod::push(SurfaceCmd::Clear { color: unpack_rgba(c) });
+    Word::T.raw()
+}
+
+/// `(%emit-fill-rect x y w h color)` — filled rectangle. Coords
+/// are fixnums (pixel-precise; sub-pixel waits on float support).
+pub extern "C-unwind" fn emit_fill_rect_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 5 {
+        panic!("%emit-fill-rect: expected 5 args (x y w h color), got {n_args}");
+    }
+    let x = arg_fixnum(args, 0).expect("x") as f32;
+    let y = arg_fixnum(args, 1).expect("y") as f32;
+    let w = arg_fixnum(args, 2).expect("w") as f32;
+    let h = arg_fixnum(args, 3).expect("h") as f32;
+    let c = arg_fixnum(args, 4).expect("color");
+    batch_mod::push(SurfaceCmd::FillRect {
+        rect: Rect { x0: x, y0: y, x1: x + w, y1: y + h },
+        corner_radius: 0.0,
+        color: unpack_rgba(c),
+    });
+    Word::T.raw()
+}
+
+/// `(%emit-stroke-rect x y w h thickness color)` — outlined rectangle.
+pub extern "C-unwind" fn emit_stroke_rect_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 6 {
+        panic!("%emit-stroke-rect: expected 6 args, got {n_args}");
+    }
+    let x = arg_fixnum(args, 0).expect("x") as f32;
+    let y = arg_fixnum(args, 1).expect("y") as f32;
+    let w = arg_fixnum(args, 2).expect("w") as f32;
+    let h = arg_fixnum(args, 3).expect("h") as f32;
+    let t = arg_fixnum(args, 4).expect("thickness") as f32;
+    let c = arg_fixnum(args, 5).expect("color");
+    batch_mod::push(SurfaceCmd::StrokeRect {
+        rect: Rect { x0: x, y0: y, x1: x + w, y1: y + h },
+        corner_radius: 0.0,
+        half_thickness: t * 0.5,
+        color: unpack_rgba(c),
+    });
+    Word::T.raw()
+}
+
+/// `(%emit-draw-line x1 y1 x2 y2 thickness color)` — line segment.
+pub extern "C-unwind" fn emit_draw_line_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 6 {
+        panic!("%emit-draw-line: expected 6 args, got {n_args}");
+    }
+    let x1 = arg_fixnum(args, 0).expect("x1") as f32;
+    let y1 = arg_fixnum(args, 1).expect("y1") as f32;
+    let x2 = arg_fixnum(args, 2).expect("x2") as f32;
+    let y2 = arg_fixnum(args, 3).expect("y2") as f32;
+    let t = arg_fixnum(args, 4).expect("thickness") as f32;
+    let c = arg_fixnum(args, 5).expect("color");
+    batch_mod::push(SurfaceCmd::DrawLine {
+        p0: Point { x: x1, y: y1 },
+        p1: Point { x: x2, y: y2 },
+        half_thickness: t * 0.5,
+        color: unpack_rgba(c),
+    });
+    Word::T.raw()
 }
 
 fn mouse_op_name(op: i64) -> &'static str {

@@ -295,6 +295,60 @@
               (lambda () ,body-form)
               (lambda (,var) ,@handler-body))))))))
 
+;; -- iGui drawing ------------------------------------------------------------
+;;
+;; Colors are packed fixnums: 0xRRGGBBAA. (rgb r g b) sets alpha to
+;; 255; (rgba r g b a) lets the caller specify it.
+
+(defun rgb (r g b)
+  "Pack a fully-opaque color into a fixnum."
+  (+ (* r 16777216)        ; r << 24
+     (* g 65536)            ; g << 16
+     (* b 256)              ; b << 8
+     255))
+
+(defun rgba (r g b a)
+  (+ (* r 16777216)
+     (* g 65536)
+     (* b 256)
+     a))
+
+;; A handful of named colors. Match common-CL/Win32 conventions
+;; loosely; users who want their own should just call (rgb ...).
+(defparameter +black+   (rgb 0 0 0))
+(defparameter +white+   (rgb 255 255 255))
+(defparameter +red+     (rgb 220 50 50))
+(defparameter +green+   (rgb 50 180 80))
+(defparameter +blue+    (rgb 50 100 200))
+(defparameter +yellow+  (rgb 220 200 60))
+(defparameter +slate+   (rgb 46 51 57))
+(defparameter +panel+   (rgb 30 33 38))
+
+(defmacro with-batch (child-id &rest body)
+  "Open a drawing batch for CHILD-ID, evaluate BODY (which calls
+   clear/fill-rect/draw-line/etc.), and submit on exit.
+
+   Each new submit replaces the child's previous on-screen batch
+   (latest-wins) — so the body should re-emit the entire pane,
+   not just changes."
+  `(progn
+     (%begin-batch ,child-id)
+     ,@body
+     (%submit-batch)))
+
+(defun clear (color)
+  "Fill the active pane with COLOR."
+  (%emit-clear color))
+
+(defun fill-rect (x y w h color)
+  (%emit-fill-rect x y w h color))
+
+(defun stroke-rect (x y w h thickness color)
+  (%emit-stroke-rect x y w h thickness color))
+
+(defun draw-line (x1 y1 x2 y2 thickness color)
+  (%emit-draw-line x1 y1 x2 y2 thickness color))
+
 ;; -- File I/O ----------------------------------------------------------------
 ;;
 ;; The native primitives are:

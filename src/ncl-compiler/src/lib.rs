@@ -278,6 +278,22 @@ fn install_igui(coord: &Arc<GcCoordinator>, mutator: &mut MutatorState) {
                    ncl_runtime::set_title_shim, 2);
     install_native(coord, mutator, "NEXT-EVENT",
                    ncl_runtime::next_event_shim, 1);
+
+    // Drawing primitives. The user-Lisp `with-batch` macro wraps
+    // begin/submit; the emit-* helpers push commands onto the
+    // thread-local current batch.
+    install_native(coord, mutator, "%BEGIN-BATCH",
+                   ncl_runtime::begin_batch_shim, 1);
+    install_native(coord, mutator, "%SUBMIT-BATCH",
+                   ncl_runtime::submit_batch_shim, 0);
+    install_native(coord, mutator, "%EMIT-CLEAR",
+                   ncl_runtime::emit_clear_shim, 1);
+    install_native(coord, mutator, "%EMIT-FILL-RECT",
+                   ncl_runtime::emit_fill_rect_shim, 5);
+    install_native(coord, mutator, "%EMIT-STROKE-RECT",
+                   ncl_runtime::emit_stroke_rect_shim, 6);
+    install_native(coord, mutator, "%EMIT-DRAW-LINE",
+                   ncl_runtime::emit_draw_line_shim, 6);
 }
 
 fn install_native(
