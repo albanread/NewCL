@@ -38,6 +38,20 @@ pub enum Expr {
     /// and optional params already bound, so CL's
     /// `(defun foo (a &optional (b (* a 2))))` semantics work.
     OptArg { idx: u32, default: Box<Expr> },
+    /// `(values v1 v2 ... vN)` — write all `vals` into the
+    /// thread-local multi-value slot, return `vals[0]` (or NIL if
+    /// empty). The caller (typically multiple-value-bind) reads the
+    /// slot to recover the secondaries; for non-tail uses, the slot
+    /// is just discarded by the surrounding code.
+    Values(Vec<Expr>),
+    /// `Expr::EnsureSingleMv(primary)` — evaluate `primary`, write
+    /// `[primary]` into the multi-value slot, return `primary`. The
+    /// tail-position transform wraps every function-body tail that
+    /// isn't `Expr::Values` in this op so the slot always reflects
+    /// the function's actual return values, even when the body
+    /// internally called another function that itself returned
+    /// multiple values.
+    EnsureSingleMv(Box<Expr>),
     /// `&key` accessor: scan `args[key_start..n_args]` for a pair
     /// whose first element `eq`s `keyword_word` (a tagged Symbol);
     /// if found, return the following arg. If not found, evaluate
@@ -253,6 +267,10 @@ impl Expr {
     }
     pub fn param(idx: usize) -> Expr { Expr::Param(idx) }
     pub fn bind_rest(start: u32) -> Expr { Expr::BindRest(start) }
+    pub fn values(vals: Vec<Expr>) -> Expr { Expr::Values(vals) }
+    pub fn ensure_single_mv(primary: Expr) -> Expr {
+        Expr::EnsureSingleMv(Box::new(primary))
+    }
     pub fn opt_arg(idx: u32, default: Expr) -> Expr {
         Expr::OptArg { idx, default: Box::new(default) }
     }

@@ -284,6 +284,58 @@
 ;; passed to error — typically a string. Conditions as typed
 ;; objects with class hierarchies wait on CLOS.
 
+(defmacro multiple-value-list (form)
+  "Evaluate FORM and return a fresh list of all the values it
+   produced. If FORM returned a single value, the list has one
+   element; if FORM was `(values v1 v2 ... vN)` in tail position,
+   the list has N elements.
+
+   Implementation: clear the multi-value slot before FORM runs, so
+   that constants / variable lookups / native shim calls (which
+   don't write the slot) are observable as such. Then JIT'd
+   function calls in FORM either set the slot via `Expr::Values`
+   (tail-position `(values ...)`) or via `EnsureSingleMv` (every
+   other function exit). Either way `%multiple-value-list-of`
+   reads the slot afterward and falls back to `(primary)` when it
+   was never written."
+  (let ((p (gensym "MV-PRIMARY")))
+    `(progn
+       (%mv-clear)
+       (let ((,p ,form))
+         (%multiple-value-list-of ,p)))))
+
+(defmacro multiple-value-bind (vars form &rest body)
+  "Evaluate FORM, then bind the symbols in VARS to its primary,
+   secondary, … values. Excess vars get NIL; extra values are
+   discarded. BODY is run in the new bindings.
+
+   Expansion mirrors `multiple-value-list`: clear, evaluate form,
+   snapshot, then destructure."
+  (let ((p (gensym "MV-PRIMARY"))
+        (l (gensym "MV-LIST")))
+    `(progn
+       (%mv-clear)
+       (let ((,p ,form))
+         (let ((,l (%multiple-value-list-of ,p)))
+           ,(multiple-value-bind-build-bindings vars l body))))))
+
+(defun multiple-value-bind-build-bindings (vars list-sym body)
+  "Helper for the multiple-value-bind macro. Builds a chain of
+   let-bindings that pull successive elements out of LIST-SYM and
+   bind them to the names in VARS. Each step guards with `(if l
+   ...)` so a list shorter than VARS binds the trailing names to
+   NIL instead of crashing on (car nil). The generated form ends
+   in BODY."
+  (cond
+    ((null vars) `(progn ,@body))
+    (t
+     (let ((var (car vars))
+           (rest (cdr vars))
+           (l (gensym "MV-TAIL")))
+       `(let ((,var (if ,list-sym (car ,list-sym) nil))
+              (,l (if ,list-sym (cdr ,list-sym) nil)))
+          ,(multiple-value-bind-build-bindings rest l body))))))
+
 (defmacro handler-case (body-form &rest clauses)
   "(handler-case body
       (error (var) recovery))

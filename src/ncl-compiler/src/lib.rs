@@ -183,6 +183,11 @@ impl Session {
         } else {
             ncl_ir::Expr::let_(prologue, lowered_body)
         };
+        // Tail-position transform: wrap any non-`(values ...)` tail
+        // expression in EnsureSingleMv so the multi-value slot is
+        // always exactly the function's actual return values when
+        // the caller reads it. See lower::instrument_tail_for_mv.
+        let body_expr = lower::instrument_tail_for_mv(body_expr);
 
         let arity = params.required.len() as u32;
         let code_ptr = ncl_llvm::jit_compile_function(arity, &body_expr)
@@ -277,6 +282,14 @@ fn install_native_functions(
                    ncl_runtime::eql_shim, 2);
     install_native(coord, mutator, "TYPEP",
                    ncl_runtime::typep_shim, 2);
+    // Multi-value support — `(values ...)` itself is a special form
+    // lowered in lower.rs; this is the primitive used by the
+    // multiple-value-bind / multiple-value-list macros to read the
+    // thread-local slot back as a Lisp list.
+    install_native(coord, mutator, "%MULTIPLE-VALUE-LIST-OF",
+                   ncl_runtime::multiple_value_list_of_shim, 1);
+    install_native(coord, mutator, "%MV-CLEAR",
+                   ncl_runtime::mv_clear_shim, 0);
 
     install_native(coord, mutator, "STRING-SPLIT-NEWLINES",
                    string_split_newlines_shim, 1);

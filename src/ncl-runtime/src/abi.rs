@@ -1115,6 +1115,111 @@ fn is_keyword(w: Word) -> bool {
         .unwrap_or(false)
 }
 
+// ───────────────────────────────────────────────────────────────────
+// Multiple values — thread-local "extra return values" buffer.
+//
+// Per CL, a function that returns normally produces one value, but
+// `(values v1 v2 ... vN)` lets it return N. The receiving site
+// (multiple-value-bind / multiple-value-list) reads them.
+//
+// Storage: a thread-local Vec<u64>. The compiler enforces the
+// invariant that, after every function call, the slot contains
+// exactly the called function's return values:
+//   - If the function's tail expression was `(values ...)`,
+//     `Expr::Values` wrote the full set.
+//   - Otherwise the tail-position transform wraps the body in
+//     `Expr::EnsureSingleMv`, which writes [primary] at exit.
+//
+// Without that invariant, a subroutine call inside a function would
+// pollute the slot, and the outer multiple-value-bind would observe
+// stale data. With the invariant, the slot is always fresh.
+//
+// JIT-callable. Lowered from `Expr::Values` and `Expr::EnsureSingleMv`.
+// ───────────────────────────────────────────────────────────────────
+
+use std::cell::RefCell;
+
+thread_local! {
+    static MV_VALUES: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
+
+/// `(%mv-clear)` — empty the multi-value slot. The
+/// multiple-value-bind / multiple-value-list macros call this
+/// before evaluating their form so that, if the form turns out to
+/// be a non-function expression (constant, variable lookup, native
+/// shim call), the slot is observably empty and the macro falls
+/// back to `[primary]`. JIT-compiled function calls overwrite the
+/// slot via EnsureSingleMv or Expr::Values; native shim calls
+/// don't, hence the need for an explicit pre-clear.
+pub extern "C-unwind" fn mv_clear_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    _args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    MV_VALUES.with(|cell| cell.borrow_mut().clear());
+    Word::NIL.raw()
+}
+
+/// Write `[v]` into the multi-value slot. Used by the
+/// EnsureSingleMv epilogue around any function body whose tail
+/// expression isn't `(values ...)`.
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_set_mv_single(v: u64) {
+    MV_VALUES.with(|cell| {
+        let mut b = cell.borrow_mut();
+        b.clear();
+        b.push(v);
+    });
+}
+
+/// Write `args[0..n]` into the multi-value slot. Used by
+/// `Expr::Values` for `(values v1 v2 ... vN)` in tail position.
+///
+/// SAFETY: `args` must point to at least `n` valid `u64`s.
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_set_mv_many(args: *const u64, n: u64) {
+    MV_VALUES.with(|cell| {
+        let mut b = cell.borrow_mut();
+        b.clear();
+        for i in 0..n {
+            b.push(unsafe { *args.add(i as usize) });
+        }
+    });
+}
+
+/// `(multiple-value-list-of primary)` — return the multi-value slot
+/// as a fresh Lisp list. If the slot is somehow empty (shouldn't
+/// happen given the invariant, but defensive), fall back to
+/// `(primary)`. Used inside the `multiple-value-bind` /
+/// `multiple-value-list` macro expansions, called immediately
+/// after the form being inspected.
+pub extern "C-unwind" fn multiple_value_list_of_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!(
+            "multiple-value-list-of: expected 1 arg (primary), got {n_args}"
+        );
+    }
+    let primary = unsafe { *args };
+    let m = unsafe { &mut *mutator };
+    let snapshot: Vec<u64> = MV_VALUES.with(|cell| cell.borrow().clone());
+    let source = if snapshot.is_empty() {
+        vec![primary]
+    } else {
+        snapshot
+    };
+    let mut acc = Word::NIL;
+    for &v in source.iter().rev() {
+        acc = m.alloc_cons(Word::from_raw(v), acc);
+    }
+    acc.raw()
+}
+
 /// `ncl_lookup_keyword(args, key_start, n_args, keyword) -> value`.
 ///
 /// Scan `args[key_start..n_args]` in steps of 2. If `args[i]`

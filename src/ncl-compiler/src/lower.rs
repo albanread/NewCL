@@ -571,6 +571,20 @@ fn lower_call_in_mut(
             binary_op(&head_name, args, env, coord, Expr::string_char)
         }
         "LET" => lower_let(args, env, coord),
+        // `(values v1 v2 ... vN)` — write all into the multi-value
+        // slot, return `vals[0]` (or NIL). In tail position the
+        // surrounding function's transform leaves this alone, so
+        // multiple-value-bind sees the full set. In non-tail
+        // position the slot is overwritten by the next call's
+        // exit-time `EnsureSingleMv`, but the primary still flows
+        // through as the form's value.
+        "VALUES" => {
+            let lowered: Result<Vec<_>, _> = args
+                .iter()
+                .map(|a| lower_in_mut(a, env, coord))
+                .collect();
+            Ok(Expr::values(lowered?))
+        }
         "DEFUN" => Err(CompileError::BadDefun(
             "(defun ...) is only allowed at top level".into(),
         )),
@@ -1149,6 +1163,8 @@ fn lower_lambda(
     } else {
         Expr::let_(prologue, lowered_body)
     };
+    // Same tail-position MV instrumentation as for top-level defun.
+    let body_expr = instrument_tail_for_mv(body_expr);
 
     let captures = inner_env.take_captures();
     Ok(Expr::lambda(params.required.len() as u32, body_expr, captures))
@@ -1214,6 +1230,46 @@ pub(crate) fn build_arglist_prologue(
     }
 
     Ok(bindings)
+}
+
+/// Walk an expression's tail positions. Where the tail position
+/// already holds an `Expr::Values`, leave it alone — `values` will
+/// write the multi-value slot itself. Anywhere else, wrap the tail
+/// with `Expr::EnsureSingleMv`, which writes `[primary]` into the
+/// slot at function exit. Together this guarantees the per-call
+/// invariant that the multi-value slot reflects the actual return
+/// values of the function the caller just invoked.
+///
+/// "Tail position" recurses through forms that propagate their last
+/// sub-expression's value as their own — Progn (last form), Let
+/// (body), If (both branches). Everything else is a leaf tail and
+/// gets the single-MV wrap.
+pub(crate) fn instrument_tail_for_mv(e: Expr) -> Expr {
+    match e {
+        Expr::Values(_) => e,
+        Expr::Progn(mut es) => {
+            if let Some(last) = es.pop() {
+                es.push(instrument_tail_for_mv(last));
+            }
+            Expr::Progn(es)
+        }
+        Expr::Let { bindings, body } => {
+            Expr::Let {
+                bindings,
+                body: Box::new(instrument_tail_for_mv(*body)),
+            }
+        }
+        Expr::If(c, t, f) => Expr::If(
+            c,
+            Box::new(instrument_tail_for_mv(*t)),
+            Box::new(instrument_tail_for_mv(*f)),
+        ),
+        // EnsureSingleMv on top of EnsureSingleMv would be wasted
+        // work; keep the inner one.
+        Expr::EnsureSingleMv(_) => e,
+        // Everything else is a leaf tail. Wrap.
+        other => Expr::ensure_single_mv(other),
+    }
 }
 
 /// Push a name into `env` as either a plain local or a one-cell

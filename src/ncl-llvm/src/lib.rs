@@ -29,7 +29,8 @@ use ncl_runtime::{
     ncl_alloc_cons, ncl_apply, ncl_build_rest_list, ncl_call, ncl_equal, ncl_funcall,
     ncl_length, ncl_load_function, ncl_load_value, ncl_lookup_keyword,
     ncl_make_closure, ncl_set_car,
-    ncl_set_cdr, ncl_store_value, ncl_string_char, ncl_string_eq, ncl_string_set,
+    ncl_set_cdr, ncl_set_mv_many, ncl_set_mv_single, ncl_store_value,
+    ncl_string_char, ncl_string_eq, ncl_string_set,
     MutatorState, Tag, Word,
 };
 
@@ -218,6 +219,8 @@ struct Helpers<'ctx> {
     build_rest_list: FunctionValue<'ctx>,
     apply: FunctionValue<'ctx>,
     lookup_keyword: FunctionValue<'ctx>,
+    set_mv_single: FunctionValue<'ctx>,
+    set_mv_many: FunctionValue<'ctx>,
 }
 
 fn declare_runtime_helpers<'ctx>(
@@ -375,6 +378,23 @@ fn declare_runtime_helpers<'ctx>(
         Some(Linkage::External),
     );
 
+    // ncl_set_mv_single(value) -> ()
+    let set_mv_single_type = context.void_type().fn_type(&[i64_t.into()], false);
+    let set_mv_single = module.add_function(
+        "ncl_set_mv_single",
+        set_mv_single_type,
+        Some(Linkage::External),
+    );
+
+    // ncl_set_mv_many(args_ptr, n) -> ()
+    let set_mv_many_type =
+        context.void_type().fn_type(&[ptr_t.into(), i64_t.into()], false);
+    let set_mv_many = module.add_function(
+        "ncl_set_mv_many",
+        set_mv_many_type,
+        Some(Linkage::External),
+    );
+
     Helpers {
         alloc_cons,
         call_fn,
@@ -393,6 +413,8 @@ fn declare_runtime_helpers<'ctx>(
         build_rest_list,
         apply,
         lookup_keyword,
+        set_mv_single,
+        set_mv_many,
     }
 }
 
@@ -414,6 +436,8 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(&helpers.build_rest_list, ncl_build_rest_list as *const () as usize);
     engine.add_global_mapping(&helpers.apply, ncl_apply as *const () as usize);
     engine.add_global_mapping(&helpers.lookup_keyword, ncl_lookup_keyword as *const () as usize);
+    engine.add_global_mapping(&helpers.set_mv_single, ncl_set_mv_single as *const () as usize);
+    engine.add_global_mapping(&helpers.set_mv_many, ncl_set_mv_many as *const () as usize);
 }
 
 /// Convert an i1 comparison result to a tagged Word (T or NIL).
@@ -676,6 +700,57 @@ fn emit_expr<'ctx>(
                 .map_err(|e| format!("key phi: {e}"))?;
             phi.add_incoming(&[(&defaulted, then_end), (&raw, else_end)]);
             Ok(phi.as_basic_value().into_int_value())
+        }
+        Expr::Values(vals) => {
+            // Evaluate each val, store into a stack-alloca'd buffer,
+            // call ncl_set_mv_many, return vals[0] (or NIL).
+            if vals.is_empty() {
+                let nil = i64_t.const_int(Word::NIL.raw(), false);
+                let n = i64_t.const_int(0, false);
+                let null_ptr = ptr_t.const_null();
+                builder
+                    .build_call(
+                        helpers.set_mv_many,
+                        &[null_ptr.into(), n.into()],
+                        "set_mv_zero",
+                    )
+                    .map_err(|e| format!("call set_mv_many: {e}"))?;
+                return Ok(nil);
+            }
+            let n = vals.len() as u64;
+            let n_const = i64_t.const_int(n, false);
+            let buf = builder
+                .build_array_alloca(i64_t, n_const, "mv_buf")
+                .map_err(|e| format!("alloca mv_buf: {e}"))?;
+            let mut lowered_vals = Vec::with_capacity(vals.len());
+            for (i, v) in vals.iter().enumerate() {
+                let lv = emit_expr(context, builder, function, helpers, arity, locals, v)?;
+                let idx = i64_t.const_int(i as u64, false);
+                let slot = unsafe {
+                    builder
+                        .build_in_bounds_gep(i64_t, buf, &[idx], "mv_slot")
+                        .map_err(|e| format!("gep mv_slot: {e}"))?
+                };
+                builder
+                    .build_store(slot, lv)
+                    .map_err(|e| format!("store mv_slot: {e}"))?;
+                lowered_vals.push(lv);
+            }
+            builder
+                .build_call(
+                    helpers.set_mv_many,
+                    &[buf.into(), n_const.into()],
+                    "set_mv",
+                )
+                .map_err(|e| format!("call set_mv_many: {e}"))?;
+            Ok(lowered_vals[0])
+        }
+        Expr::EnsureSingleMv(primary) => {
+            let v = emit_expr(context, builder, function, helpers, arity, locals, primary)?;
+            builder
+                .build_call(helpers.set_mv_single, &[v.into()], "ensure_single")
+                .map_err(|e| format!("call set_mv_single: {e}"))?;
+            Ok(v)
         }
         Expr::ClosureRef(idx) => {
             // env (function param 1) is a Vector-tagged Word. Untag,
