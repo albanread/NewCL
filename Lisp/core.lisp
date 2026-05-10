@@ -157,7 +157,32 @@
 (defun zerop (n) (= n 0))
 (defun plusp (n) (> n 0))
 (defun minusp (n) (< n 0))
-;; oddp / evenp wait on integer division (truncate / mod).
+
+;; CL `mod` matches the sign of the divisor; `rem` matches the
+;; sign of the dividend. They differ only when divisor and
+;; dividend have opposite signs and the remainder is non-zero.
+(defun mod (a b)
+  (let ((r (rem a b)))
+    (if (zerop r)
+        0
+        (if (eq (minusp r) (minusp b))
+            r
+            (+ r b)))))
+
+(defun evenp (n) (zerop (rem n 2)))
+(defun oddp (n) (not (evenp n)))
+
+;; (floor a b): largest integer k such that k*b <= a (when b > 0;
+;; flips for b < 0). Differs from truncate only when sign(a) !=
+;; sign(b) and there's a non-zero remainder, in which case floor
+;; rounds further from zero.
+(defun floor (a b)
+  (let ((q (truncate a b))
+        (r (rem a b)))
+    (if (and (not (zerop r))
+             (not (eq (minusp r) (minusp b))))
+        (- q 1)
+        q)))
 
 (defun 1+ (n) (+ n 1))
 (defun 1- (n) (- n 1))

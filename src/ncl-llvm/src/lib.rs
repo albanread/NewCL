@@ -638,6 +638,33 @@ fn emit_expr<'ctx>(
                 .build_int_mul(lhs, rhs_untagged, "mul")
                 .map_err(|e| format!("build_int_mul: {e}"))
         }
+        Expr::Truncate(a, b) => {
+            // Untag both, sdiv, retag.
+            let lhs = emit_expr(context, builder, function, helpers, arity, locals, a)?;
+            let rhs = emit_expr(context, builder, function, helpers, arity, locals, b)?;
+            let three = i64_t.const_int(3, false);
+            let lhs_u = builder
+                .build_right_shift(lhs, three, true, "untag_lhs")
+                .map_err(|e| format!("ashr: {e}"))?;
+            let rhs_u = builder
+                .build_right_shift(rhs, three, true, "untag_rhs")
+                .map_err(|e| format!("ashr: {e}"))?;
+            let q = builder
+                .build_int_signed_div(lhs_u, rhs_u, "trunc")
+                .map_err(|e| format!("build_int_signed_div: {e}"))?;
+            builder
+                .build_left_shift(q, three, "trunc_tag")
+                .map_err(|e| format!("shl: {e}"))
+        }
+        Expr::Rem(a, b) => {
+            // srem of two tagged fixnums returns an already-tagged
+            // fixnum: (a<<3) srem (b<<3) = (a rem b) << 3.
+            let lhs = emit_expr(context, builder, function, helpers, arity, locals, a)?;
+            let rhs = emit_expr(context, builder, function, helpers, arity, locals, b)?;
+            builder
+                .build_int_signed_rem(lhs, rhs, "rem")
+                .map_err(|e| format!("build_int_signed_rem: {e}"))
+        }
         Expr::Cons(car, cdr) => {
             let car_val = emit_expr(context, builder, function, helpers, arity, locals, car)?;
             let cdr_val = emit_expr(context, builder, function, helpers, arity, locals, cdr)?;

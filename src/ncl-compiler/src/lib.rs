@@ -1649,6 +1649,82 @@ mod end_to_end_tests {
         assert_eq!(result, "720");
     }
 
+    // -- truncate / rem (integer division primitives) ---------------------
+
+    #[test]
+    fn truncate_basic() {
+        assert_eq!(eval_str("(truncate 10 3)").unwrap(), "3");
+        assert_eq!(eval_str("(truncate 7 2)").unwrap(), "3");
+        assert_eq!(eval_str("(truncate 6 3)").unwrap(), "2");
+        // Truncate rounds toward zero — negative dividend.
+        assert_eq!(eval_str("(truncate -7 2)").unwrap(), "-3");
+        assert_eq!(eval_str("(truncate 7 -2)").unwrap(), "-3");
+        assert_eq!(eval_str("(truncate -7 -2)").unwrap(), "3");
+    }
+
+    #[test]
+    fn rem_basic() {
+        assert_eq!(eval_str("(rem 10 3)").unwrap(), "1");
+        assert_eq!(eval_str("(rem 7 2)").unwrap(), "1");
+        assert_eq!(eval_str("(rem 6 3)").unwrap(), "0");
+        // rem matches the sign of the dividend.
+        assert_eq!(eval_str("(rem -7 2)").unwrap(), "-1");
+        assert_eq!(eval_str("(rem 7 -2)").unwrap(), "1");
+        assert_eq!(eval_str("(rem -7 -2)").unwrap(), "-1");
+    }
+
+    #[test]
+    fn truncate_rem_invariant() {
+        // (= a (+ (* (truncate a b) b) (rem a b))) for any a, b.
+        let mut session = Session::new();
+        session
+            .eval("(defun ok (a b) (= a (+ (* (truncate a b) b) (rem a b))))")
+            .unwrap();
+        assert_eq!(session.eval("(ok 17 5)").unwrap(), "T");
+        assert_eq!(session.eval("(ok -17 5)").unwrap(), "T");
+        assert_eq!(session.eval("(ok 17 -5)").unwrap(), "T");
+        assert_eq!(session.eval("(ok -17 -5)").unwrap(), "T");
+        assert_eq!(session.eval("(ok 42 7)").unwrap(), "T");
+    }
+
+    #[test]
+    fn stdlib_mod_matches_divisor_sign() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Same sign as divisor — differs from rem when signs differ.
+        assert_eq!(s.eval("(mod 10 3)").unwrap(), "1");
+        assert_eq!(s.eval("(mod -7 2)").unwrap(), "1");   // rem returns -1
+        assert_eq!(s.eval("(mod 7 -2)").unwrap(), "-1");  // rem returns 1
+        assert_eq!(s.eval("(mod -7 -2)").unwrap(), "-1"); // matches rem
+        // Exact divisions return 0 regardless of sign.
+        assert_eq!(s.eval("(mod 6 3)").unwrap(), "0");
+        assert_eq!(s.eval("(mod -6 3)").unwrap(), "0");
+    }
+
+    #[test]
+    fn stdlib_oddp_evenp() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(evenp 0)").unwrap(), "T");
+        assert_eq!(s.eval("(evenp 4)").unwrap(), "T");
+        assert_eq!(s.eval("(evenp -4)").unwrap(), "T");
+        assert_eq!(s.eval("(evenp 3)").unwrap(), "nil");
+        assert_eq!(s.eval("(oddp 3)").unwrap(), "T");
+        assert_eq!(s.eval("(oddp -3)").unwrap(), "T");
+        assert_eq!(s.eval("(oddp 0)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn stdlib_floor_rounds_toward_negative_infinity() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Differs from truncate on mixed signs with non-zero remainder.
+        assert_eq!(s.eval("(floor 7 2)").unwrap(), "3");
+        assert_eq!(s.eval("(floor -7 2)").unwrap(), "-4");  // truncate would give -3
+        assert_eq!(s.eval("(floor 7 -2)").unwrap(), "-4");
+        assert_eq!(s.eval("(floor -7 -2)").unwrap(), "3");
+        // Exact divisions match truncate.
+        assert_eq!(s.eval("(floor 6 3)").unwrap(), "2");
+        assert_eq!(s.eval("(floor -6 3)").unwrap(), "-2");
+    }
+
     // -- when / unless ----------------------------------------------------
 
     #[test]

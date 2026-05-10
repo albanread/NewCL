@@ -339,6 +339,12 @@ fn lower_call_in_mut(
     match head_name.as_str() {
         "+" => fold_arithmetic(&head_name, args, env, coord, 0, Expr::add),
         "*" => fold_arithmetic(&head_name, args, env, coord, 1, Expr::mul),
+        // Integer division and remainder. CL's `truncate` and `rem`
+        // pair: rem's sign matches the dividend (LLVM srem
+        // semantics). `mod` (sign of divisor) is a user-Lisp
+        // wrapper — see Lisp/core.lisp.
+        "TRUNCATE" => binary_op(&head_name, args, env, coord, Expr::truncate),
+        "REM" => binary_op(&head_name, args, env, coord, Expr::rem),
         "QUOTE" => {
             if args.len() != 1 {
                 return Err(CompileError::BadArity {

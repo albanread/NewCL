@@ -47,6 +47,17 @@ pub enum Expr {
     Sub(Box<Expr>, Box<Expr>),
     /// Binary multiplication.
     Mul(Box<Expr>, Box<Expr>),
+    /// Integer division, truncating toward zero. Both operands are
+    /// tagged fixnums; the lowering untags, runs LLVM `sdiv`, and
+    /// re-tags the quotient. Division by zero is currently UB at
+    /// the LLVM level (lands as a hardware SIGFPE / STATUS_INTEGER_
+    /// DIVIDE_BY_ZERO) — proper condition signalling waits on the
+    /// condition system.
+    Truncate(Box<Expr>, Box<Expr>),
+    /// Remainder. Result has the sign of the dividend (matches
+    /// LLVM `srem` and CL's `rem`). Both operands tagged; result is
+    /// already tagged because `srem (a<<3) (b<<3) = (a rem b) << 3`.
+    Rem(Box<Expr>, Box<Expr>),
     /// Allocate a cons cell. Calls `ncl_alloc_cons` at runtime.
     Cons(Box<Expr>, Box<Expr>),
     /// Read the car field of a cons.
@@ -148,6 +159,10 @@ impl Expr {
     pub fn add(a: Expr, b: Expr) -> Expr { Expr::Add(Box::new(a), Box::new(b)) }
     pub fn sub(a: Expr, b: Expr) -> Expr { Expr::Sub(Box::new(a), Box::new(b)) }
     pub fn mul(a: Expr, b: Expr) -> Expr { Expr::Mul(Box::new(a), Box::new(b)) }
+    pub fn truncate(a: Expr, b: Expr) -> Expr {
+        Expr::Truncate(Box::new(a), Box::new(b))
+    }
+    pub fn rem(a: Expr, b: Expr) -> Expr { Expr::Rem(Box::new(a), Box::new(b)) }
     pub fn cons(car: Expr, cdr: Expr) -> Expr { Expr::Cons(Box::new(car), Box::new(cdr)) }
     pub fn car(x: Expr) -> Expr { Expr::Car(Box::new(x)) }
     pub fn cdr(x: Expr) -> Expr { Expr::Cdr(Box::new(x)) }
