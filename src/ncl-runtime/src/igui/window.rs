@@ -342,11 +342,11 @@ unsafe extern "system" fn frame_wnd_proc(
             unsafe { DefFrameProcW(hwnd, Some(mdi), msg, wparam, lparam) }
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
-            push_key(true, wparam, lparam);
+            push_key(FRAME_CHILD_ID, true, wparam, lparam);
             unsafe { DefFrameProcW(hwnd, Some(mdi), msg, wparam, lparam) }
         }
         WM_KEYUP | WM_SYSKEYUP => {
-            push_key(false, wparam, lparam);
+            push_key(FRAME_CHILD_ID, false, wparam, lparam);
             unsafe { DefFrameProcW(hwnd, Some(mdi), msg, wparam, lparam) }
         }
         WM_CHAR => {
@@ -479,11 +479,11 @@ fn handle_open_child(req: &OpenChildRequest) -> Option<i64> {
     Some(child_id)
 }
 
-fn msg_time() -> i64 {
+pub(crate) fn msg_time() -> i64 {
     unsafe { GetMessageTime() as i64 }
 }
 
-fn current_modifiers() -> i64 {
+pub(crate) fn current_modifiers() -> i64 {
     let mut m = 0i64;
     unsafe {
         if (GetKeyState(VK_SHIFT.0 as i32) as i16) < 0 {
@@ -507,11 +507,11 @@ fn current_modifiers() -> i64 {
     m
 }
 
-fn push_key(down: bool, wparam: WPARAM, lparam: LPARAM) {
+pub(crate) fn push_key(child_id: i64, down: bool, wparam: WPARAM, lparam: LPARAM) {
     let scancode = ((lparam.0 >> 16) & 0xFF) as i64;
     let repeat = (lparam.0 & 0xFFFF) as i64;
     channels::push(IGuiEvent::Key {
-        child_id: FRAME_CHILD_ID,
+        child_id,
         vkey: wparam.0 as i64,
         scancode,
         mods: current_modifiers(),
@@ -521,7 +521,7 @@ fn push_key(down: bool, wparam: WPARAM, lparam: LPARAM) {
     });
 }
 
-fn push_mouse(child_id: i64, op: i64, button: i64, lparam: LPARAM) {
+pub(crate) fn push_mouse(child_id: i64, op: i64, button: i64, lparam: LPARAM) {
     let x = (lparam.0 & 0xFFFF) as i16 as i64;
     let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i64;
     channels::push(IGuiEvent::Mouse {

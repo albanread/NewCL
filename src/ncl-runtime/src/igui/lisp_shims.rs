@@ -668,85 +668,129 @@ pub extern "C-unwind" fn emit_draw_text_styled_shim(
     let c = arg_fixnum(args, 4).expect("color");
     let opts = arg(args, 5);
 
-    let mut family = "Segoe UI".to_string();
-    let mut weight: u16 = 400;
-    let mut style = FontStyle::Normal;
-    let mut stretch = FontStretch::Normal;
-    let mut alignment = TextAlign::Leading;
-
-    let mut cur = opts;
-    while !cur.is_nil() {
-        let Some((k, rest)) = take_pair(cur) else { break };
-        let Some((v, rest)) = take_pair(rest) else { break };
-        cur = rest;
-        let Some(kname) = keyword_name(k) else { continue };
-        match kname.as_ref() {
-            ":FAMILY" => {
-                if v.tag() == Tag::String {
-                    family = crate::gc_string::chars_of(v).collect();
-                }
-            }
-            ":WEIGHT" => {
-                if let Some(n) = v.as_fixnum() {
-                    weight = n.clamp(100, 900) as u16;
-                }
-            }
-            ":STYLE" => {
-                if let Some(name) = keyword_name(v) {
-                    style = match name.as_ref() {
-                        ":ITALIC" => FontStyle::Italic,
-                        ":OBLIQUE" => FontStyle::Oblique,
-                        _ => FontStyle::Normal,
-                    };
-                }
-            }
-            ":STRETCH" => {
-                if let Some(n) = v.as_fixnum() {
-                    stretch = match n {
-                        1 => FontStretch::UltraCondensed,
-                        2 => FontStretch::ExtraCondensed,
-                        3 => FontStretch::Condensed,
-                        4 => FontStretch::SemiCondensed,
-                        5 => FontStretch::Normal,
-                        6 => FontStretch::SemiExpanded,
-                        7 => FontStretch::Expanded,
-                        8 => FontStretch::ExtraExpanded,
-                        9 => FontStretch::UltraExpanded,
-                        _ => FontStretch::Normal,
-                    };
-                }
-            }
-            ":ALIGN" => {
-                if let Some(name) = keyword_name(v) {
-                    alignment = match name.as_ref() {
-                        ":CENTER" => TextAlign::Center,
-                        ":TRAILING" | ":RIGHT" => TextAlign::Trailing,
-                        ":JUSTIFIED" => TextAlign::Justified,
-                        _ => TextAlign::Leading,
-                    };
-                }
-            }
-            _ => {}
-        }
-    }
-
+    let style_opts = parse_text_opts(opts);
     batch_mod::push(SurfaceCmd::DrawTextRun {
         run: TextRun {
             text,
             origin: Point { x, y },
-            family,
+            family: style_opts.family,
             size,
-            weight,
-            style,
-            stretch,
+            weight: style_opts.weight,
+            style: style_opts.style,
+            stretch: style_opts.stretch,
             locale: "en-us".to_string(),
             color: unpack_rgba(c),
             max_width: None,
-            alignment,
+            alignment: style_opts.alignment,
             trimming: TextTrimming::None,
         },
     });
     Word::T.raw()
+}
+
+/// `(measure-text child-id text size opts-plist)` →
+/// `(:width W :height H :ascent A :line-count N)` or NIL.
+///
+/// Uses the same text-runs and the same DirectWrite layout cache
+/// the drawing path uses, so width/height returned here matches
+/// what `draw-text-styled` will render. Implementation submits a
+/// measure-only batch on top of the live draw batch and restores
+/// the draw batch as soon as the reply arrives — so the pane's
+/// visible content shouldn't change observably for the user
+/// (modulo a frame's worth of paint timing, which is invisibly
+/// fast).
+pub extern "C-unwind" fn measure_text_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 4 {
+        panic!("measure-text: expected 4 args (child-id text size opts), got {n_args}");
+    }
+    let Some(child_id) = arg_fixnum(args, 0) else {
+        panic!("measure-text: child-id must be a fixnum");
+    };
+    let Some(text) = arg_string(args, 1) else {
+        panic!("measure-text: text must be a string");
+    };
+    let size = arg_fixnum(args, 2).expect("size") as f32;
+    let opts = arg(args, 3);
+
+    let style_opts = parse_text_opts(opts);
+    let run = TextRun {
+        text,
+        origin: Point { x: 0.0, y: 0.0 },
+        family: style_opts.family,
+        size,
+        weight: style_opts.weight,
+        style: style_opts.style,
+        stretch: style_opts.stretch,
+        locale: "en-us".to_string(),
+        color: Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+        max_width: None,
+        alignment: style_opts.alignment,
+        trimming: TextTrimming::None,
+    };
+
+    // Save state we'll need to put back when we're done.
+    //
+    //   `in_progress` — the batch the calling thread is currently
+    //                   building, if any (i.e. we were called from
+    //                   inside a with-batch). `begin()` would
+    //                   clobber this without the save.
+    //   `displayed`   — the batch currently in the pane's slot,
+    //                   which `submit()` of our measure batch will
+    //                   replace. We restore it after the measure
+    //                   reply arrives so the visible content stays
+    //                   put.
+    let in_progress = batch_mod::finish();
+    let displayed = batch_mod::snapshot(child_id);
+
+    let request_id = super::replies::alloc_id();
+    let rx = super::replies::install(request_id);
+    batch_mod::begin(child_id);
+    batch_mod::push(SurfaceCmd::MeasureTextRun { request_id, run });
+    let Some(b) = batch_mod::finish() else {
+        batch_mod::restore_current(in_progress);
+        return Word::NIL.raw();
+    };
+    if !batch_mod::submit(b) {
+        batch_mod::restore_current(in_progress);
+        return Word::NIL.raw();
+    }
+
+    let metrics = super::replies::wait(rx);
+
+    // Restore the displayed batch (so the pane's visible content
+    // doesn't go blank), then the in-progress batch (so the
+    // surrounding with-batch can keep pushing into it).
+    if let Some(arc) = displayed {
+        let _ = batch_mod::submit((*arc).clone());
+    }
+    batch_mod::restore_current(in_progress);
+
+    let (width, height, ascent, line_count) = match metrics {
+        Some(super::replies::Reply::Metrics { width, height, ascent, line_count }) => {
+            (width, height, ascent, line_count)
+        }
+        _ => return Word::NIL.raw(),
+    };
+
+    let m = unsafe { &mut *mutator };
+    let coord = std::sync::Arc::clone(m.coord());
+    let pairs = [
+        (kw(&coord, "WIDTH"), Word::fixnum(width.round() as i64)),
+        (kw(&coord, "HEIGHT"), Word::fixnum(height.round() as i64)),
+        (kw(&coord, "ASCENT"), Word::fixnum(ascent.round() as i64)),
+        (kw(&coord, "LINE-COUNT"), Word::fixnum(line_count as i64)),
+    ];
+    let mut acc = Word::NIL;
+    for (k, v) in pairs.iter().rev() {
+        acc = m.alloc_cons(*v, acc);
+        acc = m.alloc_cons(*k, acc);
+    }
+    acc.raw()
 }
 
 /// Pull a (car, cdr) from a Word that's expected to be a Cons.
@@ -769,6 +813,91 @@ fn keyword_name(w: Word) -> Option<std::sync::Arc<str>> {
         return None;
     }
     crate::sym_names::lookup(w.raw())
+}
+
+/// Parsed text-styling options. Used by both `draw-text-styled`
+/// and `measure-text` so the rendering and the measurement see
+/// identical text-run parameters.
+struct TextOpts {
+    family: String,
+    weight: u16,
+    style: FontStyle,
+    stretch: FontStretch,
+    alignment: TextAlign,
+}
+
+impl Default for TextOpts {
+    fn default() -> Self {
+        TextOpts {
+            family: "Segoe UI".to_string(),
+            weight: 400,
+            style: FontStyle::Normal,
+            stretch: FontStretch::Normal,
+            alignment: TextAlign::Leading,
+        }
+    }
+}
+
+/// Walk a `(:key1 val1 :key2 val2 ...)` plist and populate text
+/// styling fields. Unrecognised keys are silently ignored.
+fn parse_text_opts(opts: Word) -> TextOpts {
+    let mut out = TextOpts::default();
+    let mut cur = opts;
+    while !cur.is_nil() {
+        let Some((k, rest)) = take_pair(cur) else { break };
+        let Some((v, rest)) = take_pair(rest) else { break };
+        cur = rest;
+        let Some(kname) = keyword_name(k) else { continue };
+        match kname.as_ref() {
+            ":FAMILY" => {
+                if v.tag() == Tag::String {
+                    out.family = crate::gc_string::chars_of(v).collect();
+                }
+            }
+            ":WEIGHT" => {
+                if let Some(n) = v.as_fixnum() {
+                    out.weight = n.clamp(100, 900) as u16;
+                }
+            }
+            ":STYLE" => {
+                if let Some(name) = keyword_name(v) {
+                    out.style = match name.as_ref() {
+                        ":ITALIC" => FontStyle::Italic,
+                        ":OBLIQUE" => FontStyle::Oblique,
+                        _ => FontStyle::Normal,
+                    };
+                }
+            }
+            ":STRETCH" => {
+                if let Some(n) = v.as_fixnum() {
+                    out.stretch = match n {
+                        1 => FontStretch::UltraCondensed,
+                        2 => FontStretch::ExtraCondensed,
+                        3 => FontStretch::Condensed,
+                        4 => FontStretch::SemiCondensed,
+                        5 => FontStretch::Normal,
+                        6 => FontStretch::SemiExpanded,
+                        7 => FontStretch::Expanded,
+                        8 => FontStretch::ExtraExpanded,
+                        9 => FontStretch::UltraExpanded,
+                        _ => FontStretch::Normal,
+                    };
+                }
+            }
+            ":ALIGN" => {
+                if let Some(name) = keyword_name(v) {
+                    out.alignment = match name.as_ref() {
+                        ":CENTER" => TextAlign::Center,
+                        ":TRAILING" | ":RIGHT" => TextAlign::Trailing,
+                        ":JUSTIFIED" => TextAlign::Justified,
+                        _ => TextAlign::Leading,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// `(%emit-draw-text x y text size color)` — render a string in

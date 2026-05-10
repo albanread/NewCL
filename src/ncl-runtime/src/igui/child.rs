@@ -41,13 +41,17 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefMDIChildProcW, DefWindowProcW, GetClientRect, GetParent,
     GetWindowLongPtrW, IsWindow, IsWindowVisible, KillTimer, LoadCursorW, RegisterClassExW,
-    SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, CREATESTRUCTW, GWLP_USERDATA,
-    IDC_ARROW, MDICREATESTRUCTW, SWP_NOACTIVATE, SWP_NOZORDER, WINDOW_EX_STYLE,
-    WM_DPICHANGED_AFTERPARENT, WM_ERASEBKGND, WM_MDIDESTROY, WM_NCCREATE, WM_NCDESTROY,
-    WM_PAINT, WM_SETCURSOR, WM_SETTEXT, WM_SIZE, WM_TIMER, WNDCLASSEXW, WNDCLASS_STYLES,
+    SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, CREATESTRUCTW,
+    GWLP_USERDATA, IDC_ARROW, MDICREATESTRUCTW, SWP_NOACTIVATE, SWP_NOZORDER,
+    WHEEL_DELTA, WINDOW_EX_STYLE, WM_CHAR, WM_DPICHANGED_AFTERPARENT, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MDIDESTROY, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY,
+    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTEXT,
+    WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WNDCLASS_STYLES,
     WS_CHILD, WS_CLIPSIBLINGS, WS_VISIBLE,
 };
 
@@ -1836,6 +1840,119 @@ unsafe extern "system" fn render_host_wnd_proc(
             if !raw.is_null() {
                 let state = unsafe { &*raw };
                 super::cursor::refresh_for(state.child_id, hwnd);
+            }
+            LRESULT(0)
+        }
+        // ─── Input ─────────────────────────────────────────────────
+        WM_MOUSEMOVE => {
+            if !raw.is_null() {
+                let cid = unsafe { (*raw).child_id };
+                window::push_mouse(cid, super::channels::mouse_op::MOVE, 0, lparam);
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            if !raw.is_null() {
+                let cid = unsafe { (*raw).child_id };
+                // Click → focus, so subsequent keystrokes route here.
+                let _ = unsafe { SetFocus(Some(hwnd)) };
+                window::push_mouse(cid, super::channels::mouse_op::LEFT_DOWN, 1, lparam);
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            if !raw.is_null() {
+                let cid = unsafe { (*raw).child_id };
+                window::push_mouse(cid, super::channels::mouse_op::LEFT_UP, 1, lparam);
+            }
+            LRESULT(0)
+        }
+        WM_RBUTTONDOWN => {
+            if !raw.is_null() {
+                let cid = unsafe { (*raw).child_id };
+                window::push_mouse(cid, super::channels::mouse_op::RIGHT_DOWN, 2, lparam);
+            }
+            LRESULT(0)
+        }
+        WM_RBUTTONUP => {
+            if !raw.is_null() {
+                let cid = unsafe { (*raw).child_id };
+                window::push_mouse(cid, super::channels::mouse_op::RIGHT_UP, 2, lparam);
+            }
+            LRESULT(0)
+        }
+        WM_MBUTTONDOWN => {
+            if !raw.is_null() {
+                let cid = unsafe { (*raw).child_id };
+                window::push_mouse(cid, super::channels::mouse_op::MIDDLE_DOWN, 3, lparam);
+            }
+            LRESULT(0)
+        }
+        WM_MBUTTONUP => {
+            if !raw.is_null() {
+                let cid = unsafe { (*raw).child_id };
+                window::push_mouse(cid, super::channels::mouse_op::MIDDLE_UP, 3, lparam);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            if !raw.is_null() {
+                let cid = unsafe { (*raw).child_id };
+                let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as i64;
+                let lines = delta / WHEEL_DELTA as i64;
+                let x = (lparam.0 & 0xFFFF) as i16 as i64;
+                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i64;
+                channels::push(IGuiEvent::Mouse {
+                    child_id: cid,
+                    x,
+                    y,
+                    op: super::channels::mouse_op::WHEEL,
+                    button: 0,
+                    mods: window::current_modifiers(),
+                    wheel_delta: delta,
+                    wheel_lines: lines,
+                    time_ms: window::msg_time(),
+                });
+            }
+            LRESULT(0)
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            if !raw.is_null() {
+                let cid = unsafe { (*raw).child_id };
+                window::push_key(cid, true, wparam, lparam);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_KEYUP | WM_SYSKEYUP => {
+            if !raw.is_null() {
+                let cid = unsafe { (*raw).child_id };
+                window::push_key(cid, false, wparam, lparam);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_CHAR => {
+            if !raw.is_null() {
+                let cid = unsafe { (*raw).child_id };
+                channels::push(IGuiEvent::Char {
+                    child_id: cid,
+                    codepoint: wparam.0 as i64,
+                    mods: window::current_modifiers(),
+                    time_ms: window::msg_time(),
+                });
+            }
+            LRESULT(0)
+        }
+        WM_SETFOCUS => {
+            if !raw.is_null() {
+                let cid = unsafe { (*raw).child_id };
+                channels::push(IGuiEvent::Focus { child_id: cid, gained: true });
+            }
+            LRESULT(0)
+        }
+        WM_KILLFOCUS => {
+            if !raw.is_null() {
+                let cid = unsafe { (*raw).child_id };
+                channels::push(IGuiEvent::Focus { child_id: cid, gained: false });
             }
             LRESULT(0)
         }

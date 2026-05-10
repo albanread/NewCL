@@ -47,8 +47,8 @@ pub use igui::lisp_shims::{
     emit_fill_circle_shim,
     emit_fill_oval_shim, emit_fill_rect_shim, emit_stroke_circle_shim,
     emit_stroke_oval_shim, emit_stroke_rect_shim, igui_quit_shim,
-    igui_start_shim, igui_wait_shim, log_write_shim, next_event_shim,
-    open_child_shim, set_title_shim, submit_batch_shim,
+    igui_start_shim, igui_wait_shim, log_write_shim, measure_text_shim,
+    next_event_shim, open_child_shim, set_title_shim, submit_batch_shim,
 };
 pub use printer::{format_word, format_word_aesthetic};
 

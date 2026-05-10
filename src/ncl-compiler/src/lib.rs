@@ -298,6 +298,8 @@ fn install_igui(coord: &Arc<GcCoordinator>, mutator: &mut MutatorState) {
                    ncl_runtime::emit_draw_text_shim, 5);
     install_native(coord, mutator, "%EMIT-DRAW-TEXT-STYLED",
                    ncl_runtime::emit_draw_text_styled_shim, 6);
+    install_native(coord, mutator, "%MEASURE-TEXT",
+                   ncl_runtime::measure_text_shim, 4);
     install_native(coord, mutator, "%EMIT-FILL-OVAL",
                    ncl_runtime::emit_fill_oval_shim, 5);
     install_native(coord, mutator, "%EMIT-STROKE-OVAL",

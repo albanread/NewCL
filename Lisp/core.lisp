@@ -391,6 +391,15 @@
    floats land when the compiler grows them."
   (%emit-draw-arc cx cy radius rotation-deg aperture-deg thickness color))
 
+(defun measure-text (child-id text size &rest opts)
+  "Measure TEXT as it would render in CHILD-ID's pane. Returns a
+   plist `(:width W :height H :ascent A :line-count N)` (all
+   fixnums, rounded to nearest pixel) or NIL on failure.
+
+   OPTS takes the same keys as `draw-text-styled` so layout sees
+   the same metrics drawing will produce."
+  (%measure-text child-id text size opts))
+
 ;; -- Log view ----------------------------------------------------------------
 
 (defun log (control &rest args)

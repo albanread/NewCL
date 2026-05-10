@@ -362,6 +362,14 @@ pub fn finish() -> Option<PaneBatch> {
     CURRENT.with(|slot| slot.borrow_mut().take())
 }
 
+/// Restore an earlier in-progress batch into the thread-local
+/// CURRENT slot. Used by `measure-text` so that calling it from
+/// inside a `with-batch` doesn't clobber the user's draw work in
+/// progress: take_current()-do-measure-restore-current(saved).
+pub fn restore_current(saved: Option<PaneBatch>) {
+    CURRENT.with(|slot| *slot.borrow_mut() = saved);
+}
+
 // ─── Phase 5: path builder ──────────────────────────────────────────
 
 thread_local! {
