@@ -26,7 +26,7 @@ use inkwell::values::{FunctionValue, IntValue};
 
 use ncl_ir::Expr;
 use ncl_runtime::{
-    ncl_alloc_cons, ncl_apply, ncl_aref_generic, ncl_aset_generic,
+    ncl_abort_pending, ncl_alloc_cons, ncl_apply, ncl_aref_generic, ncl_aset_generic,
     ncl_build_rest_list, ncl_call, ncl_equal, ncl_funcall,
     ncl_length, ncl_load_function, ncl_load_value, ncl_lookup_keyword,
     ncl_make_closure, ncl_set_car,
@@ -224,6 +224,7 @@ struct Helpers<'ctx> {
     set_mv_many: FunctionValue<'ctx>,
     aref_generic: FunctionValue<'ctx>,
     aset_generic: FunctionValue<'ctx>,
+    abort_pending: FunctionValue<'ctx>,
 }
 
 fn declare_runtime_helpers<'ctx>(
@@ -418,6 +419,16 @@ fn declare_runtime_helpers<'ctx>(
         Some(Linkage::External),
     );
 
+    // ncl_abort_pending() -> i32  — call-site check for the
+    // non-local exit flag. Lowered after every Lisp call.
+    let i32_t = context.i32_type();
+    let abort_pending_type = i32_t.fn_type(&[], false);
+    let abort_pending = module.add_function(
+        "ncl_abort_pending",
+        abort_pending_type,
+        Some(Linkage::External),
+    );
+
     Helpers {
         alloc_cons,
         call_fn,
@@ -440,6 +451,7 @@ fn declare_runtime_helpers<'ctx>(
         set_mv_many,
         aref_generic,
         aset_generic,
+        abort_pending,
     }
 }
 
@@ -465,6 +477,56 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(&helpers.set_mv_many, ncl_set_mv_many as *const () as usize);
     engine.add_global_mapping(&helpers.aref_generic, ncl_aref_generic as *const () as usize);
     engine.add_global_mapping(&helpers.aset_generic, ncl_aset_generic as *const () as usize);
+    engine.add_global_mapping(&helpers.abort_pending, ncl_abort_pending as *const () as usize);
+}
+
+/// Emit the post-call abort check. Calls ncl_abort_pending; if
+/// non-zero, branches to a fresh "early return" block that
+/// returns NIL; otherwise positions at a fresh "continue" block
+/// where the caller's IR can keep building. The caller's
+/// pre-check `result` IntValue stays SSA-accessible in the
+/// continue block (LLVM dominance lets us still use it).
+///
+/// This is the call-site instrumentation that makes (return-from
+/// …) and (error …) actually abort the rest of the body, not
+/// just set a flag the next block boundary will pick up. Same
+/// flag mechanism, plumbed through every Lisp call.
+fn emit_post_call_abort_check<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+) -> Result<(), String> {
+    let i32_t = context.i32_type();
+    let i64_t = context.i64_type();
+    let call = builder
+        .build_call(helpers.abort_pending, &[], "abort_check")
+        .map_err(|e| format!("call abort_pending: {e}"))?;
+    let pending = call
+        .try_as_basic_value()
+        .unwrap_basic()
+        .into_int_value();
+    let zero = i32_t.const_int(0, false);
+    let is_pending = builder
+        .build_int_compare(IntPredicate::NE, pending, zero, "is_abort")
+        .map_err(|e| format!("icmp: {e}"))?;
+    let exit_bb = context.append_basic_block(*function, "abort_exit");
+    let cont_bb = context.append_basic_block(*function, "abort_cont");
+    builder
+        .build_conditional_branch(is_pending, exit_bb, cont_bb)
+        .map_err(|e| format!("cond br: {e}"))?;
+    // Early-return block: NIL is a placeholder — the value is
+    // never observed because every function in the abort chain
+    // also returns early; the matching block / handler-case at
+    // the outer end reads the real value from the abort state.
+    builder.position_at_end(exit_bb);
+    let nil = i64_t.const_int(Word::NIL.raw(), false);
+    builder
+        .build_return(Some(&nil))
+        .map_err(|e| format!("early ret: {e}"))?;
+    // Resume normal IR from the continue block.
+    builder.position_at_end(cont_bb);
+    Ok(())
 }
 
 /// Convert an i1 comparison result to a tagged Word (T or NIL).
@@ -899,7 +961,9 @@ fn emit_expr<'ctx>(
                     "funcall_result",
                 )
                 .map_err(|e| format!("build_call funcall: {e}"))?;
-            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+            let result = call.try_as_basic_value().unwrap_basic().into_int_value();
+            emit_post_call_abort_check(context, builder, function, helpers)?;
+            Ok(result)
         }
         Expr::Apply { fn_expr, prefix, tail } => {
             let fn_val =
@@ -952,7 +1016,9 @@ fn emit_expr<'ctx>(
                     "apply_result",
                 )
                 .map_err(|e| format!("build_call apply: {e}"))?;
-            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+            let result = call.try_as_basic_value().unwrap_basic().into_int_value();
+            emit_post_call_abort_check(context, builder, function, helpers)?;
+            Ok(result)
         }
         Expr::Add(a, b) => {
             let lhs = emit_expr(context, builder, function, helpers, arity, locals, a)?;
@@ -1340,7 +1406,9 @@ fn emit_expr<'ctx>(
                     "call_result",
                 )
                 .map_err(|e| format!("build_call ncl_call: {e}"))?;
-            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+            let result = call.try_as_basic_value().unwrap_basic().into_int_value();
+            emit_post_call_abort_check(context, builder, function, helpers)?;
+            Ok(result)
         }
     }
 }

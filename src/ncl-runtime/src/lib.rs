@@ -38,7 +38,7 @@ pub use abi::{
     loop_return_shim, make_array_shim, multiple_value_list_of_shim, mv_clear_shim,
     native_block_shim, native_loop_shim,
     return_from_shim,
-    ncl_alloc_cons, ncl_apply, ncl_aref_generic, ncl_aset_generic,
+    ncl_abort_pending, ncl_alloc_cons, ncl_apply, ncl_aref_generic, ncl_aset_generic,
     ncl_build_rest_list, ncl_call, ncl_car, ncl_cdr, ncl_equal, ncl_funcall,
     ncl_length, ncl_load_function, ncl_load_value, ncl_lookup_keyword,
     ncl_make_closure, ncl_set_car,

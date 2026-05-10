@@ -498,6 +498,10 @@ pub extern "C-unwind" fn error_shim(
     }
     CONDITION_SLOT.with(|s| s.set(cond));
     CONDITION_PENDING.with(|p| p.set(true));
+    // Also flip the unified abort flag so the call-site
+    // instrumentation propagates this condition out of the body
+    // immediately rather than waiting for natural return.
+    ABORT_PENDING.with(|p| p.set(true));
     Word::NIL.raw()
 }
 
@@ -542,6 +546,10 @@ pub extern "C-unwind" fn handler_case_shim(
     let cond = CONDITION_SLOT.with(|s| s.replace(saved_slot));
 
     if was_pending {
+        // We're consuming this condition — clear the unified
+        // abort flag so the call-site instrumentation in the
+        // handler body doesn't see a stale pending.
+        ABORT_PENDING.with(|p| p.set(false));
         let env = crate::gc_function::env(handler_word);
         let code = crate::gc_function::code_ptr(handler_word);
         let f: crate::gc_function::LispCodeFn =
@@ -598,8 +606,17 @@ pub extern "C-unwind" fn native_loop_shim(
         let code = crate::gc_function::code_ptr(thunk);
         let f: crate::gc_function::LispCodeFn =
             unsafe { std::mem::transmute(code) };
-        let _ = unsafe { f(mutator, env.raw(), std::ptr::null(), 0) };
+        let body_value = unsafe { f(mutator, env.raw(), std::ptr::null(), 0) };
 
+        // Block return / condition signal in flight — exit the
+        // loop and propagate. Without this, a (return-from N V)
+        // from inside a loop body would set ABORT_PENDING, the
+        // body's call-site instrumentation would early-return,
+        // and the loop would just keep iterating (we'd never
+        // observe the abort or the value).
+        if ABORT_PENDING.with(|p| p.get()) {
+            break body_value;
+        }
         if LOOP_BREAK_PENDING.with(|p| p.get()) {
             break LOOP_BREAK_VALUE.with(|v| v.get());
         }
@@ -1288,16 +1305,37 @@ thread_local! {
     /// frame, and signals "abort pending."
     static BLOCK_STACK: RefCell<Vec<BlockFrame>> = const { RefCell::new(Vec::new()) };
 
-    /// Set by return-from, cleared by the matching block on
-    /// exit. While true, every (block …) on the way out
-    /// inspects BLOCK_TARGET to decide whether the abort is
-    /// theirs.
-    static BLOCK_ABORT_PENDING: Cell<bool> = const { Cell::new(false) };
-
     /// Name (raw symbol Word) of the block return-from is
-    /// targeting. Only meaningful when BLOCK_ABORT_PENDING is
-    /// true.
+    /// targeting. Only meaningful when ABORT_PENDING is true
+    /// AND the abort is a block return (not a condition signal).
     static BLOCK_TARGET: Cell<u64> = const { Cell::new(0) };
+}
+
+// Unified non-local exit flag. Set by either `error` or
+// `return-from`; cleared by whichever (handler-case / native-
+// block) ends up consuming it. The JIT instruments every Lisp
+// function call to check this — if set, the calling function
+// returns immediately without executing further forms,
+// propagating the abort up to its consumer.
+//
+// This is the call-site instrumentation that makes (return-from
+// …) actually abort the rest of the body, not just set a flag
+// that's checked at block boundary. Same fix applies to (error
+// …): code after `(error 'foo)` no longer runs.
+thread_local! {
+    pub(crate) static ABORT_PENDING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// JIT-callable check. Returns 1 if a non-local exit is
+/// pending; 0 otherwise. Lowered as an inline call after every
+/// Expr::Call / Funcall / Apply.
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_abort_pending() -> i32 {
+    if ABORT_PENDING.with(|c| c.get()) {
+        1
+    } else {
+        0
+    }
 }
 
 /// `(%native-block NAME THUNK)` — the primitive behind the
@@ -1344,19 +1382,23 @@ pub extern "C-unwind" fn native_block_shim(
             .value
     });
 
-    let pending = BLOCK_ABORT_PENDING.with(|p| p.get());
+    let pending = ABORT_PENDING.with(|p| p.get());
     if pending {
+        // Abort might be ours (a return-from targeting our name)
+        // or somebody else's (a condition, or a return-from
+        // targeting an outer block). BLOCK_TARGET == 0 means it's
+        // not a block abort at all (it's a condition).
         let target = BLOCK_TARGET.with(|t| t.get());
-        if target == name {
+        if target != 0 && target == name {
             // The abort targets us — consume it and return the
             // value the matching return-from stashed on our frame.
-            BLOCK_ABORT_PENDING.with(|p| p.set(false));
+            ABORT_PENDING.with(|p| p.set(false));
             BLOCK_TARGET.with(|t| t.set(0));
             return our_frame_value;
         }
         // Not our abort — leave the flag pending so a surrounding
-        // block (or the unbound-block panic in return_from_shim)
-        // catches it. Drop body_result.
+        // block (or handler-case for a condition) catches it.
+        // Drop body_result.
     }
     body_result
 }
@@ -1395,7 +1437,7 @@ pub extern "C-unwind" fn return_from_shim(
             .unwrap_or_else(|| "<unknown>".to_string());
         panic!("return-from: no enclosing block named {sym_name}");
     }
-    BLOCK_ABORT_PENDING.with(|p| p.set(true));
+    ABORT_PENDING.with(|p| p.set(true));
     BLOCK_TARGET.with(|t| t.set(name));
     Word::NIL.raw()
 }
