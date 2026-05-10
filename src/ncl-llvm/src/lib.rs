@@ -15,6 +15,7 @@
 //! here so the rest of the workspace stays LLVM-version-agnostic.
 
 use inkwell::AddressSpace;
+use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
@@ -176,6 +177,7 @@ fn emit_expr<'ctx>(
             Ok(i64_t.const_int(Word::fixnum(*n).raw(), false))
         }
         Expr::Nil => Ok(i64_t.const_int(Word::NIL.raw(), false)),
+        Expr::True => Ok(i64_t.const_int(Word::T.raw(), false)),
         Expr::Add(a, b) => {
             let lhs = emit_expr(context, builder, function, helpers, a)?;
             let rhs = emit_expr(context, builder, function, helpers, b)?;
@@ -255,6 +257,64 @@ fn emit_expr<'ctx>(
                 .build_load(i64_t, cdr_ptr, "cdr")
                 .map_err(|e| format!("load cdr: {e}"))?;
             Ok(loaded.into_int_value())
+        }
+        Expr::Eq(a, b) => {
+            let lhs = emit_expr(context, builder, function, helpers, a)?;
+            let rhs = emit_expr(context, builder, function, helpers, b)?;
+            let cmp = builder
+                .build_int_compare(IntPredicate::EQ, lhs, rhs, "eq_cmp")
+                .map_err(|e| format!("icmp: {e}"))?;
+            // Select Word::T if equal, Word::NIL if not.
+            let t_word = i64_t.const_int(Word::T.raw(), false);
+            let nil_word = i64_t.const_int(Word::NIL.raw(), false);
+            let sel = builder
+                .build_select(cmp, t_word, nil_word, "eq_result")
+                .map_err(|e| format!("select: {e}"))?;
+            Ok(sel.into_int_value())
+        }
+        Expr::If(cond, then_branch, else_branch) => {
+            // is_truthy = (cond_val != Word::NIL)
+            let cond_val = emit_expr(context, builder, function, helpers, cond)?;
+            let nil_word = i64_t.const_int(Word::NIL.raw(), false);
+            let is_truthy = builder
+                .build_int_compare(IntPredicate::NE, cond_val, nil_word, "is_truthy")
+                .map_err(|e| format!("icmp: {e}"))?;
+
+            let then_block = context.append_basic_block(*function, "then");
+            let else_block = context.append_basic_block(*function, "else");
+            let merge_block = context.append_basic_block(*function, "merge");
+
+            builder
+                .build_conditional_branch(is_truthy, then_block, else_block)
+                .map_err(|e| format!("br: {e}"))?;
+
+            // Then branch.
+            builder.position_at_end(then_block);
+            let then_val = emit_expr(context, builder, function, helpers, then_branch)?;
+            // The branch may have emitted nested control flow, in
+            // which case the current insertion point is the end of
+            // the LAST block of that subgraph — not the original
+            // then_block. Capture it for the phi node.
+            let then_end = builder.get_insert_block().unwrap();
+            builder
+                .build_unconditional_branch(merge_block)
+                .map_err(|e| format!("br: {e}"))?;
+
+            // Else branch.
+            builder.position_at_end(else_block);
+            let else_val = emit_expr(context, builder, function, helpers, else_branch)?;
+            let else_end = builder.get_insert_block().unwrap();
+            builder
+                .build_unconditional_branch(merge_block)
+                .map_err(|e| format!("br: {e}"))?;
+
+            // Merge: phi between the two arms.
+            builder.position_at_end(merge_block);
+            let phi = builder
+                .build_phi(i64_t, "if_result")
+                .map_err(|e| format!("phi: {e}"))?;
+            phi.add_incoming(&[(&then_val, then_end), (&else_val, else_end)]);
+            Ok(phi.as_basic_value().into_int_value())
         }
     }
 }

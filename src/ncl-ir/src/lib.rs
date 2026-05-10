@@ -15,6 +15,8 @@ pub enum Expr {
     Const(i64),
     /// The literal `nil`.
     Nil,
+    /// The truth value `t`.
+    True,
     /// Binary addition (overflows wrap silently in Phase 3; the
     /// trap-and-promote-to-bignum path lands when the numeric
     /// tower does).
@@ -29,6 +31,13 @@ pub enum Expr {
     Car(Box<Expr>),
     /// Read the cdr field of a cons.
     Cdr(Box<Expr>),
+    /// Object identity. Returns `t` if the two operands have the
+    /// same Word bits, else `nil`.
+    Eq(Box<Expr>, Box<Expr>),
+    /// Conditional. If the first sub-expression evaluates to
+    /// anything other than `nil`, evaluate the second; else the
+    /// third.
+    If(Box<Expr>, Box<Expr>, Box<Expr>),
 }
 
 impl Expr {
@@ -38,6 +47,10 @@ impl Expr {
     pub fn cons(car: Expr, cdr: Expr) -> Expr { Expr::Cons(Box::new(car), Box::new(cdr)) }
     pub fn car(x: Expr) -> Expr { Expr::Car(Box::new(x)) }
     pub fn cdr(x: Expr) -> Expr { Expr::Cdr(Box::new(x)) }
+    pub fn eq(a: Expr, b: Expr) -> Expr { Expr::Eq(Box::new(a), Box::new(b)) }
+    pub fn if_(c: Expr, t: Expr, e: Expr) -> Expr {
+        Expr::If(Box::new(c), Box::new(t), Box::new(e))
+    }
 }
 
 #[cfg(test)]

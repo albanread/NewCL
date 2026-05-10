@@ -31,8 +31,32 @@ pub fn lower(v: &Value) -> Result<Expr, CompileError> {
     match v {
         Value::Fixnum(n) => Ok(Expr::Const(*n)),
         Value::Nil => Ok(Expr::Nil),
+        // Bare `t` in source position. CL's `t` is the symbol T
+        // (self-evaluating), but we don't have full symbol
+        // resolution yet — for v1, lower it to the truth-value
+        // immediate. When symbols become first-class, this gets
+        // revisited.
+        Value::Symbol(s) if &*s.name == "T" => Ok(Expr::True),
         Value::Cons(_) => lower_call(v),
         other => Err(CompileError::NotImplemented(format!("{other:?}"))),
+    }
+}
+
+/// Lower a quoted form `(quote x)`. Most kinds need symbol
+/// resolution or compile-time heap allocation; for v1 we support
+/// only the literal kinds that map cleanly to existing IR.
+fn lower_quoted(v: &Value) -> Result<Expr, CompileError> {
+    match v {
+        Value::Fixnum(n) => Ok(Expr::Const(*n)),
+        Value::Nil => Ok(Expr::Nil),
+        Value::Symbol(s) if &*s.name == "T" => Ok(Expr::True),
+        // Quoted symbols other than T, quoted lists, quoted
+        // strings — these need either symbol resolution or
+        // compile-time allocation, both of which arrive with the
+        // next phase.
+        other => Err(CompileError::NotImplemented(format!(
+            "quoted {other:?}"
+        ))),
     }
 }
 
@@ -52,6 +76,43 @@ fn lower_call(v: &Value) -> Result<Expr, CompileError> {
     match head_name.as_str() {
         "+" => fold_arithmetic(&head_name, args, 0, Expr::add),
         "*" => fold_arithmetic(&head_name, args, 1, Expr::mul),
+        "QUOTE" => {
+            if args.len() != 1 {
+                return Err(CompileError::BadArity {
+                    head: head_name,
+                    expected: "1",
+                    got: args.len(),
+                });
+            }
+            lower_quoted(&args[0])
+        }
+        "EQ" => {
+            if args.len() != 2 {
+                return Err(CompileError::BadArity {
+                    head: head_name,
+                    expected: "2",
+                    got: args.len(),
+                });
+            }
+            Ok(Expr::eq(lower(&args[0])?, lower(&args[1])?))
+        }
+        "IF" => match args.len() {
+            2 => Ok(Expr::if_(
+                lower(&args[0])?,
+                lower(&args[1])?,
+                Expr::Nil,
+            )),
+            3 => Ok(Expr::if_(
+                lower(&args[0])?,
+                lower(&args[1])?,
+                lower(&args[2])?,
+            )),
+            n => Err(CompileError::BadArity {
+                head: head_name,
+                expected: "2 or 3",
+                got: n,
+            }),
+        },
         "CONS" => {
             if args.len() != 2 {
                 return Err(CompileError::BadArity {

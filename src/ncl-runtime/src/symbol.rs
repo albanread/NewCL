@@ -15,11 +15,11 @@
 //! expose mutable static state directly — see `universe.rs`.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use crate::value::Value;
 
-#[derive(Debug)]
 pub struct Symbol {
     pub name: Arc<str>,
     /// Home package. `None` for uninterned symbols (`#:foo`).
@@ -29,6 +29,20 @@ pub struct Symbol {
     pub function: Mutex<Option<Value>>,
     /// Value cell (dynamic / global value).
     pub value: Mutex<Option<Value>>,
+}
+
+impl fmt::Debug for Symbol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Print just the package-qualified name. The default
+        // derive(Debug) recurses through `home` into the Package's
+        // symbol table, which contains every other Symbol, every
+        // one of THEIR packages, and so on — a multi-megabyte
+        // dump. Don't do that.
+        match &self.home {
+            None => write!(f, "Symbol(#:{})", self.name),
+            Some(p) => write!(f, "Symbol({}::{})", p.name, self.name),
+        }
+    }
 }
 
 impl Symbol {
@@ -67,7 +81,6 @@ pub enum Visibility {
     Inherited,
 }
 
-#[derive(Debug)]
 pub struct Package {
     pub name: Arc<str>,
     pub nicknames: Vec<Arc<str>>,
@@ -76,6 +89,17 @@ pub struct Package {
     /// Packages this one `:use`s. Lookups fall through these for
     /// inherited symbols.
     pub uses: Vec<Arc<Package>>,
+}
+
+impl fmt::Debug for Package {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Likewise — don't recurse through the symbol table.
+        f.debug_struct("Package")
+            .field("name", &self.name)
+            .field("nicknames", &self.nicknames)
+            .field("uses", &self.uses.iter().map(|p| &p.name).collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 impl Package {

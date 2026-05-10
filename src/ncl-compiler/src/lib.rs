@@ -183,6 +183,112 @@ mod end_to_end_tests {
         );
     }
 
+    // -- eq, if, quote ------------------------------------------------------
+
+    #[test]
+    fn eq_returns_t_for_equal_fixnums() {
+        assert_eq!(eval_str("(eq 1 1)").unwrap(), "T");
+        assert_eq!(eval_str("(eq -7 -7)").unwrap(), "T");
+        assert_eq!(eval_str("(eq 0 0)").unwrap(), "T");
+    }
+
+    #[test]
+    fn eq_returns_nil_for_unequal_fixnums() {
+        assert_eq!(eval_str("(eq 1 2)").unwrap(), "nil");
+        assert_eq!(eval_str("(eq 0 1)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn eq_handles_nil_and_t() {
+        assert_eq!(eval_str("(eq nil nil)").unwrap(), "T");
+        assert_eq!(eval_str("(eq t t)").unwrap(), "T");
+        assert_eq!(eval_str("(eq nil t)").unwrap(), "nil");
+        assert_eq!(eval_str("(eq nil 0)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn eq_on_freshly_consed_pairs_is_nil() {
+        // Two distinct cons cells, even with same contents, are not eq.
+        assert_eq!(eval_str("(eq (cons 1 2) (cons 1 2))").unwrap(), "nil");
+    }
+
+    #[test]
+    fn if_chooses_then_branch_for_truthy_condition() {
+        assert_eq!(eval_str("(if t 7 8)").unwrap(), "7");
+        assert_eq!(eval_str("(if 1 7 8)").unwrap(), "7");
+        // 0 is truthy in CL — only nil is false.
+        assert_eq!(eval_str("(if 0 7 8)").unwrap(), "7");
+    }
+
+    #[test]
+    fn if_chooses_else_branch_for_nil_condition() {
+        assert_eq!(eval_str("(if nil 7 8)").unwrap(), "8");
+        assert_eq!(eval_str("(if () 7 8)").unwrap(), "8");
+    }
+
+    #[test]
+    fn if_two_arg_form_defaults_to_nil() {
+        assert_eq!(eval_str("(if t 42)").unwrap(), "42");
+        assert_eq!(eval_str("(if nil 42)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn if_eq_combo_classic_branching() {
+        assert_eq!(eval_str("(if (eq 1 1) 7 8)").unwrap(), "7");
+        assert_eq!(eval_str("(if (eq 1 2) 7 8)").unwrap(), "8");
+    }
+
+    #[test]
+    fn nested_if_works() {
+        assert_eq!(
+            eval_str("(if (eq 1 1) (if (eq 2 2) 100 200) 300)").unwrap(),
+            "100",
+        );
+        assert_eq!(
+            eval_str("(if (eq 1 2) 100 (if (eq 3 3) 200 300))").unwrap(),
+            "200",
+        );
+        assert_eq!(
+            eval_str("(if (eq 1 2) 100 (if (eq 3 4) 200 300))").unwrap(),
+            "300",
+        );
+    }
+
+    #[test]
+    fn if_branch_can_allocate() {
+        assert_eq!(
+            eval_str("(if (eq 1 1) (cons 1 2) (cons 3 4))").unwrap(),
+            "(1 . 2)",
+        );
+        assert_eq!(
+            eval_str("(if (eq 1 2) (cons 1 2) (cons 3 4))").unwrap(),
+            "(3 . 4)",
+        );
+    }
+
+    #[test]
+    fn quote_fixnum_and_nil() {
+        assert_eq!(eval_str("(quote 42)").unwrap(), "42");
+        assert_eq!(eval_str("'42").unwrap(), "42");
+        assert_eq!(eval_str("(quote nil)").unwrap(), "nil");
+        assert_eq!(eval_str("'nil").unwrap(), "nil");
+        assert_eq!(eval_str("(quote t)").unwrap(), "T");
+        assert_eq!(eval_str("'t").unwrap(), "T");
+    }
+
+    #[test]
+    fn t_self_evaluates() {
+        assert_eq!(eval_str("t").unwrap(), "T");
+    }
+
+    #[test]
+    fn arithmetic_inside_if_condition() {
+        // (if (eq (+ 1 1) 2) 'yes 'no) — but quoted symbols aren't
+        // supported yet, so use fixnum branches.
+        assert_eq!(eval_str("(if (eq (+ 1 1) 2) 99 88)").unwrap(), "99");
+        assert_eq!(eval_str("(if (eq (* 2 3) 7) 99 88)").unwrap(), "88");
+    }
+
     #[test]
     fn unknown_form_returns_compile_error() {
         let r = eval_str("(undefined-fn 1 2)");
