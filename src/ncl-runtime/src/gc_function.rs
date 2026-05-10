@@ -7,19 +7,23 @@
 //! where a redefinition orphans a Function whose old code is still
 //! on a live stack).
 //!
-//! Layout (4 cells = 32 bytes):
+//! Layout (5 cells = 40 bytes):
 //!
 //! ```text
-//!   cell 0   HeapHeader      type=Function, length=3
+//!   cell 0   HeapHeader      type=Function, length=4
 //!   cell 1   code_ptr        raw machine-code pointer (NOT a Word)
 //!   cell 2   arity           required-argument count, as u64
 //!   cell 3   name            Word — the Symbol this was bound to
+//!   cell 4   env             Word — Vector of captured values, or nil
 //! ```
 //!
 //! The code pointer is the address of JIT'd native code with
-//! signature `fn(*mut MutatorState, *const u64 /* args */, u64 /* n */) -> u64`.
+//! signature
+//!   `fn(*mut MutatorState, env: u64, args: *const u64, n: u64) -> u64`.
 //! Calling a function dispatches through this signature so every
-//! call site has the same shape regardless of arity.
+//! call site has the same shape regardless of arity OR closure
+//! status. defun'd functions get env=nil; lambda-created closures
+//! get a Vector-tagged Word pointing at their captured values.
 
 use std::ptr::NonNull;
 
@@ -30,7 +34,8 @@ use crate::word::{Tag, Word};
 pub const CODE_PTR_OFFSET: usize = 1;
 pub const ARITY_OFFSET: usize = 2;
 pub const NAME_OFFSET: usize = 3;
-pub const FUNCTION_PAYLOAD_CELLS: u32 = 3;
+pub const ENV_OFFSET: usize = 4;
+pub const FUNCTION_PAYLOAD_CELLS: u32 = 4;
 
 /// Allocate a fresh Function in the static area. The code_ptr is a
 /// raw machine-code address; the JIT keeps the underlying engine
@@ -40,6 +45,7 @@ pub fn alloc_function_in_static(
     code_ptr: usize,
     arity: u32,
     name: Word,
+    env: Word,
 ) -> Option<Word> {
     let header_ptr =
         static_area.try_alloc_with_header(HeapType::Function, FUNCTION_PAYLOAD_CELLS)?;
@@ -48,6 +54,7 @@ pub fn alloc_function_in_static(
         *p.add(CODE_PTR_OFFSET) = code_ptr as u64;
         *p.add(ARITY_OFFSET) = arity as u64;
         *p.add(NAME_OFFSET) = name.raw();
+        *p.add(ENV_OFFSET) = env.raw();
     }
     Some(Word::from_ptr(p as *const u8, Tag::Function))
 }
@@ -66,6 +73,13 @@ pub fn arity(fn_word: Word) -> u32 {
 pub fn name(fn_word: Word) -> Word {
     let p = fn_ptr(fn_word);
     Word::from_raw(unsafe { *p.add(NAME_OFFSET) })
+}
+
+/// Read the closure environment from a Function. Nil for plain
+/// defun'd functions; Vector-tagged for lambdas with captures.
+pub fn env(fn_word: Word) -> Word {
+    let p = fn_ptr(fn_word);
+    Word::from_raw(unsafe { *p.add(ENV_OFFSET) })
 }
 
 fn fn_ptr(fn_word: Word) -> *mut u64 {
@@ -87,11 +101,12 @@ pub fn header(fn_word: Word) -> HeapHeader {
 }
 
 /// SAFETY: `code` must be a function pointer compatible with
-/// `extern "C" fn(*mut MutatorState, *const u64, u64) -> u64`,
+/// `extern "C" fn(*mut MutatorState, env: u64, *const u64, u64) -> u64`,
 /// `args` must hold `n_args` valid `Word`s. Used by the dispatch
-/// helper in `abi.rs`.
+/// helpers in `abi.rs`.
 pub type LispCodeFn = unsafe extern "C" fn(
     mutator: *mut crate::mutator::MutatorState,
+    env: u64,
     args: *const u64,
     n_args: u64,
 ) -> u64;
@@ -108,12 +123,13 @@ mod tests {
     #[test]
     fn function_layout() {
         let s = fresh_static();
-        let f = alloc_function_in_static(&s, 0xdeadbeef, 2, Word::NIL).unwrap();
+        let f = alloc_function_in_static(&s, 0xdeadbeef, 2, Word::NIL, Word::NIL).unwrap();
         assert_eq!(f.tag(), Tag::Function);
         assert_eq!(header(f).ty(), HeapType::Function);
         assert_eq!(header(f).length_cells(), FUNCTION_PAYLOAD_CELLS);
         assert_eq!(code_ptr(f), 0xdeadbeef);
         assert_eq!(arity(f), 2);
         assert!(name(f).is_nil());
+        assert!(env(f).is_nil());
     }
 }

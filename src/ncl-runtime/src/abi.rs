@@ -86,8 +86,10 @@ pub extern "C" fn ncl_store_value(
 /// JIT'd `(name arg1 arg2 ...)` lowers to a call here.
 ///
 /// Loads the symbol's function cell with acquire semantics, follows
-/// the Function pointer to get the code address, and calls it with
-/// `(mutator, args_ptr, n_args)`. Panics if the cell is unbound.
+/// the Function pointer to get the code address and the closure
+/// env, and calls
+///   `code(mutator, env, args, n_args)`.
+/// Panics if the cell is unbound.
 #[unsafe(no_mangle)]
 pub extern "C" fn ncl_call(
     mutator: *mut crate::mutator::MutatorState,
@@ -98,15 +100,91 @@ pub extern "C" fn ncl_call(
     let sym = Word::from_raw(sym_word);
     let fn_value = crate::gc_symbol::function_acquire(sym);
     if fn_value.is_unbound() {
-        panic!("ncl_call: unbound function for symbol {sym_word:#x}");
+        let name = crate::sym_names::lookup(sym_word)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{sym_word:#x}"));
+        panic!("ncl_call: unbound function: {name}");
     }
     if fn_value.tag() != Tag::Function {
         panic!("ncl_call: function cell is not a Function: {fn_value:?}");
     }
+    let env = crate::gc_function::env(fn_value);
     let code = crate::gc_function::code_ptr(fn_value);
     let f: crate::gc_function::LispCodeFn =
         unsafe { std::mem::transmute(code) };
-    unsafe { f(mutator, args, n_args) }
+    unsafe { f(mutator, env.raw(), args, n_args) }
+}
+
+/// Call a Function value directly (no symbol lookup). Used by
+/// `funcall` and by code that has a first-class Function value.
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_funcall(
+    mutator: *mut crate::mutator::MutatorState,
+    fn_word: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    let f_word = Word::from_raw(fn_word);
+    if f_word.tag() != Tag::Function {
+        panic!("funcall: not a function: {f_word:?}");
+    }
+    let env = crate::gc_function::env(f_word);
+    let code = crate::gc_function::code_ptr(f_word);
+    let f: crate::gc_function::LispCodeFn =
+        unsafe { std::mem::transmute(code) };
+    unsafe { f(mutator, env.raw(), args, n_args) }
+}
+
+/// Allocate a closure: a Function in static with the given code,
+/// arity, and a freshly allocated env Vector containing the
+/// captured values. JIT'd `(lambda …)` evaluates each capture
+/// expression in outer scope, packs the values into a stack
+/// buffer, and calls here to materialise the function value.
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_make_closure(
+    mutator: *mut crate::mutator::MutatorState,
+    code_ptr: u64,
+    arity: u64,
+    captures: *const u64,
+    n_captures: u64,
+) -> u64 {
+    let m = unsafe { &mut *mutator };
+    let env_word = if n_captures == 0 {
+        Word::NIL
+    } else {
+        let vec = m.alloc_vector(n_captures as u32);
+        // Vec layout: cell 0 is header, cells 1..=n are payload.
+        let p = vec
+            .as_mut_ptr::<u64>(Tag::Vector)
+            .expect("vector ptr");
+        unsafe {
+            for i in 0..n_captures {
+                *p.add(1 + i as usize) = *captures.add(i as usize);
+            }
+        }
+        vec
+    };
+    // Lambdas live in static for now (with the env-pointer card
+    // marked if env is in young — see below).
+    let coord = m.coord();
+    let fn_word = crate::gc_function::alloc_function_in_static(
+        coord.static_area(),
+        code_ptr as usize,
+        arity as u32,
+        Word::NIL, // anonymous lambdas have no name
+        env_word,
+    )
+    .expect("static area exhausted in lambda creation");
+    // If env is a young-heap Vector, the Function in static now
+    // contains a static→young pointer. Mark the card.
+    if !env_word.is_nil() {
+        let env_cell_addr = unsafe {
+            (fn_word.as_ptr::<u8>(Tag::Function).unwrap() as *const u8)
+                .add(crate::gc_function::ENV_OFFSET * 8)
+        };
+        coord.mark_card(env_cell_addr);
+    }
+    fn_word.raw()
 }
 
 #[cfg(test)]

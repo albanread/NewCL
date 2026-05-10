@@ -98,6 +98,7 @@ impl Session {
             code_ptr,
             params.len() as u32,
             sym_word,
+            Word::NIL, // defun'd functions have no closure env
         )
         .ok_or_else(|| EvalError::Jit("static area exhausted".to_string()))?;
         self.mutator.set_symbol_function(sym_word, fn_word);
@@ -506,6 +507,126 @@ mod end_to_end_tests {
     #[test]
     fn empty_let_body_is_nil() {
         assert_eq!(eval_str("(let ((x 5)))").unwrap(), "nil");
+    }
+
+    // -- lambda + closures ------------------------------------------------
+
+    #[test]
+    fn lambda_no_capture_via_funcall() {
+        assert_eq!(eval_str("(funcall (lambda (x) (+ x 1)) 41)").unwrap(), "42");
+        assert_eq!(eval_str("(funcall (lambda (x y) (* x y)) 6 7)").unwrap(), "42");
+    }
+
+    #[test]
+    fn lambda_zero_args() {
+        assert_eq!(eval_str("(funcall (lambda () 42))").unwrap(), "42");
+    }
+
+    #[test]
+    fn lambda_can_be_assigned_and_called() {
+        let mut session = Session::new();
+        session.eval("(defparameter *square* (lambda (x) (* x x)))").unwrap();
+        assert_eq!(session.eval("(funcall *square* 9)").unwrap(), "81");
+    }
+
+    #[test]
+    fn closure_captures_outer_param() {
+        // The classic "make-adder" pattern. Verifies closure capture
+        // of a function parameter.
+        let result = eval_str(
+            "(defun make-adder (n) (lambda (x) (+ x n)))
+             (funcall (make-adder 5) 10)",
+        )
+        .unwrap();
+        assert_eq!(result, "15");
+    }
+
+    #[test]
+    fn closure_captures_let_local() {
+        let result = eval_str(
+            "(let ((n 100))
+               (funcall (lambda (x) (+ x n)) 5))",
+        )
+        .unwrap();
+        assert_eq!(result, "105");
+    }
+
+    #[test]
+    fn higher_order_compose() {
+        let result = eval_str(
+            "(defun compose (f g)
+               (lambda (x) (funcall f (funcall g x))))
+             (funcall (compose (lambda (x) (* x x))
+                               (lambda (x) (+ x 1)))
+                      4)",
+        )
+        .unwrap();
+        // compose(square, succ)(4) = square(succ(4)) = square(5) = 25
+        assert_eq!(result, "25");
+    }
+
+    #[test]
+    fn map_list_with_lambda() {
+        // The first higher-order list operation.
+        let result = eval_str(
+            "(defun map-list (f lst)
+               (if (null lst)
+                   nil
+                   (cons (funcall f (car lst)) (map-list f (cdr lst)))))
+             (map-list (lambda (x) (* x x)) '(1 2 3 4 5))",
+        )
+        .unwrap();
+        assert_eq!(result, "(1 4 9 16 25)");
+    }
+
+    #[test]
+    fn closure_captures_multiple_outer_vars() {
+        let result = eval_str(
+            "(defun make-affine (m b)
+               (lambda (x) (+ (* m x) b)))
+             (funcall (make-affine 3 7) 10)",
+        )
+        .unwrap();
+        // 3 * 10 + 7 = 37
+        assert_eq!(result, "37");
+    }
+
+    #[test]
+    fn nested_closures_inner_captures_outer_lambda_param() {
+        // (lambda (x) (lambda (y) (+ x y))) — inner lambda captures
+        // outer lambda's param x.
+        let result = eval_str(
+            "(funcall (funcall (lambda (x) (lambda (y) (+ x y))) 10) 5)",
+        )
+        .unwrap();
+        assert_eq!(result, "15");
+    }
+
+    #[test]
+    fn closure_used_recursively_via_caller() {
+        // A function that takes a function and applies it n times.
+        let result = eval_str(
+            "(defun apply-n (f x n)
+               (if (eq n 0) x (apply-n f (funcall f x) (- n 1))))
+             (apply-n (lambda (x) (* x 2)) 1 10)",
+        )
+        .unwrap();
+        // 1 * 2^10 = 1024
+        assert_eq!(result, "1024");
+    }
+
+    #[test]
+    fn closure_filter_with_predicate() {
+        let result = eval_str(
+            "(defun filter (pred lst)
+               (cond ((null lst) nil)
+                     ((funcall pred (car lst))
+                      (cons (car lst) (filter pred (cdr lst))))
+                     (t (filter pred (cdr lst)))))
+             (filter (lambda (x) (> x 3)) '(1 5 2 6 3 7))",
+        )
+        .unwrap();
+        assert_eq!(result, "(5 6 7)");
     }
 
     // -- defparameter / setq / global value cells --------------------------

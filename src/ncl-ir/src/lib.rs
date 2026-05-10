@@ -90,6 +90,25 @@ pub enum Expr {
     /// (release). The lowered form of `(setq name value)` and
     /// `(defparameter name value)`.
     StoreGlobal { sym_word: u64, value: Box<Expr> },
+    /// Closure reference: read `env[i]` from the current call's env
+    /// argument. Only valid inside a lambda body that has at least
+    /// `i+1` captures.
+    ClosureRef(usize),
+    /// Lambda expression. JIT-compiles `body` as a separate function
+    /// with the lambda's signature; at the construction site,
+    /// evaluates each `captures[i]` in outer scope and packs the
+    /// values into the lambda's env vector.
+    Lambda {
+        arity: u32,
+        body: Box<Expr>,
+        captures: Vec<Expr>,
+    },
+    /// Call a first-class function value. `fn_expr` evaluates to a
+    /// Function-tagged Word; the call dispatches through `ncl_funcall`.
+    Funcall {
+        fn_expr: Box<Expr>,
+        args: Vec<Expr>,
+    },
 }
 
 impl Expr {
@@ -118,6 +137,13 @@ impl Expr {
     pub fn load_global(sym_word: u64) -> Expr { Expr::LoadGlobal(sym_word) }
     pub fn store_global(sym_word: u64, value: Expr) -> Expr {
         Expr::StoreGlobal { sym_word, value: Box::new(value) }
+    }
+    pub fn closure_ref(idx: usize) -> Expr { Expr::ClosureRef(idx) }
+    pub fn lambda(arity: u32, body: Expr, captures: Vec<Expr>) -> Expr {
+        Expr::Lambda { arity, body: Box::new(body), captures }
+    }
+    pub fn funcall(fn_expr: Expr, args: Vec<Expr>) -> Expr {
+        Expr::Funcall { fn_expr: Box::new(fn_expr), args }
     }
     pub fn param(idx: usize) -> Expr { Expr::Param(idx) }
     pub fn local(idx: usize) -> Expr { Expr::Local(idx) }

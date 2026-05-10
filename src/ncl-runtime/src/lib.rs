@@ -24,7 +24,10 @@ pub mod universe;
 pub mod value;
 pub mod word;
 
-pub use abi::{ncl_alloc_cons, ncl_call, ncl_car, ncl_cdr, ncl_load_value, ncl_store_value};
+pub use abi::{
+    ncl_alloc_cons, ncl_call, ncl_car, ncl_cdr, ncl_funcall, ncl_load_value,
+    ncl_make_closure, ncl_store_value,
+};
 pub use printer::format_word;
 
 pub use heap::{

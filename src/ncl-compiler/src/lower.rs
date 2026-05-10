@@ -18,24 +18,35 @@ use std::sync::Arc;
 use ncl_ir::Expr;
 use ncl_runtime::{GcCoordinator, Value, Word};
 
-/// A binding kind in the lexical environment. Parameters live in
-/// the function's args array (Param(idx)); let-bound locals live
-/// in a stack-vec the emitter manages (Local(idx)).
+/// A binding kind in the lexical environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Binding {
+    /// Function parameter — read from the call's args[idx].
     Param(usize),
+    /// Let-bound local — read from the emitter's locals stack[idx].
     Local(usize),
+    /// Closure reference — read from env[idx] in the current
+    /// function's closure environment.
+    ClosureRef(usize),
 }
 
-/// Lexical environment for lowering. Tracks names and their
-/// binding kinds, in order of introduction. Lookups walk in
-/// reverse so inner shadows outer.
+/// Lexical environment for lowering. Tracks names → bindings.
+/// Lambda bodies install a `capture_parent` that lookups fall
+/// back to: any outer-env name referenced inside the lambda is
+/// added to the lambda's captures list and recorded as a new
+/// `ClosureRef` binding.
 #[derive(Debug, Clone, Default)]
 pub struct LocalEnv {
     bindings: Vec<(Arc<str>, Binding)>,
-    /// Number of `Local` bindings currently in scope. Used by `let`
-    /// to assign the next index when extending the env.
     local_count: usize,
+    closure_count: usize,
+    /// Set when this env is the inner env of a lambda body. Lookups
+    /// that miss in `bindings` fall back to here, capturing on hit.
+    capture_parent: Option<Box<LocalEnv>>,
+    /// Outer-scope expressions corresponding to ClosureRef indices.
+    /// Each is evaluated at lambda-creation time and stored in the
+    /// closure's env vector.
+    captures: Vec<Expr>,
 }
 
 impl LocalEnv {
@@ -47,10 +58,36 @@ impl LocalEnv {
             .enumerate()
             .map(|(i, n)| (Arc::clone(n), Binding::Param(i)))
             .collect();
-        LocalEnv { bindings, local_count: 0 }
+        LocalEnv {
+            bindings,
+            local_count: 0,
+            closure_count: 0,
+            capture_parent: None,
+            captures: Vec::new(),
+        }
     }
 
-    pub fn find(&self, name: &str) -> Option<Binding> {
+    /// Build an env for lowering a lambda body. The lambda's own
+    /// params are at Param(0..N); names not bound here fall back
+    /// to `parent` and become captures (ClosureRef).
+    pub fn for_lambda(params: &[Arc<str>], parent: LocalEnv) -> LocalEnv {
+        let bindings = params
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (Arc::clone(n), Binding::Param(i)))
+            .collect();
+        LocalEnv {
+            bindings,
+            local_count: 0,
+            closure_count: 0,
+            capture_parent: Some(Box::new(parent)),
+            captures: Vec::new(),
+        }
+    }
+
+    /// Read-only lookup in this env's bindings only. Does NOT
+    /// consult capture_parent.
+    pub fn find_local(&self, name: &str) -> Option<Binding> {
         self.bindings
             .iter()
             .rev()
@@ -58,7 +95,35 @@ impl LocalEnv {
             .map(|(_, b)| *b)
     }
 
-    /// Push a new local binding. Used during `let` lowering.
+    /// Lookup, with capture from `capture_parent` if needed. May
+    /// add to `captures` and `bindings` (returning the new
+    /// ClosureRef). Used by `lower_in_mut` for symbol resolution.
+    pub fn find_or_capture(&mut self, name: &str) -> Option<Binding> {
+        if let Some(b) = self.find_local(name) {
+            return Some(b);
+        }
+        let parent = self.capture_parent.as_ref()?;
+        let parent_b = parent.find_local(name)?;
+        // Add a capture entry.
+        let idx = self.closure_count;
+        let outer_expr = match parent_b {
+            Binding::Param(i) => Expr::Param(i),
+            Binding::Local(i) => Expr::Local(i),
+            Binding::ClosureRef(i) => Expr::ClosureRef(i),
+        };
+        self.captures.push(outer_expr);
+        self.bindings
+            .push((Arc::from(name), Binding::ClosureRef(idx)));
+        self.closure_count += 1;
+        Some(Binding::ClosureRef(idx))
+    }
+
+    /// Compatibility wrapper: callers that don't care about
+    /// captures can still use `find`. Same as `find_local`.
+    pub fn find(&self, name: &str) -> Option<Binding> {
+        self.find_local(name)
+    }
+
     pub fn push_local(&mut self, name: Arc<str>) -> usize {
         let idx = self.local_count;
         self.bindings.push((name, Binding::Local(idx)));
@@ -66,8 +131,6 @@ impl LocalEnv {
         idx
     }
 
-    /// Snapshot the current binding count and local count, for
-    /// `let` to roll back on scope exit.
     pub fn checkpoint(&self) -> (usize, usize) {
         (self.bindings.len(), self.local_count)
     }
@@ -75,6 +138,13 @@ impl LocalEnv {
     pub fn restore(&mut self, cp: (usize, usize)) {
         self.bindings.truncate(cp.0);
         self.local_count = cp.1;
+    }
+
+    /// Take ownership of the captures list. Called after lambda-
+    /// body lowering completes, to extract the captures for the
+    /// resulting `Expr::Lambda`.
+    pub fn take_captures(&mut self) -> Vec<Expr> {
+        std::mem::take(&mut self.captures)
     }
 }
 
@@ -113,13 +183,16 @@ fn lower_in_mut(
         Value::Fixnum(n) => Ok(Expr::Const(*n)),
         Value::Nil => Ok(Expr::Nil),
         Value::Symbol(s) => {
-            // Local first (param or let-bound), then T, then global
-            // value-cell load. The load itself is done at runtime
-            // via ncl_load_value, which panics on unbound.
-            if let Some(b) = env.find(&s.name) {
+            // Local first (param/let/closure-capture), then T, then
+            // global value-cell load. Capture happens lazily — if
+            // we're inside a lambda body and the name resolves in
+            // the parent env, find_or_capture adds it as a closure
+            // capture and returns ClosureRef.
+            if let Some(b) = env.find_or_capture(&s.name) {
                 Ok(match b {
                     Binding::Param(i) => Expr::Param(i),
                     Binding::Local(i) => Expr::Local(i),
+                    Binding::ClosureRef(i) => Expr::ClosureRef(i),
                 })
             } else if &*s.name == "T" {
                 Ok(Expr::True)
@@ -224,6 +297,8 @@ fn lower_call_in_mut(
             }
             Ok(result)
         }
+        "LAMBDA" => lower_lambda(args, env, coord),
+        "FUNCALL" => lower_funcall(args, env, coord),
         // (setq name value)  — assign the value cell of `name`. CL
         // also allows (setq a 1 b 2 …) for parallel assignments;
         // v1 supports the binary form only.
@@ -595,6 +670,93 @@ fn lower_defparameter(
     let sym_word = coord.intern(&name);
     let value = lower_in_mut(&args[1], env, coord)?;
     Ok(Expr::store_global(sym_word.raw(), value))
+}
+
+/// Lower a `(lambda (params...) body...)` form. Builds an inner
+/// env that captures any outer-env names referenced in the body,
+/// lowers the body in that env (which records captures lazily),
+/// and emits an `Expr::Lambda` with both the body and the
+/// outer-scope expressions for each capture.
+fn lower_lambda(
+    args: &[Value],
+    outer_env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
+    if args.is_empty() {
+        return Err(CompileError::BadArity {
+            head: "LAMBDA".into(),
+            expected: "at least 1 (param list)",
+            got: 0,
+        });
+    }
+    let params = parse_param_list_lambda(&args[0])?;
+    let body_forms = &args[1..];
+
+    // Inner env starts with params at Param(0..N) and a capture
+    // parent pointing at the outer env (clone — we only read from
+    // it during lookup_or_capture).
+    let mut inner_env = LocalEnv::for_lambda(&params, outer_env.clone());
+
+    let body_expr = if body_forms.is_empty() {
+        Expr::Nil
+    } else if body_forms.len() == 1 {
+        lower_in_mut(&body_forms[0], &mut inner_env, coord)?
+    } else {
+        let lowered: Result<Vec<_>, _> = body_forms
+            .iter()
+            .map(|f| lower_in_mut(f, &mut inner_env, coord))
+            .collect();
+        Expr::progn(lowered?)
+    };
+
+    let captures = inner_env.take_captures();
+    Ok(Expr::lambda(params.len() as u32, body_expr, captures))
+}
+
+/// Parse a lambda parameter list into a Vec of names.
+fn parse_param_list_lambda(v: &Value) -> Result<Vec<Arc<str>>, CompileError> {
+    let mut out = Vec::new();
+    let mut cur = v.clone();
+    loop {
+        match cur {
+            Value::Nil => return Ok(out),
+            Value::Cons(c) => {
+                let Value::Symbol(s) = &c.car else {
+                    return Err(CompileError::NotImplemented(format!(
+                        "lambda parameter must be a symbol, got {:?}", c.car,
+                    )));
+                };
+                out.push(Arc::clone(&s.name));
+                cur = c.cdr.clone();
+            }
+            other => {
+                return Err(CompileError::NotImplemented(format!(
+                    "lambda param list must be a proper list, got {other:?}"
+                )));
+            }
+        }
+    }
+}
+
+/// `(funcall fn arg1 arg2 ...)` — call an arbitrary function value.
+fn lower_funcall(
+    args: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
+    if args.is_empty() {
+        return Err(CompileError::BadArity {
+            head: "FUNCALL".into(),
+            expected: "at least 1 (function)",
+            got: 0,
+        });
+    }
+    let fn_expr = lower_in_mut(&args[0], env, coord)?;
+    let lowered_args: Result<Vec<_>, _> = args[1..]
+        .iter()
+        .map(|a| lower_in_mut(a, env, coord))
+        .collect();
+    Ok(Expr::funcall(fn_expr, lowered_args?))
 }
 
 fn binary_op(

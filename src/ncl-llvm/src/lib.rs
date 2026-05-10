@@ -25,7 +25,8 @@ use inkwell::values::{FunctionValue, IntValue};
 
 use ncl_ir::Expr;
 use ncl_runtime::{
-    ncl_alloc_cons, ncl_call, ncl_load_value, ncl_store_value, MutatorState, Tag, Word,
+    ncl_alloc_cons, ncl_call, ncl_funcall, ncl_load_value, ncl_make_closure,
+    ncl_store_value, MutatorState, Tag, Word,
 };
 
 // We leak each compilation's Context + Module + Engine so the
@@ -108,13 +109,17 @@ pub fn jit_add(a: i64, b: i64) -> Result<i64, String> {
 
 /// JIT-compile and run an `Expr` tree as a top-level form. Builds
 /// an entry function with the unified Lisp signature and calls it
-/// with `(mutator, null, 0)` — top-level forms have no parameters.
-/// Returns the result as a tagged `Word`.
+/// with `(mutator, NIL, null, 0)` — top-level forms have no
+/// parameters and no closure environment. Returns the result as
+/// a tagged `Word`.
 pub fn jit_eval(expr: &Expr, mutator: *mut MutatorState) -> Result<Word, String> {
     let code = build_lisp_function(expr, 0)?;
-    type EntryFn = unsafe extern "C" fn(*mut MutatorState, *const u64, u64) -> u64;
+    type EntryFn =
+        unsafe extern "C" fn(*mut MutatorState, u64, *const u64, u64) -> u64;
     let f: EntryFn = unsafe { std::mem::transmute(code) };
-    Ok(Word::from_raw(unsafe { f(mutator, std::ptr::null(), 0) }))
+    Ok(Word::from_raw(unsafe {
+        f(mutator, Word::NIL.raw(), std::ptr::null(), 0)
+    }))
 }
 
 /// JIT-compile a Lisp function with `arity` positional parameters.
@@ -140,7 +145,12 @@ fn build_lisp_function(body: &Expr, arity: u32) -> Result<usize, String> {
     let i64_t = context.i64_type();
     let ptr_t = context.ptr_type(AddressSpace::default());
 
-    let fn_type = i64_t.fn_type(&[ptr_t.into(), ptr_t.into(), i64_t.into()], false);
+    // Unified Lisp function signature:
+    //   fn(mutator: ptr, env: i64, args: ptr, n_args: i64) -> i64
+    let fn_type = i64_t.fn_type(
+        &[ptr_t.into(), i64_t.into(), ptr_t.into(), i64_t.into()],
+        false,
+    );
     let function = module.add_function("the_fn", fn_type, None);
     let entry_block = context.append_basic_block(function, "entry");
     builder.position_at_end(entry_block);
@@ -179,6 +189,8 @@ fn build_lisp_function(body: &Expr, arity: u32) -> Result<usize, String> {
 struct Helpers<'ctx> {
     alloc_cons: FunctionValue<'ctx>,
     call_fn: FunctionValue<'ctx>,
+    funcall_fn: FunctionValue<'ctx>,
+    make_closure: FunctionValue<'ctx>,
     load_value: FunctionValue<'ctx>,
     store_value: FunctionValue<'ctx>,
 }
@@ -222,26 +234,48 @@ fn declare_runtime_helpers<'ctx>(
         Some(Linkage::External),
     );
 
-    Helpers { alloc_cons, call_fn, load_value, store_value }
+    // ncl_funcall(mutator, fn_word, args_ptr, n_args) -> u64
+    let funcall_type = i64_t.fn_type(
+        &[ptr_t.into(), i64_t.into(), ptr_t.into(), i64_t.into()],
+        false,
+    );
+    let funcall_fn =
+        module.add_function("ncl_funcall", funcall_type, Some(Linkage::External));
+
+    // ncl_make_closure(mutator, code_ptr, arity, captures, n_caps) -> u64
+    let make_closure_type = i64_t.fn_type(
+        &[
+            ptr_t.into(),
+            i64_t.into(),
+            i64_t.into(),
+            ptr_t.into(),
+            i64_t.into(),
+        ],
+        false,
+    );
+    let make_closure = module.add_function(
+        "ncl_make_closure",
+        make_closure_type,
+        Some(Linkage::External),
+    );
+
+    Helpers {
+        alloc_cons,
+        call_fn,
+        funcall_fn,
+        make_closure,
+        load_value,
+        store_value,
+    }
 }
 
 fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>) {
-    engine.add_global_mapping(
-        &helpers.alloc_cons,
-        ncl_alloc_cons as *const () as usize,
-    );
-    engine.add_global_mapping(
-        &helpers.call_fn,
-        ncl_call as *const () as usize,
-    );
-    engine.add_global_mapping(
-        &helpers.load_value,
-        ncl_load_value as *const () as usize,
-    );
-    engine.add_global_mapping(
-        &helpers.store_value,
-        ncl_store_value as *const () as usize,
-    );
+    engine.add_global_mapping(&helpers.alloc_cons, ncl_alloc_cons as *const () as usize);
+    engine.add_global_mapping(&helpers.call_fn, ncl_call as *const () as usize);
+    engine.add_global_mapping(&helpers.funcall_fn, ncl_funcall as *const () as usize);
+    engine.add_global_mapping(&helpers.make_closure, ncl_make_closure as *const () as usize);
+    engine.add_global_mapping(&helpers.load_value, ncl_load_value as *const () as usize);
+    engine.add_global_mapping(&helpers.store_value, ncl_store_value as *const () as usize);
 }
 
 /// Convert an i1 comparison result to a tagged Word (T or NIL).
@@ -360,9 +394,9 @@ fn emit_expr<'ctx>(
                     "Param({idx}) out of range for arity {arity}"
                 ));
             }
-            // args_ptr is param 1. Load i64 at args_ptr[idx].
+            // args_ptr is param 2 (mutator=0, env=1, args=2, n_args=3).
             let args_ptr = function
-                .get_nth_param(1)
+                .get_nth_param(2)
                 .unwrap()
                 .into_pointer_value();
             let i = i64_t.const_int(*idx as u64, false);
@@ -375,6 +409,128 @@ fn emit_expr<'ctx>(
                 .build_load(i64_t, elem_ptr, "arg")
                 .map_err(|e| format!("load arg: {e}"))?;
             Ok(val.into_int_value())
+        }
+        Expr::ClosureRef(idx) => {
+            // env (function param 1) is a Vector-tagged Word. Untag,
+            // skip the header (cell 0), read cell idx+1.
+            let env_word = function.get_nth_param(1).unwrap().into_int_value();
+            let mask = i64_t.const_int(!0b111u64, false);
+            let untagged = builder
+                .build_and(env_word, mask, "untag_env")
+                .map_err(|e| format!("and: {e}"))?;
+            let ptr = builder
+                .build_int_to_ptr(untagged, ptr_t, "env_ptr")
+                .map_err(|e| format!("int_to_ptr: {e}"))?;
+            // Skip header (cell 0), index idx+1.
+            let i = i64_t.const_int((*idx as u64) + 1, false);
+            let cell_ptr = unsafe {
+                builder
+                    .build_gep(i64_t, ptr, &[i], "env_cell_ptr")
+                    .map_err(|e| format!("gep env: {e}"))?
+            };
+            let val = builder
+                .build_load(i64_t, cell_ptr, "env_val")
+                .map_err(|e| format!("load env: {e}"))?;
+            Ok(val.into_int_value())
+        }
+        Expr::Lambda { arity: lam_arity, body, captures } => {
+            // 1. JIT-compile the body as a separate function.
+            //    Recursive call to build_lisp_function.
+            let code_addr = build_lisp_function(body, *lam_arity)?;
+            // 2. Evaluate each capture expression in CURRENT scope.
+            let cap_vals: Vec<IntValue> = captures
+                .iter()
+                .map(|c| emit_expr(context, builder, function, helpers, arity, locals, c))
+                .collect::<Result<_, _>>()?;
+            // 3. Stack-alloc array for the captured values.
+            let n = cap_vals.len();
+            let arr_type = i64_t.array_type(n.max(1) as u32);
+            let arr_alloca = builder
+                .build_alloca(arr_type, "cap_buf")
+                .map_err(|e| format!("alloca: {e}"))?;
+            for (i, val) in cap_vals.iter().enumerate() {
+                let elem = unsafe {
+                    builder
+                        .build_in_bounds_gep(
+                            arr_type,
+                            arr_alloca,
+                            &[
+                                i64_t.const_int(0, false),
+                                i64_t.const_int(i as u64, false),
+                            ],
+                            "cap_slot",
+                        )
+                        .map_err(|e| format!("gep cap: {e}"))?
+                };
+                builder
+                    .build_store(elem, *val)
+                    .map_err(|e| format!("store cap: {e}"))?;
+            }
+            // 4. Call ncl_make_closure(mutator, code, arity, caps, n).
+            let mutator_arg = function.get_nth_param(0).unwrap();
+            let code_const = i64_t.const_int(code_addr as u64, false);
+            let arity_const = i64_t.const_int(*lam_arity as u64, false);
+            let n_const = i64_t.const_int(n as u64, false);
+            let call = builder
+                .build_call(
+                    helpers.make_closure,
+                    &[
+                        mutator_arg.into(),
+                        code_const.into(),
+                        arity_const.into(),
+                        arr_alloca.into(),
+                        n_const.into(),
+                    ],
+                    "lambda",
+                )
+                .map_err(|e| format!("build_call make_closure: {e}"))?;
+            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+        }
+        Expr::Funcall { fn_expr, args } => {
+            let fn_val =
+                emit_expr(context, builder, function, helpers, arity, locals, fn_expr)?;
+            let arg_vals: Vec<IntValue> = args
+                .iter()
+                .map(|a| emit_expr(context, builder, function, helpers, arity, locals, a))
+                .collect::<Result<_, _>>()?;
+            let n = arg_vals.len();
+            let arr_type = i64_t.array_type(n.max(1) as u32);
+            let arr_alloca = builder
+                .build_alloca(arr_type, "funcall_args")
+                .map_err(|e| format!("alloca: {e}"))?;
+            for (i, val) in arg_vals.iter().enumerate() {
+                let elem = unsafe {
+                    builder
+                        .build_in_bounds_gep(
+                            arr_type,
+                            arr_alloca,
+                            &[
+                                i64_t.const_int(0, false),
+                                i64_t.const_int(i as u64, false),
+                            ],
+                            "fc_slot",
+                        )
+                        .map_err(|e| format!("gep fc: {e}"))?
+                };
+                builder
+                    .build_store(elem, *val)
+                    .map_err(|e| format!("store fc: {e}"))?;
+            }
+            let mutator_arg = function.get_nth_param(0).unwrap();
+            let n_const = i64_t.const_int(n as u64, false);
+            let call = builder
+                .build_call(
+                    helpers.funcall_fn,
+                    &[
+                        mutator_arg.into(),
+                        fn_val.into(),
+                        arr_alloca.into(),
+                        n_const.into(),
+                    ],
+                    "funcall_result",
+                )
+                .map_err(|e| format!("build_call funcall: {e}"))?;
+            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
         }
         Expr::Add(a, b) => {
             let lhs = emit_expr(context, builder, function, helpers, arity, locals, a)?;

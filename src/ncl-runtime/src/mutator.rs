@@ -286,6 +286,10 @@ impl Drop for MutatorState {
 }
 
 impl MutatorState {
+    /// Access the GC coordinator. Used by runtime ABI helpers
+    /// (e.g. `ncl_make_closure`) that need to allocate in static.
+    pub fn coord(&self) -> &Arc<GcCoordinator> { &self.coord }
+
     /// Allocate a cons cell. Bumps in TLAB on the fast path; refills
     /// (and possibly triggers GC) on the slow path.
     pub fn alloc_cons(&mut self, car: Word, cdr: Word) -> Word {
@@ -295,6 +299,27 @@ impl MutatorState {
         self.refill_tlab(2);
         // Guaranteed to fit after refill (TLAB size >> 2 cells).
         unsafe { self.tlab_write_cons(car, cdr) }
+    }
+
+    /// Allocate a Vector with `length_cells` payload cells. Returns
+    /// the Vector-tagged Word. The header is initialised but the
+    /// payload cells are zero (which is fixnum-tagged 0, not nil —
+    /// callers that want nil must initialise explicitly).
+    pub fn alloc_vector(&mut self, length_cells: u32) -> Word {
+        let total = 1 + length_cells as usize;
+        if self.tlab.top + total > self.tlab.limit {
+            self.refill_tlab(total);
+        }
+        let p = unsafe { self.tlab.base.add(self.tlab.top) };
+        unsafe {
+            *p = crate::heap::HeapHeader::new(
+                crate::heap::HeapType::Vector,
+                length_cells,
+            )
+            .raw();
+        }
+        self.tlab.top += total;
+        Word::from_ptr(p as *const u8, Tag::Vector)
     }
 
     /// Inline cons write. Caller has confirmed `top + 2 <= limit`.
