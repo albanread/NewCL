@@ -640,6 +640,137 @@ pub extern "C-unwind" fn emit_draw_arc_shim(
     Word::T.raw()
 }
 
+/// `(%emit-draw-text-styled x y text size color opts-plist)` —
+/// styled-text variant. `opts-plist` is a property list with any
+/// of:
+///   :family   string         — DirectWrite font family name
+///   :weight   fixnum         — 100..900 (DWRITE_FONT_WEIGHT scale)
+///   :style    keyword        — :normal / :italic / :oblique
+///   :align    keyword        — :leading / :trailing / :center / :justified
+///   :stretch  fixnum         — 1..9 (DWRITE_FONT_STRETCH scale)
+/// Unrecognised keys are ignored. Missing keys take the same
+/// defaults as `(draw-text …)`.
+pub extern "C-unwind" fn emit_draw_text_styled_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 6 {
+        panic!("%emit-draw-text-styled: expected 6 args, got {n_args}");
+    }
+    let x = arg_fixnum(args, 0).expect("x") as f32;
+    let y = arg_fixnum(args, 1).expect("y") as f32;
+    let Some(text) = arg_string(args, 2) else {
+        panic!("%emit-draw-text-styled: text must be a string");
+    };
+    let size = arg_fixnum(args, 3).expect("size") as f32;
+    let c = arg_fixnum(args, 4).expect("color");
+    let opts = arg(args, 5);
+
+    let mut family = "Segoe UI".to_string();
+    let mut weight: u16 = 400;
+    let mut style = FontStyle::Normal;
+    let mut stretch = FontStretch::Normal;
+    let mut alignment = TextAlign::Leading;
+
+    let mut cur = opts;
+    while !cur.is_nil() {
+        let Some((k, rest)) = take_pair(cur) else { break };
+        let Some((v, rest)) = take_pair(rest) else { break };
+        cur = rest;
+        let Some(kname) = keyword_name(k) else { continue };
+        match kname.as_ref() {
+            ":FAMILY" => {
+                if v.tag() == Tag::String {
+                    family = crate::gc_string::chars_of(v).collect();
+                }
+            }
+            ":WEIGHT" => {
+                if let Some(n) = v.as_fixnum() {
+                    weight = n.clamp(100, 900) as u16;
+                }
+            }
+            ":STYLE" => {
+                if let Some(name) = keyword_name(v) {
+                    style = match name.as_ref() {
+                        ":ITALIC" => FontStyle::Italic,
+                        ":OBLIQUE" => FontStyle::Oblique,
+                        _ => FontStyle::Normal,
+                    };
+                }
+            }
+            ":STRETCH" => {
+                if let Some(n) = v.as_fixnum() {
+                    stretch = match n {
+                        1 => FontStretch::UltraCondensed,
+                        2 => FontStretch::ExtraCondensed,
+                        3 => FontStretch::Condensed,
+                        4 => FontStretch::SemiCondensed,
+                        5 => FontStretch::Normal,
+                        6 => FontStretch::SemiExpanded,
+                        7 => FontStretch::Expanded,
+                        8 => FontStretch::ExtraExpanded,
+                        9 => FontStretch::UltraExpanded,
+                        _ => FontStretch::Normal,
+                    };
+                }
+            }
+            ":ALIGN" => {
+                if let Some(name) = keyword_name(v) {
+                    alignment = match name.as_ref() {
+                        ":CENTER" => TextAlign::Center,
+                        ":TRAILING" | ":RIGHT" => TextAlign::Trailing,
+                        ":JUSTIFIED" => TextAlign::Justified,
+                        _ => TextAlign::Leading,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    batch_mod::push(SurfaceCmd::DrawTextRun {
+        run: TextRun {
+            text,
+            origin: Point { x, y },
+            family,
+            size,
+            weight,
+            style,
+            stretch,
+            locale: "en-us".to_string(),
+            color: unpack_rgba(c),
+            max_width: None,
+            alignment,
+            trimming: TextTrimming::None,
+        },
+    });
+    Word::T.raw()
+}
+
+/// Pull a (car, cdr) from a Word that's expected to be a Cons.
+/// Returns None for nil or non-cons.
+fn take_pair(w: Word) -> Option<(Word, Word)> {
+    if w.tag() != Tag::Cons {
+        return None;
+    }
+    let p = w.as_ptr::<u64>(Tag::Cons)?;
+    let car = Word::from_raw(unsafe { *p });
+    let cdr = Word::from_raw(unsafe { *p.add(1) });
+    Some((car, cdr))
+}
+
+/// Lookup a Word's printer-name if it's a Symbol with a registered
+/// name. Used to extract `:FAMILY`, `:CENTER`, etc. from keyword
+/// args at the iGui boundary.
+fn keyword_name(w: Word) -> Option<std::sync::Arc<str>> {
+    if w.tag() != Tag::Symbol {
+        return None;
+    }
+    crate::sym_names::lookup(w.raw())
+}
+
 /// `(%emit-draw-text x y text size color)` — render a string in
 /// the default UI font (Segoe UI, weight 400). The defaults cover
 /// the common case; users who need a different family / weight /

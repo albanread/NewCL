@@ -355,6 +355,22 @@
    fixnums for now (sub-pixel waits on float support)."
   (%emit-draw-text x y text size color))
 
+(defun draw-text-styled (x y text size color &rest opts)
+  "Like draw-text but with styling. OPTS is a flat property list
+   of any of:
+     :family   STRING    — font family, e.g. \"Consolas\"
+     :weight   FIXNUM    — 100..900 (regular = 400, bold = 700)
+     :style    KEYWORD   — :normal | :italic | :oblique
+     :stretch  FIXNUM    — 1 (ultra-condensed) .. 9 (ultra-expanded)
+     :align    KEYWORD   — :leading | :trailing | :center | :justified
+   Unrecognised keys are ignored. Missing keys take the same
+   defaults as `draw-text`.
+
+   Example:
+     (draw-text-styled 10 20 \"Code\" 14 +white+
+                       :family \"Consolas\" :weight 700 :style :italic)"
+  (%emit-draw-text-styled x y text size color opts))
+
 (defun fill-oval (x y w h color)
   "Filled ellipse, axis-aligned, with the given bounding box."
   (%emit-fill-oval x y w h color))

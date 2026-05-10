@@ -43,7 +43,8 @@ pub use abi::{
 #[cfg(windows)]
 pub use igui::lisp_shims::{
     begin_batch_shim, close_child_shim, emit_clear_shim, emit_draw_arc_shim,
-    emit_draw_line_shim, emit_draw_text_shim, emit_fill_circle_shim,
+    emit_draw_line_shim, emit_draw_text_shim, emit_draw_text_styled_shim,
+    emit_fill_circle_shim,
     emit_fill_oval_shim, emit_fill_rect_shim, emit_stroke_circle_shim,
     emit_stroke_oval_shim, emit_stroke_rect_shim, igui_quit_shim,
     igui_start_shim, igui_wait_shim, log_write_shim, next_event_shim,
