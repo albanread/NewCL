@@ -13,7 +13,9 @@
 pub mod symbol;
 pub mod universe;
 pub mod value;
+pub mod word;
 
 pub use symbol::{Package, Symbol, Visibility};
 pub use universe::{pkg, universe, Universe};
 pub use value::{Cons, FfiBlock, Value};
+pub use word::{Tag, Word, FIXNUM_MAX, FIXNUM_MIN, PAYLOAD_MASK, TAG_BITS, TAG_MASK};
