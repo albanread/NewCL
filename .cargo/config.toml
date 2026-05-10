@@ -1,0 +1,8 @@
+# Workstation-local LLVM install prefix. inkwell / llvm-sys read this
+# at build time to find headers and libs. The env-var name encodes the
+# major LLVM version, e.g. LLVM_SYS_221_PREFIX for the 22.1.x series.
+#
+# Update the path if your LLVM install lives elsewhere. We use the
+# same install as our sibling project NewCP.
+[env]
+LLVM_SYS_221_PREFIX = "C:\\projects\\LLVM\\install"

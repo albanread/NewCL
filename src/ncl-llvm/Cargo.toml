@@ -3,12 +3,9 @@ name = "ncl-llvm"
 version = "0.0.0"
 edition = "2024"
 
-# Phase 2 brings up the JIT here. inkwell + llvm-sys deps land then;
-# until then this crate is a stub so the workspace compiles without
-# requiring an LLVM install.
-
 [dependencies]
 ncl-ir = { path = "../ncl-ir" }
+inkwell = { version = "=0.9.0", default-features = false, features = ["llvm22-1", "target-x86"] }
 
 [lints]
 workspace = true
