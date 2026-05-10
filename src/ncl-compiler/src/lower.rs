@@ -30,6 +30,7 @@ pub enum CompileError {
 pub fn lower(v: &Value) -> Result<Expr, CompileError> {
     match v {
         Value::Fixnum(n) => Ok(Expr::Const(*n)),
+        Value::Nil => Ok(Expr::Nil),
         Value::Cons(_) => lower_call(v),
         other => Err(CompileError::NotImplemented(format!("{other:?}"))),
     }
@@ -51,6 +52,36 @@ fn lower_call(v: &Value) -> Result<Expr, CompileError> {
     match head_name.as_str() {
         "+" => fold_arithmetic(&head_name, args, 0, Expr::add),
         "*" => fold_arithmetic(&head_name, args, 1, Expr::mul),
+        "CONS" => {
+            if args.len() != 2 {
+                return Err(CompileError::BadArity {
+                    head: head_name,
+                    expected: "2",
+                    got: args.len(),
+                });
+            }
+            Ok(Expr::cons(lower(&args[0])?, lower(&args[1])?))
+        }
+        "CAR" => {
+            if args.len() != 1 {
+                return Err(CompileError::BadArity {
+                    head: head_name,
+                    expected: "1",
+                    got: args.len(),
+                });
+            }
+            Ok(Expr::car(lower(&args[0])?))
+        }
+        "CDR" => {
+            if args.len() != 1 {
+                return Err(CompileError::BadArity {
+                    head: head_name,
+                    expected: "1",
+                    got: args.len(),
+                });
+            }
+            Ok(Expr::cdr(lower(&args[0])?))
+        }
         "-" => match args.len() {
             0 => Err(CompileError::BadArity {
                 head: head_name,

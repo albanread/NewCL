@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 ncl-ir = { path = "../ncl-ir" }
+ncl-runtime = { path = "../ncl-runtime" }
 inkwell = { version = "=0.9.0", default-features = false, features = ["llvm22-1", "target-x86"] }
 
 [lints]

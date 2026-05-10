@@ -10,15 +10,20 @@
 //! atomically swapped, retirement machinery is reserved for orphaned
 //! compiled code only.
 
+pub mod abi;
 pub mod gc_symbol;
 pub mod heap;
 pub mod mutator;
+pub mod printer;
 pub mod stack_map;
 pub mod static_area;
 pub mod symbol;
 pub mod universe;
 pub mod value;
 pub mod word;
+
+pub use abi::{ncl_alloc_cons, ncl_car, ncl_cdr};
+pub use printer::format_word;
 
 pub use heap::{
     CardTable, GcBit, Heap, HeapHeader, HeapType, CARD_SIZE_BYTES, CARD_SIZE_CELLS,

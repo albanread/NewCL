@@ -17,8 +17,8 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             };
             match ncl_compiler::eval_str(&src) {
-                Ok(n) => {
-                    println!("{n}");
+                Ok(s) => {
+                    println!("{s}");
                     ExitCode::SUCCESS
                 }
                 Err(e) => {

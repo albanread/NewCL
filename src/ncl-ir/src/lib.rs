@@ -13,6 +13,8 @@
 pub enum Expr {
     /// An immediate fixnum.
     Const(i64),
+    /// The literal `nil`.
+    Nil,
     /// Binary addition (overflows wrap silently in Phase 3; the
     /// trap-and-promote-to-bignum path lands when the numeric
     /// tower does).
@@ -21,12 +23,21 @@ pub enum Expr {
     Sub(Box<Expr>, Box<Expr>),
     /// Binary multiplication.
     Mul(Box<Expr>, Box<Expr>),
+    /// Allocate a cons cell. Calls `ncl_alloc_cons` at runtime.
+    Cons(Box<Expr>, Box<Expr>),
+    /// Read the car field of a cons.
+    Car(Box<Expr>),
+    /// Read the cdr field of a cons.
+    Cdr(Box<Expr>),
 }
 
 impl Expr {
     pub fn add(a: Expr, b: Expr) -> Expr { Expr::Add(Box::new(a), Box::new(b)) }
     pub fn sub(a: Expr, b: Expr) -> Expr { Expr::Sub(Box::new(a), Box::new(b)) }
     pub fn mul(a: Expr, b: Expr) -> Expr { Expr::Mul(Box::new(a), Box::new(b)) }
+    pub fn cons(car: Expr, cdr: Expr) -> Expr { Expr::Cons(Box::new(car), Box::new(cdr)) }
+    pub fn car(x: Expr) -> Expr { Expr::Car(Box::new(x)) }
+    pub fn cdr(x: Expr) -> Expr { Expr::Cdr(Box::new(x)) }
 }
 
 #[cfg(test)]

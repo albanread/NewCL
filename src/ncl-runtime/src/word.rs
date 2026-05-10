@@ -76,14 +76,18 @@ const SUBTAG_MASK: u64 = 0b11111 << TAG_BITS;
 const SUBTAG_T: u64 = 0;
 const SUBTAG_CHAR: u64 = 1;
 const SUBTAG_UNBOUND: u64 = 2;
+const SUBTAG_NIL: u64 = 3;
 
 const fn immediate(subtag: u64, payload: u64) -> u64 {
     (payload << (TAG_BITS + SUBTAG_BITS)) | (subtag << TAG_BITS) | (Tag::Immediate as u64)
 }
 
 impl Word {
-    /// `nil` — bit pattern 0 (fixnum-tagged zero).
-    pub const NIL: Word = Word(0);
+    /// `nil` — the empty list, the only false value, also the symbol
+    /// `COMMON-LISP:NIL`. Represented as immediate sub-tag 3 so it
+    /// is distinguishable from `fixnum 0` (CL says `(eq nil 0)` is
+    /// false). `(eq x nil)` is still one `cmp x, NIL_RAW`.
+    pub const NIL: Word = Word(immediate(SUBTAG_NIL, 0));
 
     /// `T` — the canonical truth value.
     pub const T: Word = Word(immediate(SUBTAG_T, 0));
@@ -146,7 +150,7 @@ impl Word {
 
     pub fn tag(self) -> Tag { Tag::from_bits(self.0) }
 
-    pub fn is_nil(self) -> bool { self.0 == 0 }
+    pub fn is_nil(self) -> bool { self.0 == Word::NIL.0 }
     pub fn is_t(self) -> bool { self.0 == Word::T.0 }
     pub fn is_unbound(self) -> bool { self.0 == Word::UNBOUND.0 }
     pub fn is_fixnum(self) -> bool { self.tag() == Tag::Fixnum }
@@ -236,12 +240,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nil_is_zero() {
-        assert_eq!(Word::NIL.raw(), 0);
+    fn nil_distinct_from_fixnum_zero() {
         assert!(Word::NIL.is_nil());
-        // nil is a fixnum-tagged zero, so it claims fixnum tag.
-        assert!(Word::NIL.is_fixnum());
-        assert_eq!(Word::NIL.as_fixnum(), Some(0));
+        assert!(!Word::NIL.is_fixnum());
+        assert_eq!(Word::NIL.as_fixnum(), None);
+        assert_eq!(Word::NIL.tag(), Tag::Immediate);
+
+        let zero = Word::fixnum(0);
+        assert!(zero.is_fixnum());
+        assert!(!zero.is_nil());
+        assert_eq!(zero.as_fixnum(), Some(0));
+        assert_ne!(zero.raw(), Word::NIL.raw());
     }
 
     #[test]
