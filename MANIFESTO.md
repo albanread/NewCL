@@ -220,7 +220,36 @@ decide.
    IR → LLVM IR — and we resist adding stages between those until a
    real demo forces us to.
 
-5. **When in doubt, be Lisp.** We borrow architecture from NewCP because
+5. **FFI is a feature, not a foundation.** Common Lisp programs that
+   want to call out to C, Win32, or COM can. The Corman demos do, and
+   we honour that — `#!…!#` blocks parse, `defun-dll` works, the FFI
+   is a fully supported user-facing capability.
+
+   But our own implementation never goes through FFI. `cl:open` uses
+   Rust's `std::fs`, not `CreateFileW`. `cl:make-thread` uses
+   `std::thread`, not `CreateThread`. `cl:get-internal-real-time` uses
+   `std::time::Instant`, not `QueryPerformanceCounter`. The stdlib is
+   Rust-backed; the FFI sits beside it for user code to reach.
+
+   Why: relying on FFI for our own internals would pollute the
+   language/OS separation — every primitive would carry a "what's the
+   Cocoa equivalent?" question into the Mac port, and the iGui
+   thread-boundary rule would leak into our stream and time and
+   thread code. Keeping FFI out of our foundation keeps the porting
+   cost where it belongs (the iGui shim) and nowhere else.
+
+   Concrete consequences:
+   - Crate dependencies flow `ncl-ffi → ncl-runtime`, never the
+     reverse.
+   - `ncl-runtime` and `ncl-cl` contain no FFI imports and no
+     `#![allow]` for unsafe FFI patterns.
+   - Corman's `Sys/` source tree is not ported. Its FFI-heavy
+     implementation of the standard library is not the spec; the
+     ANSI surface it presents is. We re-implement the standard
+     library natively in Rust, and the demos see the same API
+     they always did.
+
+6. **When in doubt, be Lisp.** We borrow architecture from NewCP because
    it has solved many of the same problems we will face — JIT,
    incremental loading, hot reload, OS shim, GUI substrate. But NewCP is
    a Component Pascal system, and Component Pascal is module-shaped and
