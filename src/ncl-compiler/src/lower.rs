@@ -146,12 +146,21 @@ impl LocalEnv {
     /// When the parent binding is a Cell variant, the captured slot
     /// holds the cons (the box); the inner binding is a
     /// `ClosureRefCell` so reads and writes auto-deref through it.
+    ///
+    /// Recursive across nested lambdas: if the immediate parent
+    /// doesn't have NAME in its own bindings, ask the parent to
+    /// capture it from ITS parent. This grows a capture chain so
+    /// `(lambda () (lambda () (lambda () outer-var)))` correctly
+    /// threads `outer-var` through every intermediate env. Without
+    /// the recursion, an inner lambda could only see vars one
+    /// scope up — surprising behavior caught when maphash's
+    /// nested loops produced "unbound variable: FN".
     pub fn find_or_capture(&mut self, name: &str) -> Option<Binding> {
         if let Some(b) = self.find_local(name) {
             return Some(b);
         }
-        let parent = self.capture_parent.as_ref()?;
-        let parent_b = parent.find_local(name)?;
+        let parent = self.capture_parent.as_mut()?;
+        let parent_b = parent.find_or_capture(name)?;
         let idx = self.closure_count;
         let (outer_expr, inner_binding) = match parent_b {
             Binding::Param(i) => (Expr::Param(i), Binding::ClosureRef(idx)),
@@ -1175,10 +1184,15 @@ fn lower_lambda(
     let body_forms = &args[1..];
 
     // Inner env starts with required params at Param(0..N) and a
-    // capture parent pointing at the outer env (clone — we only
-    // read from it during lookup_or_capture). Optionals, the rest
-    // binding, and keys are then layered on as let-locals via the
-    // shared prologue helper.
+    // capture parent that begins as a clone of `outer_env`. The
+    // clone gets mutated when the body's lookups call
+    // `find_or_capture` recursively — those mutations need to
+    // make it back to `outer_env` too, so the surrounding
+    // function's captures vec grows in lockstep. We snapshot
+    // `outer_env`'s sizes here, then reconcile the parent clone's
+    // tail back after the body is lowered.
+    let outer_captures_before = outer_env.captures.len();
+    let outer_bindings_before = outer_env.bindings.len();
     let mut inner_env = LocalEnv::for_lambda(&params.required, outer_env.clone());
     let prologue = build_arglist_prologue(&params, body_forms, &mut inner_env, coord)?;
 
@@ -1203,6 +1217,43 @@ fn lower_lambda(
     let body_expr = instrument_tail_for_mv(body_expr);
 
     let captures = inner_env.take_captures();
+
+    // Reconcile: any names this lambda's body resolved by recursively
+    // capturing through `outer_env` were applied to the parent
+    // *clone* inside `inner_env.capture_parent`, not to `outer_env`
+    // directly. Copy any new captures/bindings back so the
+    // surrounding function knows about them. Without this, a
+    // grandchild lambda that captures from a grandparent would
+    // produce a parent Lambda IR with empty captures and a runtime
+    // ClosureRef would read garbage.
+    if let Some(parent_clone) = inner_env.capture_parent.take() {
+        let new_caps: Vec<Expr> = parent_clone
+            .captures
+            .iter()
+            .skip(outer_captures_before)
+            .cloned()
+            .collect();
+        for c in new_caps {
+            outer_env.captures.push(c);
+        }
+        let new_bindings: Vec<(Arc<str>, Binding)> = parent_clone
+            .bindings
+            .iter()
+            .skip(outer_bindings_before)
+            .cloned()
+            .collect();
+        for b in new_bindings {
+            outer_env.bindings.push(b);
+        }
+        // closure_count tracks how many ClosureRef indices were
+        // handed out; if the parent clone grew its closure_count,
+        // outer_env must reflect that so the next capture in
+        // outer_env's scope picks the right next index.
+        if parent_clone.closure_count > outer_env.closure_count {
+            outer_env.closure_count = parent_clone.closure_count;
+        }
+    }
+
     Ok(Expr::lambda(params.required.len() as u32, body_expr, captures))
 }
 

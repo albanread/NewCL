@@ -431,29 +431,20 @@
     ht))
 
 (defun maphash (fn ht)
-  "Call FN with each key and value of HT. Returns NIL.
-
-   Implementation note: a single flat loop, deliberately. The
-   compiler's closure-capture path only walks one parent, so a
-   lambda inside two nested loops can't see FN — `loop` is a
-   macro that wraps its body in a thunk, and (loop (loop body))
-   asks for two levels of capture. Folding bucket-walk and
-   within-bucket-walk into one loop sidesteps that. Lift the
-   restriction once the compiler grows multi-level capture."
-  (let ((bi 0)
-        (n (%ht-nbuckets ht))
-        (bucket nil))
+  "Call FN with each key and value of HT. Returns NIL."
+  (let ((i 0)
+        (n (%ht-nbuckets ht)))
     (loop
       (cond
-        ;; Bucket exhausted (or never started) — advance the
-        ;; bucket index and refill, or finish if no more.
-        ((null bucket)
-         (cond
-           ((>= bi n) (return nil))
-           (t (setq bucket (%ht-bucket ht bi))
-              (setq bi (+ bi 1)))))
-        (t (funcall fn (car (car bucket)) (cdr (car bucket)))
-           (setq bucket (cdr bucket)))))))
+        ((>= i n) (return nil))
+        (t
+         (let ((bucket (%ht-bucket ht i)))
+           (loop
+             (cond
+               ((null bucket) (return nil))
+               (t (funcall fn (car (car bucket)) (cdr (car bucket)))
+                  (setq bucket (cdr bucket))))))
+         (setq i (+ i 1)))))))
 
 (defmacro multiple-value-list (form)
   "Evaluate FORM and return a fresh list of all the values it
