@@ -253,3 +253,380 @@
 (defun standard-generic-function-p (x)
   (declare (ignore x))
   nil)
+
+;; ─── Stage B: class metaobjects + bootstrap ─────────────────────────────────
+;;
+;; The chicken-and-egg: defclass needs the metaclass to exist, but
+;; the metaclass is itself a class. Closette resolves this with a
+;; manual construction sequence at the end of the file (its "10
+;; easy steps"). We follow the same shape — the data (the-defclass-
+;; standard-class) is declared up front, then the bootstrap section
+;; at the bottom of this stage hand-builds standard-class and T.
+
+;; -- find-class registry ----------------------------------------------------
+
+(defparameter *clos-class-table* (make-hash-table :test 'eq))
+
+(defun find-class (name &optional (errorp t))
+  "Return the class object registered under NAME. Signals an
+   error if no such class is registered and ERRORP is true;
+   returns NIL otherwise."
+  (let ((c (gethash name *clos-class-table*)))
+    (cond
+      (c c)
+      (errorp (error "find-class: no class named ~A" name))
+      (t nil))))
+
+(defun %setf-find-class (new-value name &optional errorp)
+  (declare (ignore errorp))
+  (setf (gethash name *clos-class-table*) new-value)
+  new-value)
+
+(defun forget-all-classes ()
+  (clrhash *clos-class-table*)
+  nil)
+
+(defparameter *clos-generic-function-table* (make-hash-table :test 'eq))
+
+(defun forget-all-generic-functions ()
+  (clrhash *clos-generic-function-table*)
+  nil)
+
+;; -- Slot definitions (plist representation) --------------------------------
+;;
+;; Closette represents slot definitions as plists with :name,
+;; :initargs, :initform, :initfunction, :readers, :writers,
+;; :allocation, optionally :documentation and :shared-slot. The
+;; accessors are getf/setf-getf*. See clos.lisp:747.
+
+(defun make-direct-slot-definition (&key name (initargs nil) (initform nil)
+                                          (initfunction nil) (readers nil)
+                                          (writers nil) (allocation :instance))
+  (let ((slot (list ':name name
+                    ':initargs initargs
+                    ':initform initform
+                    ':initfunction initfunction
+                    ':readers readers
+                    ':writers writers
+                    ':allocation allocation)))
+    (when (eq allocation :class)
+      (setf slot (nconc slot (list ':shared-slot (list secret-unbound-value)))))
+    slot))
+
+(defun make-effective-slot-definition (&key name (initargs nil) (initform nil)
+                                            (initfunction nil) (allocation :instance))
+  (list ':name name
+        ':initargs initargs
+        ':initform initform
+        ':initfunction initfunction
+        ':allocation allocation))
+
+(defun slot-definition-name (slot) (getf slot ':name))
+(defun slot-definition-initargs (slot) (getf slot ':initargs))
+(defun slot-definition-initform (slot) (getf slot ':initform))
+(defun slot-definition-initfunction (slot) (getf slot ':initfunction))
+(defun slot-definition-readers (slot) (getf slot ':readers))
+(defun slot-definition-writers (slot) (getf slot ':writers))
+(defun slot-definition-allocation (slot) (getf slot ':allocation))
+(defun slot-definition-documentation (slot) (getf slot ':documentation))
+(defun slot-definition-shared-slot (slot) (getf slot ':shared-slot))
+
+(defun instance-slot-p (slot)
+  (eq (slot-definition-allocation slot) ':instance))
+
+;; -- Standard-class slot positions (the meta-circular shortcut) -------------
+;;
+;; standard-class's effective-slots layout — the index of each
+;; slot in the slot-storage vector. Closette hard-codes these in
+;; slot-location; we mirror the choice. See the-defclass-standard-
+;; class below for the source of truth, but ORDER MATTERS for the
+;; bootstrap so we list them once explicitly.
+
+(defparameter *standard-class-slot-names*
+  '(name documentation direct-subclasses direct-superclasses
+    class-precedence-list direct-methods direct-slots
+    effective-slots shared-slot-definitions shared-slots
+    direct-default-initargs effective-default-initargs))
+
+;; the-class-standard-class is filled in by the bootstrap below.
+;; the-slots-of-standard-class is the list of effective-slot-
+;; definitions for standard-class.
+(defparameter the-slots-of-standard-class nil)
+(defparameter the-class-standard-class nil)
+
+(defparameter the-defclass-standard-class
+  '(defclass standard-class (class)
+     ((name :initarg :name)
+      (documentation :initform () :initarg :documentation)
+      (direct-subclasses :initform ())
+      (direct-superclasses :initarg :direct-superclasses)
+      (class-precedence-list)
+      (direct-methods :initform ())
+      (direct-slots)
+      (effective-slots)
+      (shared-slot-definitions :initform ())
+      (shared-slots :initform ())
+      (direct-default-initargs :initform () :initarg :direct-default-initargs)
+      (effective-default-initargs :initform ()))))
+
+;; -- Slot access ------------------------------------------------------------
+;;
+;; slot-location walks the class's effective-slots list looking
+;; for the named slot, returning its position-among-instance-slots
+;; (shared slots are counted separately). Closette short-circuits
+;; the lookup of 'effective-slots in standard-class because that
+;; query would recurse forever otherwise.
+
+(defun slot-location (class slot-name)
+  "Return the index of SLOT-NAME within CLASS's instance-slot
+   storage, or NIL if it's a shared slot or absent. Special case:
+   the lookup of 'effective-slots in standard-class returns 7 by
+   construction — without this short-circuit, finding any slot in
+   standard-class would recurse infinitely."
+  (cond
+    ((and (eq slot-name 'effective-slots)
+          (eq class the-class-standard-class))
+     7)
+    (t
+     (let ((slots (class-effective-slots class))
+           (pos 0)
+           (result nil))
+       (loop
+         (cond
+           ((null slots) (return nil))
+           (t (let ((s (car slots)))
+                (cond
+                  ((eq (slot-definition-name s) slot-name)
+                   (setq result pos)
+                   (setq slots nil))
+                  (t (when (instance-slot-p s)
+                       (setq pos (+ pos 1)))
+                     (setq slots (cdr slots))))))))
+       result))))
+
+(defun shared-slot-location (class slot-name)
+  (let ((slots (class-shared-slot-definitions class))
+        (pos 0)
+        (result nil))
+    (loop
+      (cond
+        ((null slots) (return nil))
+        (t (let ((s (car slots)))
+             (cond
+               ((eq (slot-definition-name s) slot-name)
+                (setq result pos)
+                (setq slots nil))
+               (t (setq pos (+ pos 1))
+                  (setq slots (cdr slots))))))))
+    result))
+
+;; slot-contents is just svref. Closette uses a uref-with-offset
+;; trick for inline access; we don't have that and svref is fine.
+(defun slot-contents (slots location) (svref slots location))
+(defun %setf-slot-contents (new-value slots location)
+  (setf (svref slots location) new-value)
+  new-value)
+
+(defun std-slot-value (instance slot-name)
+  "Read SLOT-NAME from INSTANCE via slot-location. Errors if
+   the slot doesn't exist or is unbound."
+  (let ((class (class-of instance)))
+    (let ((location (slot-location class slot-name))
+          (val nil))
+      (cond
+        (location
+         (setq val (slot-contents (std-instance-slots instance) location)))
+        (t
+         (let ((sloc (shared-slot-location class slot-name)))
+           (cond
+             (sloc
+              (setq val (car (slot-contents (class-shared-slots class) sloc))))
+             (t (error "The slot ~A is missing from the class ~A."
+                       slot-name class))))))
+      (when (eq secret-unbound-value val)
+        (error "The slot ~A is unbound in the object ~A." slot-name instance))
+      val)))
+
+(defun %setf-std-slot-value (new-value instance slot-name)
+  (let ((class (class-of instance)))
+    (let ((location (slot-location class slot-name)))
+      (cond
+        (location
+         (setf (slot-contents (std-instance-slots instance) location)
+               new-value))
+        (t
+         (let ((sloc (shared-slot-location class slot-name)))
+           (cond
+             (sloc
+              (setf (car (slot-contents (class-shared-slots class) sloc))
+                    new-value))
+             (t (error "The slot ~A is missing from the class ~A."
+                       slot-name class))))))))
+  new-value)
+
+;; slot-value / (setf slot-value) — Stage D adds the full
+;; standard-class-p dispatch path and slot-value-using-class.
+;; For Stage B we just route to std-slot-value.
+
+(defun slot-value (object slot-name)
+  (std-slot-value object slot-name))
+
+(defun %setf-slot-value (new-value object slot-name)
+  (%setf-std-slot-value new-value object slot-name))
+
+;; -- Class metaobject accessors --------------------------------------------
+;;
+;; Closette implements these as plain defuns calling slot-value.
+;; They become generic functions in stage E (which dispatches via
+;; standard-class-p to the std-slot-value fast path); for now they
+;; just call slot-value directly.
+
+(defun class-name (class) (slot-value class 'name))
+(defun %setf-class-name (new-value class)
+  (setf (slot-value class 'name) new-value))
+
+(defun class-documentation (class) (slot-value class 'documentation))
+(defun %setf-class-documentation (new-value class)
+  (setf (slot-value class 'documentation) new-value))
+
+(defun class-direct-superclasses (class)
+  (slot-value class 'direct-superclasses))
+(defun %setf-class-direct-superclasses (new-value class)
+  (setf (slot-value class 'direct-superclasses) new-value))
+
+(defun class-direct-slots (class) (slot-value class 'direct-slots))
+(defun %setf-class-direct-slots (new-value class)
+  (setf (slot-value class 'direct-slots) new-value))
+
+(defun class-precedence-list (class)
+  (slot-value class 'class-precedence-list))
+(defun %setf-class-precedence-list (new-value class)
+  (setf (slot-value class 'class-precedence-list) new-value))
+
+(defun class-effective-slots (class) (slot-value class 'effective-slots))
+(defun %setf-class-effective-slots (new-value class)
+  (setf (slot-value class 'effective-slots) new-value))
+
+(defun class-direct-subclasses (class)
+  (slot-value class 'direct-subclasses))
+(defun %setf-class-direct-subclasses (new-value class)
+  (setf (slot-value class 'direct-subclasses) new-value))
+
+(defun class-direct-methods (class) (slot-value class 'direct-methods))
+(defun %setf-class-direct-methods (new-value class)
+  (setf (slot-value class 'direct-methods) new-value))
+
+(defun class-shared-slots (class) (slot-value class 'shared-slots))
+(defun %setf-class-shared-slots (new-value class)
+  (setf (slot-value class 'shared-slots) new-value))
+
+(defun class-shared-slot-definitions (class)
+  (slot-value class 'shared-slot-definitions))
+(defun %setf-class-shared-slot-definitions (new-value class)
+  (setf (slot-value class 'shared-slot-definitions) new-value))
+
+;; -- subclassp / sub-specializer-p -----------------------------------------
+
+(defun subclassp (c1 c2)
+  (not (null (find c2 (class-precedence-list c1)))))
+
+(defun sub-specializer-p (c1 c2 c-arg)
+  (let ((cpl (class-precedence-list c-arg)))
+    (not (null (find c2 (cdr (member c1 cpl)))))))
+
+;; -- class-of + built-in-class-of ------------------------------------------
+;;
+;; Initial built-in-class-of returns NIL for built-in types until
+;; Stage C runs the full bootstrap that defclasses INTEGER /
+;; SYMBOL / etc. After that, all built-ins resolve.
+
+(defun class-of (x)
+  (cond
+    ((clos-instance-p x) (std-instance-class x))
+    (t (built-in-class-of x))))
+
+(defun built-in-class-of (x)
+  "Slow but straightforward typecase. Stage C extends the
+   class table to cover all the built-in types this checks for."
+  (typecase x
+    (null      (find-class 'null nil))
+    (symbol    (find-class 'symbol nil))
+    (integer   (find-class 'integer nil))
+    (cons      (find-class 'cons nil))
+    (character (find-class 'character nil))
+    (string    (find-class 'string nil))
+    (vector    (find-class 'vector nil))
+    (function  (find-class 'function nil))
+    (t         (find-class 't nil))))
+
+;; -- Standard-instance allocation (used during bootstrap and later) ---------
+
+(defun std-allocate-instance (class)
+  (allocate-std-instance
+    class
+    (allocate-slot-storage
+      (length (class-effective-slots class))
+      secret-unbound-value)))
+
+;; ─── Bootstrap steps 1-5: skeleton standard-class + T ───────────────────────
+;;
+;; Each defclass slot in the-defclass-standard-class becomes an
+;; effective-slot-definition (just :name + :allocation :instance
+;; for now; initforms get plumbed in stage C). Then we manually
+;; allocate standard-class and patch up the circular class-of
+;; link — once that's done class-effective-slots etc. all work
+;; on standard-class itself.
+
+(forget-all-classes)
+(forget-all-generic-functions)
+
+;; Step 1: build effective-slot-definitions for standard-class's slots.
+(setq the-slots-of-standard-class
+      (mapcar (lambda (slotd)
+                (make-effective-slot-definition
+                  :name (car slotd)
+                  :initargs (let ((a (getf (cdr slotd) ':initarg)))
+                              (cond (a (list a))
+                                    (t nil)))
+                  :initform (getf (cdr slotd) ':initform)
+                  :allocation ':instance))
+              (nth 3 the-defclass-standard-class)))
+
+;; Step 2: hand-allocate standard-class with placeholder class link.
+(setq the-class-standard-class
+      (allocate-std-instance
+        'tba
+        (make-array (length the-slots-of-standard-class)
+                    :initial-element secret-unbound-value)))
+;; Step 3: install the circular class-of link.
+(setf (std-instance-class the-class-standard-class)
+      the-class-standard-class)
+;; (now slot-value on standard-class works — slot-location's
+;; effective-slots short-circuit kicks in)
+
+;; Step 4: fill in standard-class's class-effective-slots so that
+;; lookups for OTHER slot names also work.
+(setf (class-effective-slots the-class-standard-class)
+      the-slots-of-standard-class)
+;; Step 5: hand-build the class T. T has no superclasses, no
+;; methods, no slots — it's the root of the type hierarchy.
+(setf (gethash 't *clos-class-table*)
+      (let ((class (std-allocate-instance the-class-standard-class)))
+        (setf (class-name class) 't)
+        (setf (class-documentation class) nil)
+        (setf (class-direct-subclasses class) nil)
+        (setf (class-direct-superclasses class) nil)
+        (setf (class-direct-methods class) nil)
+        (setf (class-direct-slots class) nil)
+        (setf (class-precedence-list class) (list class))
+        (setf (class-effective-slots class) nil)
+        (setf (class-shared-slot-definitions class) nil)
+        (setf (class-shared-slots class) nil)
+        class))
+
+;; Return a printable sentinel so Session::eval's last-value
+;; format_word doesn't try to render the circular T-class
+;; instance (the printer doesn't yet handle cycles). Stage I
+;; will introduce a print-object hook that breaks the cycle
+;; properly; until then, a leading-NIL works.
+nil
