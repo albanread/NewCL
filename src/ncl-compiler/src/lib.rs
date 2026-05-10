@@ -914,6 +914,144 @@ mod end_to_end_tests {
         );
     }
 
+    // -- setf: generalised assignment --------------------------------------
+
+    #[test]
+    fn setf_on_symbol_acts_like_setq() {
+        let mut session = Session::new();
+        session.eval("(defparameter *x* 0)").unwrap();
+        session.eval("(setf *x* 42)").unwrap();
+        assert_eq!(session.eval("*x*").unwrap(), "42");
+    }
+
+    #[test]
+    fn setf_on_symbol_returns_value() {
+        let mut session = Session::new();
+        session.eval("(defparameter *x* 0)").unwrap();
+        // setf evaluates to the assigned value, like setq.
+        assert_eq!(session.eval("(setf *x* 99)").unwrap(), "99");
+    }
+
+    #[test]
+    fn setf_car_mutates_cons() {
+        let mut session = Session::new();
+        session.eval("(defparameter *p* (cons 1 2))").unwrap();
+        session.eval("(setf (car *p*) 99)").unwrap();
+        assert_eq!(session.eval("(car *p*)").unwrap(), "99");
+        // cdr unchanged.
+        assert_eq!(session.eval("(cdr *p*)").unwrap(), "2");
+    }
+
+    #[test]
+    fn setf_cdr_mutates_cons() {
+        let mut session = Session::new();
+        session.eval("(defparameter *p* (cons 1 2))").unwrap();
+        session.eval("(setf (cdr *p*) 99)").unwrap();
+        assert_eq!(session.eval("(car *p*)").unwrap(), "1");
+        assert_eq!(session.eval("(cdr *p*)").unwrap(), "99");
+    }
+
+    #[test]
+    fn setf_first_and_rest_aliases() {
+        let mut session = Session::new();
+        session.eval("(defparameter *p* (cons 1 2))").unwrap();
+        session.eval("(setf (first *p*) 10)").unwrap();
+        session.eval("(setf (rest *p*) 20)").unwrap();
+        assert_eq!(session.eval("(car *p*)").unwrap(), "10");
+        assert_eq!(session.eval("(cdr *p*)").unwrap(), "20");
+    }
+
+    #[test]
+    fn setf_returns_new_value_for_cons() {
+        // CL: setf returns the value, not the modified container.
+        let mut session = Session::new();
+        session.eval("(defparameter *p* (cons 1 2))").unwrap();
+        assert_eq!(session.eval("(setf (car *p*) 7)").unwrap(), "7");
+        assert_eq!(session.eval("(setf (cdr *p*) 8)").unwrap(), "8");
+    }
+
+    #[test]
+    fn setf_car_on_nested_list() {
+        let mut session = Session::new();
+        session
+            .eval("(defparameter *p* (cons 1 (cons 2 (cons 3 nil))))")
+            .unwrap();
+        // Mutate the second cell's car.
+        session.eval("(setf (car (cdr *p*)) 99)").unwrap();
+        assert_eq!(session.eval("*p*").unwrap(), "(1 99 3)");
+    }
+
+    #[test]
+    fn setf_cdr_can_create_dotted_pair() {
+        let mut session = Session::new();
+        session.eval("(defparameter *p* (cons 1 nil))").unwrap();
+        session.eval("(setf (cdr *p*) 2)").unwrap();
+        assert_eq!(session.eval("*p*").unwrap(), "(1 . 2)");
+    }
+
+    #[test]
+    fn setf_aref_mutates_string() {
+        let mut session = Session::new();
+        session.eval(r#"(defparameter *s* "hello")"#).unwrap();
+        session.eval(r#"(setf (aref *s* 0) #\H)"#).unwrap();
+        assert_eq!(session.eval("*s*").unwrap(), r#""Hello""#);
+    }
+
+    #[test]
+    fn setf_char_mutates_string() {
+        let mut session = Session::new();
+        session.eval(r#"(defparameter *s* "world")"#).unwrap();
+        session.eval(r#"(setf (char *s* 4) #\!)"#).unwrap();
+        assert_eq!(session.eval("*s*").unwrap(), r#""worl!""#);
+    }
+
+    #[test]
+    fn setf_string_returns_char() {
+        let mut session = Session::new();
+        session.eval(r#"(defparameter *s* "abc")"#).unwrap();
+        assert_eq!(
+            session.eval(r#"(setf (aref *s* 1) #\X)"#).unwrap(),
+            r#"#\X"#,
+        );
+    }
+
+    #[test]
+    fn setf_string_unicode() {
+        // Set a Unicode codepoint in a string.
+        let mut session = Session::new();
+        session.eval(r#"(defparameter *s* "cafe")"#).unwrap();
+        session.eval(r#"(setf (aref *s* 3) #\é)"#).unwrap();
+        assert_eq!(session.eval("*s*").unwrap(), r#""café""#);
+    }
+
+    #[test]
+    fn setf_in_function_body() {
+        let mut session = Session::new();
+        session
+            .eval("(defun set-head (p v) (setf (car p) v))")
+            .unwrap();
+        session.eval("(defparameter *q* (cons 0 0))").unwrap();
+        session.eval("(set-head *q* 42)").unwrap();
+        assert_eq!(session.eval("(car *q*)").unwrap(), "42");
+    }
+
+    #[test]
+    fn setf_unsupported_place_errors() {
+        // (setf 5 6) — not a place.
+        let r = eval_str("(setf 5 6)");
+        assert!(r.is_err(), "expected error for non-place setf, got {r:?}");
+    }
+
+    #[test]
+    fn setf_unknown_form_errors() {
+        // No (foo …) setf-expander wired in. Fails to compile.
+        let r = eval_str("(setf (foo x) 1)");
+        assert!(matches!(
+            r,
+            Err(EvalError::Compile(CompileError::NotImplemented(_))),
+        ));
+    }
+
     // -- defparameter / setq / global value cells --------------------------
 
     #[test]

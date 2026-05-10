@@ -26,8 +26,8 @@ use inkwell::values::{FunctionValue, IntValue};
 use ncl_ir::Expr;
 use ncl_runtime::{
     ncl_alloc_cons, ncl_call, ncl_equal, ncl_funcall, ncl_length, ncl_load_function,
-    ncl_load_value, ncl_make_closure, ncl_store_value, ncl_string_char,
-    ncl_string_eq, MutatorState, Tag, Word,
+    ncl_load_value, ncl_make_closure, ncl_set_car, ncl_set_cdr, ncl_store_value,
+    ncl_string_char, ncl_string_eq, ncl_string_set, MutatorState, Tag, Word,
 };
 
 // We leak each compilation's Context + Module + Engine so the
@@ -200,6 +200,9 @@ struct Helpers<'ctx> {
     equal: FunctionValue<'ctx>,
     string_eq: FunctionValue<'ctx>,
     string_char: FunctionValue<'ctx>,
+    set_car: FunctionValue<'ctx>,
+    set_cdr: FunctionValue<'ctx>,
+    string_set: FunctionValue<'ctx>,
 }
 
 fn declare_runtime_helpers<'ctx>(
@@ -298,6 +301,29 @@ fn declare_runtime_helpers<'ctx>(
         Some(Linkage::External),
     );
 
+    // ncl_set_car(mutator, cons, value) -> u64
+    let mutator_binary_type =
+        i64_t.fn_type(&[ptr_t.into(), i64_t.into(), i64_t.into()], false);
+    let set_car = module.add_function(
+        "ncl_set_car",
+        mutator_binary_type,
+        Some(Linkage::External),
+    );
+    let set_cdr = module.add_function(
+        "ncl_set_cdr",
+        mutator_binary_type,
+        Some(Linkage::External),
+    );
+
+    // ncl_string_set(s, idx, ch) -> u64  (idx is raw, not tagged)
+    let string_set_type =
+        i64_t.fn_type(&[i64_t.into(), i64_t.into(), i64_t.into()], false);
+    let string_set = module.add_function(
+        "ncl_string_set",
+        string_set_type,
+        Some(Linkage::External),
+    );
+
     Helpers {
         alloc_cons,
         call_fn,
@@ -310,6 +336,9 @@ fn declare_runtime_helpers<'ctx>(
         equal,
         string_eq,
         string_char,
+        set_car,
+        set_cdr,
+        string_set,
     }
 }
 
@@ -325,6 +354,9 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(&helpers.equal, ncl_equal as *const () as usize);
     engine.add_global_mapping(&helpers.string_eq, ncl_string_eq as *const () as usize);
     engine.add_global_mapping(&helpers.string_char, ncl_string_char as *const () as usize);
+    engine.add_global_mapping(&helpers.set_car, ncl_set_car as *const () as usize);
+    engine.add_global_mapping(&helpers.set_cdr, ncl_set_cdr as *const () as usize);
+    engine.add_global_mapping(&helpers.string_set, ncl_string_set as *const () as usize);
 }
 
 /// Convert an i1 comparison result to a tagged Word (T or NIL).
@@ -792,6 +824,50 @@ fn emit_expr<'ctx>(
                     "str_char",
                 )
                 .map_err(|e| format!("build_call string_char: {e}"))?;
+            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+        }
+        Expr::SetCar(cons, value) => {
+            let vc = emit_expr(context, builder, function, helpers, arity, locals, cons)?;
+            let vv = emit_expr(context, builder, function, helpers, arity, locals, value)?;
+            let mutator_arg = function.get_nth_param(0).unwrap();
+            let call = builder
+                .build_call(
+                    helpers.set_car,
+                    &[mutator_arg.into(), vc.into(), vv.into()],
+                    "set_car",
+                )
+                .map_err(|e| format!("build_call set_car: {e}"))?;
+            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+        }
+        Expr::SetCdr(cons, value) => {
+            let vc = emit_expr(context, builder, function, helpers, arity, locals, cons)?;
+            let vv = emit_expr(context, builder, function, helpers, arity, locals, value)?;
+            let mutator_arg = function.get_nth_param(0).unwrap();
+            let call = builder
+                .build_call(
+                    helpers.set_cdr,
+                    &[mutator_arg.into(), vc.into(), vv.into()],
+                    "set_cdr",
+                )
+                .map_err(|e| format!("build_call set_cdr: {e}"))?;
+            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+        }
+        Expr::SetChar { s, idx, ch } => {
+            let vs = emit_expr(context, builder, function, helpers, arity, locals, s)?;
+            let vi_tagged = emit_expr(context, builder, function, helpers, arity, locals, idx)?;
+            let vch = emit_expr(context, builder, function, helpers, arity, locals, ch)?;
+            // Index is a tagged fixnum; ncl_string_set wants raw.
+            let three = i64_t.const_int(3, false);
+            let untagged = builder
+                .build_right_shift(vi_tagged, three, true, "untag_idx")
+                .map_err(|e| format!("ashr: {e}"))?;
+            let call = builder
+                .build_call(
+                    helpers.string_set,
+                    &[vs.into(), untagged.into(), vch.into()],
+                    "str_set",
+                )
+                .map_err(|e| format!("build_call string_set: {e}"))?;
             Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
         }
         Expr::StoreGlobal { sym_word, value } => {

@@ -346,6 +346,11 @@ fn lower_call_in_mut(
         // also allows (setq a 1 b 2 …) for parallel assignments;
         // v1 supports the binary form only.
         "SETQ" => lower_setq(&head_name, args, env, coord),
+        // (setf place value)  — generalised assignment. We dispatch
+        // by syntactic shape of `place`: a bare symbol falls through
+        // to setq; (car x) / (cdr x) / (aref s i) / (char s i)
+        // emit the matching mutation primitive.
+        "SETF" => lower_setf(args, env, coord),
         // (defparameter name value [doc])
         // (defvar name value [doc])
         // For v1 both behave like setq — they install/replace the
@@ -693,6 +698,94 @@ fn lower_setq(
     let sym_word = coord.intern(&name);
     let value = lower_in_mut(&args[1], env, coord)?;
     Ok(Expr::store_global(sym_word.raw(), value))
+}
+
+/// `(setf place value)`. We pattern-match on the shape of `place`:
+///
+/// - bare symbol → `(setq name value)`
+/// - `(car x)`   → SetCar
+/// - `(cdr x)`   → SetCdr
+/// - `(first x)` → SetCar (alias)
+/// - `(rest x)`  → SetCdr (alias)
+/// - `(aref s i)` / `(char s i)` → SetChar
+///
+/// CL's full setf is a macro extensible via `defsetf` /
+/// `define-setf-expander`. Until macros land, this is a built-in
+/// that recognises a fixed set of place forms.
+fn lower_setf(
+    args: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
+    if args.len() != 2 {
+        return Err(CompileError::BadArity {
+            head: "SETF".into(),
+            expected: "2",
+            got: args.len(),
+        });
+    }
+    let place = &args[0];
+    let value_form = &args[1];
+
+    // Bare symbol: same as setq.
+    if let Value::Symbol(_) = place {
+        return lower_setq("SETF", args, env, coord);
+    }
+
+    // (head subargs...) — must be one of the recognised place forms.
+    let place_items = list_to_vec(place)?;
+    let place_head = match place_items.first() {
+        Some(Value::Symbol(s)) => s.name.to_string(),
+        _ => {
+            return Err(CompileError::NotImplemented(format!(
+                "setf place must be a symbol or recognised form, got {place:?}"
+            )));
+        }
+    };
+    let place_args = &place_items[1..];
+
+    match place_head.as_str() {
+        "CAR" | "FIRST" => {
+            if place_args.len() != 1 {
+                return Err(CompileError::BadArity {
+                    head: format!("setf {place_head}"),
+                    expected: "(car place)",
+                    got: place_args.len(),
+                });
+            }
+            let cons = lower_in_mut(&place_args[0], env, coord)?;
+            let value = lower_in_mut(value_form, env, coord)?;
+            Ok(Expr::set_car(cons, value))
+        }
+        "CDR" | "REST" => {
+            if place_args.len() != 1 {
+                return Err(CompileError::BadArity {
+                    head: format!("setf {place_head}"),
+                    expected: "(cdr place)",
+                    got: place_args.len(),
+                });
+            }
+            let cons = lower_in_mut(&place_args[0], env, coord)?;
+            let value = lower_in_mut(value_form, env, coord)?;
+            Ok(Expr::set_cdr(cons, value))
+        }
+        "AREF" | "CHAR" | "STRING-CHAR" => {
+            if place_args.len() != 2 {
+                return Err(CompileError::BadArity {
+                    head: format!("setf {place_head}"),
+                    expected: "(aref s i)",
+                    got: place_args.len(),
+                });
+            }
+            let s = lower_in_mut(&place_args[0], env, coord)?;
+            let idx = lower_in_mut(&place_args[1], env, coord)?;
+            let ch = lower_in_mut(value_form, env, coord)?;
+            Ok(Expr::set_char(s, idx, ch))
+        }
+        other => Err(CompileError::NotImplemented(format!(
+            "setf place not yet supported: ({other} ...)"
+        ))),
+    }
 }
 
 fn lower_defparameter(

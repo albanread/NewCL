@@ -113,6 +113,20 @@ pub enum Expr {
     /// `(string-char s i)` or `(aref s i)` for strings — read the
     /// i-th codepoint as a character.
     StringChar(Box<Expr>, Box<Expr>),
+    /// Mutate the car of a cons cell. The lowered form of
+    /// `(setf (car x) v)`. Evaluates to the new value.
+    SetCar(Box<Expr>, Box<Expr>),
+    /// Mutate the cdr of a cons cell. The lowered form of
+    /// `(setf (cdr x) v)`.
+    SetCdr(Box<Expr>, Box<Expr>),
+    /// Mutate the i-th codepoint of a string. The lowered form of
+    /// `(setf (aref s i) c)` or `(setf (char s i) c)`. Evaluates to
+    /// the new character.
+    SetChar {
+        s: Box<Expr>,
+        idx: Box<Expr>,
+        ch: Box<Expr>,
+    },
     /// Lambda expression. JIT-compiles `body` as a separate function
     /// with the lambda's signature; at the construction site,
     /// evaluates each `captures[i]` in outer scope and packs the
@@ -168,6 +182,15 @@ impl Expr {
     }
     pub fn string_char(s: Expr, i: Expr) -> Expr {
         Expr::StringChar(Box::new(s), Box::new(i))
+    }
+    pub fn set_car(cons: Expr, value: Expr) -> Expr {
+        Expr::SetCar(Box::new(cons), Box::new(value))
+    }
+    pub fn set_cdr(cons: Expr, value: Expr) -> Expr {
+        Expr::SetCdr(Box::new(cons), Box::new(value))
+    }
+    pub fn set_char(s: Expr, idx: Expr, ch: Expr) -> Expr {
+        Expr::SetChar { s: Box::new(s), idx: Box::new(idx), ch: Box::new(ch) }
     }
     pub fn lambda(arity: u32, body: Expr, captures: Vec<Expr>) -> Expr {
         Expr::Lambda { arity, body: Box::new(body), captures }

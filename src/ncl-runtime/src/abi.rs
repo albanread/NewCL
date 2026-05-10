@@ -306,6 +306,75 @@ pub extern "C" fn ncl_make_closure(
     fn_word.raw()
 }
 
+/// Mutate the car field of a cons cell. JIT'd `(setf (car x) v)`
+/// lowers to a call here. Returns the new value (per setf
+/// semantics — the *cell* gets the new value, but the form
+/// evaluates to the value, not the cons).
+///
+/// The card containing the modified cell is marked so the GC's
+/// inter-generational scan picks up any old→young pointer this
+/// store may have created.
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_set_car(
+    mutator: *mut crate::mutator::MutatorState,
+    cons: u64,
+    new_value: u64,
+) -> u64 {
+    let m = unsafe { &mut *mutator };
+    let w = Word::from_raw(cons);
+    let p = w
+        .as_mut_ptr::<u64>(Tag::Cons)
+        .expect("ncl_set_car called on non-cons");
+    unsafe { *p = new_value };
+    m.mark_card(p as *const u8);
+    new_value
+}
+
+/// Mutate the cdr field of a cons cell. As `ncl_set_car` but at
+/// offset 1.
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_set_cdr(
+    mutator: *mut crate::mutator::MutatorState,
+    cons: u64,
+    new_value: u64,
+) -> u64 {
+    let m = unsafe { &mut *mutator };
+    let w = Word::from_raw(cons);
+    let p = w
+        .as_mut_ptr::<u64>(Tag::Cons)
+        .expect("ncl_set_cdr called on non-cons");
+    let slot = unsafe { p.add(1) };
+    unsafe { *slot = new_value };
+    m.mark_card(slot as *const u8);
+    new_value
+}
+
+/// Mutate the i-th codepoint of a string. JIT'd
+/// `(setf (aref s i) c)` and `(setf (char s i) c)` lower here.
+/// Returns the character word that was stored.
+///
+/// No write barrier: strings hold scalar codepoints, so a string
+/// store can never create an old→young pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_string_set(s: u64, idx: u64, ch: u64) -> u64 {
+    let ws = Word::from_raw(s);
+    if ws.tag() != Tag::String {
+        panic!("(setf (aref string ...)): argument is not a string: {ws:?}");
+    }
+    let n = crate::gc_string::char_count(ws);
+    let i = idx as usize;
+    if i >= n {
+        panic!("(setf (aref s {i}) ...): index out of bounds for length {n}");
+    }
+    let cw = Word::from_raw(ch);
+    let cp = cw
+        .as_char()
+        .unwrap_or_else(|| panic!("(setf (aref string ...)): value is not a character: {cw:?}"))
+        as u32;
+    crate::gc_string::set_char_at(ws, i, cp);
+    ch
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
