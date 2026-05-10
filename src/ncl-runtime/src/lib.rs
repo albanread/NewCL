@@ -39,6 +39,12 @@ pub use abi::{
     open_output_file_shim, read_char_from_shim, read_line_shim, write_string_to_shim,
     NclCondition,
 };
+
+#[cfg(windows)]
+pub use igui::lisp_shims::{
+    close_child_shim, igui_quit_shim, igui_start_shim, igui_wait_shim,
+    next_event_shim, open_child_shim, set_title_shim,
+};
 pub use printer::{format_word, format_word_aesthetic};
 
 pub use heap::{

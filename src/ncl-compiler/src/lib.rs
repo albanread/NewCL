@@ -250,6 +250,30 @@ fn install_native_functions(
                    ncl_runtime::error_shim, 1);
     install_native(coord, mutator, "%HANDLER-CASE",
                    ncl_runtime::handler_case_shim, 2);
+
+    // iGui (Windows only). Spawns the GUI thread and exposes the
+    // window-management trio + event poll. Drawing primitives
+    // come in a follow-up commit.
+    #[cfg(windows)]
+    install_igui(coord, mutator);
+}
+
+#[cfg(windows)]
+fn install_igui(coord: &Arc<GcCoordinator>, mutator: &mut MutatorState) {
+    install_native(coord, mutator, "IGUI-START",
+                   ncl_runtime::igui_start_shim, 0);
+    install_native(coord, mutator, "IGUI-WAIT",
+                   ncl_runtime::igui_wait_shim, 0);
+    install_native(coord, mutator, "IGUI-QUIT",
+                   ncl_runtime::igui_quit_shim, 0);
+    install_native(coord, mutator, "OPEN-CHILD",
+                   ncl_runtime::open_child_shim, 1);
+    install_native(coord, mutator, "CLOSE-CHILD",
+                   ncl_runtime::close_child_shim, 1);
+    install_native(coord, mutator, "SET-TITLE",
+                   ncl_runtime::set_title_shim, 2);
+    install_native(coord, mutator, "NEXT-EVENT",
+                   ncl_runtime::next_event_shim, 1);
 }
 
 fn install_native(
