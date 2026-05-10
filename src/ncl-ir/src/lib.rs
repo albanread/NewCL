@@ -21,6 +21,19 @@ pub enum Expr {
     /// Only valid inside a function body — top-level expressions
     /// don't have parameters and Param is a compile error there.
     Param(usize),
+    /// Reference to the Nth let-bound local. Indexed in the order
+    /// the let bindings were entered (per nested let scopes), reset
+    /// when the let scope exits.
+    Local(usize),
+    /// Sequential evaluation: each form runs, the last one's value
+    /// is the result. Empty progn yields `nil` per CL convention.
+    Progn(Vec<Expr>),
+    /// Lexical binding scope. Each `bindings[i]` is evaluated in
+    /// the *outer* env (parallel binding, like CL's `let`); their
+    /// results are pushed to the locals vec for `body` to read via
+    /// `Local(prev_top + i)`. Body is single-expression (the
+    /// lowering wraps multiple body forms in a `Progn`).
+    Let { bindings: Vec<Expr>, body: Box<Expr> },
     /// Binary addition (overflows wrap silently in Phase 3; the
     /// trap-and-promote-to-bignum path lands when the numeric
     /// tower does).
@@ -64,6 +77,11 @@ impl Expr {
         Expr::Call { sym_word, args }
     }
     pub fn param(idx: usize) -> Expr { Expr::Param(idx) }
+    pub fn local(idx: usize) -> Expr { Expr::Local(idx) }
+    pub fn progn(forms: Vec<Expr>) -> Expr { Expr::Progn(forms) }
+    pub fn let_(bindings: Vec<Expr>, body: Expr) -> Expr {
+        Expr::Let { bindings, body: Box::new(body) }
+    }
 }
 
 #[cfg(test)]

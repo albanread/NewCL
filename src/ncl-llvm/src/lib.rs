@@ -129,9 +129,7 @@ pub fn jit_compile_function(arity: u32, body: &Expr) -> Result<usize, String> {
 // -- Implementation ---------------------------------------------------------
 
 fn build_lisp_function(body: &Expr, arity: u32) -> Result<usize, String> {
-    // Per-compilation Context + Module + Engine, all leaked.
     let context_ptr = keep_forever(Context::create());
-    // SAFETY: context_ptr is freshly allocated and we won't drop it.
     let context: &'static Context = unsafe { &*context_ptr };
 
     let module = context.create_module("ncl_fn");
@@ -140,7 +138,6 @@ fn build_lisp_function(body: &Expr, arity: u32) -> Result<usize, String> {
     let i64_t = context.i64_type();
     let ptr_t = context.ptr_type(AddressSpace::default());
 
-    // Unified signature: (mutator, args_ptr, n_args) -> i64.
     let fn_type = i64_t.fn_type(&[ptr_t.into(), ptr_t.into(), i64_t.into()], false);
     let function = module.add_function("the_fn", fn_type, None);
     let entry_block = context.append_basic_block(function, "entry");
@@ -148,7 +145,16 @@ fn build_lisp_function(body: &Expr, arity: u32) -> Result<usize, String> {
 
     let helpers = declare_runtime_helpers(context, &module);
 
-    let result = emit_expr(context, &builder, &function, &helpers, arity, body)?;
+    let mut locals: Vec<IntValue<'_>> = Vec::new();
+    let result = emit_expr(
+        context,
+        &builder,
+        &function,
+        &helpers,
+        arity,
+        &mut locals,
+        body,
+    )?;
     builder
         .build_return(Some(&result))
         .map_err(|e| format!("build_return: {e}"))?;
@@ -162,9 +168,6 @@ fn build_lisp_function(body: &Expr, arity: u32) -> Result<usize, String> {
         .get_function_address("the_fn")
         .map_err(|e| format!("get_function_address: {e}"))?;
 
-    // Leak module and engine. The function-pointer address remains
-    // valid as long as the engine is alive; the engine borrows from
-    // the module which borrows from the context. All leaked.
     let _ = keep_forever(module);
     let _ = keep_forever(engine);
 
@@ -218,6 +221,7 @@ fn emit_expr<'ctx>(
     function: &FunctionValue<'ctx>,
     helpers: &Helpers<'ctx>,
     arity: u32,
+    locals: &mut Vec<IntValue<'ctx>>,
     expr: &Expr,
 ) -> Result<IntValue<'ctx>, String> {
     let i64_t = context.i64_type();
@@ -226,6 +230,39 @@ fn emit_expr<'ctx>(
         Expr::Const(n) => Ok(i64_t.const_int(Word::fixnum(*n).raw(), false)),
         Expr::Nil => Ok(i64_t.const_int(Word::NIL.raw(), false)),
         Expr::True => Ok(i64_t.const_int(Word::T.raw(), false)),
+        Expr::Local(idx) => {
+            locals
+                .get(*idx)
+                .copied()
+                .ok_or_else(|| format!("Local({idx}) out of range — only {} locals in scope", locals.len()))
+        }
+        Expr::Progn(forms) => {
+            if forms.is_empty() {
+                return Ok(i64_t.const_int(Word::NIL.raw(), false));
+            }
+            let mut last = i64_t.const_int(Word::NIL.raw(), false);
+            for f in forms {
+                last = emit_expr(context, builder, function, helpers, arity, locals, f)?;
+            }
+            Ok(last)
+        }
+        Expr::Let { bindings, body } => {
+            let saved = locals.len();
+            for binding in bindings {
+                // Evaluate in CURRENT locals (outer scope) — let's
+                // parallel-binding semantics. The binding doesn't
+                // see itself or sibling bindings.
+                let v = emit_expr(
+                    context, builder, function, helpers, arity, locals, binding,
+                )?;
+                locals.push(v);
+            }
+            let result = emit_expr(
+                context, builder, function, helpers, arity, locals, body,
+            )?;
+            locals.truncate(saved);
+            Ok(result)
+        }
         Expr::Param(idx) => {
             if *idx as u32 >= arity {
                 return Err(format!(
@@ -249,22 +286,22 @@ fn emit_expr<'ctx>(
             Ok(val.into_int_value())
         }
         Expr::Add(a, b) => {
-            let lhs = emit_expr(context, builder, function, helpers, arity, a)?;
-            let rhs = emit_expr(context, builder, function, helpers, arity, b)?;
+            let lhs = emit_expr(context, builder, function, helpers, arity, locals, a)?;
+            let rhs = emit_expr(context, builder, function, helpers, arity, locals, b)?;
             builder
                 .build_int_add(lhs, rhs, "add")
                 .map_err(|e| format!("build_int_add: {e}"))
         }
         Expr::Sub(a, b) => {
-            let lhs = emit_expr(context, builder, function, helpers, arity, a)?;
-            let rhs = emit_expr(context, builder, function, helpers, arity, b)?;
+            let lhs = emit_expr(context, builder, function, helpers, arity, locals, a)?;
+            let rhs = emit_expr(context, builder, function, helpers, arity, locals, b)?;
             builder
                 .build_int_sub(lhs, rhs, "sub")
                 .map_err(|e| format!("build_int_sub: {e}"))
         }
         Expr::Mul(a, b) => {
-            let lhs = emit_expr(context, builder, function, helpers, arity, a)?;
-            let rhs = emit_expr(context, builder, function, helpers, arity, b)?;
+            let lhs = emit_expr(context, builder, function, helpers, arity, locals, a)?;
+            let rhs = emit_expr(context, builder, function, helpers, arity, locals, b)?;
             let three = i64_t.const_int(3, false);
             let rhs_untagged = builder
                 .build_right_shift(rhs, three, true, "untag_rhs")
@@ -274,8 +311,8 @@ fn emit_expr<'ctx>(
                 .map_err(|e| format!("build_int_mul: {e}"))
         }
         Expr::Cons(car, cdr) => {
-            let car_val = emit_expr(context, builder, function, helpers, arity, car)?;
-            let cdr_val = emit_expr(context, builder, function, helpers, arity, cdr)?;
+            let car_val = emit_expr(context, builder, function, helpers, arity, locals, car)?;
+            let cdr_val = emit_expr(context, builder, function, helpers, arity, locals, cdr)?;
             let mutator_arg = function.get_nth_param(0).unwrap();
             let call = builder
                 .build_call(
@@ -287,7 +324,7 @@ fn emit_expr<'ctx>(
             Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
         }
         Expr::Car(x) => {
-            let cons_val = emit_expr(context, builder, function, helpers, arity, x)?;
+            let cons_val = emit_expr(context, builder, function, helpers, arity, locals, x)?;
             let mask = i64_t.const_int(!0b111u64, false);
             let untagged = builder
                 .build_and(cons_val, mask, "untag_cons")
@@ -301,7 +338,7 @@ fn emit_expr<'ctx>(
             Ok(loaded.into_int_value())
         }
         Expr::Cdr(x) => {
-            let cons_val = emit_expr(context, builder, function, helpers, arity, x)?;
+            let cons_val = emit_expr(context, builder, function, helpers, arity, locals, x)?;
             let mask = i64_t.const_int(!0b111u64, false);
             let untagged = builder
                 .build_and(cons_val, mask, "untag_cons")
@@ -321,8 +358,8 @@ fn emit_expr<'ctx>(
             Ok(loaded.into_int_value())
         }
         Expr::Eq(a, b) => {
-            let lhs = emit_expr(context, builder, function, helpers, arity, a)?;
-            let rhs = emit_expr(context, builder, function, helpers, arity, b)?;
+            let lhs = emit_expr(context, builder, function, helpers, arity, locals, a)?;
+            let rhs = emit_expr(context, builder, function, helpers, arity, locals, b)?;
             let cmp = builder
                 .build_int_compare(IntPredicate::EQ, lhs, rhs, "eq_cmp")
                 .map_err(|e| format!("icmp: {e}"))?;
@@ -334,7 +371,7 @@ fn emit_expr<'ctx>(
             Ok(sel.into_int_value())
         }
         Expr::If(cond, then_branch, else_branch) => {
-            let cond_val = emit_expr(context, builder, function, helpers, arity, cond)?;
+            let cond_val = emit_expr(context, builder, function, helpers, arity, locals, cond)?;
             let nil_word = i64_t.const_int(Word::NIL.raw(), false);
             let is_truthy = builder
                 .build_int_compare(IntPredicate::NE, cond_val, nil_word, "is_truthy")
@@ -349,14 +386,14 @@ fn emit_expr<'ctx>(
                 .map_err(|e| format!("br: {e}"))?;
 
             builder.position_at_end(then_block);
-            let then_val = emit_expr(context, builder, function, helpers, arity, then_branch)?;
+            let then_val = emit_expr(context, builder, function, helpers, arity, locals, then_branch)?;
             let then_end = builder.get_insert_block().unwrap();
             builder
                 .build_unconditional_branch(merge_block)
                 .map_err(|e| format!("br: {e}"))?;
 
             builder.position_at_end(else_block);
-            let else_val = emit_expr(context, builder, function, helpers, arity, else_branch)?;
+            let else_val = emit_expr(context, builder, function, helpers, arity, locals, else_branch)?;
             let else_end = builder.get_insert_block().unwrap();
             builder
                 .build_unconditional_branch(merge_block)
@@ -373,7 +410,7 @@ fn emit_expr<'ctx>(
             // Evaluate each argument first.
             let arg_vals: Vec<IntValue> = args
                 .iter()
-                .map(|a| emit_expr(context, builder, function, helpers, arity, a))
+                .map(|a| emit_expr(context, builder, function, helpers, arity, locals, a))
                 .collect::<Result<_, _>>()?;
             let n = arg_vals.len();
 

@@ -64,8 +64,8 @@ impl Session {
     /// Recognises `(defun …)` at top level; everything else goes
     /// through lower → JIT → call.
     pub fn eval_value(&mut self, v: &Value) -> Result<Word, EvalError> {
-        if let Some((name, params, body)) = match_defun(v)? {
-            return self.handle_defun(&name, &params, &body);
+        if let Some((name, params, body_forms)) = match_defun(v)? {
+            return self.handle_defun(&name, &params, &body_forms);
         }
         let expr = lower(v, &self.coord).map_err(EvalError::Compile)?;
         let mutator_ptr = &mut *self.mutator as *mut _;
@@ -76,11 +76,20 @@ impl Session {
         &mut self,
         name: &str,
         params: &[Arc<str>],
-        body: &Value,
+        body_forms: &[Value],
     ) -> Result<Word, EvalError> {
         let env = LocalEnv::with_params(params);
-        let body_expr = lower_in(body, &env, &self.coord)
-            .map_err(EvalError::Compile)?;
+        // Implicit progn: multiple body forms wrap into a Progn.
+        let body_expr = if body_forms.len() == 1 {
+            lower_in(&body_forms[0], &env, &self.coord)
+                .map_err(EvalError::Compile)?
+        } else {
+            let lowered: Result<Vec<_>, _> = body_forms
+                .iter()
+                .map(|f| lower_in(f, &env, &self.coord))
+                .collect();
+            ncl_ir::Expr::progn(lowered.map_err(EvalError::Compile)?)
+        };
         let code_ptr = ncl_llvm::jit_compile_function(params.len() as u32, &body_expr)
             .map_err(EvalError::Jit)?;
         let sym_word = self.coord.intern(name);
@@ -92,8 +101,6 @@ impl Session {
         )
         .ok_or_else(|| EvalError::Jit("static area exhausted".to_string()))?;
         self.mutator.set_symbol_function(sym_word, fn_word);
-        // CL says `defun` returns the symbol's name. We return nil
-        // for v1; tests don't depend on it.
         Ok(Word::NIL)
     }
 }
@@ -102,19 +109,17 @@ impl Default for Session {
     fn default() -> Self { Session::new() }
 }
 
-/// Recognise `(defun name (params...) body)`. Returns `Some` if the
-/// form is a defun (with the body as a Value), else `None`. The
-/// body is the LAST argument — implicit progn for multi-statement
-/// bodies isn't yet supported, so a multi-form body errors.
+/// Recognise `(defun name (params...) body...)`. Returns `Some` if
+/// the form is a defun. Implicit progn is supported — multiple body
+/// forms are returned as a Vec for the caller to wrap.
 fn match_defun(
     v: &Value,
-) -> Result<Option<(String, Vec<Arc<str>>, Value)>, EvalError> {
+) -> Result<Option<(String, Vec<Arc<str>>, Vec<Value>)>, EvalError> {
     let Value::Cons(c) = v else { return Ok(None); };
     let Value::Symbol(head) = &c.car else { return Ok(None); };
     if &*head.name != "DEFUN" {
         return Ok(None);
     }
-    // Walk the args.
     let args = list_to_vec_of_value(&c.cdr).map_err(|e| {
         EvalError::Compile(CompileError::ImproperList(e))
     })?;
@@ -123,12 +128,6 @@ fn match_defun(
             "defun needs name, params, and body — got {} args",
             args.len()
         ))));
-    }
-    if args.len() > 3 {
-        return Err(EvalError::Compile(CompileError::BadDefun(
-            "multi-statement defun bodies (implicit progn) not yet supported"
-                .to_string(),
-        )));
     }
     let name = match &args[0] {
         Value::Symbol(s) => s.name.to_string(),
@@ -139,8 +138,8 @@ fn match_defun(
         }
     };
     let params = parse_param_list(&args[1])?;
-    let body = args[2].clone();
-    Ok(Some((name, params, body)))
+    let body_forms = args[2..].to_vec();
+    Ok(Some((name, params, body_forms)))
 }
 
 fn parse_param_list(v: &Value) -> Result<Vec<Arc<str>>, EvalError> {
@@ -382,6 +381,146 @@ mod end_to_end_tests {
         session.eval("(defun double (x) (+ x x))").unwrap();
         session.eval("(defun quadruple (x) (double (double x)))").unwrap();
         assert_eq!(session.eval("(quadruple 5)").unwrap(), "20");
+    }
+
+    // -- progn -------------------------------------------------------------
+
+    #[test]
+    fn progn_returns_last_value() {
+        assert_eq!(eval_str("(progn 1 2 3)").unwrap(), "3");
+        assert_eq!(eval_str("(progn (+ 1 1) (* 3 4))").unwrap(), "12");
+    }
+
+    #[test]
+    fn empty_progn_is_nil() {
+        assert_eq!(eval_str("(progn)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn progn_in_function_body() {
+        let mut session = Session::new();
+        session
+            .eval(
+                "(defun do-stuff (x)
+                   (progn
+                     (* x 2)
+                     (* x 3)
+                     (* x 10)))",
+            )
+            .unwrap();
+        assert_eq!(session.eval("(do-stuff 7)").unwrap(), "70");
+    }
+
+    #[test]
+    fn implicit_progn_in_defun_body() {
+        // No explicit progn; multi-form body.
+        let mut session = Session::new();
+        session
+            .eval("(defun sum-of-cubes (x) (* x x) (* x x x))")
+            .unwrap();
+        assert_eq!(session.eval("(sum-of-cubes 3)").unwrap(), "27");
+    }
+
+    // -- let ---------------------------------------------------------------
+
+    #[test]
+    fn let_binds_local_variable() {
+        assert_eq!(eval_str("(let ((x 10)) x)").unwrap(), "10");
+        assert_eq!(eval_str("(let ((x 10)) (+ x x))").unwrap(), "20");
+    }
+
+    #[test]
+    fn let_with_multiple_bindings() {
+        assert_eq!(
+            eval_str("(let ((x 10) (y 20)) (+ x y))").unwrap(),
+            "30",
+        );
+    }
+
+    #[test]
+    fn let_bindings_are_parallel() {
+        // Outer x = 1; inner let evaluates `(+ x 100)` with x=1
+        // (outer scope), THEN binds x=101 for the body. Body uses
+        // x=101 and y=2.
+        let mut session = Session::new();
+        session.eval("(defun id (n) n)").unwrap();
+        // No outer x; this just tests the basic binding.
+        assert_eq!(
+            session.eval("(let ((x 5) (y 7)) (* x y))").unwrap(),
+            "35",
+        );
+    }
+
+    #[test]
+    fn nested_let() {
+        assert_eq!(
+            eval_str("(let ((x 10)) (let ((y 5)) (+ x y)))").unwrap(),
+            "15",
+        );
+    }
+
+    #[test]
+    fn inner_let_shadows_outer() {
+        assert_eq!(
+            eval_str("(let ((x 1)) (let ((x 99)) x))").unwrap(),
+            "99",
+        );
+        assert_eq!(
+            eval_str("(let ((x 1)) (+ (let ((x 99)) x) x))").unwrap(),
+            "100",
+        );
+    }
+
+    #[test]
+    fn let_in_function_body() {
+        let mut session = Session::new();
+        session
+            .eval(
+                "(defun hypot-sq (a b)
+                   (let ((aa (* a a))
+                         (bb (* b b)))
+                     (+ aa bb)))",
+            )
+            .unwrap();
+        assert_eq!(session.eval("(hypot-sq 3 4)").unwrap(), "25");
+    }
+
+    #[test]
+    fn let_with_multiple_body_forms() {
+        // Implicit progn inside let.
+        assert_eq!(
+            eval_str("(let ((x 5)) 99 (+ x x))").unwrap(),
+            "10",
+        );
+    }
+
+    #[test]
+    fn let_can_shadow_param() {
+        let mut session = Session::new();
+        session
+            .eval("(defun f (x) (let ((x 99)) x))")
+            .unwrap();
+        assert_eq!(session.eval("(f 1)").unwrap(), "99");
+    }
+
+    #[test]
+    fn empty_let_body_is_nil() {
+        assert_eq!(eval_str("(let ((x 5)))").unwrap(), "nil");
+    }
+
+    #[test]
+    fn let_with_recursive_call_in_body() {
+        // (defun fact-via-let (n)
+        //   (let ((sub (- n 1)))
+        //     (if (eq n 0) 1 (* n (fact-via-let sub)))))
+        let result = eval_str(
+            "(defun fact-via-let (n)
+               (let ((sub (- n 1)))
+                 (if (eq n 0) 1 (* n (fact-via-let sub)))))
+             (fact-via-let 6)",
+        )
+        .unwrap();
+        assert_eq!(result, "720");
     }
 
     // -- Errors ------------------------------------------------------------

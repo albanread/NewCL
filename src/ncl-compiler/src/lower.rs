@@ -18,25 +18,64 @@ use std::sync::Arc;
 use ncl_ir::Expr;
 use ncl_runtime::{GcCoordinator, Value};
 
-/// Parameter environment for lowering a function body.
+/// A binding kind in the lexical environment. Parameters live in
+/// the function's args array (Param(idx)); let-bound locals live
+/// in a stack-vec the emitter manages (Local(idx)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Binding {
+    Param(usize),
+    Local(usize),
+}
+
+/// Lexical environment for lowering. Tracks names and their
+/// binding kinds, in order of introduction. Lookups walk in
+/// reverse so inner shadows outer.
 #[derive(Debug, Clone, Default)]
 pub struct LocalEnv {
-    params: Vec<Arc<str>>,
+    bindings: Vec<(Arc<str>, Binding)>,
+    /// Number of `Local` bindings currently in scope. Used by `let`
+    /// to assign the next index when extending the env.
+    local_count: usize,
 }
 
 impl LocalEnv {
-    pub fn empty() -> LocalEnv { LocalEnv { params: Vec::new() } }
+    pub fn empty() -> LocalEnv { LocalEnv::default() }
 
     pub fn with_params(names: &[Arc<str>]) -> LocalEnv {
-        LocalEnv { params: names.to_vec() }
+        let bindings = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (Arc::clone(n), Binding::Param(i)))
+            .collect();
+        LocalEnv { bindings, local_count: 0 }
     }
 
-    pub fn find(&self, name: &str) -> Option<usize> {
-        self.params.iter().position(|p| &**p == name)
+    pub fn find(&self, name: &str) -> Option<Binding> {
+        self.bindings
+            .iter()
+            .rev()
+            .find(|(n, _)| &**n == name)
+            .map(|(_, b)| *b)
     }
 
-    pub fn len(&self) -> usize { self.params.len() }
-    pub fn is_empty(&self) -> bool { self.params.is_empty() }
+    /// Push a new local binding. Used during `let` lowering.
+    pub fn push_local(&mut self, name: Arc<str>) -> usize {
+        let idx = self.local_count;
+        self.bindings.push((name, Binding::Local(idx)));
+        self.local_count += 1;
+        idx
+    }
+
+    /// Snapshot the current binding count and local count, for
+    /// `let` to roll back on scope exit.
+    pub fn checkpoint(&self) -> (usize, usize) {
+        (self.bindings.len(), self.local_count)
+    }
+
+    pub fn restore(&mut self, cp: (usize, usize)) {
+        self.bindings.truncate(cp.0);
+        self.local_count = cp.1;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -59,26 +98,37 @@ pub fn lower_in(
     env: &LocalEnv,
     coord: &Arc<GcCoordinator>,
 ) -> Result<Expr, CompileError> {
+    let mut env = env.clone();
+    lower_in_mut(v, &mut env, coord)
+}
+
+/// Internal lowering with a mutable env (so `let` can extend it
+/// in place and roll back at scope exit).
+fn lower_in_mut(
+    v: &Value,
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
     match v {
         Value::Fixnum(n) => Ok(Expr::Const(*n)),
         Value::Nil => Ok(Expr::Nil),
         Value::Symbol(s) => {
-            // Local parameter first, then T self-evaluating.
-            if let Some(idx) = env.find(&s.name) {
-                Ok(Expr::Param(idx))
+            // Local first (param or let-bound), then T.
+            if let Some(b) = env.find(&s.name) {
+                Ok(match b {
+                    Binding::Param(i) => Expr::Param(i),
+                    Binding::Local(i) => Expr::Local(i),
+                })
             } else if &*s.name == "T" {
                 Ok(Expr::True)
             } else {
-                // Global value-cell reference would land here;
-                // not yet supported (defparameter / defvar arrive
-                // when symbol value cells are wired through).
                 Err(CompileError::NotImplemented(format!(
                     "global value reference: {}",
                     s.name
                 )))
             }
         }
-        Value::Cons(_) => lower_call_in(v, env, coord),
+        Value::Cons(_) => lower_call_in_mut(v, env, coord),
         other => Err(CompileError::NotImplemented(format!("{other:?}"))),
     }
 }
@@ -97,9 +147,9 @@ fn lower_quoted(v: &Value) -> Result<Expr, CompileError> {
     }
 }
 
-fn lower_call_in(
+fn lower_call_in_mut(
     v: &Value,
-    env: &LocalEnv,
+    env: &mut LocalEnv,
     coord: &Arc<GcCoordinator>,
 ) -> Result<Expr, CompileError> {
     let items = list_to_vec(v)?;
@@ -136,20 +186,20 @@ fn lower_call_in(
                 });
             }
             Ok(Expr::eq(
-                lower_in(&args[0], env, coord)?,
-                lower_in(&args[1], env, coord)?,
+                lower_in_mut(&args[0], env, coord)?,
+                lower_in_mut(&args[1], env, coord)?,
             ))
         }
         "IF" => match args.len() {
             2 => Ok(Expr::if_(
-                lower_in(&args[0], env, coord)?,
-                lower_in(&args[1], env, coord)?,
+                lower_in_mut(&args[0], env, coord)?,
+                lower_in_mut(&args[1], env, coord)?,
                 Expr::Nil,
             )),
             3 => Ok(Expr::if_(
-                lower_in(&args[0], env, coord)?,
-                lower_in(&args[1], env, coord)?,
-                lower_in(&args[2], env, coord)?,
+                lower_in_mut(&args[0], env, coord)?,
+                lower_in_mut(&args[1], env, coord)?,
+                lower_in_mut(&args[2], env, coord)?,
             )),
             n => Err(CompileError::BadArity {
                 head: head_name,
@@ -166,8 +216,8 @@ fn lower_call_in(
                 });
             }
             Ok(Expr::cons(
-                lower_in(&args[0], env, coord)?,
-                lower_in(&args[1], env, coord)?,
+                lower_in_mut(&args[0], env, coord)?,
+                lower_in_mut(&args[1], env, coord)?,
             ))
         }
         "CAR" => {
@@ -178,7 +228,7 @@ fn lower_call_in(
                     got: args.len(),
                 });
             }
-            Ok(Expr::car(lower_in(&args[0], env, coord)?))
+            Ok(Expr::car(lower_in_mut(&args[0], env, coord)?))
         }
         "CDR" => {
             if args.len() != 1 {
@@ -188,7 +238,7 @@ fn lower_call_in(
                     got: args.len(),
                 });
             }
-            Ok(Expr::cdr(lower_in(&args[0], env, coord)?))
+            Ok(Expr::cdr(lower_in_mut(&args[0], env, coord)?))
         }
         "-" => match args.len() {
             0 => Err(CompileError::BadArity {
@@ -197,42 +247,111 @@ fn lower_call_in(
                 got: 0,
             }),
             1 => {
-                let x = lower_in(&args[0], env, coord)?;
+                let x = lower_in_mut(&args[0], env, coord)?;
                 Ok(Expr::sub(Expr::Const(0), x))
             }
             _ => {
-                let mut acc = lower_in(&args[0], env, coord)?;
+                let mut acc = lower_in_mut(&args[0], env, coord)?;
                 for a in &args[1..] {
-                    acc = Expr::sub(acc, lower_in(a, env, coord)?);
+                    acc = Expr::sub(acc, lower_in_mut(a, env, coord)?);
                 }
                 Ok(acc)
             }
         },
-        // DEFUN is not handled here — it's a top-level meta-form
-        // intercepted by the Session driver before lowering. If
-        // it appears nested inside an expression, surface a clear
-        // error rather than silently miscompiling.
+        "PROGN" => {
+            if args.is_empty() {
+                return Ok(Expr::Nil);
+            }
+            let lowered: Result<Vec<_>, _> =
+                args.iter().map(|a| lower_in_mut(a, env, coord)).collect();
+            Ok(Expr::progn(lowered?))
+        }
+        "LET" => lower_let(args, env, coord),
         "DEFUN" => Err(CompileError::BadDefun(
             "(defun ...) is only allowed at top level".into(),
         )),
-        // Unknown head: it's a function call. Intern the symbol
-        // (allocates a stable Symbol-tagged Word in static if not
-        // already there) and emit a Call.
+        // Unknown head: it's a function call.
         _ => {
             let sym_word = coord.intern(&head_name);
             let lowered_args: Result<Vec<_>, _> = args
                 .iter()
-                .map(|a| lower_in(a, env, coord))
+                .map(|a| lower_in_mut(a, env, coord))
                 .collect();
             Ok(Expr::call(sym_word.raw(), lowered_args?))
         }
     }
 }
 
+/// `(let ((var val) ...) body...)`. Bindings evaluated in OUTER env
+/// (parallel let, not let*); body sees them as new Locals. Multiple
+/// body forms are wrapped in implicit progn.
+fn lower_let(
+    args: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
+    if args.is_empty() {
+        return Err(CompileError::BadArity {
+            head: "LET".into(),
+            expected: "at least 1 (bindings)",
+            got: 0,
+        });
+    }
+    let bindings_form = &args[0];
+    let body_forms = &args[1..];
+
+    // Parse bindings list — each entry is (name value).
+    let bindings_list = list_to_vec(bindings_form)?;
+    let mut binding_exprs: Vec<Expr> = Vec::new();
+    let mut binding_names: Vec<Arc<str>> = Vec::new();
+
+    for binding in &bindings_list {
+        let pair = list_to_vec(binding)?;
+        if pair.len() != 2 {
+            return Err(CompileError::NotImplemented(format!(
+                "let binding must be (name value), got {pair:?}"
+            )));
+        }
+        let name = match &pair[0] {
+            Value::Symbol(s) => Arc::clone(&s.name),
+            other => {
+                return Err(CompileError::NotImplemented(format!(
+                    "let binding name must be a symbol, got {other:?}"
+                )));
+            }
+        };
+        // Evaluate value in OUTER env (parallel binding semantics).
+        let val_expr = lower_in_mut(&pair[1], env, coord)?;
+        binding_exprs.push(val_expr);
+        binding_names.push(name);
+    }
+
+    // Extend env with new locals, lower body, restore env.
+    let cp = env.checkpoint();
+    for name in &binding_names {
+        env.push_local(Arc::clone(name));
+    }
+
+    let body_expr = if body_forms.is_empty() {
+        Expr::Nil
+    } else if body_forms.len() == 1 {
+        lower_in_mut(&body_forms[0], env, coord)?
+    } else {
+        let lowered: Result<Vec<_>, _> = body_forms
+            .iter()
+            .map(|f| lower_in_mut(f, env, coord))
+            .collect();
+        Expr::progn(lowered?)
+    };
+
+    env.restore(cp);
+    Ok(Expr::let_(binding_exprs, body_expr))
+}
+
 fn fold_arithmetic(
     _head: &str,
     args: &[Value],
-    env: &LocalEnv,
+    env: &mut LocalEnv,
     coord: &Arc<GcCoordinator>,
     identity: i64,
     combine: fn(Expr, Expr) -> Expr,
@@ -240,9 +359,9 @@ fn fold_arithmetic(
     if args.is_empty() {
         return Ok(Expr::Const(identity));
     }
-    let mut acc = lower_in(&args[0], env, coord)?;
+    let mut acc = lower_in_mut(&args[0], env, coord)?;
     for a in &args[1..] {
-        acc = combine(acc, lower_in(a, env, coord)?);
+        acc = combine(acc, lower_in_mut(a, env, coord)?);
     }
     Ok(acc)
 }
