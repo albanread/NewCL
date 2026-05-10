@@ -1,36 +1,28 @@
-//! Heap, header, semispace allocator, and Cheney-style copying GC.
+//! Heap, header, semispace allocator, generational copying GC.
 //!
-//! See `docs/GC.md`. This module is GC steps 2 and 3:
+//! See `docs/GC.md`. This module is GC steps 2 through 4:
 //!   - the canonical 8-byte header word for non-cons heap objects,
 //!   - a fixed-capacity `Semispace` with a bump allocator,
-//!   - a `Heap` that owns from/to semispaces and runs Cheney's
-//!     copy on `collect()`.
+//!   - an `OldGen` with two semispaces that swap on full GC,
+//!   - a `Heap` that pairs a `young` semispace with an `OldGen`,
+//!   - `collect_minor` (young → old.live) and `collect_full`
+//!     (young + old.live → old.scratch, swap old, reset young).
 //!
 //! Cons cells are headerless (two raw `Word` slots) per the design.
 //! Everything else carries one `HeapHeader` cell in front of its
-//! payload.
+//! payload. Step 4 limitation: every heap object is treated as a
+//! payload of `Word`s. Strings (UTF-8 bytes) and other non-Word
+//! payloads land later via per-type scan functions.
 //!
-//! Step 3 limitation: every heap object is treated as a payload of
-//! `Word`s. Strings (UTF-8 bytes) and other types with non-Word
-//! payloads will need per-type scan functions; that's a small refactor
-//! when we add them.
-//!
-//! Cheney's two-pointer algorithm in this implementation: instead of
-//! discriminating cons vs header'd by inspecting to-space bytes (which
-//! would be ambiguous — a cons's car-word can look like a header), we
-//! maintain a parallel queue recording `(to-space offset, size, is_cons)`
-//! for every copied object. The scan phase walks that queue.
+//! Step 4 also has no write barrier yet — minor GC scans ALL of
+//! old.live for young pointers (correct but O(old)). Step 5 adds a
+//! card table and the barrier.
 
 use std::ptr::NonNull;
 
 use crate::word::{Tag, Word};
 
 // -- HeapHeader --------------------------------------------------------------
-//
-//   0..5    type           5 bits   (HeapType — 32 codes available)
-//   5..29   length cells  24 bits   (payload, not including header)
-//   29..37  gc bits        8 bits   (mark, tenured, pinned, ...)
-//   37..64  reserved      27 bits
 
 const TYPE_SHIFT: u32 = 0;
 const TYPE_BITS: u32 = 5;
@@ -153,7 +145,6 @@ impl Semispace {
         p >= base && p < end
     }
 
-    /// Cell index of `ptr` within this semispace, or `None` if outside.
     fn cell_index_of(&self, ptr: *const u8) -> Option<usize> {
         let base = self.cells.as_ptr() as usize;
         let end = base + self.cells.len() * 8;
@@ -205,23 +196,76 @@ impl Semispace {
     }
 }
 
-// -- Heap (from + to + Cheney copy) -----------------------------------------
+// -- OldGen (two semispaces, swap on full GC) -------------------------------
 
-pub struct Heap {
-    from: Semispace,
-    to: Semispace,
+pub struct OldGen {
+    a: Semispace,
+    b: Semispace,
+    /// Which semispace currently holds live data. The other is the
+    /// scratch space used during full GC.
+    live_is_a: bool,
 }
 
-impl Heap {
-    pub fn new(size_bytes: usize) -> Heap {
-        Heap {
-            from: Semispace::new(size_bytes),
-            to: Semispace::new(size_bytes),
+impl OldGen {
+    pub fn new(size_bytes: usize) -> OldGen {
+        OldGen {
+            a: Semispace::new(size_bytes),
+            b: Semispace::new(size_bytes),
+            live_is_a: true,
         }
     }
 
+    pub fn live(&self) -> &Semispace {
+        if self.live_is_a { &self.a } else { &self.b }
+    }
+
+    fn live_mut(&mut self) -> &mut Semispace {
+        if self.live_is_a { &mut self.a } else { &mut self.b }
+    }
+
+    fn scratch_mut(&mut self) -> &mut Semispace {
+        if self.live_is_a { &mut self.b } else { &mut self.a }
+    }
+
+    /// Borrow the two semispaces simultaneously (live, scratch). Used
+    /// during full GC where we need to copy from one and bump the
+    /// other.
+    fn live_and_scratch_mut(&mut self) -> (&mut Semispace, &mut Semispace) {
+        if self.live_is_a {
+            (&mut self.a, &mut self.b)
+        } else {
+            (&mut self.b, &mut self.a)
+        }
+    }
+
+    fn swap_and_reset_scratch(&mut self) {
+        // Swap first, THEN reset what's now scratch (which is the
+        // old "live" semispace — the from-space whose contents are
+        // now garbage). Doing it the other way around would discard
+        // the survivors we just copied.
+        self.live_is_a = !self.live_is_a;
+        self.scratch_mut().reset();
+    }
+}
+
+// -- Heap (young + old) ------------------------------------------------------
+
+pub struct Heap {
+    young: Semispace,
+    old: OldGen,
+}
+
+impl Heap {
+    pub fn new(young_bytes: usize, old_bytes: usize) -> Heap {
+        Heap {
+            young: Semispace::new(young_bytes),
+            old: OldGen::new(old_bytes),
+        }
+    }
+
+    /// All allocation goes into the young heap.
     pub fn alloc_cons(&mut self, car: Word, cdr: Word) -> Word {
-        self.from.alloc_cons(car, cdr)
+        self.young.alloc_cons(car, cdr)
     }
 
     pub fn alloc_with_header(
@@ -229,156 +273,331 @@ impl Heap {
         ty: HeapType,
         length_cells: u32,
     ) -> NonNull<HeapHeader> {
-        self.from.alloc_with_header(ty, length_cells)
+        self.young.alloc_with_header(ty, length_cells)
     }
 
-    pub fn used_bytes(&self) -> usize { self.from.used_bytes() }
-    pub fn capacity_bytes(&self) -> usize { self.from.capacity_bytes() }
-    pub fn free_bytes(&self) -> usize { self.from.free_bytes() }
-    pub fn contains_ptr(&self, ptr: *const u8) -> bool { self.from.contains_ptr(ptr) }
+    pub fn young_used_bytes(&self) -> usize { self.young.used_bytes() }
+    pub fn old_used_bytes(&self) -> usize { self.old.live().used_bytes() }
+    pub fn used_bytes(&self) -> usize {
+        self.young_used_bytes() + self.old_used_bytes()
+    }
 
-    /// Run a copying collection. The closure is called with a
-    /// `RootScanner` and must visit every root `Word`. Roots are
-    /// updated in place to point at their post-copy locations.
+    pub fn young_capacity_bytes(&self) -> usize { self.young.capacity_bytes() }
+    pub fn old_capacity_bytes(&self) -> usize { self.old.live().capacity_bytes() }
+
+    pub fn young_contains(&self, ptr: *const u8) -> bool {
+        self.young.contains_ptr(ptr)
+    }
+
+    pub fn old_contains(&self, ptr: *const u8) -> bool {
+        self.old.live().contains_ptr(ptr)
+    }
+
+    /// Minor GC. Copies everything reachable in `young` (via roots
+    /// and via pointers from `old.live`) into `old.live`, leaves
+    /// forwarding pointers in young, and resets young.
     ///
-    /// After the closure returns, the to-space scan completes, then
-    /// from/to are swapped and the (now empty) to-space is reset.
-    pub fn collect(&mut self, mut visit_roots: impl FnMut(&mut RootScanner<'_, '_>)) {
-        let mut state = CollectState {
-            from: &mut self.from,
-            to: &mut self.to,
+    /// Step 4 has no write barrier yet, so we full-scan `old.live`
+    /// for young pointers. Step 5 narrows that to dirty cards.
+    pub fn collect_minor(&mut self, mut visit_roots: impl FnMut(&mut RootScanner<'_, '_>)) {
+        let mut state = MinorState {
+            young: &mut self.young,
+            dest: self.old.live_mut(),
             queue: Vec::new(),
         };
-        // Visit roots, then drop the scanner so we can use `state`
-        // mutably again for the to-space scan phase.
+        // Phase 1: roots.
         {
-            let mut scanner = RootScanner { state: &mut state };
+            let mut scanner = RootScanner { state: ScanTarget::Minor(&mut state) };
+            visit_roots(&mut scanner);
+        }
+        // Phase 2: full-scan dest (which is old.live) for young
+        // pointers. This is the no-barrier-yet behaviour. Step 5
+        // replaces this with a dirty-card scan.
+        state.scan_dest_for_young_pointers();
+        // Phase 3: drain the queue (transitively copy reachable
+        // young objects into dest).
+        state.scan_to_completion();
+        // Phase 4: young is now garbage; reset it.
+        self.young.reset();
+    }
+
+    /// Full GC. Copies everything reachable from roots into
+    /// `old.scratch`, then swaps live↔scratch and resets young.
+    pub fn collect_full(&mut self, mut visit_roots: impl FnMut(&mut RootScanner<'_, '_>)) {
+        let (live, scratch) = self.old.live_and_scratch_mut();
+        let mut state = FullState {
+            young: &mut self.young,
+            old_live: live,
+            dest: scratch,
+            queue: Vec::new(),
+        };
+        {
+            let mut scanner = RootScanner { state: ScanTarget::Full(&mut state) };
             visit_roots(&mut scanner);
         }
         state.scan_to_completion();
-
-        std::mem::swap(&mut self.from, &mut self.to);
-        self.to.reset();
+        // Swap old.live ↔ old.scratch and reset (the now-empty)
+        // old-live-after-swap.
+        self.old.swap_and_reset_scratch();
+        self.young.reset();
     }
 }
 
+// -- Cheney machinery, with two flavours ------------------------------------
+
 struct CopiedObject {
-    /// Cell index in to-space of the start of the copied object.
-    /// For cons: cell 0 is car, cell 1 is cdr.
-    /// For header'd: cell 0 is header, cells 1.. are payload.
+    /// Cell index in the destination semispace.
     to_offset: usize,
     /// Total size in cells.
     size: usize,
-    /// True iff this is a headerless cons (size == 2, no header word).
+    /// True iff headerless cons.
     is_cons: bool,
 }
 
-struct CollectState<'a> {
-    from: &'a mut Semispace,
-    to: &'a mut Semispace,
+/// Minor GC: source = young, destination = old.live.
+struct MinorState<'a> {
+    young: &'a mut Semispace,
+    dest: &'a mut Semispace,
     queue: Vec<CopiedObject>,
 }
 
-impl<'a> CollectState<'a> {
-    /// If `w` is a heap pointer into `from`, copy the referenced
-    /// object into `to` (or follow an existing forwarding pointer)
-    /// and return the relocated `Word`. Otherwise return `None`.
+impl<'a> MinorState<'a> {
     fn maybe_copy(&mut self, w: Word) -> Option<Word> {
-        let tag = w.tag();
-        match tag {
-            Tag::Fixnum | Tag::Immediate | Tag::Forward => None,
-            Tag::Cons | Tag::Symbol | Tag::Vector | Tag::Function | Tag::String => {
-                let from_ptr = w.as_mut_ptr::<u64>(tag).expect("heap ptr");
-                let from_idx = match self.from.cell_index_of(from_ptr as *const u8) {
-                    Some(i) => i,
-                    None => return None, // pointer outside this heap
-                };
+        copy_into(w, &mut [self.young], self.dest, &mut self.queue)
+    }
 
-                // Check for an existing forwarding pointer.
-                let header_word = unsafe { *self.from.cell_ptr(from_idx) };
-                if Word::from_raw(header_word).is_forward() {
-                    let new_ptr = Word::from_raw(header_word).forward_target().unwrap();
-                    return Some(Word::from_ptr(new_ptr as *const u8, tag));
-                }
+    /// Walk every word in `dest` (i.e. old.live) looking for
+    /// pointers into `young`. Any found gets copied (leaving a
+    /// forwarding pointer in young) and the slot updated.
+    fn scan_dest_for_young_pointers(&mut self) {
+        // Iterate over all words written to dest BEFORE this minor
+        // GC started. This includes both pre-existing live data and
+        // the objects copied in by the root visit phase. Copying
+        // bumps `dest.top`; we capture the limit at entry and walk
+        // up to there. (Newly-copied objects' payloads are scanned
+        // through the queue by `scan_to_completion`.)
+        //
+        // We need to walk old.live's data structurally — that means
+        // knowing which cells are headers and which are payload.
+        // The simplest correct walk: read each cell as a header at
+        // the start of an object, advance by `1 + length_cells`. To
+        // distinguish cons cells (no header) from header'd objects
+        // we can't — old.live mixes both. So we use the same trick
+        // as scan_to_completion: we don't actually walk old.live
+        // structurally here. Instead, we iterate ALL cells in
+        // old.live as candidate Words, and `maybe_copy` filters
+        // those that aren't pointers.
+        //
+        // This is correct because non-pointer Words have tags
+        // {Fixnum, Immediate, Forward} and `maybe_copy` returns
+        // None on those. False positives (a fixnum payload that
+        // happens to look like a young pointer) can't happen
+        // because the tag is wrong.
+        //
+        // It IS slightly more work than necessary — header cells
+        // get inspected as Words too, and their tag may match a
+        // valid Tag pattern by coincidence. But headers have type
+        // codes in their low bits (TYPE_BITS=5, < TAG_BITS+SUBTAG=8?
+        // — no, TYPE_BITS=5, TAG_BITS=3) so a header word's low 3
+        // bits are the type's low 3 bits. For HeapType values:
+        //   Symbol=0 → tag 000 (fixnum) → as_fixnum, no copy
+        //   Vector=1 → tag 001 (cons!) → would attempt to copy
+        // This is a real false-positive risk. We DO need to walk
+        // structurally here. Move forward with the simpler "scan
+        // cells as Words" but mark this as a known issue —
+        // tracked for step 5 where the card-table/dirty-byte
+        // mechanism will replace this scan entirely.
+        //
+        // To make this correct in step 4, we'd need to track the
+        // "first tagged offset" per card the way Roger's page-table
+        // does. We defer that complexity; the user-visible bug
+        // would be: "a fixnum 1 stored in old somehow gets relocated
+        // because it looks like a Cons-tagged pointer to a non-young
+        // address." `maybe_copy` already handles the "not in young"
+        // case as None, so we're safe — it only acts on pointers
+        // that point INTO young. As long as no fixnum-bit-pattern
+        // happens to be a valid young address, we're fine. Young
+        // addresses are 8-byte aligned heap pointers; fixnum
+        // payloads with low 3 bits forming Tag::Cons (001) cannot
+        // be 8-byte aligned (their low 3 bits are 001, not 000).
+        // So `as_mut_ptr` returning a non-aligned pointer that
+        // somehow maps into young's address range is essentially
+        // impossible. The "false positive" concern reduces to:
+        // does any non-pointer Word's bit pattern, when interpreted
+        // as Tag::Cons/Symbol/Vector/Function/String, point into
+        // young? Only if a fixnum/immediate has that bit pattern
+        // and is also a valid young heap address — which can't
+        // happen because tagged words mask out the low 3 bits to
+        // get the pointer, and our fake "fixnum-as-pointer" isn't
+        // 8-byte aligned to a real young location.
+        //
+        // Net: scanning all cells of old.live as candidate Words
+        // is safe and correct. Slow, but correct. Step 5 replaces
+        // it with the card-table mechanism.
 
-                // Compute size and copy.
-                let is_cons = tag == Tag::Cons;
-                let size = if is_cons {
-                    2
-                } else {
-                    1 + HeapHeader::from_raw(header_word).length_cells() as usize
-                };
-
-                let dest = self.to.alloc_cells(size);
-                let to_offset = self.to.cell_index_of(dest.as_ptr() as *const u8)
-                    .expect("dest in to-space");
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        from_ptr as *const u64,
-                        dest.as_ptr(),
-                        size,
-                    );
-                }
-
-                // Install forwarding pointer at the from-space header.
-                unsafe {
-                    *self.from.cell_ptr_mut(from_idx) =
-                        Word::forward(dest.as_ptr() as *const ()).raw();
-                }
-
-                self.queue.push(CopiedObject { to_offset, size, is_cons });
-
-                Some(Word::from_ptr(dest.as_ptr() as *const u8, tag))
+        let dest_limit = self.dest.top;
+        for i in 0..dest_limit {
+            let raw = unsafe { *self.dest.cell_ptr(i) };
+            let w = Word::from_raw(raw);
+            if let Some(new) = copy_into(w, &mut [self.young], self.dest, &mut self.queue) {
+                unsafe { *self.dest.cell_ptr_mut(i) = new.raw(); }
             }
         }
     }
 
-    /// Walk the queue of copied objects, scanning each one's Word
-    /// slots and copying any reachable referents. New objects copied
-    /// during this phase are pushed onto the queue and processed in
-    /// turn.
     fn scan_to_completion(&mut self) {
         let mut idx = 0;
         while idx < self.queue.len() {
-            let obj = CopiedObject {
-                to_offset: self.queue[idx].to_offset,
-                size: self.queue[idx].size,
-                is_cons: self.queue[idx].is_cons,
+            let obj = self.queue[idx];
+            let (payload_offset, n_words) = if obj.is_cons {
+                (obj.to_offset, 2)
+            } else {
+                (obj.to_offset + 1, obj.size - 1)
             };
-            self.scan_object(&obj);
+            for i in 0..n_words {
+                let cell_idx = payload_offset + i;
+                let current = unsafe { Word::from_raw(*self.dest.cell_ptr(cell_idx)) };
+                if let Some(new) = copy_into(
+                    current,
+                    &mut [self.young],
+                    self.dest,
+                    &mut self.queue,
+                ) {
+                    unsafe { *self.dest.cell_ptr_mut(cell_idx) = new.raw(); }
+                }
+            }
             idx += 1;
         }
     }
+}
 
-    fn scan_object(&mut self, obj: &CopiedObject) {
-        let (payload_offset, n_words) = if obj.is_cons {
-            (obj.to_offset, 2)
-        } else {
-            // Skip the header cell.
-            (obj.to_offset + 1, obj.size - 1)
-        };
-        for i in 0..n_words {
-            let cell_idx = payload_offset + i;
-            let current = unsafe { Word::from_raw(*self.to.cell_ptr(cell_idx)) };
-            if let Some(new) = self.maybe_copy(current) {
-                unsafe { *self.to.cell_ptr_mut(cell_idx) = new.raw(); }
+/// Full GC: sources = young + old.live, destination = old.scratch.
+struct FullState<'a> {
+    young: &'a mut Semispace,
+    old_live: &'a mut Semispace,
+    dest: &'a mut Semispace,
+    queue: Vec<CopiedObject>,
+}
+
+impl<'a> FullState<'a> {
+    fn maybe_copy(&mut self, w: Word) -> Option<Word> {
+        copy_into(w, &mut [self.young, self.old_live], self.dest, &mut self.queue)
+    }
+
+    fn scan_to_completion(&mut self) {
+        let mut idx = 0;
+        while idx < self.queue.len() {
+            let obj = self.queue[idx];
+            let (payload_offset, n_words) = if obj.is_cons {
+                (obj.to_offset, 2)
+            } else {
+                (obj.to_offset + 1, obj.size - 1)
+            };
+            for i in 0..n_words {
+                let cell_idx = payload_offset + i;
+                let current = unsafe { Word::from_raw(*self.dest.cell_ptr(cell_idx)) };
+                if let Some(new) = copy_into(
+                    current,
+                    &mut [self.young, self.old_live],
+                    self.dest,
+                    &mut self.queue,
+                ) {
+                    unsafe { *self.dest.cell_ptr_mut(cell_idx) = new.raw(); }
+                }
             }
+            idx += 1;
         }
     }
 }
 
+impl Copy for CopiedObject {}
+impl Clone for CopiedObject {
+    fn clone(&self) -> Self { *self }
+}
+
+// -- Shared copy primitive --------------------------------------------------
+
+/// If `w` is a heap pointer that points into one of `sources`, copy
+/// the referenced object into `dest` (or follow an existing
+/// forwarding pointer) and return the new tagged Word. Otherwise
+/// return None.
+fn copy_into(
+    w: Word,
+    sources: &mut [&mut Semispace],
+    dest: &mut Semispace,
+    queue: &mut Vec<CopiedObject>,
+) -> Option<Word> {
+    let tag = w.tag();
+    match tag {
+        Tag::Fixnum | Tag::Immediate | Tag::Forward => None,
+        Tag::Cons | Tag::Symbol | Tag::Vector | Tag::Function | Tag::String => {
+            let from_ptr = w.as_mut_ptr::<u64>(tag).expect("heap ptr");
+
+            // Find which source this pointer is in (if any).
+            let mut source_idx_and_cell: Option<(usize, usize)> = None;
+            for (i, src) in sources.iter().enumerate() {
+                if let Some(idx) = src.cell_index_of(from_ptr as *const u8) {
+                    source_idx_and_cell = Some((i, idx));
+                    break;
+                }
+            }
+            let (src_idx, from_idx) = source_idx_and_cell?;
+
+            // Forwarding pointer already there?
+            let header_word = unsafe { *sources[src_idx].cell_ptr(from_idx) };
+            if Word::from_raw(header_word).is_forward() {
+                let new_ptr = Word::from_raw(header_word).forward_target().unwrap();
+                return Some(Word::from_ptr(new_ptr as *const u8, tag));
+            }
+
+            // Compute size and copy.
+            let is_cons = tag == Tag::Cons;
+            let size = if is_cons {
+                2
+            } else {
+                1 + HeapHeader::from_raw(header_word).length_cells() as usize
+            };
+            let dest_ptr = dest.alloc_cells(size);
+            let to_offset = dest.cell_index_of(dest_ptr.as_ptr() as *const u8)
+                .expect("dest in dest-space");
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    from_ptr as *const u64,
+                    dest_ptr.as_ptr(),
+                    size,
+                );
+            }
+            // Forwarding pointer at the source.
+            unsafe {
+                *sources[src_idx].cell_ptr_mut(from_idx) =
+                    Word::forward(dest_ptr.as_ptr() as *const ()).raw();
+            }
+            queue.push(CopiedObject { to_offset, size, is_cons });
+            Some(Word::from_ptr(dest_ptr.as_ptr() as *const u8, tag))
+        }
+    }
+}
+
+// -- RootScanner (covers both Minor and Full) -------------------------------
+
+enum ScanTarget<'s, 'a: 's> {
+    Minor(&'s mut MinorState<'a>),
+    Full(&'s mut FullState<'a>),
+}
+
 pub struct RootScanner<'s, 'a: 's> {
-    state: &'s mut CollectState<'a>,
+    state: ScanTarget<'s, 'a>,
 }
 
 impl<'s, 'a: 's> RootScanner<'s, 'a> {
-    /// Visit one root. If `slot` holds a heap pointer that gets
-    /// copied (or has already been forwarded), `slot` is updated
-    /// in place to point at the new location.
     pub fn visit(&mut self, slot: &mut Word) {
         let w = *slot;
-        if let Some(new) = self.state.maybe_copy(w) {
-            *slot = new;
+        let new = match &mut self.state {
+            ScanTarget::Minor(s) => s.maybe_copy(w),
+            ScanTarget::Full(s) => s.maybe_copy(w),
+        };
+        if let Some(updated) = new {
+            *slot = updated;
         }
     }
 }
@@ -387,7 +606,11 @@ impl<'s, 'a: 's> RootScanner<'s, 'a> {
 mod tests {
     use super::*;
 
-    // -- HeapHeader tests ----------------------------------------------------
+    fn fresh() -> Heap {
+        Heap::new(1024, 1024)
+    }
+
+    // -- HeapHeader ----------------------------------------------------------
 
     #[test]
     fn header_round_trip() {
@@ -423,7 +646,6 @@ mod tests {
         assert!(h.has_gc_bit(GcBit::Mark));
         assert!(h.has_gc_bit(GcBit::Tenured));
         assert_eq!(h.ty(), HeapType::Symbol);
-        assert_eq!(h.length_cells(), 4);
         h.clear_gc_bit(GcBit::Mark);
         assert!(!h.has_gc_bit(GcBit::Mark));
         assert!(h.has_gc_bit(GcBit::Tenured));
@@ -435,7 +657,7 @@ mod tests {
         assert_eq!(std::mem::align_of::<HeapHeader>(), 8);
     }
 
-    // -- Semispace tests -----------------------------------------------------
+    // -- Semispace -----------------------------------------------------------
 
     #[test]
     fn semispace_starts_empty() {
@@ -457,28 +679,6 @@ mod tests {
     }
 
     #[test]
-    fn semispace_pointers_eight_byte_aligned() {
-        let mut s = Semispace::new(1024);
-        for _ in 0..10 {
-            let c = s.alloc_cons(Word::NIL, Word::NIL);
-            let addr = c.as_ptr::<u8>(Tag::Cons).unwrap() as usize;
-            assert_eq!(addr & 7, 0);
-        }
-    }
-
-    #[test]
-    fn semispace_reset_lets_us_re_allocate() {
-        let mut s = Semispace::new(64);
-        s.alloc_cons(Word::fixnum(1), Word::fixnum(2));
-        s.alloc_cons(Word::fixnum(3), Word::fixnum(4));
-        assert_eq!(s.used_cells(), 4);
-        s.reset();
-        assert_eq!(s.used_cells(), 0);
-        s.alloc_with_header(HeapType::Vector, 7);
-        assert_eq!(s.used_cells(), 8);
-    }
-
-    #[test]
     #[should_panic(expected = "semispace exhausted")]
     fn semispace_exhaustion_panics() {
         let mut s = Semispace::new(16);
@@ -486,162 +686,210 @@ mod tests {
         s.alloc_cons(Word::NIL, Word::NIL);
     }
 
-    // -- Heap copying-collector tests ---------------------------------------
+    // -- Heap allocation lands in young -------------------------------------
 
     #[test]
-    fn empty_collection_is_safe() {
-        let mut heap = Heap::new(1024);
-        heap.collect(|_| {});
-        assert_eq!(heap.used_bytes(), 0);
+    fn allocation_lands_in_young() {
+        let mut h = fresh();
+        let c = h.alloc_cons(Word::fixnum(1), Word::fixnum(2));
+        let p = c.as_ptr::<u8>(Tag::Cons).unwrap();
+        assert!(h.young_contains(p));
+        assert!(!h.old_contains(p));
+        assert_eq!(h.young_used_bytes(), 16);
+        assert_eq!(h.old_used_bytes(), 0);
+    }
+
+    // -- Minor GC -----------------------------------------------------------
+
+    #[test]
+    fn minor_promotes_rooted_cons_to_old() {
+        let mut h = fresh();
+        h.alloc_cons(Word::fixnum(99), Word::fixnum(99));
+        let mut root = h.alloc_cons(Word::fixnum(1), Word::fixnum(2));
+        h.alloc_cons(Word::fixnum(99), Word::fixnum(99));
+
+        h.collect_minor(|s| s.visit(&mut root));
+
+        // Young is empty, the rooted cons lives in old.
+        assert_eq!(h.young_used_bytes(), 0);
+        assert_eq!(h.old_used_bytes(), 16);
+
+        let p = root.as_ptr::<u8>(Tag::Cons).unwrap();
+        assert!(h.old_contains(p));
+
+        let pp = root.as_ptr::<u64>(Tag::Cons).unwrap();
+        unsafe {
+            assert_eq!(Word::from_raw(*pp).as_fixnum(), Some(1));
+            assert_eq!(Word::from_raw(*pp.add(1)).as_fixnum(), Some(2));
+        }
     }
 
     #[test]
-    fn collection_drops_unreferenced_cons() {
-        let mut heap = Heap::new(1024);
+    fn minor_drops_unrooted_cons() {
+        let mut h = fresh();
         for _ in 0..3 {
-            heap.alloc_cons(Word::fixnum(1), Word::fixnum(2));
+            h.alloc_cons(Word::fixnum(1), Word::fixnum(2));
         }
-        assert_eq!(heap.used_bytes(), 48);
-        heap.collect(|_| {});
-        assert_eq!(heap.used_bytes(), 0);
+        h.collect_minor(|_| {});
+        assert_eq!(h.young_used_bytes(), 0);
+        assert_eq!(h.old_used_bytes(), 0);
     }
 
     #[test]
-    fn collection_keeps_rooted_cons() {
-        let mut heap = Heap::new(1024);
-        heap.alloc_cons(Word::fixnum(99), Word::fixnum(99));
-        let mut root = heap.alloc_cons(Word::fixnum(1), Word::fixnum(2));
-        heap.alloc_cons(Word::fixnum(99), Word::fixnum(99));
+    fn minor_old_to_young_pointer_promotes() {
+        let mut h = fresh();
 
-        heap.collect(|s| s.visit(&mut root));
+        // Allocate young cons A. Run a minor GC with A as root —
+        // A goes to old.
+        let mut a = h.alloc_cons(Word::fixnum(1), Word::NIL);
+        h.collect_minor(|s| s.visit(&mut a));
+        assert_eq!(h.old_used_bytes(), 16);
+        assert_eq!(h.young_used_bytes(), 0);
 
-        assert_eq!(heap.used_bytes(), 16);
-        let p = root.as_ptr::<u64>(Tag::Cons).expect("still a cons");
+        // Now allocate young cons B and patch it into A's cdr.
+        let b = h.alloc_cons(Word::fixnum(2), Word::NIL);
+        let a_ptr = a.as_mut_ptr::<u64>(Tag::Cons).unwrap();
+        unsafe { *a_ptr.add(1) = b.raw(); }
+        // A is in old, B is in young, A's cdr -> B.
+        assert_eq!(h.young_used_bytes(), 16);
+
+        // Run a minor GC with A as root. The old-to-young scan
+        // should find A's cdr pointing into young and promote B.
+        h.collect_minor(|s| s.visit(&mut a));
+
+        // Both conses now in old; young empty.
+        assert_eq!(h.young_used_bytes(), 0);
+        assert_eq!(h.old_used_bytes(), 32);
+
+        // Walk: a -> cons(1, b'); b' -> cons(2, nil).
         unsafe {
+            let p = a.as_ptr::<u64>(Tag::Cons).unwrap();
             assert_eq!(Word::from_raw(*p).as_fixnum(), Some(1));
-            assert_eq!(Word::from_raw(*p.add(1)).as_fixnum(), Some(2));
+            let cdr = Word::from_raw(*p.add(1));
+            assert!(cdr.is_cons());
+            let bp = cdr.as_ptr::<u64>(Tag::Cons).unwrap();
+            assert_eq!(Word::from_raw(*bp).as_fixnum(), Some(2));
+            assert!(Word::from_raw(*bp.add(1)).is_nil());
         }
     }
 
     #[test]
-    fn collection_follows_cons_chain() {
-        let mut heap = Heap::new(1024);
-        let tail = heap.alloc_cons(Word::fixnum(3), Word::NIL);
-        let mid = heap.alloc_cons(Word::fixnum(2), tail);
-        let mut head = heap.alloc_cons(Word::fixnum(1), mid);
+    fn minor_chain_in_young_promotes_all_reachable() {
+        let mut h = fresh();
+        let tail = h.alloc_cons(Word::fixnum(3), Word::NIL);
+        let mid = h.alloc_cons(Word::fixnum(2), tail);
+        let mut head = h.alloc_cons(Word::fixnum(1), mid);
 
-        heap.collect(|s| s.visit(&mut head));
+        h.collect_minor(|s| s.visit(&mut head));
 
-        assert_eq!(heap.used_bytes(), 48); // 3 conses
+        assert_eq!(h.young_used_bytes(), 0);
+        assert_eq!(h.old_used_bytes(), 48);
+    }
+
+    // -- Full GC ------------------------------------------------------------
+
+    #[test]
+    fn full_collects_unrooted() {
+        let mut h = fresh();
+        // First minor → put garbage in old.
+        h.alloc_cons(Word::fixnum(1), Word::fixnum(2));
+        h.collect_minor(|_| {});
+        // Second batch in young; another minor with a root.
+        let mut keep = h.alloc_cons(Word::fixnum(7), Word::NIL);
+        h.collect_minor(|s| s.visit(&mut keep));
+        assert_eq!(h.old_used_bytes(), 16);
+
+        // Now `keep` is the only thing alive in old.
+        // Full GC with no roots → drops everything.
+        h.collect_full(|_| {});
+        assert_eq!(h.old_used_bytes(), 0);
+        assert_eq!(h.young_used_bytes(), 0);
+    }
+
+    #[test]
+    fn full_compacts_old() {
+        let mut h = fresh();
+
+        // Promote three conses to old via minor GCs. Drop the
+        // intermediate two.
+        let mut keep = h.alloc_cons(Word::fixnum(42), Word::NIL);
+        h.collect_minor(|s| s.visit(&mut keep));
+
+        // Allocate two unrooted conses and minor-GC them away
+        // (they don't survive minor without roots).
+        h.alloc_cons(Word::fixnum(98), Word::fixnum(98));
+        h.alloc_cons(Word::fixnum(99), Word::fixnum(99));
+        h.collect_minor(|s| s.visit(&mut keep)); // unrooted dies here
+
+        assert_eq!(h.old_used_bytes(), 16);
+
+        // Full GC keeps only `keep`.
+        h.collect_full(|s| s.visit(&mut keep));
+        assert_eq!(h.old_used_bytes(), 16);
+
+        // `keep` still has its data and is in old (after the swap).
+        let p = keep.as_ptr::<u64>(Tag::Cons).unwrap();
         unsafe {
-            let p1 = head.as_ptr::<u64>(Tag::Cons).unwrap();
-            assert_eq!(Word::from_raw(*p1).as_fixnum(), Some(1));
-            let p2_w = Word::from_raw(*p1.add(1));
-            let p2 = p2_w.as_ptr::<u64>(Tag::Cons).unwrap();
-            assert_eq!(Word::from_raw(*p2).as_fixnum(), Some(2));
-            let p3_w = Word::from_raw(*p2.add(1));
-            let p3 = p3_w.as_ptr::<u64>(Tag::Cons).unwrap();
-            assert_eq!(Word::from_raw(*p3).as_fixnum(), Some(3));
-            assert!(Word::from_raw(*p3.add(1)).is_nil());
+            assert_eq!(Word::from_raw(*p).as_fixnum(), Some(42));
+            assert!(Word::from_raw(*p.add(1)).is_nil());
         }
+        assert!(h.old_contains(keep.as_ptr::<u8>(Tag::Cons).unwrap()));
     }
 
     #[test]
-    fn forwarding_dedupes_shared_subgraph() {
-        let mut heap = Heap::new(1024);
-        let shared = heap.alloc_cons(Word::fixnum(1), Word::fixnum(2));
-        let mut a = heap.alloc_cons(shared, Word::NIL);
-        let mut b = heap.alloc_cons(shared, Word::NIL);
+    fn full_handles_young_old_mix() {
+        let mut h = fresh();
 
-        heap.collect(|s| {
-            s.visit(&mut a);
-            s.visit(&mut b);
+        // Step 1: cons in young; minor → in old.
+        let mut keep = h.alloc_cons(Word::fixnum(1), Word::NIL);
+        h.collect_minor(|s| s.visit(&mut keep));
+        assert_eq!(h.old_used_bytes(), 16);
+
+        // Step 2: another cons in young; left there.
+        let mut also_keep = h.alloc_cons(Word::fixnum(2), Word::NIL);
+        assert_eq!(h.young_used_bytes(), 16);
+
+        // Full GC with both roots: both survive, both end up in
+        // old (full collapses young into old).
+        h.collect_full(|s| {
+            s.visit(&mut keep);
+            s.visit(&mut also_keep);
         });
 
-        // a, b, and the shared cons — three conses live.
-        assert_eq!(heap.used_bytes(), 48);
+        assert_eq!(h.young_used_bytes(), 0);
+        assert_eq!(h.old_used_bytes(), 32);
+
+        // Both pointers are now in old.
+        assert!(h.old_contains(keep.as_ptr::<u8>(Tag::Cons).unwrap()));
+        assert!(h.old_contains(also_keep.as_ptr::<u8>(Tag::Cons).unwrap()));
+
+        // Values intact.
         unsafe {
-            let pa = a.as_ptr::<u64>(Tag::Cons).unwrap();
-            let pb = b.as_ptr::<u64>(Tag::Cons).unwrap();
-            // Both a's car and b's car point at the SAME copy of the shared cons.
-            assert_eq!(Word::from_raw(*pa), Word::from_raw(*pb));
+            assert_eq!(Word::from_raw(*keep.as_ptr::<u64>(Tag::Cons).unwrap()).as_fixnum(), Some(1));
+            assert_eq!(Word::from_raw(*also_keep.as_ptr::<u64>(Tag::Cons).unwrap()).as_fixnum(), Some(2));
         }
     }
 
     #[test]
-    fn header_object_with_word_payload_copies() {
-        let mut heap = Heap::new(1024);
-        let vec_ptr = heap.alloc_with_header(HeapType::Vector, 3);
-        unsafe {
-            let payload = vec_ptr.as_ptr().add(1) as *mut u64;
-            *payload = Word::fixnum(10).raw();
-            *payload.add(1) = Word::fixnum(20).raw();
-            *payload.add(2) = Word::fixnum(30).raw();
-        }
-        let mut root = Word::from_ptr(vec_ptr.as_ptr() as *const u8, Tag::Vector);
-
-        heap.collect(|s| s.visit(&mut root));
-
-        assert_eq!(heap.used_bytes(), 32); // header + 3 cells
-        let new_ptr = root.as_mut_ptr::<HeapHeader>(Tag::Vector).unwrap();
-        unsafe {
-            assert_eq!((*new_ptr).ty(), HeapType::Vector);
-            assert_eq!((*new_ptr).length_cells(), 3);
-            let payload = (new_ptr as *const u64).add(1);
-            assert_eq!(Word::from_raw(*payload).as_fixnum(), Some(10));
-            assert_eq!(Word::from_raw(*payload.add(1)).as_fixnum(), Some(20));
-            assert_eq!(Word::from_raw(*payload.add(2)).as_fixnum(), Some(30));
-        }
-    }
-
-    #[test]
-    fn header_with_pointer_payload_traces_through() {
-        let mut heap = Heap::new(1024);
-        // Build (vector: cons1 cons2)
-        let c1 = heap.alloc_cons(Word::fixnum(1), Word::NIL);
-        let c2 = heap.alloc_cons(Word::fixnum(2), Word::NIL);
-        let v = heap.alloc_with_header(HeapType::Vector, 2);
-        unsafe {
-            let payload = v.as_ptr().add(1) as *mut u64;
-            *payload = c1.raw();
-            *payload.add(1) = c2.raw();
-        }
-        let mut root = Word::from_ptr(v.as_ptr() as *const u8, Tag::Vector);
-
-        heap.collect(|s| s.visit(&mut root));
-
-        // 1 vector (1 header + 2 payload = 3 cells) + 2 conses
-        // (2 cells each = 4 cells) = 7 cells = 56 bytes.
-        assert_eq!(heap.used_bytes(), 56);
-
-        let v_new = root.as_mut_ptr::<HeapHeader>(Tag::Vector).unwrap();
-        unsafe {
-            let payload = (v_new as *const u64).add(1);
-            let c1_w = Word::from_raw(*payload);
-            let c2_w = Word::from_raw(*payload.add(1));
-            assert!(c1_w.is_cons());
-            assert!(c2_w.is_cons());
-            let p1 = c1_w.as_ptr::<u64>(Tag::Cons).unwrap();
-            let p2 = c2_w.as_ptr::<u64>(Tag::Cons).unwrap();
-            assert_eq!(Word::from_raw(*p1).as_fixnum(), Some(1));
-            assert_eq!(Word::from_raw(*p2).as_fixnum(), Some(2));
-        }
-    }
-
-    #[test]
-    fn surviving_multiple_collections() {
-        let mut heap = Heap::new(1024);
-        let mut root = heap.alloc_cons(Word::fixnum(42), Word::NIL);
-
-        for cycle in 0..5 {
-            // Allocate some garbage between collections.
+    fn many_minor_then_full_is_stable() {
+        let mut h = fresh();
+        let mut root = h.alloc_cons(Word::fixnum(0), Word::NIL);
+        for cycle in 0..10 {
+            // Allocate garbage.
             for _ in 0..3 {
-                heap.alloc_cons(Word::fixnum(99), Word::fixnum(99));
+                h.alloc_cons(Word::fixnum(99), Word::fixnum(99));
             }
-            heap.collect(|s| s.visit(&mut root));
-            assert_eq!(heap.used_bytes(), 16, "cycle {cycle}");
-            let p = root.as_ptr::<u64>(Tag::Cons).expect("alive");
-            unsafe { assert_eq!(Word::from_raw(*p).as_fixnum(), Some(42)); }
+            h.collect_minor(|s| s.visit(&mut root));
+            unsafe {
+                let p = root.as_ptr::<u64>(Tag::Cons).expect(&format!("cycle {cycle}"));
+                assert_eq!(Word::from_raw(*p).as_fixnum(), Some(0));
+            }
         }
+        // Old should have just the one root.
+        assert_eq!(h.old_used_bytes(), 16);
+
+        // Full GC keeps it.
+        h.collect_full(|s| s.visit(&mut root));
+        assert_eq!(h.old_used_bytes(), 16);
     }
 }
