@@ -349,6 +349,197 @@ pub extern "C" fn ncl_set_cdr(
     new_value
 }
 
+// ---- File I/O shims --------------------------------------------------------
+//
+// Each shim has the standard JIT calling convention so it can be
+// installed in a symbol's function cell via the install_native
+// mechanism. Internally, all dispatch to the higher-level
+// functions in `file_sys`.
+
+fn arg(args: *const u64, i: u64) -> Word {
+    Word::from_raw(unsafe { *args.add(i as usize) })
+}
+
+fn arg_fixnum(args: *const u64, i: u64) -> Option<i64> {
+    arg(args, i).as_fixnum()
+}
+
+/// (open-input-file path) → handle (fixnum) or 0
+pub extern "C" fn open_input_file_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("open-input-file: expected 1 arg (path), got {n_args}");
+    }
+    let h = crate::file_sys::open_file(arg(args, 0), crate::file_sys::Mode::Input);
+    Word::fixnum(h).raw()
+}
+
+/// (open-output-file path) → handle (truncates existing)
+pub extern "C" fn open_output_file_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("open-output-file: expected 1 arg (path), got {n_args}");
+    }
+    let h = crate::file_sys::open_file(arg(args, 0), crate::file_sys::Mode::Output);
+    Word::fixnum(h).raw()
+}
+
+/// (open-append-file path) → handle (creates or appends)
+pub extern "C" fn open_append_file_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("open-append-file: expected 1 arg (path), got {n_args}");
+    }
+    let h = crate::file_sys::open_file(arg(args, 0), crate::file_sys::Mode::Append);
+    Word::fixnum(h).raw()
+}
+
+/// (close-stream handle) → t
+pub extern "C" fn close_stream_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("close-stream: expected 1 arg (handle), got {n_args}");
+    }
+    let h = arg_fixnum(args, 0).unwrap_or(0);
+    crate::file_sys::close_file(h);
+    Word::T.raw()
+}
+
+/// (read-line handle) → string or nil (EOF)
+pub extern "C" fn read_line_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("read-line: expected 1 arg (handle), got {n_args}");
+    }
+    let h = arg_fixnum(args, 0).unwrap_or(0);
+    match crate::file_sys::read_line(h) {
+        Some(s) => {
+            let m = unsafe { &mut *mutator };
+            crate::gc_string::alloc_string_in_young(m, &s).raw()
+        }
+        None => Word::NIL.raw(),
+    }
+}
+
+/// (read-char-from handle) → char or nil (EOF)
+pub extern "C" fn read_char_from_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("read-char-from: expected 1 arg (handle), got {n_args}");
+    }
+    let h = arg_fixnum(args, 0).unwrap_or(0);
+    match crate::file_sys::read_char(h) {
+        Some(c) => Word::char(c).raw(),
+        None => Word::NIL.raw(),
+    }
+}
+
+/// (write-string-to handle string) → string
+pub extern "C" fn write_string_to_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("write-string-to: expected 2 args (handle, string), got {n_args}");
+    }
+    let h = arg_fixnum(args, 0).unwrap_or(0);
+    let s_word = arg(args, 1);
+    if s_word.tag() != Tag::String {
+        panic!("write-string-to: second arg must be a string, got {s_word:?}");
+    }
+    let s: String = crate::gc_string::chars_of(s_word).collect();
+    crate::file_sys::write_string(h, &s);
+    s_word.raw()
+}
+
+/// (file-position handle) → fixnum or -1
+pub extern "C" fn file_position_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("file-position: expected 1 arg (handle), got {n_args}");
+    }
+    let h = arg_fixnum(args, 0).unwrap_or(0);
+    Word::fixnum(crate::file_sys::file_position(h)).raw()
+}
+
+/// (file-length handle) → fixnum or -1
+pub extern "C" fn file_length_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("file-length: expected 1 arg (handle), got {n_args}");
+    }
+    let h = arg_fixnum(args, 0).unwrap_or(0);
+    Word::fixnum(crate::file_sys::file_length(h)).raw()
+}
+
+/// (file-exists path) → t or nil
+pub extern "C" fn file_exists_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("file-exists: expected 1 arg (path), got {n_args}");
+    }
+    if crate::file_sys::file_exists(arg(args, 0)) {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
+/// (delete-file path) → t or nil
+pub extern "C" fn delete_file_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("delete-file: expected 1 arg (path), got {n_args}");
+    }
+    if crate::file_sys::delete_file(arg(args, 0)) {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
 /// Lisp-callable shim for `append`. Binary append — concatenates
 /// two lists; the second list's tail is shared (not copied). Used
 /// by backquote-splicing macros, so it has to be available before

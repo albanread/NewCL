@@ -225,3 +225,101 @@
 (defun max (a &rest r) (%max-of a r))
 
 (defun abs (n) (if (< n 0) (- n) n))
+
+;; -- File I/O ----------------------------------------------------------------
+;;
+;; The native primitives are:
+;;   open-input-file path        → handle (or 0 if open fails)
+;;   open-output-file path       → handle (truncates existing)
+;;   open-append-file path       → handle (creates or appends)
+;;   close-stream handle         → t
+;;   read-line handle            → string or nil at EOF
+;;   read-char-from handle       → char or nil at EOF
+;;   write-string-to handle s    → s
+;;   file-position handle        → fixnum or -1
+;;   file-length handle          → fixnum or -1
+;;   file-exists path            → t / nil
+;;   delete-file path            → t / nil
+;;
+;; The Lisp wrappers below add ergonomics — line-at-a-time text
+;; iteration, RAII via with-open-file, file-as-string slurping.
+
+(defun write-line (stream s)
+  "Write S to STREAM followed by a newline. Returns S."
+  (write-string-to stream s)
+  (write-string-to stream (format nil "~%"))
+  s)
+
+(defmacro with-open-file (binding-and-mode &rest body)
+  "(with-open-file (var path direction) body...)
+   Direction is one of the bare symbols INPUT, OUTPUT, APPEND.
+   (Once the keyword package is wired we'll switch to :input etc.)
+   Opens path, binds the handle to var, evaluates body, and closes
+   the handle on the way out. (Without conditions we can't yet
+   guarantee close on non-local exit; the body just isn't allowed
+   to escape via a condition until those land.)"
+  (let ((var (car binding-and-mode))
+        (path (car (cdr binding-and-mode)))
+        (direction (car (cdr (cdr binding-and-mode)))))
+    ;; Dispatch at macro-expansion time: compare the symbol the
+    ;; user passed against the literal direction symbols.
+    (let ((open-fn (cond
+                     ((eq direction 'input)  'open-input-file)
+                     ((eq direction 'output) 'open-output-file)
+                     ((eq direction 'append) 'open-append-file)
+                     (t 'open-input-file))))
+      `(let ((,var (,open-fn ,path)))
+         (let ((result (progn ,@body)))
+           (close-stream ,var)
+           result)))))
+
+(defun %read-lines-from (stream acc)
+  ;; Tail-recursive line reader. Acc is built reversed; caller flips.
+  (let ((line (read-line stream)))
+    (if (null line)
+        (reverse acc)
+        (%read-lines-from stream (cons line acc)))))
+
+(defun read-file-lines (path)
+  "Read every line of PATH into a list of strings (newlines stripped)."
+  (let ((stream (open-input-file path)))
+    (let ((result (%read-lines-from stream nil)))
+      (close-stream stream)
+      result)))
+
+(defun read-file-string (path)
+  "Read the entire contents of PATH as a single string. Lines are
+   joined with newlines."
+  (let ((lines (read-file-lines path)))
+    (cond
+      ((null lines) "")
+      ((null (cdr lines)) (car lines))
+      (t (%join-lines lines)))))
+
+(defun %join-lines (lines)
+  ;; Concatenate lines with \n separators using format.
+  (cond
+    ((null lines) "")
+    ((null (cdr lines)) (car lines))
+    (t (format nil "~A~%~A" (car lines) (%join-lines (cdr lines))))))
+
+(defun write-file-string (path s)
+  "Write the string S to PATH, replacing any existing file."
+  (let ((stream (open-output-file path)))
+    (write-string-to stream s)
+    (close-stream stream)
+    s))
+
+(defun write-file-lines (path lines)
+  "Write each string in LINES to PATH, one per line, replacing
+   any existing file."
+  (let ((stream (open-output-file path)))
+    (%write-lines-to stream lines)
+    (close-stream stream)
+    lines))
+
+(defun %write-lines-to (stream lines)
+  (cond
+    ((null lines) nil)
+    (t (write-line stream (car lines))
+       (%write-lines-to stream (cdr lines)))))

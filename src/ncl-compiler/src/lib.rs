@@ -212,6 +212,33 @@ fn install_native_functions(
     // backquote works in a bare Session, before any user-Lisp
     // stdlib has been read.
     install_native(coord, mutator, "APPEND", ncl_runtime::append_shim, 2);
+
+    // File I/O. The handle-table architecture is borrowed from the
+    // sister NewCP repo's `host_file_sys.rs`, adapted for our
+    // String-Word path encoding. User-Lisp wrappers (with-open-file,
+    // read-file-string, write-file-string) live in Lisp/core.lisp.
+    install_native(coord, mutator, "OPEN-INPUT-FILE",
+                   ncl_runtime::open_input_file_shim, 1);
+    install_native(coord, mutator, "OPEN-OUTPUT-FILE",
+                   ncl_runtime::open_output_file_shim, 1);
+    install_native(coord, mutator, "OPEN-APPEND-FILE",
+                   ncl_runtime::open_append_file_shim, 1);
+    install_native(coord, mutator, "CLOSE-STREAM",
+                   ncl_runtime::close_stream_shim, 1);
+    install_native(coord, mutator, "READ-LINE",
+                   ncl_runtime::read_line_shim, 1);
+    install_native(coord, mutator, "READ-CHAR-FROM",
+                   ncl_runtime::read_char_from_shim, 1);
+    install_native(coord, mutator, "WRITE-STRING-TO",
+                   ncl_runtime::write_string_to_shim, 2);
+    install_native(coord, mutator, "FILE-POSITION",
+                   ncl_runtime::file_position_shim, 1);
+    install_native(coord, mutator, "FILE-LENGTH",
+                   ncl_runtime::file_length_shim, 1);
+    install_native(coord, mutator, "FILE-EXISTS",
+                   ncl_runtime::file_exists_shim, 1);
+    install_native(coord, mutator, "DELETE-FILE",
+                   ncl_runtime::delete_file_shim, 1);
 }
 
 fn install_native(
@@ -1948,6 +1975,136 @@ mod end_to_end_tests {
         // &rest followed by multiple names.
         let r = eval_str("(defun f (a &rest r s) a)");
         assert!(r.is_err());
+    }
+
+    // -- File I/O --------------------------------------------------------
+
+    fn temp_path(name: &str) -> String {
+        let mut p = std::env::temp_dir();
+        p.push(format!("ncl_test_{}_{name}", std::process::id()));
+        p.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn file_round_trip_string() {
+        let mut s = Session::with_stdlib().unwrap();
+        let path = temp_path("roundtrip.txt");
+        s.eval(&format!(r#"(defparameter *p* "{}")"#, path.replace('\\', "\\\\")))
+            .unwrap();
+        s.eval(r#"(write-file-string *p* "hello, world!")"#).unwrap();
+        assert_eq!(
+            s.eval("(read-file-string *p*)").unwrap(),
+            r#""hello, world!""#,
+        );
+        s.eval("(delete-file *p*)").unwrap();
+    }
+
+    #[test]
+    fn file_exists_round_trip() {
+        let mut s = Session::with_stdlib().unwrap();
+        let path = temp_path("exists.txt");
+        s.eval(&format!(r#"(defparameter *p* "{}")"#, path.replace('\\', "\\\\")))
+            .unwrap();
+        // Doesn't exist yet.
+        assert_eq!(s.eval("(file-exists *p*)").unwrap(), "nil");
+        s.eval(r#"(write-file-string *p* "hi")"#).unwrap();
+        assert_eq!(s.eval("(file-exists *p*)").unwrap(), "T");
+        s.eval("(delete-file *p*)").unwrap();
+        assert_eq!(s.eval("(file-exists *p*)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn file_lines_round_trip() {
+        let mut s = Session::with_stdlib().unwrap();
+        let path = temp_path("lines.txt");
+        s.eval(&format!(r#"(defparameter *p* "{}")"#, path.replace('\\', "\\\\")))
+            .unwrap();
+        s.eval(r#"(write-file-lines *p* '("alpha" "beta" "gamma"))"#).unwrap();
+        assert_eq!(
+            s.eval("(read-file-lines *p*)").unwrap(),
+            r#"("alpha" "beta" "gamma")"#,
+        );
+        s.eval("(delete-file *p*)").unwrap();
+    }
+
+    #[test]
+    fn with_open_file_macro_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        let path = temp_path("with_open.txt");
+        s.eval(&format!(r#"(defparameter *p* "{}")"#, path.replace('\\', "\\\\")))
+            .unwrap();
+        // Write via with-open-file.
+        s.eval(
+            "(with-open-file (out *p* output) \
+               (write-line out \"line 1\") \
+               (write-line out \"line 2\"))",
+        )
+        .unwrap();
+        // Read back via with-open-file.
+        assert_eq!(
+            s.eval("(with-open-file (in *p* input) (read-line in))").unwrap(),
+            r#""line 1""#,
+        );
+        s.eval("(delete-file *p*)").unwrap();
+    }
+
+    #[test]
+    fn read_line_returns_nil_at_eof() {
+        let mut s = Session::with_stdlib().unwrap();
+        let path = temp_path("eof.txt");
+        s.eval(&format!(r#"(defparameter *p* "{}")"#, path.replace('\\', "\\\\")))
+            .unwrap();
+        s.eval(r#"(write-file-string *p* "single")"#).unwrap();
+        s.eval("(defparameter *h* (open-input-file *p*))").unwrap();
+        assert_eq!(s.eval("(read-line *h*)").unwrap(), r#""single""#);
+        // Past EOF.
+        assert_eq!(s.eval("(read-line *h*)").unwrap(), "nil");
+        s.eval("(close-stream *h*)").unwrap();
+        s.eval("(delete-file *p*)").unwrap();
+    }
+
+    #[test]
+    fn file_append_mode() {
+        let mut s = Session::with_stdlib().unwrap();
+        let path = temp_path("append.txt");
+        s.eval(&format!(r#"(defparameter *p* "{}")"#, path.replace('\\', "\\\\")))
+            .unwrap();
+        // Write initial.
+        s.eval(r#"(write-file-string *p* "first")"#).unwrap();
+        // Append more.
+        s.eval(
+            "(with-open-file (out *p* append) (write-string-to out \"-second\"))",
+        )
+        .unwrap();
+        assert_eq!(
+            s.eval("(read-file-string *p*)").unwrap(),
+            r#""first-second""#,
+        );
+        s.eval("(delete-file *p*)").unwrap();
+    }
+
+    #[test]
+    fn file_open_failure_returns_zero_handle() {
+        let mut s = Session::with_stdlib().unwrap();
+        // A path that almost certainly doesn't exist.
+        let h = s
+            .eval(r#"(open-input-file "Z:\\definitely-not-here-9876.xyz")"#)
+            .unwrap();
+        assert_eq!(h, "0");
+    }
+
+    #[test]
+    fn file_unicode_round_trip() {
+        let mut s = Session::with_stdlib().unwrap();
+        let path = temp_path("unicode.txt");
+        s.eval(&format!(r#"(defparameter *p* "{}")"#, path.replace('\\', "\\\\")))
+            .unwrap();
+        s.eval(r#"(write-file-string *p* "café 🦀 日本")"#).unwrap();
+        assert_eq!(
+            s.eval("(read-file-string *p*)").unwrap(),
+            r#""café 🦀 日本""#,
+        );
+        s.eval("(delete-file *p*)").unwrap();
     }
 
     // -- defmacro / macros -----------------------------------------------
