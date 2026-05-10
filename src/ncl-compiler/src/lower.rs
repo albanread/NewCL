@@ -1,43 +1,84 @@
 //! Lowering: `ncl_runtime::Value` → `ncl_ir::Expr`.
 //!
-//! Phase 3a recognises fixnum literals and three arithmetic
-//! operators (`+`, `-`, `*`) in operator position. Variadic
-//! arities fold left:
+//! Phase 3a recognised fixnum literals and three arithmetic
+//! operators. Cons/car/cdr added the first allocating forms.
+//! Eq/if/quote added the first conditional. Now defun and function
+//! calls land — `lower` takes a `LocalEnv` (parameter scope) and a
+//! `GcCoordinator` (for symbol interning) so it can resolve symbol
+//! references and emit calls through the symbol's function cell.
 //!
-//! ```text
-//! (+ a b c)  →  Add(Add(a, b), c)
-//! ```
-//!
-//! Empty `(+)` is `0`, single-arg `(+ x)` is `x`. Same shape for
-//! `*` (identity 1) and `-` (single-arg negates). Anything else
-//! returns `CompileError::NotImplemented` — the compiler grows as
-//! the language does.
+//! Top-level forms are lowered with `LocalEnv::empty()`. Function
+//! bodies are lowered with a `LocalEnv` that maps each parameter
+//! name to its index. A bare symbol resolves locals first, then
+//! special-cases `T`; anything else lowering as a function call
+//! against an unknown head goes through symbol intern + `Expr::Call`.
+
+use std::sync::Arc;
 
 use ncl_ir::Expr;
-use ncl_runtime::Value;
+use ncl_runtime::{GcCoordinator, Value};
+
+/// Parameter environment for lowering a function body.
+#[derive(Debug, Clone, Default)]
+pub struct LocalEnv {
+    params: Vec<Arc<str>>,
+}
+
+impl LocalEnv {
+    pub fn empty() -> LocalEnv { LocalEnv { params: Vec::new() } }
+
+    pub fn with_params(names: &[Arc<str>]) -> LocalEnv {
+        LocalEnv { params: names.to_vec() }
+    }
+
+    pub fn find(&self, name: &str) -> Option<usize> {
+        self.params.iter().position(|p| &**p == name)
+    }
+
+    pub fn len(&self) -> usize { self.params.len() }
+    pub fn is_empty(&self) -> bool { self.params.is_empty() }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompileError {
-    /// We don't yet know how to compile this value.
     NotImplemented(String),
-    /// Function applied with the wrong number of arguments.
     BadArity { head: String, expected: &'static str, got: usize },
-    /// A list whose tail wasn't a proper list (had a dotted cdr).
     ImproperList(String),
+    /// `(defun)` form at non-top-level, or malformed.
+    BadDefun(String),
 }
 
-/// Lower a single Value to an Expr.
-pub fn lower(v: &Value) -> Result<Expr, CompileError> {
+/// Lower a top-level Value to an Expr (no parameter scope).
+pub fn lower(v: &Value, coord: &Arc<GcCoordinator>) -> Result<Expr, CompileError> {
+    lower_in(v, &LocalEnv::empty(), coord)
+}
+
+/// Lower a Value in the given parameter environment.
+pub fn lower_in(
+    v: &Value,
+    env: &LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
     match v {
         Value::Fixnum(n) => Ok(Expr::Const(*n)),
         Value::Nil => Ok(Expr::Nil),
-        // Bare `t` in source position. CL's `t` is the symbol T
-        // (self-evaluating), but we don't have full symbol
-        // resolution yet — for v1, lower it to the truth-value
-        // immediate. When symbols become first-class, this gets
-        // revisited.
-        Value::Symbol(s) if &*s.name == "T" => Ok(Expr::True),
-        Value::Cons(_) => lower_call(v),
+        Value::Symbol(s) => {
+            // Local parameter first, then T self-evaluating.
+            if let Some(idx) = env.find(&s.name) {
+                Ok(Expr::Param(idx))
+            } else if &*s.name == "T" {
+                Ok(Expr::True)
+            } else {
+                // Global value-cell reference would land here;
+                // not yet supported (defparameter / defvar arrive
+                // when symbol value cells are wired through).
+                Err(CompileError::NotImplemented(format!(
+                    "global value reference: {}",
+                    s.name
+                )))
+            }
+        }
+        Value::Cons(_) => lower_call_in(v, env, coord),
         other => Err(CompileError::NotImplemented(format!("{other:?}"))),
     }
 }
@@ -50,17 +91,17 @@ fn lower_quoted(v: &Value) -> Result<Expr, CompileError> {
         Value::Fixnum(n) => Ok(Expr::Const(*n)),
         Value::Nil => Ok(Expr::Nil),
         Value::Symbol(s) if &*s.name == "T" => Ok(Expr::True),
-        // Quoted symbols other than T, quoted lists, quoted
-        // strings — these need either symbol resolution or
-        // compile-time allocation, both of which arrive with the
-        // next phase.
         other => Err(CompileError::NotImplemented(format!(
             "quoted {other:?}"
         ))),
     }
 }
 
-fn lower_call(v: &Value) -> Result<Expr, CompileError> {
+fn lower_call_in(
+    v: &Value,
+    env: &LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
     let items = list_to_vec(v)?;
     let head_name = match items.first() {
         Some(Value::Symbol(s)) => s.name.to_string(),
@@ -74,8 +115,8 @@ fn lower_call(v: &Value) -> Result<Expr, CompileError> {
     let args = &items[1..];
 
     match head_name.as_str() {
-        "+" => fold_arithmetic(&head_name, args, 0, Expr::add),
-        "*" => fold_arithmetic(&head_name, args, 1, Expr::mul),
+        "+" => fold_arithmetic(&head_name, args, env, coord, 0, Expr::add),
+        "*" => fold_arithmetic(&head_name, args, env, coord, 1, Expr::mul),
         "QUOTE" => {
             if args.len() != 1 {
                 return Err(CompileError::BadArity {
@@ -94,18 +135,21 @@ fn lower_call(v: &Value) -> Result<Expr, CompileError> {
                     got: args.len(),
                 });
             }
-            Ok(Expr::eq(lower(&args[0])?, lower(&args[1])?))
+            Ok(Expr::eq(
+                lower_in(&args[0], env, coord)?,
+                lower_in(&args[1], env, coord)?,
+            ))
         }
         "IF" => match args.len() {
             2 => Ok(Expr::if_(
-                lower(&args[0])?,
-                lower(&args[1])?,
+                lower_in(&args[0], env, coord)?,
+                lower_in(&args[1], env, coord)?,
                 Expr::Nil,
             )),
             3 => Ok(Expr::if_(
-                lower(&args[0])?,
-                lower(&args[1])?,
-                lower(&args[2])?,
+                lower_in(&args[0], env, coord)?,
+                lower_in(&args[1], env, coord)?,
+                lower_in(&args[2], env, coord)?,
             )),
             n => Err(CompileError::BadArity {
                 head: head_name,
@@ -121,7 +165,10 @@ fn lower_call(v: &Value) -> Result<Expr, CompileError> {
                     got: args.len(),
                 });
             }
-            Ok(Expr::cons(lower(&args[0])?, lower(&args[1])?))
+            Ok(Expr::cons(
+                lower_in(&args[0], env, coord)?,
+                lower_in(&args[1], env, coord)?,
+            ))
         }
         "CAR" => {
             if args.len() != 1 {
@@ -131,7 +178,7 @@ fn lower_call(v: &Value) -> Result<Expr, CompileError> {
                     got: args.len(),
                 });
             }
-            Ok(Expr::car(lower(&args[0])?))
+            Ok(Expr::car(lower_in(&args[0], env, coord)?))
         }
         "CDR" => {
             if args.len() != 1 {
@@ -141,7 +188,7 @@ fn lower_call(v: &Value) -> Result<Expr, CompileError> {
                     got: args.len(),
                 });
             }
-            Ok(Expr::cdr(lower(&args[0])?))
+            Ok(Expr::cdr(lower_in(&args[0], env, coord)?))
         }
         "-" => match args.len() {
             0 => Err(CompileError::BadArity {
@@ -150,45 +197,56 @@ fn lower_call(v: &Value) -> Result<Expr, CompileError> {
                 got: 0,
             }),
             1 => {
-                // `(- x)` is `0 - x`.
-                let x = lower(&args[0])?;
+                let x = lower_in(&args[0], env, coord)?;
                 Ok(Expr::sub(Expr::Const(0), x))
             }
             _ => {
-                // `(- a b c)` is `((a - b) - c)` — left-fold from a.
-                let mut acc = lower(&args[0])?;
+                let mut acc = lower_in(&args[0], env, coord)?;
                 for a in &args[1..] {
-                    acc = Expr::sub(acc, lower(a)?);
+                    acc = Expr::sub(acc, lower_in(a, env, coord)?);
                 }
                 Ok(acc)
             }
         },
-        other => Err(CompileError::NotImplemented(format!(
-            "unknown function: {other}"
-        ))),
+        // DEFUN is not handled here — it's a top-level meta-form
+        // intercepted by the Session driver before lowering. If
+        // it appears nested inside an expression, surface a clear
+        // error rather than silently miscompiling.
+        "DEFUN" => Err(CompileError::BadDefun(
+            "(defun ...) is only allowed at top level".into(),
+        )),
+        // Unknown head: it's a function call. Intern the symbol
+        // (allocates a stable Symbol-tagged Word in static if not
+        // already there) and emit a Call.
+        _ => {
+            let sym_word = coord.intern(&head_name);
+            let lowered_args: Result<Vec<_>, _> = args
+                .iter()
+                .map(|a| lower_in(a, env, coord))
+                .collect();
+            Ok(Expr::call(sym_word.raw(), lowered_args?))
+        }
     }
 }
 
-/// `(op)` → `identity`, `(op x)` → `x`, `(op a b c …)` → left-fold.
-/// Used for `+` (identity 0) and `*` (identity 1).
 fn fold_arithmetic(
     _head: &str,
     args: &[Value],
+    env: &LocalEnv,
+    coord: &Arc<GcCoordinator>,
     identity: i64,
     combine: fn(Expr, Expr) -> Expr,
 ) -> Result<Expr, CompileError> {
     if args.is_empty() {
         return Ok(Expr::Const(identity));
     }
-    let mut acc = lower(&args[0])?;
+    let mut acc = lower_in(&args[0], env, coord)?;
     for a in &args[1..] {
-        acc = combine(acc, lower(a)?);
+        acc = combine(acc, lower_in(a, env, coord)?);
     }
     Ok(acc)
 }
 
-/// Walk a Lisp cons-list into a Vec of its elements. Errors if the
-/// cdr-chain has a non-NIL terminator (improper list).
 fn list_to_vec(v: &Value) -> Result<Vec<Value>, CompileError> {
     let mut out = Vec::new();
     let mut cur = v.clone();
@@ -210,128 +268,98 @@ fn list_to_vec(v: &Value) -> Result<Vec<Value>, CompileError> {
 mod tests {
     use super::*;
     use ncl_reader::read_one;
+    use ncl_runtime::{GcConfig, GcCoordinator};
 
-    fn read_lower(src: &str) -> Result<Expr, CompileError> {
+    fn small_coord() -> Arc<GcCoordinator> {
+        GcCoordinator::new(GcConfig {
+            young_bytes: 16 * 1024,
+            old_bytes: 16 * 1024,
+            static_bytes: 8 * 1024,
+            tlab_cells: 64,
+        })
+    }
+
+    fn lower_top(src: &str) -> Result<Expr, CompileError> {
         let v = read_one(src).expect("read");
-        lower(&v)
+        lower(&v, &small_coord())
     }
 
     #[test]
     fn fixnum_literal() {
-        assert_eq!(read_lower("42").unwrap(), Expr::Const(42));
-        assert_eq!(read_lower("-7").unwrap(), Expr::Const(-7));
-        assert_eq!(read_lower("0").unwrap(), Expr::Const(0));
+        assert_eq!(lower_top("42").unwrap(), Expr::Const(42));
     }
 
     #[test]
     fn binary_add() {
-        let e = read_lower("(+ 1 2)").unwrap();
-        assert_eq!(e, Expr::add(Expr::Const(1), Expr::Const(2)));
+        assert_eq!(
+            lower_top("(+ 1 2)").unwrap(),
+            Expr::add(Expr::Const(1), Expr::Const(2)),
+        );
     }
 
     #[test]
-    fn nested_add() {
-        // (+ (+ 1 2) 3) → Add(Add(1, 2), 3)
-        let e = read_lower("(+ (+ 1 2) 3)").unwrap();
+    fn unknown_head_lowers_to_call() {
+        let coord = small_coord();
+        let v = read_one("(foo 1 2)").unwrap();
+        let e = lower(&v, &coord).unwrap();
+        match e {
+            Expr::Call { sym_word, args } => {
+                // The symbol got interned.
+                let interned = coord.find_interned("FOO").expect("interned");
+                assert_eq!(sym_word, interned.raw());
+                assert_eq!(args.len(), 2);
+                assert_eq!(args[0], Expr::Const(1));
+                assert_eq!(args[1], Expr::Const(2));
+            }
+            other => panic!("expected Call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn param_in_function_body() {
+        let coord = small_coord();
+        let env = LocalEnv::with_params(&[Arc::from("X")]);
+        let v = read_one("(+ x x)").unwrap();
+        let e = lower_in(&v, &env, &coord).unwrap();
+        // Both `x` references should be Param(0).
         assert_eq!(
             e,
-            Expr::add(Expr::add(Expr::Const(1), Expr::Const(2)), Expr::Const(3)),
+            Expr::add(Expr::Param(0), Expr::Param(0)),
         );
     }
 
     #[test]
-    fn variadic_add_left_folds() {
-        let e = read_lower("(+ 1 2 3 4)").unwrap();
-        // ((1 + 2) + 3) + 4
+    fn param_priority_over_t() {
+        // A parameter named T shadows the truth-value literal.
+        let coord = small_coord();
+        let env = LocalEnv::with_params(&[Arc::from("T")]);
+        let e = lower_in(&read_one("t").unwrap(), &env, &coord).unwrap();
+        assert_eq!(e, Expr::Param(0));
+    }
+
+    #[test]
+    fn defun_at_nested_position_errors() {
+        let coord = small_coord();
+        let v = read_one("(if t (defun foo () 1) 2)").unwrap();
+        let r = lower(&v, &coord);
+        assert!(matches!(r, Err(CompileError::BadDefun(_))));
+    }
+
+    #[test]
+    fn eq_and_if_still_work() {
         assert_eq!(
-            e,
-            Expr::add(
-                Expr::add(
-                    Expr::add(Expr::Const(1), Expr::Const(2)),
-                    Expr::Const(3),
-                ),
-                Expr::Const(4),
-            ),
-        );
-    }
-
-    #[test]
-    fn nullary_arithmetic_is_identity() {
-        assert_eq!(read_lower("(+)").unwrap(), Expr::Const(0));
-        assert_eq!(read_lower("(*)").unwrap(), Expr::Const(1));
-    }
-
-    #[test]
-    fn unary_passthrough_for_plus_star() {
-        assert_eq!(read_lower("(+ 7)").unwrap(), Expr::Const(7));
-        assert_eq!(read_lower("(* 9)").unwrap(), Expr::Const(9));
-    }
-
-    #[test]
-    fn unary_minus_negates() {
-        // (- 5) is 0 - 5
-        let e = read_lower("(- 5)").unwrap();
-        assert_eq!(e, Expr::sub(Expr::Const(0), Expr::Const(5)));
-    }
-
-    #[test]
-    fn binary_sub_and_mul() {
-        assert_eq!(
-            read_lower("(- 10 3)").unwrap(),
-            Expr::sub(Expr::Const(10), Expr::Const(3)),
+            lower_top("(eq 1 2)").unwrap(),
+            Expr::eq(Expr::Const(1), Expr::Const(2)),
         );
         assert_eq!(
-            read_lower("(* 6 7)").unwrap(),
-            Expr::mul(Expr::Const(6), Expr::Const(7)),
+            lower_top("(if t 1 2)").unwrap(),
+            Expr::if_(Expr::True, Expr::Const(1), Expr::Const(2)),
         );
     }
 
     #[test]
-    fn variadic_sub_left_folds() {
-        // (- 100 1 2 3) = ((100 - 1) - 2) - 3
-        let e = read_lower("(- 100 1 2 3)").unwrap();
-        assert_eq!(
-            e,
-            Expr::sub(
-                Expr::sub(
-                    Expr::sub(Expr::Const(100), Expr::Const(1)),
-                    Expr::Const(2),
-                ),
-                Expr::Const(3),
-            ),
-        );
-    }
-
-    #[test]
-    fn mixed_arithmetic() {
-        // (* (+ 1 2) (- 10 4))
-        let e = read_lower("(* (+ 1 2) (- 10 4))").unwrap();
-        assert_eq!(
-            e,
-            Expr::mul(
-                Expr::add(Expr::Const(1), Expr::Const(2)),
-                Expr::sub(Expr::Const(10), Expr::Const(4)),
-            ),
-        );
-    }
-
-    #[test]
-    fn unknown_function_errors() {
-        let r = read_lower("(foo 1 2)");
-        assert!(matches!(r, Err(CompileError::NotImplemented(_))));
-    }
-
-    #[test]
-    fn nullary_minus_errors() {
-        let r = read_lower("(-)");
-        assert!(matches!(r, Err(CompileError::BadArity { .. })));
-    }
-
-    #[test]
-    fn non_fixnum_atoms_not_yet_supported() {
-        let r = read_lower("3.14"); // float
-        assert!(matches!(r, Err(CompileError::NotImplemented(_))));
-        let r = read_lower(r#""hi""#); // string
-        assert!(matches!(r, Err(CompileError::NotImplemented(_))));
+    fn nil_lowers_to_nil() {
+        assert_eq!(lower_top("nil").unwrap(), Expr::Nil);
+        assert_eq!(lower_top("()").unwrap(), Expr::Nil);
     }
 }

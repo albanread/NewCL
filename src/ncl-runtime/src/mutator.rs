@@ -21,6 +21,7 @@
 //! root finding lands later (step 9 in the GC build order); until
 //! then, the explicit root API is the contract.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -90,6 +91,13 @@ pub struct GcCoordinator {
     /// For JIT'd code, the loaded image's interned constants, the
     /// package and symbol registries.
     static_area: Arc<StaticArea>,
+
+    /// Process-global intern table: name → Symbol-tagged Word. Each
+    /// allocated Symbol lives forever in the static area, so the raw
+    /// bits in this table stay valid for the process lifetime. Used
+    /// by the compiler to look up stable symbol addresses for
+    /// embedding in JIT'd code.
+    intern_table: Mutex<HashMap<Arc<str>, u64>>,
 }
 
 struct ParkState {
@@ -117,7 +125,39 @@ impl GcCoordinator {
             live_base,
             old_capacity,
             static_area,
+            intern_table: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Intern a symbol by name. Returns the same Symbol-tagged Word
+    /// every time the same name is looked up — symbols allocated in
+    /// the static area never move. The first lookup allocates; later
+    /// ones hit the table.
+    pub fn intern(&self, name: &str) -> Word {
+        let mut table = self.intern_table.lock().unwrap();
+        if let Some(&raw) = table.get(name) {
+            return Word::from_raw(raw);
+        }
+        let sym = crate::gc_symbol::alloc_symbol_in_static(
+            &self.static_area,
+            Word::NIL, // proper name-string allocation lands later
+            Word::NIL, // proper package wiring lands later
+        )
+        .expect("static area exhausted during intern");
+        let key: Arc<str> = Arc::from(name);
+        table.insert(key, sym.raw());
+        sym
+    }
+
+    /// Look up an interned symbol by name without allocating. Returns
+    /// `None` if the name has never been interned.
+    pub fn find_interned(&self, name: &str) -> Option<Word> {
+        self.intern_table
+            .lock()
+            .unwrap()
+            .get(name)
+            .copied()
+            .map(Word::from_raw)
     }
 
     /// Access the static area (for allocation, registry setup, etc.).

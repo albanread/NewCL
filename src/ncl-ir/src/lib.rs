@@ -17,6 +17,10 @@ pub enum Expr {
     Nil,
     /// The truth value `t`.
     True,
+    /// Reference to the Nth parameter of the current function.
+    /// Only valid inside a function body — top-level expressions
+    /// don't have parameters and Param is a compile error there.
+    Param(usize),
     /// Binary addition (overflows wrap silently in Phase 3; the
     /// trap-and-promote-to-bignum path lands when the numeric
     /// tower does).
@@ -38,6 +42,11 @@ pub enum Expr {
     /// anything other than `nil`, evaluate the second; else the
     /// third.
     If(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// Call a Lisp function via its Symbol's function cell.
+    /// `sym_word` is the raw bits of the Symbol-tagged Word
+    /// addressing the symbol in static memory; the call dispatches
+    /// through `ncl_call` which atomically loads the function cell.
+    Call { sym_word: u64, args: Vec<Expr> },
 }
 
 impl Expr {
@@ -51,6 +60,10 @@ impl Expr {
     pub fn if_(c: Expr, t: Expr, e: Expr) -> Expr {
         Expr::If(Box::new(c), Box::new(t), Box::new(e))
     }
+    pub fn call(sym_word: u64, args: Vec<Expr>) -> Expr {
+        Expr::Call { sym_word, args }
+    }
+    pub fn param(idx: usize) -> Expr { Expr::Param(idx) }
 }
 
 #[cfg(test)]

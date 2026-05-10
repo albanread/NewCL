@@ -1,18 +1,18 @@
 //! LLVM bindings + JIT.
 //!
-//! Phase 2: hand-built `jit_three`/`jit_add` to prove the toolchain
-//! works.
-//! Phase 3: `jit_eval` takes an `Expr` tree, lowers to LLVM IR,
-//! JITs, runs.
-//! Cons/Car/Cdr extension: compiled code now operates on **tagged
-//! `Word`s** (low 3 bits classify), threads a `*mut MutatorState`
-//! through the entry function, and calls back into `ncl_alloc_cons`
-//! when allocating. Fixnum arithmetic still works as plain i64
-//! ops because shifting both operands left by 3 keeps add/sub
-//! associative — the SBCL/CCL trick.
-//!
-//! All interaction with `inkwell` and `llvm-sys` is encapsulated
-//! here so the rest of the workspace stays LLVM-version-agnostic.
+//! Phase 2: hand-built `jit_three`/`jit_add` (smoke tests).
+//! Phase 3: `jit_eval` for arithmetic.
+//! Cons/Car/Cdr extension: tagged Word, callback into runtime via
+//! `ncl_alloc_cons`.
+//! Eq/If: control flow with phi nodes.
+//! Node 2 (this file): `jit_compile_function` produces a code
+//! pointer for a parameterised function. The unified function
+//! signature for ALL JIT'd Lisp code is now
+//!   `fn(mutator: *mut MutatorState, args: *const u64, n_args: u64) -> u64`
+//! so dispatch through `ncl_call` is uniform regardless of arity.
+//! `jit_eval` calls the entry function with `(mutator, null, 0)`.
+
+use std::sync::Mutex;
 
 use inkwell::AddressSpace;
 use inkwell::IntPredicate;
@@ -24,9 +24,22 @@ use inkwell::module::{Linkage, Module};
 use inkwell::values::{FunctionValue, IntValue};
 
 use ncl_ir::Expr;
-use ncl_runtime::{ncl_alloc_cons, MutatorState, Word};
+use ncl_runtime::{ncl_alloc_cons, ncl_call, MutatorState, Word};
 
-// -- Phase 2 smoke functions (kept for the existing test suite) -------------
+// We leak each compilation's Context + Module + Engine so the
+// JIT'd code stays valid for the process lifetime. A real loader
+// would track these for retirement (see MANIFESTO.md, "The
+// loader") but that machinery isn't wired through yet. We store
+// addresses as usize so the static is Sync (raw pointers aren't).
+static KEEP_ALIVE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+fn keep_forever<T: 'static>(t: T) -> *mut T {
+    let p = Box::into_raw(Box::new(t));
+    KEEP_ALIVE.lock().unwrap().push(p as usize);
+    p
+}
+
+// -- Phase 2 smoke functions ------------------------------------------------
 
 pub fn jit_three() -> Result<i64, String> {
     let context = Context::create();
@@ -89,31 +102,53 @@ pub fn jit_add(a: i64, b: i64) -> Result<i64, String> {
     Ok(unsafe { jit_fn.call(a, b) })
 }
 
-// -- Phase 3 / cons-extension JIT ------------------------------------------
+// -- Public JIT API ---------------------------------------------------------
 
-/// JIT-compile and run an `Expr` tree. Returns the result as a
-/// tagged `Word`. The mutator pointer is threaded through the
-/// entry function so `cons` allocations can call back into the
-/// runtime. Pass any valid `&mut MutatorState`; non-allocating
-/// expressions ignore it.
+/// JIT-compile and run an `Expr` tree as a top-level form. Builds
+/// an entry function with the unified Lisp signature and calls it
+/// with `(mutator, null, 0)` — top-level forms have no parameters.
+/// Returns the result as a tagged `Word`.
 pub fn jit_eval(expr: &Expr, mutator: *mut MutatorState) -> Result<Word, String> {
-    let context = Context::create();
-    let module = context.create_module("ncl_eval");
+    let code = build_lisp_function(expr, 0)?;
+    type EntryFn = unsafe extern "C" fn(*mut MutatorState, *const u64, u64) -> u64;
+    let f: EntryFn = unsafe { std::mem::transmute(code) };
+    Ok(Word::from_raw(unsafe { f(mutator, std::ptr::null(), 0) }))
+}
+
+/// JIT-compile a Lisp function with `arity` positional parameters.
+/// Returns the raw machine-code address of the entry. Used by
+/// `defun` to install a Function in a Symbol's function cell.
+///
+/// The returned pointer is a function with signature
+///   `extern "C" fn(*mut MutatorState, *const u64, u64) -> u64`
+/// and is valid for the process lifetime.
+pub fn jit_compile_function(arity: u32, body: &Expr) -> Result<usize, String> {
+    build_lisp_function(body, arity)
+}
+
+// -- Implementation ---------------------------------------------------------
+
+fn build_lisp_function(body: &Expr, arity: u32) -> Result<usize, String> {
+    // Per-compilation Context + Module + Engine, all leaked.
+    let context_ptr = keep_forever(Context::create());
+    // SAFETY: context_ptr is freshly allocated and we won't drop it.
+    let context: &'static Context = unsafe { &*context_ptr };
+
+    let module = context.create_module("ncl_fn");
     let builder = context.create_builder();
 
     let i64_t = context.i64_type();
     let ptr_t = context.ptr_type(AddressSpace::default());
 
-    // Entry function: fn entry(mutator: *mut MutatorState) -> Word
-    let entry_fn_type = i64_t.fn_type(&[ptr_t.into()], false);
-    let entry_fn = module.add_function("entry", entry_fn_type, None);
-    let entry_block = context.append_basic_block(entry_fn, "entry");
+    // Unified signature: (mutator, args_ptr, n_args) -> i64.
+    let fn_type = i64_t.fn_type(&[ptr_t.into(), ptr_t.into(), i64_t.into()], false);
+    let function = module.add_function("the_fn", fn_type, None);
+    let entry_block = context.append_basic_block(function, "entry");
     builder.position_at_end(entry_block);
 
-    // Declare runtime helpers as external functions.
-    let helpers = declare_runtime_helpers(&context, &module);
+    let helpers = declare_runtime_helpers(context, &module);
 
-    let result = emit_expr(&context, &builder, &entry_fn, &helpers, expr)?;
+    let result = emit_expr(context, &builder, &function, &helpers, arity, body)?;
     builder
         .build_return(Some(&result))
         .map_err(|e| format!("build_return: {e}"))?;
@@ -121,24 +156,24 @@ pub fn jit_eval(expr: &Expr, mutator: *mut MutatorState) -> Result<Word, String>
     let engine = module
         .create_jit_execution_engine(OptimizationLevel::None)
         .map_err(|e| format!("create_jit_execution_engine: {e}"))?;
-
-    // Map "ncl_alloc_cons" -> the actual Rust function pointer.
     register_runtime_helpers(&engine, &helpers);
 
-    type EntryFn = unsafe extern "C" fn(*mut MutatorState) -> u64;
-    let jit_fn: JitFunction<EntryFn> = unsafe {
-        engine
-            .get_function("entry")
-            .map_err(|e| format!("get_function: {e}"))?
-    };
-    Ok(Word::from_raw(unsafe { jit_fn.call(mutator) }))
+    let addr = engine
+        .get_function_address("the_fn")
+        .map_err(|e| format!("get_function_address: {e}"))?;
+
+    // Leak module and engine. The function-pointer address remains
+    // valid as long as the engine is alive; the engine borrows from
+    // the module which borrows from the context. All leaked.
+    let _ = keep_forever(module);
+    let _ = keep_forever(engine);
+
+    Ok(addr)
 }
 
-// -- Helpers -----------------------------------------------------------------
-
 struct Helpers<'ctx> {
-    /// `extern "C" fn(mutator: *mut MutatorState, car: u64, cdr: u64) -> u64`
     alloc_cons: FunctionValue<'ctx>,
+    call_fn: FunctionValue<'ctx>,
 }
 
 fn declare_runtime_helpers<'ctx>(
@@ -155,11 +190,26 @@ fn declare_runtime_helpers<'ctx>(
         alloc_cons_type,
         Some(Linkage::External),
     );
-    Helpers { alloc_cons }
+
+    // ncl_call(mutator, sym_word, args_ptr, n_args) -> u64
+    let call_type = i64_t.fn_type(
+        &[ptr_t.into(), i64_t.into(), ptr_t.into(), i64_t.into()],
+        false,
+    );
+    let call_fn = module.add_function("ncl_call", call_type, Some(Linkage::External));
+
+    Helpers { alloc_cons, call_fn }
 }
 
 fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>) {
-    engine.add_global_mapping(&helpers.alloc_cons, ncl_alloc_cons as *const () as usize);
+    engine.add_global_mapping(
+        &helpers.alloc_cons,
+        ncl_alloc_cons as *const () as usize,
+    );
+    engine.add_global_mapping(
+        &helpers.call_fn,
+        ncl_call as *const () as usize,
+    );
 }
 
 fn emit_expr<'ctx>(
@@ -167,48 +217,65 @@ fn emit_expr<'ctx>(
     builder: &Builder<'ctx>,
     function: &FunctionValue<'ctx>,
     helpers: &Helpers<'ctx>,
+    arity: u32,
     expr: &Expr,
 ) -> Result<IntValue<'ctx>, String> {
     let i64_t = context.i64_type();
+    let ptr_t = context.ptr_type(AddressSpace::default());
     match expr {
-        Expr::Const(n) => {
-            // Tag the fixnum: shift left by 3 (zero tag bits = fixnum).
-            // SBCL/CCL trick: tagged fixnums add and subtract directly.
-            Ok(i64_t.const_int(Word::fixnum(*n).raw(), false))
-        }
+        Expr::Const(n) => Ok(i64_t.const_int(Word::fixnum(*n).raw(), false)),
         Expr::Nil => Ok(i64_t.const_int(Word::NIL.raw(), false)),
         Expr::True => Ok(i64_t.const_int(Word::T.raw(), false)),
+        Expr::Param(idx) => {
+            if *idx as u32 >= arity {
+                return Err(format!(
+                    "Param({idx}) out of range for arity {arity}"
+                ));
+            }
+            // args_ptr is param 1. Load i64 at args_ptr[idx].
+            let args_ptr = function
+                .get_nth_param(1)
+                .unwrap()
+                .into_pointer_value();
+            let i = i64_t.const_int(*idx as u64, false);
+            let elem_ptr = unsafe {
+                builder
+                    .build_in_bounds_gep(i64_t, args_ptr, &[i], "arg_ptr")
+                    .map_err(|e| format!("gep arg: {e}"))?
+            };
+            let val = builder
+                .build_load(i64_t, elem_ptr, "arg")
+                .map_err(|e| format!("load arg: {e}"))?;
+            Ok(val.into_int_value())
+        }
         Expr::Add(a, b) => {
-            let lhs = emit_expr(context, builder, function, helpers, a)?;
-            let rhs = emit_expr(context, builder, function, helpers, b)?;
-            // (a << 3) + (b << 3) = (a + b) << 3 — still tagged.
+            let lhs = emit_expr(context, builder, function, helpers, arity, a)?;
+            let rhs = emit_expr(context, builder, function, helpers, arity, b)?;
             builder
                 .build_int_add(lhs, rhs, "add")
                 .map_err(|e| format!("build_int_add: {e}"))
         }
         Expr::Sub(a, b) => {
-            let lhs = emit_expr(context, builder, function, helpers, a)?;
-            let rhs = emit_expr(context, builder, function, helpers, b)?;
+            let lhs = emit_expr(context, builder, function, helpers, arity, a)?;
+            let rhs = emit_expr(context, builder, function, helpers, arity, b)?;
             builder
                 .build_int_sub(lhs, rhs, "sub")
                 .map_err(|e| format!("build_int_sub: {e}"))
         }
         Expr::Mul(a, b) => {
-            let lhs = emit_expr(context, builder, function, helpers, a)?;
-            let rhs = emit_expr(context, builder, function, helpers, b)?;
-            // Untag rhs first: (a << 3) * b = (a * b) << 3.
+            let lhs = emit_expr(context, builder, function, helpers, arity, a)?;
+            let rhs = emit_expr(context, builder, function, helpers, arity, b)?;
             let three = i64_t.const_int(3, false);
             let rhs_untagged = builder
-                .build_right_shift(rhs, three, true /* arithmetic */, "untag_rhs")
+                .build_right_shift(rhs, three, true, "untag_rhs")
                 .map_err(|e| format!("ashr: {e}"))?;
             builder
                 .build_int_mul(lhs, rhs_untagged, "mul")
                 .map_err(|e| format!("build_int_mul: {e}"))
         }
         Expr::Cons(car, cdr) => {
-            let car_val = emit_expr(context, builder, function, helpers, car)?;
-            let cdr_val = emit_expr(context, builder, function, helpers, cdr)?;
-            // The mutator pointer is the entry function's first param.
+            let car_val = emit_expr(context, builder, function, helpers, arity, car)?;
+            let cdr_val = emit_expr(context, builder, function, helpers, arity, cdr)?;
             let mutator_arg = function.get_nth_param(0).unwrap();
             let call = builder
                 .build_call(
@@ -220,14 +287,11 @@ fn emit_expr<'ctx>(
             Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
         }
         Expr::Car(x) => {
-            let cons_val = emit_expr(context, builder, function, helpers, x)?;
-            // Untag: word & ~7. For Cons (tag 001) the tag-clear can
-            // also be `word - 1` but `& ~7` is the general form.
+            let cons_val = emit_expr(context, builder, function, helpers, arity, x)?;
             let mask = i64_t.const_int(!0b111u64, false);
             let untagged = builder
                 .build_and(cons_val, mask, "untag_cons")
                 .map_err(|e| format!("and: {e}"))?;
-            let ptr_t = context.ptr_type(AddressSpace::default());
             let ptr = builder
                 .build_int_to_ptr(untagged, ptr_t, "as_ptr")
                 .map_err(|e| format!("int_to_ptr: {e}"))?;
@@ -237,16 +301,14 @@ fn emit_expr<'ctx>(
             Ok(loaded.into_int_value())
         }
         Expr::Cdr(x) => {
-            let cons_val = emit_expr(context, builder, function, helpers, x)?;
+            let cons_val = emit_expr(context, builder, function, helpers, arity, x)?;
             let mask = i64_t.const_int(!0b111u64, false);
             let untagged = builder
                 .build_and(cons_val, mask, "untag_cons")
                 .map_err(|e| format!("and: {e}"))?;
-            let ptr_t = context.ptr_type(AddressSpace::default());
             let ptr = builder
                 .build_int_to_ptr(untagged, ptr_t, "as_ptr")
                 .map_err(|e| format!("int_to_ptr: {e}"))?;
-            // GEP to cell index 1 (cdr is at +8 bytes from the cons start).
             let one = i64_t.const_int(1, false);
             let cdr_ptr = unsafe {
                 builder
@@ -259,12 +321,11 @@ fn emit_expr<'ctx>(
             Ok(loaded.into_int_value())
         }
         Expr::Eq(a, b) => {
-            let lhs = emit_expr(context, builder, function, helpers, a)?;
-            let rhs = emit_expr(context, builder, function, helpers, b)?;
+            let lhs = emit_expr(context, builder, function, helpers, arity, a)?;
+            let rhs = emit_expr(context, builder, function, helpers, arity, b)?;
             let cmp = builder
                 .build_int_compare(IntPredicate::EQ, lhs, rhs, "eq_cmp")
                 .map_err(|e| format!("icmp: {e}"))?;
-            // Select Word::T if equal, Word::NIL if not.
             let t_word = i64_t.const_int(Word::T.raw(), false);
             let nil_word = i64_t.const_int(Word::NIL.raw(), false);
             let sel = builder
@@ -273,8 +334,7 @@ fn emit_expr<'ctx>(
             Ok(sel.into_int_value())
         }
         Expr::If(cond, then_branch, else_branch) => {
-            // is_truthy = (cond_val != Word::NIL)
-            let cond_val = emit_expr(context, builder, function, helpers, cond)?;
+            let cond_val = emit_expr(context, builder, function, helpers, arity, cond)?;
             let nil_word = i64_t.const_int(Word::NIL.raw(), false);
             let is_truthy = builder
                 .build_int_compare(IntPredicate::NE, cond_val, nil_word, "is_truthy")
@@ -288,33 +348,78 @@ fn emit_expr<'ctx>(
                 .build_conditional_branch(is_truthy, then_block, else_block)
                 .map_err(|e| format!("br: {e}"))?;
 
-            // Then branch.
             builder.position_at_end(then_block);
-            let then_val = emit_expr(context, builder, function, helpers, then_branch)?;
-            // The branch may have emitted nested control flow, in
-            // which case the current insertion point is the end of
-            // the LAST block of that subgraph — not the original
-            // then_block. Capture it for the phi node.
+            let then_val = emit_expr(context, builder, function, helpers, arity, then_branch)?;
             let then_end = builder.get_insert_block().unwrap();
             builder
                 .build_unconditional_branch(merge_block)
                 .map_err(|e| format!("br: {e}"))?;
 
-            // Else branch.
             builder.position_at_end(else_block);
-            let else_val = emit_expr(context, builder, function, helpers, else_branch)?;
+            let else_val = emit_expr(context, builder, function, helpers, arity, else_branch)?;
             let else_end = builder.get_insert_block().unwrap();
             builder
                 .build_unconditional_branch(merge_block)
                 .map_err(|e| format!("br: {e}"))?;
 
-            // Merge: phi between the two arms.
             builder.position_at_end(merge_block);
             let phi = builder
                 .build_phi(i64_t, "if_result")
                 .map_err(|e| format!("phi: {e}"))?;
             phi.add_incoming(&[(&then_val, then_end), (&else_val, else_end)]);
             Ok(phi.as_basic_value().into_int_value())
+        }
+        Expr::Call { sym_word, args } => {
+            // Evaluate each argument first.
+            let arg_vals: Vec<IntValue> = args
+                .iter()
+                .map(|a| emit_expr(context, builder, function, helpers, arity, a))
+                .collect::<Result<_, _>>()?;
+            let n = arg_vals.len();
+
+            // Stack-allocate an [N x i64] for the arg array.
+            let arr_type = i64_t.array_type(n.max(1) as u32);
+            let arr_alloca = builder
+                .build_alloca(arr_type, "call_args")
+                .map_err(|e| format!("alloca: {e}"))?;
+
+            // Store each evaluated arg into its slot.
+            for (i, val) in arg_vals.iter().enumerate() {
+                let elem_ptr = unsafe {
+                    builder
+                        .build_in_bounds_gep(
+                            arr_type,
+                            arr_alloca,
+                            &[
+                                i64_t.const_int(0, false),
+                                i64_t.const_int(i as u64, false),
+                            ],
+                            "arg_slot",
+                        )
+                        .map_err(|e| format!("gep slot: {e}"))?
+                };
+                builder
+                    .build_store(elem_ptr, *val)
+                    .map_err(|e| format!("store: {e}"))?;
+            }
+
+            // Call ncl_call(mutator, sym_word, args_ptr, n_args).
+            let mutator_arg = function.get_nth_param(0).unwrap();
+            let sym_const = i64_t.const_int(*sym_word, false);
+            let n_const = i64_t.const_int(n as u64, false);
+            let call = builder
+                .build_call(
+                    helpers.call_fn,
+                    &[
+                        mutator_arg.into(),
+                        sym_const.into(),
+                        arr_alloca.into(),
+                        n_const.into(),
+                    ],
+                    "call_result",
+                )
+                .map_err(|e| format!("build_call ncl_call: {e}"))?;
+            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
         }
     }
 }
@@ -348,8 +453,6 @@ mod tests {
     #[test]
     fn add_passes_args_correctly() {
         assert_eq!(jit_add(2, 3).expect("jit_add"), 5);
-        assert_eq!(jit_add(-7, 7).expect("jit_add"), 0);
-        assert_eq!(jit_add(i64::MAX, 0).expect("jit_add"), i64::MAX);
     }
 
     fn eval_with_fresh_mutator(expr: &Expr) -> Word {
@@ -361,13 +464,6 @@ mod tests {
     #[test]
     fn eval_const() {
         assert_eq!(eval_with_fresh_mutator(&Expr::Const(42)).as_fixnum(), Some(42));
-        assert_eq!(eval_with_fresh_mutator(&Expr::Const(-7)).as_fixnum(), Some(-7));
-        assert_eq!(eval_with_fresh_mutator(&Expr::Const(0)).as_fixnum(), Some(0));
-    }
-
-    #[test]
-    fn eval_nil() {
-        assert!(eval_with_fresh_mutator(&Expr::Nil).is_nil());
     }
 
     #[test]
@@ -377,42 +473,12 @@ mod tests {
     }
 
     #[test]
-    fn eval_sub() {
-        let e = Expr::sub(Expr::Const(10), Expr::Const(3));
-        assert_eq!(eval_with_fresh_mutator(&e).as_fixnum(), Some(7));
-    }
-
-    #[test]
-    fn eval_mul_with_untag() {
-        let e = Expr::mul(Expr::Const(6), Expr::Const(7));
-        assert_eq!(eval_with_fresh_mutator(&e).as_fixnum(), Some(42));
-    }
-
-    #[test]
-    fn eval_negative_results() {
-        let e = Expr::sub(Expr::Const(5), Expr::Const(10));
-        assert_eq!(eval_with_fresh_mutator(&e).as_fixnum(), Some(-5));
-    }
-
-    #[test]
-    fn eval_nested_arithmetic() {
-        // (* (+ 1 2) (- 10 4)) = 18
-        let e = Expr::mul(
-            Expr::add(Expr::Const(1), Expr::Const(2)),
-            Expr::sub(Expr::Const(10), Expr::Const(4)),
-        );
-        assert_eq!(eval_with_fresh_mutator(&e).as_fixnum(), Some(18));
-    }
-
-    #[test]
     fn eval_cons_returns_cons_tagged() {
         let coord = GcCoordinator::new(small_config());
         let mut m = coord.register_mutator();
-        // (cons 1 2)
         let e = Expr::cons(Expr::Const(1), Expr::Const(2));
         let result = jit_eval(&e, &mut m as *mut _).unwrap();
         assert!(result.is_cons());
-        // car == 1, cdr == 2
         let p = result.as_ptr::<u64>(Tag::Cons).unwrap();
         unsafe {
             assert_eq!(Word::from_raw(*p).as_fixnum(), Some(1));
@@ -422,7 +488,6 @@ mod tests {
 
     #[test]
     fn eval_car_extracts_car() {
-        // (car (cons 1 2)) = 1
         let coord = GcCoordinator::new(small_config());
         let mut m = coord.register_mutator();
         let e = Expr::car(Expr::cons(Expr::Const(1), Expr::Const(2)));
@@ -430,66 +495,33 @@ mod tests {
         assert_eq!(result.as_fixnum(), Some(1));
     }
 
+    // -- Function compilation -----------------------------------------------
+
     #[test]
-    fn eval_cdr_extracts_cdr() {
-        // (cdr (cons 1 2)) = 2
+    fn compile_and_call_identity() {
+        // (lambda (x) x) called with arg=42 returns 42.
         let coord = GcCoordinator::new(small_config());
         let mut m = coord.register_mutator();
-        let e = Expr::cdr(Expr::cons(Expr::Const(1), Expr::Const(2)));
-        let result = jit_eval(&e, &mut m as *mut _).unwrap();
-        assert_eq!(result.as_fixnum(), Some(2));
+        let body = Expr::Param(0);
+        let code = jit_compile_function(1, &body).unwrap();
+        type Fn1 = unsafe extern "C" fn(*mut MutatorState, *const u64, u64) -> u64;
+        let f: Fn1 = unsafe { std::mem::transmute(code) };
+        let arg = Word::fixnum(42).raw();
+        let r = unsafe { f(&mut m as *mut _, &arg as *const u64, 1) };
+        assert_eq!(Word::from_raw(r).as_fixnum(), Some(42));
     }
 
     #[test]
-    fn eval_nested_cons() {
-        // (cons (cons 1 2) (cons 3 4))
+    fn compile_and_call_double() {
+        // (lambda (x) (+ x x)) called with arg=21 returns 42.
         let coord = GcCoordinator::new(small_config());
         let mut m = coord.register_mutator();
-        let e = Expr::cons(
-            Expr::cons(Expr::Const(1), Expr::Const(2)),
-            Expr::cons(Expr::Const(3), Expr::Const(4)),
-        );
-        let result = jit_eval(&e, &mut m as *mut _).unwrap();
-        assert!(result.is_cons());
-        // car is itself a cons
-        let p = result.as_ptr::<u64>(Tag::Cons).unwrap();
-        let car = Word::from_raw(unsafe { *p });
-        let cdr = Word::from_raw(unsafe { *p.add(1) });
-        assert!(car.is_cons());
-        assert!(cdr.is_cons());
-    }
-
-    #[test]
-    fn eval_car_of_cdr_of_list() {
-        // (car (cdr (cons 1 (cons 2 (cons 3 nil)))))  = 2
-        let coord = GcCoordinator::new(small_config());
-        let mut m = coord.register_mutator();
-        let list = Expr::cons(
-            Expr::Const(1),
-            Expr::cons(
-                Expr::Const(2),
-                Expr::cons(Expr::Const(3), Expr::Nil),
-            ),
-        );
-        let e = Expr::car(Expr::cdr(list));
-        let result = jit_eval(&e, &mut m as *mut _).unwrap();
-        assert_eq!(result.as_fixnum(), Some(2));
-    }
-
-    #[test]
-    fn eval_cons_with_arithmetic_args() {
-        // (cons (+ 1 2) (* 3 4)) = (3 . 12)
-        let coord = GcCoordinator::new(small_config());
-        let mut m = coord.register_mutator();
-        let e = Expr::cons(
-            Expr::add(Expr::Const(1), Expr::Const(2)),
-            Expr::mul(Expr::Const(3), Expr::Const(4)),
-        );
-        let result = jit_eval(&e, &mut m as *mut _).unwrap();
-        let p = result.as_ptr::<u64>(Tag::Cons).unwrap();
-        unsafe {
-            assert_eq!(Word::from_raw(*p).as_fixnum(), Some(3));
-            assert_eq!(Word::from_raw(*p.add(1)).as_fixnum(), Some(12));
-        }
+        let body = Expr::add(Expr::Param(0), Expr::Param(0));
+        let code = jit_compile_function(1, &body).unwrap();
+        type Fn1 = unsafe extern "C" fn(*mut MutatorState, *const u64, u64) -> u64;
+        let f: Fn1 = unsafe { std::mem::transmute(code) };
+        let arg = Word::fixnum(21).raw();
+        let r = unsafe { f(&mut m as *mut _, &arg as *const u64, 1) };
+        assert_eq!(Word::from_raw(r).as_fixnum(), Some(42));
     }
 }

@@ -48,6 +48,33 @@ pub extern "C" fn ncl_cdr(cons: u64) -> u64 {
     unsafe { *p.add(1) }
 }
 
+/// Dispatch a function call through a Symbol's function cell.
+/// JIT'd `(name arg1 arg2 ...)` lowers to a call here.
+///
+/// Loads the symbol's function cell with acquire semantics, follows
+/// the Function pointer to get the code address, and calls it with
+/// `(mutator, args_ptr, n_args)`. Panics if the cell is unbound.
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_call(
+    mutator: *mut crate::mutator::MutatorState,
+    sym_word: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    let sym = Word::from_raw(sym_word);
+    let fn_value = crate::gc_symbol::function_acquire(sym);
+    if fn_value.is_unbound() {
+        panic!("ncl_call: unbound function for symbol {sym_word:#x}");
+    }
+    if fn_value.tag() != Tag::Function {
+        panic!("ncl_call: function cell is not a Function: {fn_value:?}");
+    }
+    let code = crate::gc_function::code_ptr(fn_value);
+    let f: crate::gc_function::LispCodeFn =
+        unsafe { std::mem::transmute(code) };
+    unsafe { f(mutator, args, n_args) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

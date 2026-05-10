@@ -11,6 +11,7 @@
 //! compiled code only.
 
 pub mod abi;
+pub mod gc_function;
 pub mod gc_symbol;
 pub mod heap;
 pub mod mutator;
@@ -22,7 +23,7 @@ pub mod universe;
 pub mod value;
 pub mod word;
 
-pub use abi::{ncl_alloc_cons, ncl_car, ncl_cdr};
+pub use abi::{ncl_alloc_cons, ncl_call, ncl_car, ncl_cdr};
 pub use printer::format_word;
 
 pub use heap::{
