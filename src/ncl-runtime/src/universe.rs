@@ -56,6 +56,17 @@ impl Universe {
             vec![Arc::clone(&cl)],
         );
 
+        // C-TYPES (FFI helpers) and WIN32 (Windows API) and SYS
+        // (Corman internals). Names and nicknames per upstream
+        // E:\CL\cormanlisp\Sys\ffi.lisp and Modules\mp.lisp.
+        // We pre-register them so demos that reference `ct:foo`,
+        // `win:bar`, and `sys:*current-process*` resolve their
+        // package qualifier even before the FFI machinery exists
+        // to populate exports.
+        let c_types = Package::new("C-TYPES", &["CT"], vec![Arc::clone(&cl)]);
+        let win32 = Package::new("WIN32", &["WIN"], vec![Arc::clone(&cl)]);
+        let sys = Package::new("SYS", &[], vec![Arc::clone(&cl)]);
+
         // COMMON-LISP-USER uses CL and CORMANLISP — Corman's user
         // package inherits both, which is what makes `format`, `defun`
         // and `ccl::quit` all visible in the default workspace.
@@ -82,7 +93,7 @@ impl Universe {
         cl.intern_external("UNQUOTE-NSPLICING");
 
         let mut table = self.packages.lock().unwrap();
-        for p in [&keyword, &cl, &corman, &user] {
+        for p in [&keyword, &cl, &corman, &c_types, &win32, &sys, &user] {
             register_package(&mut table, Arc::clone(p));
         }
     }

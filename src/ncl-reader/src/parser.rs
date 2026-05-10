@@ -70,65 +70,77 @@ impl<'a> Parser<'a> {
         self
     }
 
-    /// Read every top-level form until EOF.
+    /// Read every top-level form until EOF. Skipped forms (from
+    /// non-matching `#+`/`#-`) are silently consumed.
     pub fn read_all(&mut self) -> Result<Vec<Value>, ReaderError> {
         let mut out = Vec::new();
         while self.peek_token()?.is_some() {
-            out.push(self.read_form()?);
+            if let Some(v) = self.read_form_or_skipped()? {
+                out.push(v);
+            }
+            // Skipped: loop, check peek again. Importantly this lets
+            // a trailing `#+falsefeature form` end the file cleanly
+            // instead of erroring with EOF-while-looking-for-a-form.
         }
         Ok(out)
     }
 
-    /// Read exactly one form. Errors on EOF.
+    /// Read exactly one form. Errors on EOF. Internally retries past
+    /// skipped feature-tests so the caller always gets a real form.
     pub fn read_form(&mut self) -> Result<Value, ReaderError> {
         loop {
-            let st = self.next_token_required("expecting form")?;
-            return match st.token {
-                Token::LParen => self.read_list(st.span),
-                Token::Quote => self.wrap_one("QUOTE"),
-                Token::Backquote => self.wrap_one("BACKQUOTE"),
-                Token::Comma => self.wrap_one("UNQUOTE"),
-                Token::CommaAt => self.wrap_one("UNQUOTE-SPLICING"),
-                Token::CommaDot => self.wrap_one("UNQUOTE-NSPLICING"),
-                Token::String(s) => Ok(Value::String(Arc::new(s))),
-                Token::Char(c) => Ok(Value::Char(c)),
-                Token::Atom(a) => self.resolve_atom(&a),
-                Token::FfiBlock { header, body } => Ok(Value::FfiBlock(Arc::new(
-                    ncl_runtime::FfiBlock { header, body },
-                ))),
-                Token::SharpDispatch { ch, prefix } => {
-                    if let Some(v) = self.handle_sharp(ch, prefix, st.span)? {
-                        Ok(v)
-                    } else {
-                        // `#+` / `#-` skipped — read the next form instead.
-                        continue;
-                    }
-                }
-                Token::SharpEquals(_) => Err(self.err_at(
-                    ReaderErrorKind::UnsupportedSharpDispatch {
-                        ch: '=',
-                        prefix: None,
-                        reason: "circular structure (#N=) not supported in Phase 1c",
-                    },
-                    Some(st.span),
-                )),
-                Token::SharpSharp(_) => Err(self.err_at(
-                    ReaderErrorKind::UnsupportedSharpDispatch {
-                        ch: '#',
-                        prefix: None,
-                        reason: "circular structure (#N#) not supported in Phase 1c",
-                    },
-                    Some(st.span),
-                )),
-                Token::Dot => Err(self.err_at(ReaderErrorKind::DotNotAllowedHere, Some(st.span))),
-                Token::RParen => Err(self.err_at(
-                    ReaderErrorKind::UnexpectedToken {
-                        found: ")".into(),
-                        expected: "form",
-                    },
-                    Some(st.span),
-                )),
-            };
+            if let Some(v) = self.read_form_or_skipped()? {
+                return Ok(v);
+            }
+            // Skipped — try again. If EOF after a skip, the next
+            // call inside read_form_or_skipped will surface an
+            // `UnexpectedEof("expecting form")` error.
+        }
+    }
+
+    /// Consume one token's worth of input and return a value, or
+    /// `None` if the consumption corresponded to a skipped form
+    /// (e.g. `#+nope ...`). Used by `read_form` and `read_all`.
+    fn read_form_or_skipped(&mut self) -> Result<Option<Value>, ReaderError> {
+        let st = self.next_token_required("expecting form")?;
+        match st.token {
+            Token::LParen => self.read_list(st.span).map(Some),
+            Token::Quote => self.wrap_one("QUOTE").map(Some),
+            Token::Backquote => self.wrap_one("BACKQUOTE").map(Some),
+            Token::Comma => self.wrap_one("UNQUOTE").map(Some),
+            Token::CommaAt => self.wrap_one("UNQUOTE-SPLICING").map(Some),
+            Token::CommaDot => self.wrap_one("UNQUOTE-NSPLICING").map(Some),
+            Token::String(s) => Ok(Some(Value::String(Arc::new(s)))),
+            Token::Char(c) => Ok(Some(Value::Char(c))),
+            Token::Atom(a) => self.resolve_atom(&a).map(Some),
+            Token::FfiBlock { header, body } => Ok(Some(Value::FfiBlock(Arc::new(
+                ncl_runtime::FfiBlock { header, body },
+            )))),
+            Token::SharpDispatch { ch, prefix } => self.handle_sharp(ch, prefix, st.span),
+            Token::SharpEquals(_) => Err(self.err_at(
+                ReaderErrorKind::UnsupportedSharpDispatch {
+                    ch: '=',
+                    prefix: None,
+                    reason: "circular structure (#N=) not supported in Phase 1c",
+                },
+                Some(st.span),
+            )),
+            Token::SharpSharp(_) => Err(self.err_at(
+                ReaderErrorKind::UnsupportedSharpDispatch {
+                    ch: '#',
+                    prefix: None,
+                    reason: "circular structure (#N#) not supported in Phase 1c",
+                },
+                Some(st.span),
+            )),
+            Token::Dot => Err(self.err_at(ReaderErrorKind::DotNotAllowedHere, Some(st.span))),
+            Token::RParen => Err(self.err_at(
+                ReaderErrorKind::UnexpectedToken {
+                    found: ")".into(),
+                    expected: "form",
+                },
+                Some(st.span),
+            )),
         }
     }
 
@@ -327,13 +339,90 @@ impl<'a> Parser<'a> {
         let expr = expr?;
 
         let active = eval_feature(&expr).map_err(|kind| ReaderError { kind, span: None })?;
-        let form = self.read_form()?;
         if active == want {
-            Ok(Some(form))
+            Ok(Some(self.read_form()?))
         } else {
-            // Discard. Returning None means caller's read_form loops.
-            let _ = form;
+            // Skip the next form structurally rather than reading it
+            // through the value-producing path. This is the
+            // *read-suppress* discipline: we MUST consume the right
+            // tokens, but we MUST NOT enforce package existence,
+            // intern symbols, or eval `#.` while doing so. A real
+            // example: `#+Genera (pushnew ... zwei:*foo*)` mentions
+            // a package we don't have — but the form is meant to be
+            // skipped, so the reference is fine.
+            self.skip_form()?;
             Ok(None)
+        }
+    }
+
+    /// Read and discard one form structurally — never producing a
+    /// `Value` and never resolving symbols. Implements the suppression
+    /// mode required by `#+`/`#-` discard, where the reader must walk
+    /// the form to keep the token stream balanced but must not intern,
+    /// must not eval `#.`, and must accept references to packages
+    /// that aren't registered.
+    fn skip_form(&mut self) -> Result<(), ReaderError> {
+        let st = self.next_token_required("inside skipped form")?;
+        self.skip_after_token(&st.token)
+    }
+
+    fn skip_after_token(&mut self, tok: &Token) -> Result<(), ReaderError> {
+        match tok {
+            Token::LParen => self.skip_until_close_paren(),
+            Token::Quote
+            | Token::Backquote
+            | Token::Comma
+            | Token::CommaAt
+            | Token::CommaDot => self.skip_form(),
+            Token::SharpDispatch { ch, prefix } => self.skip_after_sharp(*ch, *prefix),
+            Token::SharpEquals(_) => self.skip_form(), // `#N=` prefixes one form
+            // Self-contained tokens — already consumed.
+            Token::SharpSharp(_)
+            | Token::Atom(_)
+            | Token::String(_)
+            | Token::Char(_)
+            | Token::FfiBlock { .. }
+            | Token::Dot => Ok(()),
+            Token::RParen => Err(self.err_at(
+                ReaderErrorKind::UnexpectedToken {
+                    found: ")".into(),
+                    expected: "form (during skip)",
+                },
+                None,
+            )),
+        }
+    }
+
+    fn skip_until_close_paren(&mut self) -> Result<(), ReaderError> {
+        loop {
+            let st = self.next_token_required("inside skipped list")?;
+            if matches!(st.token, Token::RParen) {
+                return Ok(());
+            }
+            self.skip_after_token(&st.token)?;
+        }
+    }
+
+    fn skip_after_sharp(&mut self, ch: char, prefix: Option<u32>) -> Result<(), ReaderError> {
+        let _ = prefix;
+        match ch {
+            // Reader-macro chars that prefix one form.
+            '\'' | ':' | '.' | 'A' | 'a' | 'S' | 's' | 'P' | 'p' | 'C' | 'c' => self.skip_form(),
+            // Vector literal — same shape as a list.
+            '(' => self.skip_until_close_paren(),
+            // Recursive feature test — even in skip mode we need to
+            // consume its expression and form, but we don't evaluate.
+            '+' | '-' => {
+                self.skip_form()?;
+                self.skip_form()
+            }
+            // Radix dispatchers consume one digit atom.
+            'B' | 'b' | 'O' | 'o' | 'X' | 'x' | 'R' | 'r' => {
+                self.next_token_required("digits after radix in skipped form")?;
+                Ok(())
+            }
+            // Anything else: assume one form follows. Conservative.
+            _ => self.skip_form(),
         }
     }
 

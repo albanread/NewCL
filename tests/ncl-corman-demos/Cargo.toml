@@ -10,6 +10,7 @@ edition = "2024"
 # first end-to-end pipeline.
 
 [dependencies]
+ncl-reader = { path = "../../src/ncl-reader" }
 
 [lints]
 workspace = true
