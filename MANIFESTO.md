@@ -100,6 +100,33 @@ NewCormanLisp is **Rust-first**, **LLVM-based**, **64-bit-first**, and
    source wins and the cache entry is discarded. Treat the cache the
    way `cargo` treats `target/`.
 
+## The garbage collector
+
+The GC design is pinned in [docs/GC.md](docs/GC.md), committed
+ahead of code. Headlines:
+
+- **Generational copying**, two generations (young + old) plus a
+  pinned static area for compiled code and the loaded image.
+- **3-bit pointer tagging**, 64-bit word, fixnum tag `000`, cons tag
+  `001`, `forward` tag `111` (so a stale slot is one mask-and-compare
+  to detect during scanning).
+- **Headerless cons cells.** Everything else carries an 8-byte header.
+- **Forwarding-pointer-based copying**, inherited from Roger's
+  design.
+- **Software card-marking write barrier.** Hardware-assist via page
+  protection is out of scope for v1 — Roger's `:hardware-gc` was
+  off by default for stability and we honour that lesson.
+- **Precise root finding** via LLVM `gc.statepoint`-emitted stack
+  maps, with a conservative fallback during bring-up that we
+  eliminate by the time `defun` lands.
+- **Symbol's function cell is `AtomicU64`.** The single-store
+  redefinition story we already pinned needs a real atomic to land
+  on.
+
+The GC lives entirely in `ncl-runtime` in pure Rust. The OS only
+appears via a `PageAllocator` shim. `ncl-runtime` and `ncl-cl`
+contain zero FFI imports — including in the GC.
+
 ## The loader
 
 The loader is modelled on the [`newcp-loader` crate](file:///E:/NewCP/NewCP/src/newcp-loader/src/lib.rs)
