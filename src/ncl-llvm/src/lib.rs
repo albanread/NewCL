@@ -240,8 +240,8 @@ fn declare_runtime_helpers<'ctx>(
     );
     let call_fn = module.add_function("ncl_call", call_type, Some(Linkage::External));
 
-    // ncl_load_value(sym_word) -> u64
-    let load_value_type = i64_t.fn_type(&[i64_t.into()], false);
+    // ncl_load_value(mutator, sym_word) -> u64
+    let load_value_type = i64_t.fn_type(&[ptr_t.into(), i64_t.into()], false);
     let load_value = module.add_function(
         "ncl_load_value",
         load_value_type,
@@ -282,8 +282,8 @@ fn declare_runtime_helpers<'ctx>(
         Some(Linkage::External),
     );
 
-    // ncl_load_function(sym_word) -> u64
-    let load_function_type = i64_t.fn_type(&[i64_t.into()], false);
+    // ncl_load_function(mutator, sym_word) -> u64
+    let load_function_type = i64_t.fn_type(&[ptr_t.into(), i64_t.into()], false);
     let load_function = module.add_function(
         "ncl_load_function",
         load_function_type,
@@ -914,16 +914,26 @@ fn emit_expr<'ctx>(
             Ok(phi.as_basic_value().into_int_value())
         }
         Expr::LoadGlobal(sym_word) => {
+            let mutator_arg = function.get_nth_param(0).unwrap();
             let sym_const = i64_t.const_int(*sym_word, false);
             let call = builder
-                .build_call(helpers.load_value, &[sym_const.into()], "load_value")
+                .build_call(
+                    helpers.load_value,
+                    &[mutator_arg.into(), sym_const.into()],
+                    "load_value",
+                )
                 .map_err(|e| format!("build_call load_value: {e}"))?;
             Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
         }
         Expr::LoadFunction(sym_word) => {
+            let mutator_arg = function.get_nth_param(0).unwrap();
             let sym_const = i64_t.const_int(*sym_word, false);
             let call = builder
-                .build_call(helpers.load_function, &[sym_const.into()], "load_fn")
+                .build_call(
+                    helpers.load_function,
+                    &[mutator_arg.into(), sym_const.into()],
+                    "load_fn",
+                )
                 .map_err(|e| format!("build_call load_function: {e}"))?;
             Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
         }

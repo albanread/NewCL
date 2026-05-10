@@ -50,18 +50,24 @@ pub extern "C" fn ncl_cdr(cons: u64) -> u64 {
 
 /// Load a global symbol's value cell with acquire semantics.
 /// JIT'd code calls this when it reads a bare symbol that wasn't
-/// resolved to a local at compile time. Panics on unbound — the
-/// condition system that should turn this into a proper Lisp
-/// error lands later.
+/// resolved to a local at compile time. On an unbound cell, signals
+/// a Lisp condition (catchable with `handler-case`); aborts the
+/// process if no handler is installed.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_load_value(sym_word: u64) -> u64 {
+pub extern "C-unwind" fn ncl_load_value(
+    mutator: *mut crate::mutator::MutatorState,
+    sym_word: u64,
+) -> u64 {
     let sym = Word::from_raw(sym_word);
     let value = crate::gc_symbol::value_acquire(sym);
     if value.is_unbound() {
         let name = crate::sym_names::lookup(sym_word)
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("{sym_word:#x}"));
-        panic!("unbound variable: {name}");
+        return signal_condition_string(
+            mutator,
+            &format!("unbound variable: {name}"),
+        );
     }
     value.raw()
 }
@@ -186,17 +192,23 @@ pub extern "C" fn ncl_string_char(s: u64, idx: u64) -> u64 {
 /// Load a Symbol's function cell with acquire semantics. JIT'd
 /// `#'name` (i.e. `(function name)`) lowers to a call here. Used
 /// to pass defun'd functions as first-class values to higher-order
-/// code. Panics on unbound — distinct from unbound *variable*
-/// because here we know it's a function lookup.
+/// code. Signals on unbound — same condition shape as
+/// `ncl_load_value` and `ncl_call`'s unbound case.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_load_function(sym_word: u64) -> u64 {
+pub extern "C-unwind" fn ncl_load_function(
+    mutator: *mut crate::mutator::MutatorState,
+    sym_word: u64,
+) -> u64 {
     let sym = Word::from_raw(sym_word);
     let fn_value = crate::gc_symbol::function_acquire(sym);
     if fn_value.is_unbound() {
         let name = crate::sym_names::lookup(sym_word)
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("{sym_word:#x}"));
-        panic!("undefined function: {name}");
+        return signal_condition_string(
+            mutator,
+            &format!("undefined function: {name}"),
+        );
     }
     fn_value.raw()
 }
@@ -222,10 +234,16 @@ pub extern "C-unwind" fn ncl_call(
         let name = crate::sym_names::lookup(sym_word)
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("{sym_word:#x}"));
-        panic!("ncl_call: unbound function: {name}");
+        return signal_condition_string(
+            mutator,
+            &format!("undefined function: {name}"),
+        );
     }
     if fn_value.tag() != Tag::Function {
-        panic!("ncl_call: function cell is not a Function: {fn_value:?}");
+        return signal_condition_string(
+            mutator,
+            &format!("not a function: {fn_value:?}"),
+        );
     }
     let env = crate::gc_function::env(fn_value);
     let code = crate::gc_function::code_ptr(fn_value);
@@ -400,6 +418,26 @@ thread_local! {
 #[derive(Debug, Clone)]
 pub struct NclCondition {
     pub value: u64,
+}
+
+/// Signal a condition with the given message. Allocates a String
+/// in the calling thread's young heap, then stashes it in the
+/// condition slot if a handler is installed; otherwise prints and
+/// aborts. Used by `ncl_call` / `ncl_load_value` / `ncl_load_function`
+/// to turn unbound-symbol panics into catchable Lisp conditions.
+pub fn signal_condition_string(
+    mutator: *mut crate::mutator::MutatorState,
+    msg: &str,
+) -> u64 {
+    if HANDLER_DEPTH.with(|d| d.get()) == 0 {
+        eprintln!("unhandled condition: {msg}");
+        std::process::abort();
+    }
+    let m = unsafe { &mut *mutator };
+    let cond = crate::gc_string::alloc_string_in_young(m, msg);
+    CONDITION_SLOT.with(|s| s.set(cond.raw()));
+    CONDITION_PENDING.with(|p| p.set(true));
+    Word::NIL.raw()
 }
 
 /// `(error condition-or-message)` — signal a condition. With a
