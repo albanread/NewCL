@@ -815,6 +815,105 @@ mod end_to_end_tests {
         assert_eq!(session.eval(r#"(greet "bob")"#).unwrap(), "nil");
     }
 
+    // -- equal: recursive structural equality ------------------------------
+
+    #[test]
+    fn equal_on_fixnums() {
+        // Same as eq for fixnums.
+        assert_eq!(eval_str("(equal 1 1)").unwrap(), "T");
+        assert_eq!(eval_str("(equal 1 2)").unwrap(), "nil");
+        assert_eq!(eval_str("(equal 0 0)").unwrap(), "T");
+    }
+
+    #[test]
+    fn equal_on_nil_and_t() {
+        assert_eq!(eval_str("(equal nil nil)").unwrap(), "T");
+        assert_eq!(eval_str("(equal t t)").unwrap(), "T");
+        assert_eq!(eval_str("(equal nil t)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn equal_on_symbols() {
+        assert_eq!(eval_str("(equal 'foo 'foo)").unwrap(), "T");
+        assert_eq!(eval_str("(equal 'foo 'bar)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn equal_on_lists() {
+        // equal recurses through cons cells where eq would not.
+        assert_eq!(eval_str("(equal '(1 2 3) '(1 2 3))").unwrap(), "T");
+        assert_eq!(eval_str("(equal '(1 2 3) '(1 2 4))").unwrap(), "nil");
+        assert_eq!(eval_str("(equal '(1 2) '(1 2 3))").unwrap(), "nil");
+        // Two distinct list literals — eq says no, equal says yes.
+        assert_eq!(eval_str("(eq '(1 2 3) '(1 2 3))").unwrap(), "nil");
+    }
+
+    #[test]
+    fn equal_on_nested_lists() {
+        assert_eq!(
+            eval_str("(equal '(1 (2 3)) '(1 (2 3)))").unwrap(),
+            "T",
+        );
+        assert_eq!(
+            eval_str("(equal '(1 (2 3)) '(1 (2 4)))").unwrap(),
+            "nil",
+        );
+        assert_eq!(
+            eval_str("(equal '((a b) (c d)) '((a b) (c d)))").unwrap(),
+            "T",
+        );
+    }
+
+    #[test]
+    fn equal_on_strings() {
+        // equal compares strings by content (like string=).
+        assert_eq!(eval_str(r#"(equal "foo" "foo")"#).unwrap(), "T");
+        assert_eq!(eval_str(r#"(equal "foo" "bar")"#).unwrap(), "nil");
+        assert_eq!(eval_str(r#"(equal "" "")"#).unwrap(), "T");
+        assert_eq!(eval_str(r#"(equal "café" "café")"#).unwrap(), "T");
+    }
+
+    #[test]
+    fn equal_mixed_types() {
+        // Different types are never equal.
+        assert_eq!(eval_str(r#"(equal 1 "1")"#).unwrap(), "nil");
+        assert_eq!(eval_str(r#"(equal '(1) 1)"#).unwrap(), "nil");
+        assert_eq!(eval_str(r#"(equal nil 0)"#).unwrap(), "nil");
+        assert_eq!(eval_str(r#"(equal 'foo "foo")"#).unwrap(), "nil");
+    }
+
+    #[test]
+    fn equal_lists_of_strings() {
+        assert_eq!(
+            eval_str(r#"(equal '("a" "b") '("a" "b"))"#).unwrap(),
+            "T",
+        );
+        assert_eq!(
+            eval_str(r#"(equal '("a" "b") '("a" "c"))"#).unwrap(),
+            "nil",
+        );
+    }
+
+    #[test]
+    fn equal_in_function_body() {
+        let mut session = Session::new();
+        session
+            .eval("(defun same (a b) (equal a b))")
+            .unwrap();
+        assert_eq!(
+            session.eval("(same '(1 2 3) '(1 2 3))").unwrap(),
+            "T",
+        );
+        assert_eq!(
+            session.eval(r#"(same "hi" "hi")"#).unwrap(),
+            "T",
+        );
+        assert_eq!(
+            session.eval("(same '(1 2) '(1 3))").unwrap(),
+            "nil",
+        );
+    }
+
     // -- defparameter / setq / global value cells --------------------------
 
     #[test]

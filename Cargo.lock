@@ -92,7 +92,9 @@ name = "ncl-compiler"
 version = "0.0.0"
 dependencies = [
  "ncl-ir",
+ "ncl-llvm",
  "ncl-reader",
+ "ncl-runtime",
 ]
 
 [[package]]
@@ -125,6 +127,7 @@ version = "0.0.0"
 dependencies = [
  "inkwell",
  "ncl-ir",
+ "ncl-runtime",
 ]
 
 [[package]]

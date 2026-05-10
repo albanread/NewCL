@@ -478,6 +478,7 @@ fn lower_call_in_mut(
         // when floats/chars/bignums need value-equality semantics.
         "EQL" => binary_op(&head_name, args, env, coord, Expr::eq),
         "LENGTH" => unary_op(&head_name, args, env, coord, Expr::length),
+        "EQUAL" => binary_op(&head_name, args, env, coord, Expr::equal),
         "STRING=" => binary_op(&head_name, args, env, coord, Expr::string_eq),
         // (char s i) and (aref s i) for strings — until we have
         // generic vectors, both forms route here.

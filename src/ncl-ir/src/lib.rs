@@ -103,6 +103,10 @@ pub enum Expr {
     /// Polymorphic `(length s)` — works on strings (codepoint count)
     /// and lists (cons-cell count). Calls `ncl_length`.
     Length(Box<Expr>),
+    /// Structural equality. Recurses through cons trees and
+    /// compares strings codepoint-by-codepoint; falls back to eq
+    /// for other atoms. Calls `ncl_equal`.
+    Equal(Box<Expr>, Box<Expr>),
     /// `(string= a b)` — both operands must be strings. Returns T
     /// or NIL.
     StringEq(Box<Expr>, Box<Expr>),
@@ -156,6 +160,9 @@ impl Expr {
     pub fn closure_ref(idx: usize) -> Expr { Expr::ClosureRef(idx) }
     pub fn load_function(sym_word: u64) -> Expr { Expr::LoadFunction(sym_word) }
     pub fn length(x: Expr) -> Expr { Expr::Length(Box::new(x)) }
+    pub fn equal(a: Expr, b: Expr) -> Expr {
+        Expr::Equal(Box::new(a), Box::new(b))
+    }
     pub fn string_eq(a: Expr, b: Expr) -> Expr {
         Expr::StringEq(Box::new(a), Box::new(b))
     }

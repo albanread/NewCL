@@ -110,6 +110,45 @@ pub extern "C" fn ncl_length(w: u64) -> u64 {
     }
 }
 
+/// Structural equality. Recurses through cons cells, treats
+/// strings codepoint-by-codepoint, falls back to eq for atoms.
+/// JIT'd `(equal a b)` lowers to a call here.
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_equal(a: u64, b: u64) -> u64 {
+    if equal_recursive(Word::from_raw(a), Word::from_raw(b)) {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
+fn equal_recursive(a: Word, b: Word) -> bool {
+    // Fast path: same Word bits = trivially equal (covers eq case
+    // for symbols, fixnums, immediates, and identical pointers).
+    if a.raw() == b.raw() {
+        return true;
+    }
+    match (a.tag(), b.tag()) {
+        (Tag::Cons, Tag::Cons) => {
+            let pa = a.as_ptr::<u64>(Tag::Cons).expect("cons");
+            let pb = b.as_ptr::<u64>(Tag::Cons).expect("cons");
+            let car_a = Word::from_raw(unsafe { *pa });
+            let car_b = Word::from_raw(unsafe { *pb });
+            if !equal_recursive(car_a, car_b) {
+                return false;
+            }
+            let cdr_a = Word::from_raw(unsafe { *pa.add(1) });
+            let cdr_b = Word::from_raw(unsafe { *pb.add(1) });
+            equal_recursive(cdr_a, cdr_b)
+        }
+        (Tag::String, Tag::String) => crate::gc_string::string_eq(a, b),
+        // For any other combination — different tags, or non-
+        // structured atom types where we already know the bits
+        // differ — they're not equal.
+        _ => false,
+    }
+}
+
 /// String equality. Both args must be Tag::String. Returns Word::T
 /// or Word::NIL.
 #[unsafe(no_mangle)]

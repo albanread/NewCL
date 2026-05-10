@@ -25,7 +25,7 @@ use inkwell::values::{FunctionValue, IntValue};
 
 use ncl_ir::Expr;
 use ncl_runtime::{
-    ncl_alloc_cons, ncl_call, ncl_funcall, ncl_length, ncl_load_function,
+    ncl_alloc_cons, ncl_call, ncl_equal, ncl_funcall, ncl_length, ncl_load_function,
     ncl_load_value, ncl_make_closure, ncl_store_value, ncl_string_char,
     ncl_string_eq, MutatorState, Tag, Word,
 };
@@ -128,8 +128,9 @@ pub fn jit_eval(expr: &Expr, mutator: *mut MutatorState) -> Result<Word, String>
 /// `defun` to install a Function in a Symbol's function cell.
 ///
 /// The returned pointer is a function with signature
-///   `extern "C" fn(*mut MutatorState, *const u64, u64) -> u64`
-/// and is valid for the process lifetime.
+///   `extern "C" fn(*mut MutatorState, env: u64, *const u64, u64) -> u64`
+/// and is valid for the process lifetime. The `env` slot is the
+/// closure's captured-env Vector (or NIL for non-closures).
 pub fn jit_compile_function(arity: u32, body: &Expr) -> Result<usize, String> {
     build_lisp_function(body, arity)
 }
@@ -196,6 +197,7 @@ struct Helpers<'ctx> {
     load_function: FunctionValue<'ctx>,
     store_value: FunctionValue<'ctx>,
     length: FunctionValue<'ctx>,
+    equal: FunctionValue<'ctx>,
     string_eq: FunctionValue<'ctx>,
     string_char: FunctionValue<'ctx>,
 }
@@ -277,8 +279,12 @@ fn declare_runtime_helpers<'ctx>(
     let length =
         module.add_function("ncl_length", unary_u64_type, Some(Linkage::External));
 
-    // ncl_string_eq(a, b) -> u64
+    // ncl_equal(a, b) -> u64
     let binary_u64_type = i64_t.fn_type(&[i64_t.into(), i64_t.into()], false);
+    let equal =
+        module.add_function("ncl_equal", binary_u64_type, Some(Linkage::External));
+
+    // ncl_string_eq(a, b) -> u64
     let string_eq = module.add_function(
         "ncl_string_eq",
         binary_u64_type,
@@ -301,6 +307,7 @@ fn declare_runtime_helpers<'ctx>(
         load_function,
         store_value,
         length,
+        equal,
         string_eq,
         string_char,
     }
@@ -315,6 +322,7 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(&helpers.load_function, ncl_load_function as *const () as usize);
     engine.add_global_mapping(&helpers.store_value, ncl_store_value as *const () as usize);
     engine.add_global_mapping(&helpers.length, ncl_length as *const () as usize);
+    engine.add_global_mapping(&helpers.equal, ncl_equal as *const () as usize);
     engine.add_global_mapping(&helpers.string_eq, ncl_string_eq as *const () as usize);
     engine.add_global_mapping(&helpers.string_char, ncl_string_char as *const () as usize);
 }
@@ -752,6 +760,14 @@ fn emit_expr<'ctx>(
                 .map_err(|e| format!("build_call length: {e}"))?;
             Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
         }
+        Expr::Equal(a, b) => {
+            let va = emit_expr(context, builder, function, helpers, arity, locals, a)?;
+            let vb = emit_expr(context, builder, function, helpers, arity, locals, b)?;
+            let call = builder
+                .build_call(helpers.equal, &[va.into(), vb.into()], "equal")
+                .map_err(|e| format!("build_call equal: {e}"))?;
+            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+        }
         Expr::StringEq(a, b) => {
             let va = emit_expr(context, builder, function, helpers, arity, locals, a)?;
             let vb = emit_expr(context, builder, function, helpers, arity, locals, b)?;
@@ -927,10 +943,10 @@ mod tests {
         let mut m = coord.register_mutator();
         let body = Expr::Param(0);
         let code = jit_compile_function(1, &body).unwrap();
-        type Fn1 = unsafe extern "C" fn(*mut MutatorState, *const u64, u64) -> u64;
+        type Fn1 = unsafe extern "C" fn(*mut MutatorState, u64, *const u64, u64) -> u64;
         let f: Fn1 = unsafe { std::mem::transmute(code) };
         let arg = Word::fixnum(42).raw();
-        let r = unsafe { f(&mut m as *mut _, &arg as *const u64, 1) };
+        let r = unsafe { f(&mut m as *mut _, Word::NIL.raw(), &arg as *const u64, 1) };
         assert_eq!(Word::from_raw(r).as_fixnum(), Some(42));
     }
 
@@ -941,10 +957,10 @@ mod tests {
         let mut m = coord.register_mutator();
         let body = Expr::add(Expr::Param(0), Expr::Param(0));
         let code = jit_compile_function(1, &body).unwrap();
-        type Fn1 = unsafe extern "C" fn(*mut MutatorState, *const u64, u64) -> u64;
+        type Fn1 = unsafe extern "C" fn(*mut MutatorState, u64, *const u64, u64) -> u64;
         let f: Fn1 = unsafe { std::mem::transmute(code) };
         let arg = Word::fixnum(21).raw();
-        let r = unsafe { f(&mut m as *mut _, &arg as *const u64, 1) };
+        let r = unsafe { f(&mut m as *mut _, Word::NIL.raw(), &arg as *const u64, 1) };
         assert_eq!(Word::from_raw(r).as_fixnum(), Some(42));
     }
 }
