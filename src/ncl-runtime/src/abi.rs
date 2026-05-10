@@ -349,6 +349,33 @@ pub extern "C" fn ncl_set_cdr(
     new_value
 }
 
+/// Build a freshly-allocated list of `args[start..n_args]` in
+/// order. The variadic function-entry prologue calls this to bind
+/// `&rest` parameters. If `n_args <= start`, returns NIL.
+///
+/// Allocation goes through the mutator's TLAB, so the resulting
+/// list lives in the young heap and participates in normal GC.
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_build_rest_list(
+    mutator: *mut crate::mutator::MutatorState,
+    args: *const u64,
+    start: u64,
+    n_args: u64,
+) -> u64 {
+    let m = unsafe { &mut *mutator };
+    let mut result = Word::NIL;
+    if n_args > start {
+        // Cons right-to-left so the list ends up in order.
+        let mut i = n_args;
+        while i > start {
+            i -= 1;
+            let arg_w = Word::from_raw(unsafe { *args.add(i as usize) });
+            result = m.alloc_cons(arg_w, result);
+        }
+    }
+    result.raw()
+}
+
 /// Mutate the i-th codepoint of a string. JIT'd
 /// `(setf (aref s i) c)` and `(setf (char s i) c)` lower here.
 /// Returns the character word that was stored.

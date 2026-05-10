@@ -25,9 +25,10 @@ use inkwell::values::{FunctionValue, IntValue};
 
 use ncl_ir::Expr;
 use ncl_runtime::{
-    ncl_alloc_cons, ncl_call, ncl_equal, ncl_funcall, ncl_length, ncl_load_function,
-    ncl_load_value, ncl_make_closure, ncl_set_car, ncl_set_cdr, ncl_store_value,
-    ncl_string_char, ncl_string_eq, ncl_string_set, MutatorState, Tag, Word,
+    ncl_alloc_cons, ncl_build_rest_list, ncl_call, ncl_equal, ncl_funcall, ncl_length,
+    ncl_load_function, ncl_load_value, ncl_make_closure, ncl_set_car, ncl_set_cdr,
+    ncl_store_value, ncl_string_char, ncl_string_eq, ncl_string_set, MutatorState,
+    Tag, Word,
 };
 
 // We leak each compilation's Context + Module + Engine so the
@@ -203,6 +204,7 @@ struct Helpers<'ctx> {
     set_car: FunctionValue<'ctx>,
     set_cdr: FunctionValue<'ctx>,
     string_set: FunctionValue<'ctx>,
+    build_rest_list: FunctionValue<'ctx>,
 }
 
 fn declare_runtime_helpers<'ctx>(
@@ -324,6 +326,17 @@ fn declare_runtime_helpers<'ctx>(
         Some(Linkage::External),
     );
 
+    // ncl_build_rest_list(mutator, args_ptr, start, n_args) -> u64
+    let build_rest_list_type = i64_t.fn_type(
+        &[ptr_t.into(), ptr_t.into(), i64_t.into(), i64_t.into()],
+        false,
+    );
+    let build_rest_list = module.add_function(
+        "ncl_build_rest_list",
+        build_rest_list_type,
+        Some(Linkage::External),
+    );
+
     Helpers {
         alloc_cons,
         call_fn,
@@ -339,6 +352,7 @@ fn declare_runtime_helpers<'ctx>(
         set_car,
         set_cdr,
         string_set,
+        build_rest_list,
     }
 }
 
@@ -357,6 +371,7 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(&helpers.set_car, ncl_set_car as *const () as usize);
     engine.add_global_mapping(&helpers.set_cdr, ncl_set_cdr as *const () as usize);
     engine.add_global_mapping(&helpers.string_set, ncl_string_set as *const () as usize);
+    engine.add_global_mapping(&helpers.build_rest_list, ncl_build_rest_list as *const () as usize);
 }
 
 /// Convert an i1 comparison result to a tagged Word (T or NIL).
@@ -490,6 +505,26 @@ fn emit_expr<'ctx>(
                 .build_load(i64_t, elem_ptr, "arg")
                 .map_err(|e| format!("load arg: {e}"))?;
             Ok(val.into_int_value())
+        }
+        Expr::BindRest(start) => {
+            // ncl_build_rest_list(mutator, args_ptr, start, n_args)
+            let mutator_arg = function.get_nth_param(0).unwrap();
+            let args_ptr = function.get_nth_param(2).unwrap();
+            let n_args = function.get_nth_param(3).unwrap();
+            let start_const = i64_t.const_int(*start as u64, false);
+            let call = builder
+                .build_call(
+                    helpers.build_rest_list,
+                    &[
+                        mutator_arg.into(),
+                        args_ptr.into(),
+                        start_const.into(),
+                        n_args.into(),
+                    ],
+                    "rest",
+                )
+                .map_err(|e| format!("build_call build_rest_list: {e}"))?;
+            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
         }
         Expr::ClosureRef(idx) => {
             // env (function param 1) is a Vector-tagged Word. Untag,

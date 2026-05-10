@@ -152,6 +152,30 @@
   ;; Same as the LENGTH primitive on lists; provided for symmetry.
   (length lst))
 
+;; (list* a b c lst) ≡ (cons a (cons b (cons c lst))).
+;; CL's variadic list* — the last arg is used as the tail; earlier
+;; args are consed onto the front. (list* x) ≡ x.
+(defun %list*-build (head r)
+  (if (null r)
+      head
+      (cons head (%list*-build (car r) (cdr r)))))
+(defun list* (head &rest r)
+  (%list*-build head r))
+
+;; Variadic append: (append a b c d) ≡ (append a (append b (append c d))).
+;; Reuses the binary `append` defined above.
+(defun %append-many (lst rest-of-lists)
+  (if (null rest-of-lists)
+      lst
+      (append lst (%append-many (car rest-of-lists) (cdr rest-of-lists)))))
+(defun append* (&rest lists)
+  ;; Named `append*` to coexist with the binary `append`. When &rest
+  ;; argument unpacking matures we'll merge them.
+  (cond
+    ((null lists) nil)
+    ((null (cdr lists)) (car lists))
+    (t (%append-many (car lists) (cdr lists)))))
+
 ;; -- Numeric helpers ---------------------------------------------------------
 
 (defun zerop (n) (= n 0))
@@ -187,9 +211,17 @@
 (defun 1+ (n) (+ n 1))
 (defun 1- (n) (- n 1))
 
-;; CL `min` and `max` are variadic; until &rest lands these are the
-;; binary forms.
 (defun min2 (a b) (if (< a b) a b))
 (defun max2 (a b) (if (> a b) a b))
+
+;; Variadic min / max via &rest. (min) is an error in CL — we
+;; return nil for the empty case instead, until conditions exist.
+(defun %min-of (a r)
+  (if (null r) a (%min-of (min2 a (car r)) (cdr r))))
+(defun min (a &rest r) (%min-of a r))
+
+(defun %max-of (a r)
+  (if (null r) a (%max-of (max2 a (car r)) (cdr r))))
+(defun max (a &rest r) (%max-of a r))
 
 (defun abs (n) (if (< n 0) (- n) n))

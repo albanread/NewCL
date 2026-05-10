@@ -75,12 +75,32 @@ impl Session {
     fn handle_defun(
         &mut self,
         name: &str,
-        params: &[Arc<str>],
+        params: &ParamSpec,
         body_forms: &[Value],
     ) -> Result<Word, EvalError> {
-        let env = LocalEnv::with_params(params);
-        // Implicit progn: multiple body forms wrap into a Progn.
-        let body_expr = if body_forms.len() == 1 {
+        // Build the env. Required params at Param(0..N); the rest
+        // binding (if any) is a let-style local at Local(0). Whether
+        // the rest binding is boxed depends on whether the body
+        // mutates it — the same analysis we do for let.
+        let mut env = LocalEnv::with_params(&params.required);
+        let rest_is_mutated = if let Some(rest_name) = &params.rest {
+            let body_mutations = lower::mutated_in_body(
+                body_forms,
+                &std::collections::HashSet::new(),
+            );
+            let m = body_mutations.contains(rest_name);
+            if m {
+                env.push_local_cell(Arc::clone(rest_name));
+            } else {
+                env.push_local(Arc::clone(rest_name));
+            }
+            m
+        } else {
+            false
+        };
+
+        // Implicit progn over body forms.
+        let lowered_body = if body_forms.len() == 1 {
             lower_in(&body_forms[0], &env, &self.coord)
                 .map_err(EvalError::Compile)?
         } else {
@@ -90,13 +110,29 @@ impl Session {
                 .collect();
             ncl_ir::Expr::progn(lowered.map_err(EvalError::Compile)?)
         };
-        let code_ptr = ncl_llvm::jit_compile_function(params.len() as u32, &body_expr)
+
+        // If we have a rest param, wrap the body in a let that
+        // binds it to BindRest(required_count). Box if mutated.
+        let body_expr = if params.rest.is_some() {
+            let start = params.required.len() as u32;
+            let init = if rest_is_mutated {
+                ncl_ir::Expr::cons(ncl_ir::Expr::bind_rest(start), ncl_ir::Expr::Nil)
+            } else {
+                ncl_ir::Expr::bind_rest(start)
+            };
+            ncl_ir::Expr::let_(vec![init], lowered_body)
+        } else {
+            lowered_body
+        };
+
+        let arity = params.required.len() as u32;
+        let code_ptr = ncl_llvm::jit_compile_function(arity, &body_expr)
             .map_err(EvalError::Jit)?;
         let sym_word = self.coord.intern(name);
         let fn_word = gc_function::alloc_function_in_static(
             self.coord.static_area(),
             code_ptr,
-            params.len() as u32,
+            arity,
             sym_word,
             Word::NIL, // defun'd functions have no closure env
         )
@@ -141,7 +177,7 @@ impl Session {
 /// forms are returned as a Vec for the caller to wrap.
 fn match_defun(
     v: &Value,
-) -> Result<Option<(String, Vec<Arc<str>>, Vec<Value>)>, EvalError> {
+) -> Result<Option<(String, ParamSpec, Vec<Value>)>, EvalError> {
     let Value::Cons(c) = v else { return Ok(None); };
     let Value::Symbol(head) = &c.car else { return Ok(None); };
     if &*head.name != "DEFUN" {
@@ -169,12 +205,23 @@ fn match_defun(
     Ok(Some((name, params, body_forms)))
 }
 
-fn parse_param_list(v: &Value) -> Result<Vec<Arc<str>>, EvalError> {
-    let mut out = Vec::new();
+/// Parsed parameter list. Required-positional parameters first;
+/// `rest` holds the `&rest` binding if present. Common Lisp's
+/// `&optional`, `&key`, etc. are deferred — only required and
+/// `&rest` are recognised here.
+#[derive(Debug, Clone)]
+pub struct ParamSpec {
+    pub required: Vec<Arc<str>>,
+    pub rest: Option<Arc<str>>,
+}
+
+fn parse_param_list(v: &Value) -> Result<ParamSpec, EvalError> {
+    let mut required = Vec::new();
+    let mut rest: Option<Arc<str>> = None;
     let mut cur = v.clone();
     loop {
         match cur {
-            Value::Nil => return Ok(out),
+            Value::Nil => return Ok(ParamSpec { required, rest }),
             Value::Cons(c) => {
                 let Value::Symbol(s) = &c.car else {
                     return Err(EvalError::Compile(CompileError::BadDefun(format!(
@@ -182,7 +229,31 @@ fn parse_param_list(v: &Value) -> Result<Vec<Arc<str>>, EvalError> {
                         c.car
                     ))));
                 };
-                out.push(Arc::clone(&s.name));
+                if &*s.name == "&REST" {
+                    // Expect exactly one more symbol, then end-of-list.
+                    let after = c.cdr.clone();
+                    let Value::Cons(rest_cons) = after else {
+                        return Err(EvalError::Compile(CompileError::BadDefun(
+                            "&rest must be followed by a name".into(),
+                        )));
+                    };
+                    let Value::Symbol(rest_sym) = &rest_cons.car else {
+                        return Err(EvalError::Compile(CompileError::BadDefun(
+                            format!(
+                                "&rest's name must be a symbol, got {:?}",
+                                rest_cons.car
+                            ),
+                        )));
+                    };
+                    rest = Some(Arc::clone(&rest_sym.name));
+                    if !matches!(rest_cons.cdr, Value::Nil) {
+                        return Err(EvalError::Compile(CompileError::BadDefun(
+                            "extra parameters after &rest's name".into(),
+                        )));
+                    }
+                    return Ok(ParamSpec { required, rest });
+                }
+                required.push(Arc::clone(&s.name));
                 cur = c.cdr.clone();
             }
             other => {
@@ -1649,6 +1720,130 @@ mod end_to_end_tests {
         assert_eq!(result, "720");
     }
 
+    // -- &rest / variadic functions ---------------------------------------
+
+    #[test]
+    fn rest_no_extra_args() {
+        let mut s = Session::new();
+        s.eval("(defun f (a &rest r) r)").unwrap();
+        // Called with exactly the required count — rest is nil.
+        assert_eq!(s.eval("(f 1)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn rest_collects_extra_args_in_order() {
+        let mut s = Session::new();
+        s.eval("(defun f (a &rest r) r)").unwrap();
+        assert_eq!(s.eval("(f 1 2 3 4)").unwrap(), "(2 3 4)");
+        assert_eq!(s.eval("(f 1 99)").unwrap(), "(99)");
+    }
+
+    #[test]
+    fn rest_only() {
+        // (defun f (&rest r) r) — all args go into r.
+        let mut s = Session::new();
+        s.eval("(defun all (&rest r) r)").unwrap();
+        assert_eq!(s.eval("(all)").unwrap(), "nil");
+        assert_eq!(s.eval("(all 1 2 3)").unwrap(), "(1 2 3)");
+        assert_eq!(s.eval(r#"(all 'a "b" 3)"#).unwrap(), r#"(A "b" 3)"#);
+    }
+
+    #[test]
+    fn rest_with_multiple_required() {
+        let mut s = Session::new();
+        s.eval("(defun f (a b c &rest r) (cons (+ a b c) r))").unwrap();
+        assert_eq!(s.eval("(f 1 2 3)").unwrap(), "(6)");
+        assert_eq!(s.eval("(f 1 2 3 4 5)").unwrap(), "(6 4 5)");
+    }
+
+    #[test]
+    fn rest_lets_us_walk_args() {
+        // Without apply we can't recursively call the variadic
+        // function with fewer args, but we CAN walk the rest list
+        // with a separate helper. This is the common shape of
+        // "variadic frontend, list-walking backend."
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(
+            "(defun sum-list (lst) \
+               (if (null lst) 0 \
+                 (+ (car lst) (sum-list (cdr lst)))))",
+        )
+        .unwrap();
+        s.eval("(defun sum (&rest r) (sum-list r))").unwrap();
+        assert_eq!(s.eval("(sum)").unwrap(), "0");
+        assert_eq!(s.eval("(sum 1)").unwrap(), "1");
+        assert_eq!(s.eval("(sum 1 2 3 4 5)").unwrap(), "15");
+    }
+
+    #[test]
+    fn rest_in_lambda() {
+        let mut s = Session::new();
+        s.eval("(defparameter *f* (lambda (a &rest r) (cons a r)))").unwrap();
+        assert_eq!(s.eval("(funcall *f* 1)").unwrap(), "(1)");
+        assert_eq!(s.eval("(funcall *f* 1 2 3)").unwrap(), "(1 2 3)");
+    }
+
+    #[test]
+    fn rest_can_be_mutated() {
+        // setq of the rest binding works because the analysis
+        // detects mutation and boxes it like any let-local.
+        let mut s = Session::new();
+        // Variadic length implemented by walking the rest list
+        // destructively (just to exercise mutation, not because
+        // it's a good idea — `length` already does this).
+        s.eval(
+            "(defun my-count (&rest r) \
+               (let ((n 0)) \
+                 (if (null r) n \
+                   (progn (setq r (cdr r)) \
+                          (setq n (+ n 1)) \
+                          (if (null r) n \
+                            (progn (setq r (cdr r)) (setq n (+ n 1))))))))",
+        )
+        .unwrap();
+        assert_eq!(s.eval("(my-count)").unwrap(), "0");
+        assert_eq!(s.eval("(my-count 'a)").unwrap(), "1");
+        assert_eq!(s.eval("(my-count 'a 'b 'c)").unwrap(), "2");
+    }
+
+    #[test]
+    fn rest_closes_over_correctly() {
+        // Lambda with &rest, captured by another lambda.
+        let mut s = Session::new();
+        s.eval(
+            "(defun make-collector () \
+               (let ((items nil)) \
+                 (lambda (&rest new-items) \
+                   (setf items (append items new-items)) \
+                   items)))",
+        )
+        .unwrap();
+        // append is binary in our stdlib, so this needs stdlib.
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(
+            "(defun make-collector () \
+               (let ((items nil)) \
+                 (lambda (&rest new-items) \
+                   (setf items (append items new-items)) \
+                   items)))",
+        )
+        .unwrap();
+        s.eval("(defparameter *c* (make-collector))").unwrap();
+        assert_eq!(s.eval("(funcall *c* 1 2)").unwrap(), "(1 2)");
+        assert_eq!(s.eval("(funcall *c* 3)").unwrap(), "(1 2 3)");
+        assert_eq!(s.eval("(funcall *c*)").unwrap(), "(1 2 3)");
+    }
+
+    #[test]
+    fn rest_malformed_errors() {
+        // &rest with no name following.
+        let r = eval_str("(defun f (a &rest) a)");
+        assert!(r.is_err());
+        // &rest followed by multiple names.
+        let r = eval_str("(defun f (a &rest r s) a)");
+        assert!(r.is_err());
+    }
+
     // -- truncate / rem (integer division primitives) ---------------------
 
     #[test]
@@ -1913,6 +2108,46 @@ mod end_to_end_tests {
             s.eval("(last (mapcar #'1+ (reverse '(1 2 3 4))))").unwrap(),
             "(2)",
         );
+    }
+
+    #[test]
+    fn stdlib_min_max_variadic() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Single-arg forms.
+        assert_eq!(s.eval("(min 5)").unwrap(), "5");
+        assert_eq!(s.eval("(max 5)").unwrap(), "5");
+        // Multi-arg.
+        assert_eq!(s.eval("(min 3 1 4 1 5 9 2 6)").unwrap(), "1");
+        assert_eq!(s.eval("(max 3 1 4 1 5 9 2 6)").unwrap(), "9");
+        assert_eq!(s.eval("(min 7 7 7)").unwrap(), "7");
+        // Mixed signs.
+        assert_eq!(s.eval("(min -5 -2 -10)").unwrap(), "-10");
+        assert_eq!(s.eval("(max -5 -2 -10)").unwrap(), "-2");
+    }
+
+    #[test]
+    fn stdlib_list_star() {
+        let mut s = Session::with_stdlib().unwrap();
+        // (list* x) ≡ x.
+        assert_eq!(s.eval("(list* 'a)").unwrap(), "A");
+        // (list* a b) ≡ (cons a b).
+        assert_eq!(s.eval("(list* 1 2)").unwrap(), "(1 . 2)");
+        // (list* a b c lst) ≡ (cons a (cons b (cons c lst)))
+        assert_eq!(s.eval("(list* 1 2 3 '(4 5))").unwrap(), "(1 2 3 4 5)");
+        // (list* 1 2 3 nil) ≡ (1 2 3)
+        assert_eq!(s.eval("(list* 1 2 3 nil)").unwrap(), "(1 2 3)");
+    }
+
+    #[test]
+    fn stdlib_append_star_variadic() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(append*)").unwrap(), "nil");
+        assert_eq!(s.eval("(append* '(a b))").unwrap(), "(A B)");
+        assert_eq!(
+            s.eval("(append* '(1 2) '(3 4) '(5 6))").unwrap(),
+            "(1 2 3 4 5 6)",
+        );
+        assert_eq!(s.eval("(append* nil nil nil)").unwrap(), "nil");
     }
 
     #[test]

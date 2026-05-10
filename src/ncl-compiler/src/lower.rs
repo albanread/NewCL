@@ -683,7 +683,7 @@ fn collect_mutations(
 /// Run `collect_mutations` over a slice of body forms, returning the
 /// union. Each form is analysed with the same starting shadowed set
 /// (no carry-over since these are siblings, not nested).
-fn mutated_in_body(
+pub fn mutated_in_body(
     body_forms: &[Value],
     shadowed: &HashSet<Arc<str>>,
 ) -> HashSet<Arc<str>> {
@@ -1091,15 +1091,28 @@ fn lower_lambda(
             got: 0,
         });
     }
-    let params = parse_param_list_lambda(&args[0])?;
+    let (required, rest_opt) = parse_param_list_lambda(&args[0])?;
     let body_forms = &args[1..];
 
-    // Inner env starts with params at Param(0..N) and a capture
-    // parent pointing at the outer env (clone — we only read from
-    // it during lookup_or_capture).
-    let mut inner_env = LocalEnv::for_lambda(&params, outer_env.clone());
+    // Inner env starts with required params at Param(0..N) and a
+    // capture parent pointing at the outer env (clone — we only
+    // read from it during lookup_or_capture). If a rest parameter
+    // is present, push it as a let-style local (boxed if mutated).
+    let mut inner_env = LocalEnv::for_lambda(&required, outer_env.clone());
+    let rest_is_mutated = if let Some(rest_name) = &rest_opt {
+        let body_mutations = mutated_in_body(body_forms, &HashSet::new());
+        let m = body_mutations.contains(rest_name);
+        if m {
+            inner_env.push_local_cell(Arc::clone(rest_name));
+        } else {
+            inner_env.push_local(Arc::clone(rest_name));
+        }
+        m
+    } else {
+        false
+    };
 
-    let body_expr = if body_forms.is_empty() {
+    let lowered_body = if body_forms.is_empty() {
         Expr::Nil
     } else if body_forms.len() == 1 {
         lower_in_mut(&body_forms[0], &mut inner_env, coord)?
@@ -1111,24 +1124,62 @@ fn lower_lambda(
         Expr::progn(lowered?)
     };
 
+    let body_expr = if rest_opt.is_some() {
+        let start = required.len() as u32;
+        let init = if rest_is_mutated {
+            Expr::cons(Expr::bind_rest(start), Expr::Nil)
+        } else {
+            Expr::bind_rest(start)
+        };
+        Expr::let_(vec![init], lowered_body)
+    } else {
+        lowered_body
+    };
+
     let captures = inner_env.take_captures();
-    Ok(Expr::lambda(params.len() as u32, body_expr, captures))
+    Ok(Expr::lambda(required.len() as u32, body_expr, captures))
 }
 
-/// Parse a lambda parameter list into a Vec of names.
-fn parse_param_list_lambda(v: &Value) -> Result<Vec<Arc<str>>, CompileError> {
-    let mut out = Vec::new();
+/// Parse a lambda parameter list. Returns the required params plus
+/// the optional `&rest` name. Same surface shape as the defun-side
+/// `parse_param_list` in lib.rs — kept separate because the error
+/// types differ (CompileError vs EvalError).
+fn parse_param_list_lambda(
+    v: &Value,
+) -> Result<(Vec<Arc<str>>, Option<Arc<str>>), CompileError> {
+    let mut required = Vec::new();
+    let mut rest: Option<Arc<str>> = None;
     let mut cur = v.clone();
     loop {
         match cur {
-            Value::Nil => return Ok(out),
+            Value::Nil => return Ok((required, rest)),
             Value::Cons(c) => {
                 let Value::Symbol(s) = &c.car else {
                     return Err(CompileError::NotImplemented(format!(
                         "lambda parameter must be a symbol, got {:?}", c.car,
                     )));
                 };
-                out.push(Arc::clone(&s.name));
+                if &*s.name == "&REST" {
+                    let after = c.cdr.clone();
+                    let Value::Cons(rc) = after else {
+                        return Err(CompileError::NotImplemented(
+                            "&rest must be followed by a name".into(),
+                        ));
+                    };
+                    let Value::Symbol(rs) = &rc.car else {
+                        return Err(CompileError::NotImplemented(format!(
+                            "&rest's name must be a symbol, got {:?}", rc.car,
+                        )));
+                    };
+                    rest = Some(Arc::clone(&rs.name));
+                    if !matches!(rc.cdr, Value::Nil) {
+                        return Err(CompileError::NotImplemented(
+                            "extra parameters after &rest's name".into(),
+                        ));
+                    }
+                    return Ok((required, rest));
+                }
+                required.push(Arc::clone(&s.name));
                 cur = c.cdr.clone();
             }
             other => {

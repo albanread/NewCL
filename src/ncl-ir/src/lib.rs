@@ -26,6 +26,11 @@ pub enum Expr {
     /// Only valid inside a function body — top-level expressions
     /// don't have parameters and Param is a compile error there.
     Param(usize),
+    /// `&rest` accessor: build and return a freshly-allocated list
+    /// containing args[start..n_args] in order. Used at the entry
+    /// of variadic functions to bind the rest parameter. The
+    /// allocation lives in the calling thread's young heap.
+    BindRest(u32),
     /// Reference to the Nth let-bound local. Indexed in the order
     /// the let bindings were entered (per nested let scopes), reset
     /// when the let scope exits.
@@ -214,6 +219,7 @@ impl Expr {
         Expr::Funcall { fn_expr: Box::new(fn_expr), args }
     }
     pub fn param(idx: usize) -> Expr { Expr::Param(idx) }
+    pub fn bind_rest(start: u32) -> Expr { Expr::BindRest(start) }
     pub fn local(idx: usize) -> Expr { Expr::Local(idx) }
     pub fn progn(forms: Vec<Expr>) -> Expr { Expr::Progn(forms) }
     pub fn let_(bindings: Vec<Expr>, body: Expr) -> Expr {
