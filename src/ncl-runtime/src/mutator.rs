@@ -322,6 +322,27 @@ impl MutatorState {
         Word::from_ptr(p as *const u8, Tag::Vector)
     }
 
+    /// Reserve a young-heap object header'd as `String` with the
+    /// given payload length. Returns the address of the header
+    /// cell — the caller fills char_count and the codepoint cells.
+    /// The header is initialised; the payload is uninitialised.
+    pub fn alloc_string_buffer(&mut self, payload_cells: u32) -> *mut u64 {
+        let total = 1 + payload_cells as usize;
+        if self.tlab.top + total > self.tlab.limit {
+            self.refill_tlab(total);
+        }
+        let p = unsafe { self.tlab.base.add(self.tlab.top) };
+        unsafe {
+            *p = crate::heap::HeapHeader::new(
+                crate::heap::HeapType::String,
+                payload_cells,
+            )
+            .raw();
+        }
+        self.tlab.top += total;
+        p
+    }
+
     /// Inline cons write. Caller has confirmed `top + 2 <= limit`.
     unsafe fn tlab_write_cons(&mut self, car: Word, cdr: Word) -> Word {
         let p = unsafe { self.tlab.base.add(self.tlab.top) };

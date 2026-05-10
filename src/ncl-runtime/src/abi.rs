@@ -349,6 +349,39 @@ pub extern "C" fn ncl_set_cdr(
     new_value
 }
 
+/// Lisp-callable shim for `format`. Has the standard JIT function
+/// signature so it can be installed in a Symbol's function cell
+/// just like a defun'd function — making `format` a first-class
+/// function (callable via `#'`, `apply`, `funcall`).
+///
+/// Arity is "at least 2" (dest + control); subsequent args become
+/// the rest list, which `run_format` consumes one-by-one as
+/// directives are processed.
+pub extern "C" fn format_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args < 2 {
+        panic!("format: expected at least 2 args (dest, control), got {n_args}");
+    }
+    let dest = Word::from_raw(unsafe { *args });
+    let ctrl = Word::from_raw(unsafe { *args.add(1) });
+
+    // Build the rest list from args[2..] (right-to-left).
+    let m = unsafe { &mut *mutator };
+    let mut rest = Word::NIL;
+    let mut i = n_args;
+    while i > 2 {
+        i -= 1;
+        let arg = Word::from_raw(unsafe { *args.add(i as usize) });
+        rest = m.alloc_cons(arg, rest);
+    }
+
+    crate::format::run_format(m, dest, ctrl, rest).raw()
+}
+
 /// `(apply fn prefix-arg-1 ... prefix-arg-N tail-list)` —
 /// call `fn` with the prefix args followed by the spread elements
 /// of `tail-list`. The compiler emits a call here with the prefix

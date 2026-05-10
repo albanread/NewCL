@@ -33,24 +33,42 @@ pub const CHARS_START_OFFSET: usize = 2;
 pub fn alloc_string_in_static(static_area: &StaticArea, s: &str) -> Option<Word> {
     let chars: Vec<u32> = s.chars().map(|c| c as u32).collect();
     let n = chars.len();
-    // Cells: 1 for char_count + ceil(n/2) for the chars.
     let payload_cells = 1 + n.div_ceil(2);
     let header_ptr =
         static_area.try_alloc_with_header(HeapType::String, payload_cells as u32)?;
     let p = header_ptr.as_ptr() as *mut u64;
+    unsafe { fill_string_payload(p, &chars) };
+    Some(Word::from_ptr(p as *const u8, Tag::String))
+}
+
+/// Allocate a String on the calling thread's young heap. Used by
+/// transient string-producing primitives like `format` with
+/// `dest=nil`. Same payload layout as the static version.
+pub fn alloc_string_in_young(
+    m: &mut crate::mutator::MutatorState,
+    s: &str,
+) -> Word {
+    let chars: Vec<u32> = s.chars().map(|c| c as u32).collect();
+    let n = chars.len();
+    let payload_cells = 1 + n.div_ceil(2);
+    let p = m.alloc_string_buffer(payload_cells as u32);
+    unsafe { fill_string_payload(p, &chars) };
+    Word::from_ptr(p as *const u8, Tag::String)
+}
+
+unsafe fn fill_string_payload(p: *mut u64, chars: &[u32]) {
+    let n = chars.len();
     unsafe {
         *p.add(CHAR_COUNT_OFFSET) = n as u64;
-        // Zero-fill the chars region first so the last half-cell
+        // Zero-fill the chars region so the trailing half-cell
         // (when N is odd) starts clean.
         for c in 0..n.div_ceil(2) {
             *p.add(CHARS_START_OFFSET + c) = 0;
         }
-        // Pack two codepoints per cell.
         for (i, &cp) in chars.iter().enumerate() {
             pack_char(p, i, cp);
         }
     }
-    Some(Word::from_ptr(p as *const u8, Tag::String))
 }
 
 /// Read the codepoint count of a String-tagged Word.

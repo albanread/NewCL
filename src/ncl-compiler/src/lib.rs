@@ -36,7 +36,8 @@ impl Session {
 
     pub fn with_config(config: GcConfig) -> Session {
         let coord = GcCoordinator::new(config);
-        let mutator = Box::new(coord.register_mutator());
+        let mut mutator = Box::new(coord.register_mutator());
+        install_native_functions(&coord, &mut mutator);
         Session { coord, mutator }
     }
 
@@ -144,6 +145,36 @@ impl Session {
 
 impl Default for Session {
     fn default() -> Self { Session::new() }
+}
+
+/// Wire up native (Rust-implemented) Lisp functions. Each becomes
+/// a callable Function in a Symbol's function cell — first-class
+/// from the Lisp side: usable via `#'foo`, `apply`, `funcall`. Run
+/// once at session creation, before any user code evaluates.
+fn install_native_functions(
+    coord: &Arc<GcCoordinator>,
+    mutator: &mut MutatorState,
+) {
+    install_native(coord, mutator, "FORMAT", ncl_runtime::format_shim, 2);
+}
+
+fn install_native(
+    coord: &Arc<GcCoordinator>,
+    mutator: &mut MutatorState,
+    name: &str,
+    code: extern "C" fn(*mut MutatorState, u64, *const u64, u64) -> u64,
+    arity: u32,
+) {
+    let sym_word = coord.intern(name);
+    let fn_word = gc_function::alloc_function_in_static(
+        coord.static_area(),
+        code as usize,
+        arity,
+        sym_word,
+        Word::NIL, // native functions don't carry a closure env
+    )
+    .expect("static area exhausted while installing native function");
+    mutator.set_symbol_function(sym_word, fn_word);
 }
 
 /// User-Lisp portion of the standard library. Embedded at compile
@@ -1842,6 +1873,141 @@ mod end_to_end_tests {
         // &rest followed by multiple names.
         let r = eval_str("(defun f (a &rest r s) a)");
         assert!(r.is_err());
+    }
+
+    // -- format ----------------------------------------------------------
+
+    #[test]
+    fn format_nil_returns_string() {
+        // (format nil "...") returns the formatted text as a String.
+        assert_eq!(
+            eval_str(r#"(format nil "hello, world")"#).unwrap(),
+            r#""hello, world""#,
+        );
+    }
+
+    #[test]
+    fn format_a_directive_aesthetic() {
+        // ~A: aesthetic — strings printed without quotes.
+        assert_eq!(
+            eval_str(r#"(format nil "name: ~A!" "Alice")"#).unwrap(),
+            r#""name: Alice!""#,
+        );
+        // Numbers print as digits.
+        assert_eq!(
+            eval_str(r#"(format nil "x = ~A" 42)"#).unwrap(),
+            r#""x = 42""#,
+        );
+        // nil prints as "nil".
+        assert_eq!(
+            eval_str(r#"(format nil "got ~A" nil)"#).unwrap(),
+            r#""got nil""#,
+        );
+        // Lists print structurally.
+        assert_eq!(
+            eval_str(r#"(format nil "list: ~A" '(1 2 3))"#).unwrap(),
+            r#""list: (1 2 3)""#,
+        );
+    }
+
+    #[test]
+    fn format_s_directive_readable() {
+        // ~S: readable — strings keep their quotes.
+        assert_eq!(
+            eval_str(r#"(format nil "got ~S" "hi")"#).unwrap(),
+            r#""got \"hi\"""#,
+        );
+        // Chars print as #\X. The eval result is itself a string;
+        // when the REPL prints it back, the backslash inside the
+        // payload gets escaped, so `#\a` round-trips as `"#\\a"`.
+        // Use explicit escapes to dodge the Rust 2021 reserved-
+        // prefix lint on `r#"#`.
+        assert_eq!(
+            eval_str("(format nil \"~S\" #\\a)").unwrap(),
+            "\"#\\\\a\"",
+        );
+    }
+
+    #[test]
+    fn format_d_directive_decimal() {
+        assert_eq!(
+            eval_str(r#"(format nil "n = ~D" 1234)"#).unwrap(),
+            r#""n = 1234""#,
+        );
+        assert_eq!(
+            eval_str(r#"(format nil "neg: ~D" -7)"#).unwrap(),
+            r#""neg: -7""#,
+        );
+    }
+
+    #[test]
+    fn format_percent_emits_newline() {
+        assert_eq!(
+            eval_str(r#"(format nil "line1~%line2")"#).unwrap(),
+            "\"line1\nline2\"",
+        );
+    }
+
+    #[test]
+    fn format_tilde_tilde_is_literal() {
+        assert_eq!(
+            eval_str(r#"(format nil "~~ here")"#).unwrap(),
+            r#""~ here""#,
+        );
+    }
+
+    #[test]
+    fn format_multiple_directives() {
+        assert_eq!(
+            eval_str(r#"(format nil "~A is ~D years old" "Bob" 30)"#).unwrap(),
+            r#""Bob is 30 years old""#,
+        );
+    }
+
+    #[test]
+    fn format_unicode_in_control_string() {
+        // The control string is UTF-32 internally; full Unicode pass-through.
+        assert_eq!(
+            eval_str(r#"(format nil "héllo ~A" "🦀")"#).unwrap(),
+            r#""héllo 🦀""#,
+        );
+    }
+
+    #[test]
+    fn format_to_t_returns_nil() {
+        // (format t ...) writes to stdout and returns nil. The
+        // tests can't easily capture stdout, so just verify the
+        // return value.
+        let mut s = Session::new();
+        assert_eq!(s.eval(r#"(format t "ignored")"#).unwrap(), "nil");
+    }
+
+    #[test]
+    fn format_is_first_class() {
+        // FORMAT is a real callable function — usable via funcall,
+        // apply, #'.
+        let mut s = Session::new();
+        s.eval("(defparameter *fmt* #'format)").unwrap();
+        assert_eq!(
+            s.eval(r#"(funcall *fmt* nil "hi ~A" 42)"#).unwrap(),
+            r#""hi 42""#,
+        );
+        // apply works too — splat a list of args.
+        assert_eq!(
+            s.eval(r#"(apply #'format nil "~A and ~A" '(1 2))"#).unwrap(),
+            r#""1 and 2""#,
+        );
+    }
+
+    #[test]
+    fn format_no_args_passes_through() {
+        // No directives, no args — returns the control unchanged.
+        assert_eq!(
+            eval_str(r#"(format nil "plain text")"#).unwrap(),
+            r#""plain text""#,
+        );
+        // Empty control.
+        assert_eq!(eval_str(r#"(format nil "")"#).unwrap(), r#""""#);
     }
 
     // -- apply -----------------------------------------------------------

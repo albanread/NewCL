@@ -11,6 +11,7 @@
 //! compiled code only.
 
 pub mod abi;
+pub mod format;
 pub mod gc_function;
 pub mod gc_string;
 pub mod gc_symbol;
@@ -26,12 +27,12 @@ pub mod value;
 pub mod word;
 
 pub use abi::{
-    ncl_alloc_cons, ncl_apply, ncl_build_rest_list, ncl_call, ncl_car, ncl_cdr,
-    ncl_equal, ncl_funcall, ncl_length, ncl_load_function, ncl_load_value,
+    format_shim, ncl_alloc_cons, ncl_apply, ncl_build_rest_list, ncl_call, ncl_car,
+    ncl_cdr, ncl_equal, ncl_funcall, ncl_length, ncl_load_function, ncl_load_value,
     ncl_make_closure, ncl_set_car, ncl_set_cdr, ncl_store_value, ncl_string_char,
     ncl_string_eq, ncl_string_set,
 };
-pub use printer::format_word;
+pub use printer::{format_word, format_word_aesthetic};
 
 pub use heap::{
     CardTable, GcBit, Heap, HeapHeader, HeapType, CARD_SIZE_BYTES, CARD_SIZE_CELLS,

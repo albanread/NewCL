@@ -8,14 +8,26 @@
 
 use crate::word::{Tag, Word};
 
-/// Format `w` as a CL-style printed value.
+/// Format `w` as a CL-style printed value (readable / `prin1`-style):
+/// strings get wrapped in `"..."`, characters as `#\X`. This is the
+/// form used by the REPL and by the `~S` directive of `format`.
 pub fn format_word(w: Word) -> String {
     let mut out = String::new();
-    write_word(&mut out, w);
+    write_word(&mut out, w, /*readable*/ true);
     out
 }
 
-fn write_word(out: &mut String, w: Word) {
+/// Format `w` in aesthetic style (`princ`-style): strings without
+/// quotes, characters as the bare codepoint. Used by `~A` and by
+/// any printing path that wants display formatting rather than
+/// reader-roundtrippable formatting.
+pub fn format_word_aesthetic(w: Word) -> String {
+    let mut out = String::new();
+    write_word(&mut out, w, /*readable*/ false);
+    out
+}
+
+fn write_word(out: &mut String, w: Word, readable: bool) {
     if w.is_nil() {
         out.push_str("nil");
         return;
@@ -30,10 +42,12 @@ fn write_word(out: &mut String, w: Word) {
     }
     match w.tag() {
         Tag::Fixnum => out.push_str(&w.as_fixnum().unwrap().to_string()),
-        Tag::Cons => write_list(out, w),
+        Tag::Cons => write_list(out, w, readable),
         Tag::Immediate => {
             if let Some(c) = w.as_char() {
-                out.push_str("#\\");
+                if readable {
+                    out.push_str("#\\");
+                }
                 out.push(c);
             } else {
                 out.push_str(&format!("<imm {:#x}>", w.raw()));
@@ -46,41 +60,46 @@ fn write_word(out: &mut String, w: Word) {
         },
         Tag::Vector => out.push_str("<vector>"),
         Tag::Function => out.push_str("<function>"),
-        Tag::String => write_string(out, w),
+        Tag::String => write_string(out, w, readable),
     }
 }
 
-/// Print a string in CL's escaped form — wrapped in double-quotes,
-/// with `\` and `"` escaped. Other characters (including control
-/// chars and Unicode) pass through unchanged.
-fn write_string(out: &mut String, w: Word) {
-    out.push('"');
-    for c in crate::gc_string::chars_of(w) {
-        if c == '"' || c == '\\' {
-            out.push('\\');
+/// Print a string. Readable form wraps in `"..."` with `\` and `"`
+/// escaped; aesthetic form emits the raw characters.
+fn write_string(out: &mut String, w: Word, readable: bool) {
+    if readable {
+        out.push('"');
+        for c in crate::gc_string::chars_of(w) {
+            if c == '"' || c == '\\' {
+                out.push('\\');
+            }
+            out.push(c);
         }
-        out.push(c);
+        out.push('"');
+    } else {
+        for c in crate::gc_string::chars_of(w) {
+            out.push(c);
+        }
     }
-    out.push('"');
 }
 
 /// Print a cons cell as a CL list: `(a b c)` if proper, `(a b . c)`
 /// if dotted at the end.
-fn write_list(out: &mut String, head: Word) {
+fn write_list(out: &mut String, head: Word, readable: bool) {
     out.push('(');
     let mut cur = head;
     loop {
         let p = cur.as_ptr::<u64>(Tag::Cons).expect("cons");
         let car = Word::from_raw(unsafe { *p });
         let cdr = Word::from_raw(unsafe { *p.add(1) });
-        write_word(out, car);
+        write_word(out, car, readable);
         if cdr.is_nil() {
             out.push(')');
             return;
         }
         if !cdr.is_cons() {
             out.push_str(" . ");
-            write_word(out, cdr);
+            write_word(out, cdr, readable);
             out.push(')');
             return;
         }
