@@ -24,7 +24,9 @@ use inkwell::module::{Linkage, Module};
 use inkwell::values::{FunctionValue, IntValue};
 
 use ncl_ir::Expr;
-use ncl_runtime::{ncl_alloc_cons, ncl_call, MutatorState, Tag, Word};
+use ncl_runtime::{
+    ncl_alloc_cons, ncl_call, ncl_load_value, ncl_store_value, MutatorState, Tag, Word,
+};
 
 // We leak each compilation's Context + Module + Engine so the
 // JIT'd code stays valid for the process lifetime. A real loader
@@ -177,6 +179,8 @@ fn build_lisp_function(body: &Expr, arity: u32) -> Result<usize, String> {
 struct Helpers<'ctx> {
     alloc_cons: FunctionValue<'ctx>,
     call_fn: FunctionValue<'ctx>,
+    load_value: FunctionValue<'ctx>,
+    store_value: FunctionValue<'ctx>,
 }
 
 fn declare_runtime_helpers<'ctx>(
@@ -201,7 +205,24 @@ fn declare_runtime_helpers<'ctx>(
     );
     let call_fn = module.add_function("ncl_call", call_type, Some(Linkage::External));
 
-    Helpers { alloc_cons, call_fn }
+    // ncl_load_value(sym_word) -> u64
+    let load_value_type = i64_t.fn_type(&[i64_t.into()], false);
+    let load_value = module.add_function(
+        "ncl_load_value",
+        load_value_type,
+        Some(Linkage::External),
+    );
+
+    // ncl_store_value(mutator, sym_word, new_value) -> u64
+    let store_value_type =
+        i64_t.fn_type(&[ptr_t.into(), i64_t.into(), i64_t.into()], false);
+    let store_value = module.add_function(
+        "ncl_store_value",
+        store_value_type,
+        Some(Linkage::External),
+    );
+
+    Helpers { alloc_cons, call_fn, load_value, store_value }
 }
 
 fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>) {
@@ -212,6 +233,14 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(
         &helpers.call_fn,
         ncl_call as *const () as usize,
+    );
+    engine.add_global_mapping(
+        &helpers.load_value,
+        ncl_load_value as *const () as usize,
+    );
+    engine.add_global_mapping(
+        &helpers.store_value,
+        ncl_store_value as *const () as usize,
     );
 }
 
@@ -504,6 +533,27 @@ fn emit_expr<'ctx>(
                 .map_err(|e| format!("phi: {e}"))?;
             phi.add_incoming(&[(&then_val, then_end), (&else_val, else_end)]);
             Ok(phi.as_basic_value().into_int_value())
+        }
+        Expr::LoadGlobal(sym_word) => {
+            let sym_const = i64_t.const_int(*sym_word, false);
+            let call = builder
+                .build_call(helpers.load_value, &[sym_const.into()], "load_value")
+                .map_err(|e| format!("build_call load_value: {e}"))?;
+            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+        }
+        Expr::StoreGlobal { sym_word, value } => {
+            let val =
+                emit_expr(context, builder, function, helpers, arity, locals, value)?;
+            let mutator_arg = function.get_nth_param(0).unwrap();
+            let sym_const = i64_t.const_int(*sym_word, false);
+            let call = builder
+                .build_call(
+                    helpers.store_value,
+                    &[mutator_arg.into(), sym_const.into(), val.into()],
+                    "store_value",
+                )
+                .map_err(|e| format!("build_call store_value: {e}"))?;
+            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
         }
         Expr::Call { sym_word, args } => {
             // Evaluate each argument first.

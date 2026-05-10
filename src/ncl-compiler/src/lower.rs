@@ -113,7 +113,9 @@ fn lower_in_mut(
         Value::Fixnum(n) => Ok(Expr::Const(*n)),
         Value::Nil => Ok(Expr::Nil),
         Value::Symbol(s) => {
-            // Local first (param or let-bound), then T.
+            // Local first (param or let-bound), then T, then global
+            // value-cell load. The load itself is done at runtime
+            // via ncl_load_value, which panics on unbound.
             if let Some(b) = env.find(&s.name) {
                 Ok(match b {
                     Binding::Param(i) => Expr::Param(i),
@@ -122,10 +124,8 @@ fn lower_in_mut(
             } else if &*s.name == "T" {
                 Ok(Expr::True)
             } else {
-                Err(CompileError::NotImplemented(format!(
-                    "global value reference: {}",
-                    s.name
-                )))
+                let sym_word = coord.intern(&s.name);
+                Ok(Expr::load_global(sym_word.raw()))
             }
         }
         Value::Cons(_) => lower_call_in_mut(v, env, coord),
@@ -224,6 +224,16 @@ fn lower_call_in_mut(
             }
             Ok(result)
         }
+        // (setq name value)  — assign the value cell of `name`. CL
+        // also allows (setq a 1 b 2 …) for parallel assignments;
+        // v1 supports the binary form only.
+        "SETQ" => lower_setq(&head_name, args, env, coord),
+        // (defparameter name value [doc])
+        // (defvar name value [doc])
+        // For v1 both behave like setq — they install/replace the
+        // value cell and ignore the optional doc string. The
+        // distinction (defvar only sets if unbound) lands later.
+        "DEFPARAMETER" | "DEFVAR" => lower_defparameter(&head_name, args, env, coord),
         "EQ" => {
             if args.len() != 2 {
                 return Err(CompileError::BadArity {
@@ -522,6 +532,69 @@ fn lower_cond(
     };
     let rest = lower_cond(&clauses[1..], env, coord)?;
     Ok(Expr::if_(test, body, rest))
+}
+
+fn lower_setq(
+    head: &str,
+    args: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
+    if args.len() != 2 {
+        return Err(CompileError::BadArity {
+            head: head.to_string(),
+            expected: "2",
+            got: args.len(),
+        });
+    }
+    let name = match &args[0] {
+        Value::Symbol(s) => Arc::clone(&s.name),
+        other => {
+            return Err(CompileError::NotImplemented(format!(
+                "setq's first argument must be a symbol, got {other:?}"
+            )));
+        }
+    };
+    // `setq` of a local binding is "lexical assignment" — assigning
+    // to a let or function parameter. Without mutable locals (yet),
+    // this is rejected. The common case in early code is global
+    // assignment; anything that wants local mutation can defer.
+    if env.find(&name).is_some() {
+        return Err(CompileError::NotImplemented(format!(
+            "setq of a local binding: {name} (mutable locals not yet supported)"
+        )));
+    }
+    let sym_word = coord.intern(&name);
+    let value = lower_in_mut(&args[1], env, coord)?;
+    Ok(Expr::store_global(sym_word.raw(), value))
+}
+
+fn lower_defparameter(
+    head: &str,
+    args: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
+    // (defparameter name value [doc])  — doc string is optional and
+    // ignored in v1.
+    if args.len() < 2 || args.len() > 3 {
+        return Err(CompileError::BadArity {
+            head: head.to_string(),
+            expected: "2 or 3",
+            got: args.len(),
+        });
+    }
+    let name = match &args[0] {
+        Value::Symbol(s) => Arc::clone(&s.name),
+        other => {
+            return Err(CompileError::NotImplemented(format!(
+                "{head}'s first argument must be a symbol, got {other:?}"
+            )));
+        }
+    };
+    let sym_word = coord.intern(&name);
+    let value = lower_in_mut(&args[1], env, coord)?;
+    Ok(Expr::store_global(sym_word.raw(), value))
 }
 
 fn binary_op(

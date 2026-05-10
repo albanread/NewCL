@@ -508,6 +508,114 @@ mod end_to_end_tests {
         assert_eq!(eval_str("(let ((x 5)))").unwrap(), "nil");
     }
 
+    // -- defparameter / setq / global value cells --------------------------
+
+    #[test]
+    fn defparameter_then_read() {
+        let mut session = Session::new();
+        session.eval("(defparameter *foo* 42)").unwrap();
+        assert_eq!(session.eval("*foo*").unwrap(), "42");
+    }
+
+    #[test]
+    fn defparameter_returns_value() {
+        // Like setq, defparameter returns the assigned value.
+        assert_eq!(eval_str("(defparameter *x* 99)").unwrap(), "99");
+    }
+
+    #[test]
+    fn defparameter_overrides_existing() {
+        let result = eval_str(
+            "(defparameter *foo* 1)
+             (defparameter *foo* 99)
+             *foo*",
+        )
+        .unwrap();
+        assert_eq!(result, "99");
+    }
+
+    #[test]
+    fn setq_assigns() {
+        let result = eval_str(
+            "(defparameter *x* 1)
+             (setq *x* 100)
+             *x*",
+        )
+        .unwrap();
+        assert_eq!(result, "100");
+    }
+
+    #[test]
+    fn setq_returns_assigned_value() {
+        let mut session = Session::new();
+        session.eval("(defparameter *x* 0)").unwrap();
+        assert_eq!(session.eval("(setq *x* 42)").unwrap(), "42");
+    }
+
+    #[test]
+    fn function_can_modify_global_via_setq() {
+        let result = eval_str(
+            "(defparameter *counter* 0)
+             (defun bump () (setq *counter* (+ *counter* 1)))
+             (bump) (bump) (bump)
+             *counter*",
+        )
+        .unwrap();
+        assert_eq!(result, "3");
+    }
+
+    #[test]
+    fn global_value_visible_inside_function() {
+        let result = eval_str(
+            "(defparameter *base* 10)
+             (defun add-base (x) (+ x *base*))
+             (add-base 7)",
+        )
+        .unwrap();
+        assert_eq!(result, "17");
+    }
+
+    #[test]
+    fn local_shadows_global() {
+        let result = eval_str(
+            "(defparameter *x* 100)
+             (defun f (x) x)
+             (f 7)",
+        )
+        .unwrap();
+        assert_eq!(result, "7");
+    }
+
+    #[test]
+    fn let_local_shadows_global() {
+        let result = eval_str(
+            "(defparameter *x* 100)
+             (let ((*x* 5)) *x*)",
+        )
+        .unwrap();
+        assert_eq!(result, "5");
+    }
+
+    #[test]
+    fn setq_of_local_errors() {
+        // Mutable locals not yet supported.
+        let r = eval_str(
+            "(defun f (x) (setq x 99) x)
+             (f 1)",
+        );
+        assert!(matches!(r, Err(EvalError::Compile(CompileError::NotImplemented(_)))));
+    }
+
+    #[test]
+    fn quoted_symbol_with_setq() {
+        // (setq 'foo 1) should be an error — first arg must be an
+        // unquoted symbol literal. But our reader produces `'foo`
+        // as `(quote foo)` which is a Cons, not a Symbol — so
+        // setq's symbol-check fails with NotImplemented.
+        let r = eval_str("(setq 'foo 1)");
+        assert!(matches!(r, Err(EvalError::Compile(CompileError::NotImplemented(_)))));
+    }
+
     // -- list, quoted symbols, quoted lists --------------------------------
 
     #[test]
@@ -843,11 +951,10 @@ mod end_to_end_tests {
         assert!(matches!(r, Err(EvalError::Compile(CompileError::BadDefun(_)))));
     }
 
-    #[test]
-    fn bare_unknown_symbol_in_body_compiles_but_calls_undefined() {
-        // Lowering an unknown symbol in expression position fails
-        // with NotImplemented (we don't have value cells yet).
-        let r = eval_str("foo");
-        assert!(matches!(r, Err(EvalError::Compile(CompileError::NotImplemented(_)))));
-    }
+    // (Previous "bare unknown symbol fails to compile" test removed
+    // — bare globals now lower to LoadGlobal, which panics at
+    // runtime when unbound. The panic crosses an FFI boundary and
+    // is messy to catch from a unit test, so the behaviour is
+    // documented in the commit log instead. Real condition handling
+    // arrives later.)
 }

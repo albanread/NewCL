@@ -48,6 +48,40 @@ pub extern "C" fn ncl_cdr(cons: u64) -> u64 {
     unsafe { *p.add(1) }
 }
 
+/// Load a global symbol's value cell with acquire semantics.
+/// JIT'd code calls this when it reads a bare symbol that wasn't
+/// resolved to a local at compile time. Panics on unbound — the
+/// condition system that should turn this into a proper Lisp
+/// error lands later.
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_load_value(sym_word: u64) -> u64 {
+    let sym = Word::from_raw(sym_word);
+    let value = crate::gc_symbol::value_acquire(sym);
+    if value.is_unbound() {
+        let name = crate::sym_names::lookup(sym_word)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{sym_word:#x}"));
+        panic!("unbound variable: {name}");
+    }
+    value.raw()
+}
+
+/// Store a value into a global symbol's value cell with release
+/// semantics. JIT'd `(setq …)` and `(defparameter …)` lower to a
+/// call here. Returns the stored value (CL's `setq` returns the
+/// last value assigned).
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_store_value(
+    mutator: *mut crate::mutator::MutatorState,
+    sym_word: u64,
+    new_value: u64,
+) -> u64 {
+    let m = unsafe { &mut *mutator };
+    let sym = Word::from_raw(sym_word);
+    m.set_symbol_value(sym, Word::from_raw(new_value));
+    new_value
+}
+
 /// Dispatch a function call through a Symbol's function cell.
 /// JIT'd `(name arg1 arg2 ...)` lowers to a call here.
 ///

@@ -82,6 +82,14 @@ pub enum Expr {
     /// addressing the symbol in static memory; the call dispatches
     /// through `ncl_call` which atomically loads the function cell.
     Call { sym_word: u64, args: Vec<Expr> },
+    /// Read a Symbol's value cell (acquire). Used for global
+    /// variable references like `*counter*` after a `defparameter`
+    /// or `setq`.
+    LoadGlobal(u64),
+    /// Atomically store a value into a Symbol's value cell
+    /// (release). The lowered form of `(setq name value)` and
+    /// `(defparameter name value)`.
+    StoreGlobal { sym_word: u64, value: Box<Expr> },
 }
 
 impl Expr {
@@ -106,6 +114,10 @@ impl Expr {
     }
     pub fn call(sym_word: u64, args: Vec<Expr>) -> Expr {
         Expr::Call { sym_word, args }
+    }
+    pub fn load_global(sym_word: u64) -> Expr { Expr::LoadGlobal(sym_word) }
+    pub fn store_global(sym_word: u64, value: Expr) -> Expr {
+        Expr::StoreGlobal { sym_word, value: Box::new(value) }
     }
     pub fn param(idx: usize) -> Expr { Expr::Param(idx) }
     pub fn local(idx: usize) -> Expr { Expr::Local(idx) }
