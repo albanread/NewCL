@@ -1253,6 +1253,50 @@ pub extern "C-unwind" fn multiple_value_list_of_shim(
 }
 
 // ───────────────────────────────────────────────────────────────────
+// Hash function — bit-mix on a Word's raw bits.
+//
+// The Lisp hash-table layer is built on top of Vectors and cons
+// cells (see core.lisp). The only piece that genuinely has to be
+// in Rust is a fast hash that takes a Word and produces a
+// non-negative fixnum the bucket index calculation can mod.
+//
+// For the EQ / EQL cases (the only ones Closette and the GUI
+// demos actually need), hashing the raw bits is correct because
+// two values that are EQ have identical Word bits. Symbols are
+// interned (so equal-named ones share a Word), fixnums and chars
+// are immediate, T/NIL are unique.
+//
+// EQUAL hash tables on strings and conses would need a
+// content-hash; that's deferred until something needs it.
+// ───────────────────────────────────────────────────────────────────
+
+/// `(%word-hash w)` — return a non-negative fixnum hash of the
+/// raw Word bits. Uses a SplitMix64-style finaliser; one shift +
+/// two multiplies. Caller mods by bucket count.
+pub extern "C-unwind" fn word_hash_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("%word-hash: expected 1 arg, got {n_args}");
+    }
+    let w = unsafe { *args };
+    // SplitMix64 finaliser.
+    let mut h = w.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^= h >> 31;
+    // Fixnums are 61 bits signed; mask to 60 bits to guarantee a
+    // non-negative result that fits.
+    let positive = (h & ((1u64 << 60) - 1)) as i64;
+    Word::fixnum(positive).raw()
+}
+
+// ───────────────────────────────────────────────────────────────────
 // Vectors — make-array, vector, aref, svref, (setf aref).
 //
 // CL's `make-array` is heavily overloaded (multidimensional, fill

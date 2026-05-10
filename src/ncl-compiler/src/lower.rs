@@ -1102,6 +1102,23 @@ fn lower_setf(
             let ch = lower_in_mut(value_form, env, coord)?;
             Ok(Expr::set_char(s, idx, ch))
         }
+        "GETHASH" => {
+            if place_args.len() != 2 {
+                return Err(CompileError::BadArity {
+                    head: format!("setf {place_head}"),
+                    expected: "(gethash key ht)",
+                    got: place_args.len(),
+                });
+            }
+            // (setf (gethash KEY HT) VAL) → (%hash-set HT KEY VAL).
+            // The Lisp-side %hash-set lives in core.lisp on top of
+            // make-array + cons cells.
+            let key = lower_in_mut(&place_args[0], env, coord)?;
+            let ht = lower_in_mut(&place_args[1], env, coord)?;
+            let val = lower_in_mut(value_form, env, coord)?;
+            let sym = coord.intern("%HASH-SET");
+            Ok(Expr::call(sym.raw(), vec![ht, key, val]))
+        }
         other => Err(CompileError::NotImplemented(format!(
             "setf place not yet supported: ({other} ...)"
         ))),

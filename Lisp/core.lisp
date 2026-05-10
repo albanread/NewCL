@@ -284,6 +284,177 @@
 ;; passed to error — typically a string. Conditions as typed
 ;; objects with class hierarchies wait on CLOS.
 
+;; -- Hash tables -------------------------------------------------------------
+;;
+;; A hash table is a Vector laid out as:
+;;   slot 0 — test symbol (one of EQ / EQL / EQUAL)
+;;   slot 1 — current count of entries (fixnum, mutable via setf-svref)
+;;   slot 2..N+1 — N buckets, each a list of (key . value) cons cells
+;;
+;; Closette and the GUI demos only need EQ / EQL tables, so we
+;; don't yet content-hash for EQUAL (the bit-mix in %word-hash
+;; gives different strings of equal contents different bucket
+;; indices). EQUAL is tracked as the test for completeness so
+;; callers can opt in once content-hash lands.
+;;
+;; The whole structure lives on the GC heap (vector + cons cells),
+;; so old-to-young pointer marking and the ordinary trace pass take
+;; care of survival across GC.
+
+(defun make-hash-table (&key (test 'eql) (size 16))
+  "Allocate a new hash table. TEST is one of EQ, EQL, or EQUAL
+   (defaults to EQL). SIZE is the initial bucket count (defaults
+   to 16). Returns the table."
+  (let* ((nbuckets (max size 4))
+         (v (make-array (+ nbuckets 2) :initial-element nil)))
+    (setf (svref v 0) test)
+    (setf (svref v 1) 0)
+    v))
+
+(defun %ht-test (ht) (svref ht 0))
+(defun %ht-count (ht) (svref ht 1))
+(defun %ht-bump-count (ht delta)
+  (setf (svref ht 1) (+ (svref ht 1) delta)))
+(defun %ht-nbuckets (ht) (- (length ht) 2))
+(defun %ht-bucket (ht i) (svref ht (+ i 2)))
+(defun %ht-set-bucket (ht i v) (setf (svref ht (+ i 2)) v))
+
+(defun %ht-bucket-index (ht key)
+  (mod (%word-hash key) (%ht-nbuckets ht)))
+
+(defun %ht-keys-match (test k1 k2)
+  "Compare K1 and K2 under TEST. EQUAL falls back to EQUAL on
+   conses/strings; EQL handles fixnums/chars/symbols/T/NIL same
+   as EQ in our current value set; EQ is identity."
+  (cond
+    ((eq test 'eq) (eq k1 k2))
+    ((eq test 'eql) (eql k1 k2))
+    ((eq test 'equal) (equal k1 k2))
+    (t (eql k1 k2))))
+
+(defun hash-table-count (ht)
+  "Return the number of key/value pairs currently in HT."
+  (%ht-count ht))
+
+(defun hash-table-test (ht)
+  "Return the test symbol HT was created with."
+  (%ht-test ht))
+
+(defun gethash (key ht &optional default)
+  "Look up KEY in HT. Returns the associated value, or DEFAULT
+   if none. Returns NIL as the secondary value when the key was
+   absent, T when it was found."
+  (let ((bucket (%ht-bucket ht (%ht-bucket-index ht key)))
+        (test (%ht-test ht))
+        (result default)
+        (found nil))
+    (loop
+      (cond
+        ((null bucket) (return nil))
+        (t (let ((pair (car bucket)))
+             (cond
+               ((%ht-keys-match test (car pair) key)
+                (setq result (cdr pair))
+                (setq found t)
+                (setq bucket nil))
+               (t (setq bucket (cdr bucket))))))))
+    (if found
+        (values result t)
+        (values default nil))))
+
+(defun %hash-set (ht key val)
+  "Insert or update KEY → VAL. Returns VAL. Used by
+   `(setf (gethash ...) ...)` lowering."
+  (let* ((bi (%ht-bucket-index ht key))
+         (bucket (%ht-bucket ht bi))
+         (test (%ht-test ht))
+         (cur bucket)
+         (done nil))
+    (loop
+      (cond
+        ((or done (null cur))
+         ;; Not found in walk — prepend a fresh pair to the
+         ;; bucket. Inserting at the head is O(1) and keeps the
+         ;; small-bucket hot path tight.
+         (cond
+           ((not done)
+            (%ht-set-bucket ht bi (cons (cons key val) bucket))
+            (%ht-bump-count ht 1)))
+         (return val))
+        (t (let ((pair (car cur)))
+             (cond
+               ((%ht-keys-match test (car pair) key)
+                (setf (cdr pair) val)
+                (setq done t))
+               (t (setq cur (cdr cur))))))))))
+
+(defun remhash (key ht)
+  "Remove KEY from HT. Returns T if it was present, NIL otherwise."
+  (let* ((bi (%ht-bucket-index ht key))
+         (bucket (%ht-bucket ht bi))
+         (test (%ht-test ht)))
+    ;; Two cases: head-of-bucket vs middle. Handle head first.
+    (cond
+      ((null bucket) nil)
+      ((%ht-keys-match test (car (car bucket)) key)
+       (%ht-set-bucket ht bi (cdr bucket))
+       (%ht-bump-count ht -1)
+       t)
+      (t
+       ;; Walk with prev/cur so we can splice cur out by setting
+       ;; (cdr prev) = (cdr cur).
+       (let ((prev bucket)
+             (cur (cdr bucket))
+             (found nil))
+         (loop
+           (cond
+             ((null cur) (return nil))
+             ((%ht-keys-match test (car (car cur)) key)
+              (setf (cdr prev) (cdr cur))
+              (%ht-bump-count ht -1)
+              (setq found t)
+              (setq cur nil))
+             (t (setq prev cur)
+                (setq cur (cdr cur)))))
+         found)))))
+
+(defun clrhash (ht)
+  "Empty HT. Returns HT."
+  (let ((i 0)
+        (n (%ht-nbuckets ht)))
+    (loop
+      (cond
+        ((>= i n) (return nil))
+        (t (%ht-set-bucket ht i nil)
+           (setq i (+ i 1)))))
+    (setf (svref ht 1) 0)
+    ht))
+
+(defun maphash (fn ht)
+  "Call FN with each key and value of HT. Returns NIL.
+
+   Implementation note: a single flat loop, deliberately. The
+   compiler's closure-capture path only walks one parent, so a
+   lambda inside two nested loops can't see FN — `loop` is a
+   macro that wraps its body in a thunk, and (loop (loop body))
+   asks for two levels of capture. Folding bucket-walk and
+   within-bucket-walk into one loop sidesteps that. Lift the
+   restriction once the compiler grows multi-level capture."
+  (let ((bi 0)
+        (n (%ht-nbuckets ht))
+        (bucket nil))
+    (loop
+      (cond
+        ;; Bucket exhausted (or never started) — advance the
+        ;; bucket index and refill, or finish if no more.
+        ((null bucket)
+         (cond
+           ((>= bi n) (return nil))
+           (t (setq bucket (%ht-bucket ht bi))
+              (setq bi (+ bi 1)))))
+        (t (funcall fn (car (car bucket)) (cdr (car bucket)))
+           (setq bucket (cdr bucket)))))))
+
 (defmacro multiple-value-list (form)
   "Evaluate FORM and return a fresh list of all the values it
    produced. If FORM returned a single value, the list has one

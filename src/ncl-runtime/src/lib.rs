@@ -41,7 +41,7 @@ pub use abi::{
     ncl_make_closure, ncl_set_car,
     ncl_set_cdr, ncl_set_mv_many, ncl_set_mv_single, ncl_store_value,
     ncl_string_char, ncl_string_eq, ncl_string_set,
-    vector_shim,
+    vector_shim, word_hash_shim,
     open_append_file_shim, open_input_file_shim, open_output_file_shim,
     read_char_from_shim, read_line_shim, typep_shim, write_string_to_shim,
     NclCondition,
