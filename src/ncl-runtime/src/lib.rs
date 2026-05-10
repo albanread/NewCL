@@ -17,6 +17,8 @@ pub mod gc_function;
 pub mod gc_string;
 pub mod gc_symbol;
 pub mod heap;
+#[cfg(windows)]
+pub mod igui;
 pub mod mutator;
 pub mod printer;
 pub mod stack_map;
