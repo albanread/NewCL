@@ -17,8 +17,10 @@ use ncl_runtime::{
 };
 
 pub mod lower;
+pub mod macroexpand;
 
 pub use lower::{lower, lower_in, CompileError, LocalEnv};
+pub use macroexpand::{macroexpand_all, value_to_word, word_to_value};
 
 /// A NewCormanLisp evaluation session. Owns the GC coordinator and
 /// a single Lisp-thread mutator. defun'd functions persist across
@@ -62,15 +64,42 @@ impl Session {
     }
 
     /// Evaluate a single Value and return the resulting Word.
-    /// Recognises `(defun …)` at top level; everything else goes
-    /// through lower → JIT → call.
+    /// First macroexpands; then recognises `(defun …)` and
+    /// `(defmacro …)` at top level; everything else goes through
+    /// lower → JIT → call.
     pub fn eval_value(&mut self, v: &Value) -> Result<Word, EvalError> {
+        // Defmacro is recognised BEFORE macroexpansion: the body
+        // shouldn't be expanded against the (yet-to-be-installed)
+        // macro itself, and we want the body's *internal* macros
+        // expanded normally during compilation. Same convention
+        // as defun.
+        if let Some((name, params, body_forms)) = match_defmacro(v)? {
+            return self.handle_defmacro(&name, &params, &body_forms);
+        }
         if let Some((name, params, body_forms)) = match_defun(v)? {
             return self.handle_defun(&name, &params, &body_forms);
         }
-        let expr = lower(v, &self.coord).map_err(EvalError::Compile)?;
+        // Otherwise: macroexpand fully, then compile.
+        let expanded = macroexpand_all(v, &self.coord, &mut self.mutator)?;
+        let expr = lower(&expanded, &self.coord).map_err(EvalError::Compile)?;
         let mutator_ptr = &mut *self.mutator as *mut _;
         ncl_llvm::jit_eval(&expr, mutator_ptr).map_err(EvalError::Jit)
+    }
+
+    fn handle_defmacro(
+        &mut self,
+        name: &str,
+        params: &ParamSpec,
+        body_forms: &[Value],
+    ) -> Result<Word, EvalError> {
+        // Macros and defun'd functions are compiled the same way:
+        // they're both Lisp functions with the standard JIT
+        // calling convention. The only difference is where they're
+        // installed — macros into the coordinator's macro registry,
+        // defuns into the symbol's function cell.
+        let fn_word = self.compile_function(name, params, body_forms)?;
+        self.coord.install_macro(Arc::from(name), fn_word);
+        Ok(Word::NIL)
     }
 
     fn handle_defun(
@@ -79,14 +108,38 @@ impl Session {
         params: &ParamSpec,
         body_forms: &[Value],
     ) -> Result<Word, EvalError> {
+        let fn_word = self.compile_function(name, params, body_forms)?;
+        let sym_word = self.coord.intern(name);
+        self.mutator.set_symbol_function(sym_word, fn_word);
+        Ok(Word::NIL)
+    }
+
+    /// Shared lowering+JIT path for `defun` and `defmacro`. Returns
+    /// a Function-tagged Word; the caller decides where to install
+    /// it (function cell or macro registry).
+    ///
+    /// Body forms are macroexpanded against the current macro
+    /// registry before lowering. The rest parameter, if any, is
+    /// handled identically to a let-local — boxed if the mutation
+    /// analysis sees a setq/setf of it.
+    fn compile_function(
+        &mut self,
+        name: &str,
+        params: &ParamSpec,
+        body_forms: &[Value],
+    ) -> Result<Word, EvalError> {
+        // First, expand any macros used in the body.
+        let mut expanded_body: Vec<Value> = Vec::with_capacity(body_forms.len());
+        for form in body_forms {
+            expanded_body.push(macroexpand_all(form, &self.coord, &mut self.mutator)?);
+        }
+
         // Build the env. Required params at Param(0..N); the rest
-        // binding (if any) is a let-style local at Local(0). Whether
-        // the rest binding is boxed depends on whether the body
-        // mutates it — the same analysis we do for let.
+        // binding (if any) is a let-style local at Local(0).
         let mut env = LocalEnv::with_params(&params.required);
         let rest_is_mutated = if let Some(rest_name) = &params.rest {
             let body_mutations = lower::mutated_in_body(
-                body_forms,
+                &expanded_body,
                 &std::collections::HashSet::new(),
             );
             let m = body_mutations.contains(rest_name);
@@ -101,11 +154,11 @@ impl Session {
         };
 
         // Implicit progn over body forms.
-        let lowered_body = if body_forms.len() == 1 {
-            lower_in(&body_forms[0], &env, &self.coord)
+        let lowered_body = if expanded_body.len() == 1 {
+            lower_in(&expanded_body[0], &env, &self.coord)
                 .map_err(EvalError::Compile)?
         } else {
-            let lowered: Result<Vec<_>, _> = body_forms
+            let lowered: Result<Vec<_>, _> = expanded_body
                 .iter()
                 .map(|f| lower_in(f, &env, &self.coord))
                 .collect();
@@ -130,16 +183,14 @@ impl Session {
         let code_ptr = ncl_llvm::jit_compile_function(arity, &body_expr)
             .map_err(EvalError::Jit)?;
         let sym_word = self.coord.intern(name);
-        let fn_word = gc_function::alloc_function_in_static(
+        gc_function::alloc_function_in_static(
             self.coord.static_area(),
             code_ptr,
             arity,
             sym_word,
-            Word::NIL, // defun'd functions have no closure env
+            Word::NIL, // top-level functions and macros have no closure env
         )
-        .ok_or_else(|| EvalError::Jit("static area exhausted".to_string()))?;
-        self.mutator.set_symbol_function(sym_word, fn_word);
-        Ok(Word::NIL)
+        .ok_or_else(|| EvalError::Jit("static area exhausted".to_string()))
     }
 }
 
@@ -209,9 +260,26 @@ impl Session {
 fn match_defun(
     v: &Value,
 ) -> Result<Option<(String, ParamSpec, Vec<Value>)>, EvalError> {
+    match_defun_like(v, "DEFUN")
+}
+
+/// Recognise `(defmacro name (params...) body...)`. Same shape as
+/// defun; the body is compiled the same way but installed in the
+/// coordinator's macro registry rather than the symbol's function
+/// cell.
+fn match_defmacro(
+    v: &Value,
+) -> Result<Option<(String, ParamSpec, Vec<Value>)>, EvalError> {
+    match_defun_like(v, "DEFMACRO")
+}
+
+fn match_defun_like(
+    v: &Value,
+    head_name: &str,
+) -> Result<Option<(String, ParamSpec, Vec<Value>)>, EvalError> {
     let Value::Cons(c) = v else { return Ok(None); };
     let Value::Symbol(head) = &c.car else { return Ok(None); };
-    if &*head.name != "DEFUN" {
+    if &*head.name != head_name {
         return Ok(None);
     }
     let args = list_to_vec_of_value(&c.cdr).map_err(|e| {
@@ -219,7 +287,8 @@ fn match_defun(
     })?;
     if args.len() < 3 {
         return Err(EvalError::Compile(CompileError::BadDefun(format!(
-            "defun needs name, params, and body — got {} args",
+            "{} needs name, params, and body — got {} args",
+            head_name.to_lowercase(),
             args.len()
         ))));
     }
@@ -227,7 +296,8 @@ fn match_defun(
         Value::Symbol(s) => s.name.to_string(),
         other => {
             return Err(EvalError::Compile(CompileError::BadDefun(format!(
-                "defun name must be a symbol, got {other:?}"
+                "{} name must be a symbol, got {other:?}",
+                head_name.to_lowercase()
             ))));
         }
     };
@@ -1873,6 +1943,145 @@ mod end_to_end_tests {
         // &rest followed by multiple names.
         let r = eval_str("(defun f (a &rest r s) a)");
         assert!(r.is_err());
+    }
+
+    // -- defmacro / macros -----------------------------------------------
+
+    #[test]
+    fn defmacro_returns_nil() {
+        let mut s = Session::new();
+        // Defining a macro is a side-effecting form; it returns nil.
+        assert_eq!(
+            s.eval("(defmacro my-id (x) x)").unwrap(),
+            "nil",
+        );
+    }
+
+    #[test]
+    fn macro_simplest_passthrough() {
+        // The macro body returns its argument unchanged. Calling
+        // (my-id 42) expands to 42.
+        let mut s = Session::new();
+        s.eval("(defmacro my-id (x) x)").unwrap();
+        assert_eq!(s.eval("(my-id 42)").unwrap(), "42");
+        // The arg is the literal form, so quoted forms work too.
+        assert_eq!(s.eval("(my-id (+ 1 2))").unwrap(), "3");
+    }
+
+    #[test]
+    fn macro_constructs_form_with_list() {
+        // (my-when test body) → (if test body nil), built with list
+        // and quote (no backquote yet).
+        let mut s = Session::new();
+        s.eval(
+            "(defmacro my-when (test body) \
+               (list 'if test body 'nil))",
+        )
+        .unwrap();
+        assert_eq!(s.eval("(my-when t 5)").unwrap(), "5");
+        assert_eq!(s.eval("(my-when nil 5)").unwrap(), "nil");
+        // The arg forms are unevaluated until the expansion runs.
+        assert_eq!(s.eval("(my-when (> 3 2) (+ 10 20))").unwrap(), "30");
+    }
+
+    #[test]
+    fn macro_expansion_runs_at_compile_time() {
+        // The macro body uses (list 'quote x) to embed a literal
+        // form into the expansion. The expansion only runs the
+        // outer form, not the embedded literal.
+        let mut s = Session::new();
+        s.eval(
+            "(defmacro literal (x) \
+               (list 'quote x))",
+        )
+        .unwrap();
+        // (literal foo) → 'foo → the symbol FOO.
+        assert_eq!(s.eval("(literal foo)").unwrap(), "FOO");
+        assert_eq!(s.eval("(literal (1 2 3))").unwrap(), "(1 2 3)");
+    }
+
+    #[test]
+    fn macro_with_rest_args() {
+        // &rest in a macro captures all the remaining arg forms.
+        // Build (progn arg1 arg2 ...) — return the last one's value.
+        let mut s = Session::new();
+        s.eval(
+            "(defmacro my-progn (&rest forms) \
+               (cons 'progn forms))",
+        )
+        .unwrap();
+        assert_eq!(s.eval("(my-progn 1 2 3)").unwrap(), "3");
+        assert_eq!(s.eval("(my-progn (+ 1 1) (+ 2 2))").unwrap(), "4");
+    }
+
+    #[test]
+    fn macro_recursive_expansion() {
+        // A macro whose expansion contains another macro call —
+        // both get expanded.
+        let mut s = Session::new();
+        s.eval("(defmacro inc (x) (list '+ x 1))").unwrap();
+        s.eval("(defmacro double-inc (x) (list 'inc (list 'inc x)))").unwrap();
+        assert_eq!(s.eval("(double-inc 5)").unwrap(), "7");
+    }
+
+    #[test]
+    fn macro_inside_defun_body() {
+        // Macros used inside a defun's body get expanded at compile
+        // time — the defun stores the expanded code, not a runtime
+        // macro call.
+        let mut s = Session::new();
+        s.eval("(defmacro plus1 (x) (list '+ x 1))").unwrap();
+        s.eval("(defun bump (n) (plus1 n))").unwrap();
+        assert_eq!(s.eval("(bump 41)").unwrap(), "42");
+    }
+
+    #[test]
+    fn macro_in_let_body() {
+        let mut s = Session::new();
+        s.eval("(defmacro plus1 (x) (list '+ x 1))").unwrap();
+        assert_eq!(
+            s.eval("(let ((x 10)) (plus1 x))").unwrap(),
+            "11",
+        );
+    }
+
+    #[test]
+    fn macro_can_use_quote_in_expansion() {
+        let mut s = Session::new();
+        // Wraps the form in (quote ...).
+        s.eval(
+            "(defmacro literally (x) \
+               (cons 'quote (cons x nil)))",
+        )
+        .unwrap();
+        assert_eq!(s.eval("(literally hello)").unwrap(), "HELLO");
+        assert_eq!(s.eval("(literally (a b c))").unwrap(), "(A B C)");
+    }
+
+    #[test]
+    fn macro_redefinition_replaces() {
+        // A second defmacro with the same name installs a new
+        // expansion; subsequent calls use the new one. (Existing
+        // compiled code bound to the OLD expansion stays bound to
+        // the old expansion — that's CL semantics.)
+        let mut s = Session::new();
+        s.eval("(defmacro tag (x) (list 'list ''v1 x))").unwrap();
+        assert_eq!(s.eval("(tag 5)").unwrap(), "(V1 5)");
+        s.eval("(defmacro tag (x) (list 'list ''v2 x))").unwrap();
+        assert_eq!(s.eval("(tag 5)").unwrap(), "(V2 5)");
+    }
+
+    #[test]
+    fn quote_is_opaque_to_macroexpansion() {
+        // (when ...) is the WHEN special form (already a primitive).
+        // But if we redefine it as a macro and quote a (when ...)
+        // form, the quoted data should not get expanded.
+        let mut s = Session::new();
+        s.eval("(defmacro mine (x) (list '+ x 1))").unwrap();
+        // Inside quote, (mine 5) is just data — no expansion.
+        assert_eq!(s.eval("(quote (mine 5))").unwrap(), "(MINE 5)");
+        // Outside quote, it expands.
+        assert_eq!(s.eval("(mine 5)").unwrap(), "6");
     }
 
     // -- format ----------------------------------------------------------

@@ -98,6 +98,15 @@ pub struct GcCoordinator {
     /// by the compiler to look up stable symbol addresses for
     /// embedding in JIT'd code.
     intern_table: Mutex<HashMap<Arc<str>, u64>>,
+
+    /// Per-coordinator macro registry: macro-name → Function-tagged
+    /// Word. The compiler consults this during macroexpansion;
+    /// `defmacro` writes to it. Macros are install-and-replace, like
+    /// defun's symbol-function-cell — redefining a macro at the REPL
+    /// is allowed. The registry is OUTSIDE the symbol's function
+    /// cell so calling `(macro-name ...)` and `(funcall #'macro-name)`
+    /// can stay distinct (the latter would error per CL).
+    macros: Mutex<HashMap<Arc<str>, u64>>,
 }
 
 struct ParkState {
@@ -126,7 +135,26 @@ impl GcCoordinator {
             old_capacity,
             static_area,
             intern_table: Mutex::new(HashMap::new()),
+            macros: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Install (or replace) a macro by name. The Word must be a
+    /// Function-tagged value with the standard JIT calling
+    /// convention; the compiler will invoke it during expansion.
+    pub fn install_macro(&self, name: Arc<str>, fn_word: Word) {
+        self.macros.lock().unwrap().insert(name, fn_word.raw());
+    }
+
+    /// Look up a macro function by name. Returns the
+    /// Function-tagged Word, or None.
+    pub fn macro_for(&self, name: &str) -> Option<Word> {
+        self.macros
+            .lock()
+            .unwrap()
+            .get(name)
+            .copied()
+            .map(Word::from_raw)
     }
 
     /// Intern a symbol by name. Returns the same Symbol-tagged Word
