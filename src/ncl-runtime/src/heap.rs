@@ -109,6 +109,16 @@ pub enum HeapType {
     String = 3,
     FfiBlock = 4,
     Other = 5,
+    /// Arbitrary-precision integer. Layout under `bignum.rs`:
+    ///   cell 1: %BIGNUM marker symbol
+    ///   cell 2: sign (fixnum +1 or -1)
+    ///   cell 3: n_limbs (fixnum)
+    ///   cell 4: reserved (cached fixnum-equivalent / hash)
+    ///   cell 5..5+n_limbs: raw u64 limbs, little-endian
+    /// GC scans cells 0..=4 (header + boxed values), skips the
+    /// limb data — same shape as FfiBlock but with the bignum
+    /// marker for printer / typep recognition.
+    Bignum = 6,
 }
 
 impl HeapType {
@@ -120,6 +130,7 @@ impl HeapType {
             3 => Some(HeapType::String),
             4 => Some(HeapType::FfiBlock),
             5 => Some(HeapType::Other),
+            6 => Some(HeapType::Bignum),
             _ => None,
         }
     }

@@ -26,6 +26,7 @@ use inkwell::values::{FunctionValue, IntValue};
 
 use ncl_ir::Expr;
 use ncl_runtime::{
+    bignum::{ncl_add_promote, ncl_sub_promote, ncl_mul_promote, ncl_cmp_int},
     ncl_abort_pending, ncl_alloc_cons, ncl_apply, ncl_aref_generic, ncl_aset_generic,
     ncl_build_rest_list, ncl_call, ncl_equal, ncl_funcall,
     ncl_length, ncl_load_function, ncl_load_value, ncl_lookup_keyword,
@@ -225,6 +226,18 @@ struct Helpers<'ctx> {
     aref_generic: FunctionValue<'ctx>,
     aset_generic: FunctionValue<'ctx>,
     abort_pending: FunctionValue<'ctx>,
+    /// Bignum-aware arithmetic slow paths (called when the inline
+    /// fixnum overflow check fires or either operand is a bignum).
+    add_promote: FunctionValue<'ctx>,
+    sub_promote: FunctionValue<'ctx>,
+    mul_promote: FunctionValue<'ctx>,
+    /// Cross-type integer comparison. Returns -1, 0, or +1 (i64).
+    cmp_int: FunctionValue<'ctx>,
+    /// LLVM intrinsic for signed-add-with-overflow. Returns
+    /// {i64 result, i1 overflow}.
+    sadd_with_overflow: FunctionValue<'ctx>,
+    ssub_with_overflow: FunctionValue<'ctx>,
+    smul_with_overflow: FunctionValue<'ctx>,
 }
 
 fn declare_runtime_helpers<'ctx>(
@@ -429,6 +442,58 @@ fn declare_runtime_helpers<'ctx>(
         Some(Linkage::External),
     );
 
+    // ncl_add_promote / sub / mul / cmp_int — bignum-aware
+    // arithmetic slow paths. All take tagged-Word operands and
+    // return tagged-Word results.
+    let promote_type =
+        i64_t.fn_type(&[ptr_t.into(), i64_t.into(), i64_t.into()], false);
+    let add_promote = module.add_function(
+        "ncl_add_promote",
+        promote_type,
+        Some(Linkage::External),
+    );
+    let sub_promote = module.add_function(
+        "ncl_sub_promote",
+        promote_type,
+        Some(Linkage::External),
+    );
+    let mul_promote = module.add_function(
+        "ncl_mul_promote",
+        promote_type,
+        Some(Linkage::External),
+    );
+    let cmp_type = i64_t.fn_type(&[i64_t.into(), i64_t.into()], false);
+    let cmp_int = module.add_function(
+        "ncl_cmp_int",
+        cmp_type,
+        Some(Linkage::External),
+    );
+
+    // LLVM signed-arithmetic-with-overflow intrinsics.
+    // Return type is { i64 result, i1 overflow } via a struct.
+    let i1_t = context.bool_type();
+    let overflow_struct = context.struct_type(
+        &[i64_t.into(), i1_t.into()],
+        false,
+    );
+    let with_overflow_type =
+        overflow_struct.fn_type(&[i64_t.into(), i64_t.into()], false);
+    let sadd_with_overflow = module.add_function(
+        "llvm.sadd.with.overflow.i64",
+        with_overflow_type,
+        Some(Linkage::External),
+    );
+    let ssub_with_overflow = module.add_function(
+        "llvm.ssub.with.overflow.i64",
+        with_overflow_type,
+        Some(Linkage::External),
+    );
+    let smul_with_overflow = module.add_function(
+        "llvm.smul.with.overflow.i64",
+        with_overflow_type,
+        Some(Linkage::External),
+    );
+
     Helpers {
         alloc_cons,
         call_fn,
@@ -452,6 +517,13 @@ fn declare_runtime_helpers<'ctx>(
         aref_generic,
         aset_generic,
         abort_pending,
+        add_promote,
+        sub_promote,
+        mul_promote,
+        cmp_int,
+        sadd_with_overflow,
+        ssub_with_overflow,
+        smul_with_overflow,
     }
 }
 
@@ -478,6 +550,142 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(&helpers.aref_generic, ncl_aref_generic as *const () as usize);
     engine.add_global_mapping(&helpers.aset_generic, ncl_aset_generic as *const () as usize);
     engine.add_global_mapping(&helpers.abort_pending, ncl_abort_pending as *const () as usize);
+    engine.add_global_mapping(&helpers.add_promote, ncl_add_promote as *const () as usize);
+    engine.add_global_mapping(&helpers.sub_promote, ncl_sub_promote as *const () as usize);
+    engine.add_global_mapping(&helpers.mul_promote, ncl_mul_promote as *const () as usize);
+    engine.add_global_mapping(&helpers.cmp_int, ncl_cmp_int as *const () as usize);
+    // sadd/ssub/smul.with.overflow are LLVM intrinsics — no
+    // global mapping; LLVM resolves them itself.
+}
+
+/// Emit an overflow-checked arithmetic op (add/sub/mul) with a
+/// slow-path branch into the bignum promotion helper.
+///
+/// `fast_lhs` / `fast_rhs` are the inputs to the LLVM intrinsic
+/// (already shifted/untagged where the op needs it). `slow_lhs`
+/// / `slow_rhs` are the ORIGINAL tagged-Word operands passed to
+/// the slow-path helper if either side is a bignum or the
+/// intrinsic detected overflow. For add/sub the two pairs are
+/// identical; for mul, slow_rhs is the still-tagged rhs while
+/// fast_rhs is its untagged form.
+///
+/// Block layout:
+///
+///   entry → tag-check (both-fixnum?)
+///       ┌────────────────┴────────────────┐
+///       ↓ both-fixnum                     ↓ either bignum
+///   intrinsic_check                   slow_promote
+///       │                                  │
+///       ├──── overflow ────────────────────┤
+///       ↓ no overflow                      ↓
+///   fast_continue                      slow_continue
+///       └────────────── join ──────────────┘
+///                       ↓
+///                    phi (result)
+fn emit_overflow_op<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    fast_lhs: IntValue<'ctx>,
+    fast_rhs: IntValue<'ctx>,
+    slow_lhs: IntValue<'ctx>,
+    slow_rhs: IntValue<'ctx>,
+    intrinsic: FunctionValue<'ctx>,
+    promote_helper: FunctionValue<'ctx>,
+    op_name: &str,
+) -> Result<IntValue<'ctx>, String> {
+    let i64_t = context.i64_type();
+    let seven = i64_t.const_int(7, false);
+    let zero = i64_t.const_zero();
+
+    // Tag check: (slow_lhs | slow_rhs) & 7 == 0 iff both fixnums.
+    // We use slow_* (the original untouched operands) so the test
+    // is correct for the mul case where fast_rhs has been shifted.
+    let tag_or = builder
+        .build_or(slow_lhs, slow_rhs, &format!("{op_name}_tag_or"))
+        .map_err(|e| format!("or: {e}"))?;
+    let tag_bits = builder
+        .build_and(tag_or, seven, &format!("{op_name}_tag_bits"))
+        .map_err(|e| format!("and: {e}"))?;
+    let both_fixnum = builder
+        .build_int_compare(
+            inkwell::IntPredicate::EQ,
+            tag_bits,
+            zero,
+            &format!("{op_name}_both_fixnum"),
+        )
+        .map_err(|e| format!("icmp: {e}"))?;
+
+    let intrinsic_block =
+        context.append_basic_block(*function, &format!("{op_name}_check"));
+    let fast_block = context.append_basic_block(*function, &format!("{op_name}_fast"));
+    let slow_block = context.append_basic_block(*function, &format!("{op_name}_slow"));
+    let join_block = context.append_basic_block(*function, &format!("{op_name}_join"));
+
+    builder
+        .build_conditional_branch(both_fixnum, intrinsic_block, slow_block)
+        .map_err(|e| format!("tag-check br: {e}"))?;
+
+    // Intrinsic block: both operands are fixnums; do the inline
+    // checked op.
+    builder.position_at_end(intrinsic_block);
+    let call = builder
+        .build_call(
+            intrinsic,
+            &[fast_lhs.into(), fast_rhs.into()],
+            &format!("{op_name}_check"),
+        )
+        .map_err(|e| format!("call {op_name} intrinsic: {e}"))?;
+    let agg_struct = call.try_as_basic_value().unwrap_basic().into_struct_value();
+    let result_val = builder
+        .build_extract_value(agg_struct, 0, &format!("{op_name}_val"))
+        .map_err(|e| format!("extract {op_name} val: {e}"))?
+        .into_int_value();
+    let overflow_flag = builder
+        .build_extract_value(agg_struct, 1, &format!("{op_name}_oflow"))
+        .map_err(|e| format!("extract {op_name} oflow: {e}"))?
+        .into_int_value();
+    builder
+        .build_conditional_branch(overflow_flag, slow_block, fast_block)
+        .map_err(|e| format!("oflow br: {e}"))?;
+
+    // Fast-path block: branch straight to join.
+    builder.position_at_end(fast_block);
+    builder
+        .build_unconditional_branch(join_block)
+        .map_err(|e| format!("br fast→join: {e}"))?;
+    let fast_end_block = builder.get_insert_block().unwrap();
+
+    // Slow-path block: bignum promotion helper.
+    builder.position_at_end(slow_block);
+    let mutator_arg = function.get_nth_param(0).unwrap();
+    let slow_call = builder
+        .build_call(
+            promote_helper,
+            &[mutator_arg.into(), slow_lhs.into(), slow_rhs.into()],
+            &format!("{op_name}_promote"),
+        )
+        .map_err(|e| format!("call {op_name}_promote: {e}"))?;
+    let slow_result = slow_call
+        .try_as_basic_value()
+        .unwrap_basic()
+        .into_int_value();
+    builder
+        .build_unconditional_branch(join_block)
+        .map_err(|e| format!("br slow→join: {e}"))?;
+    let slow_end_block = builder.get_insert_block().unwrap();
+
+    // Join: pick fast or slow result.
+    builder.position_at_end(join_block);
+    let phi = builder
+        .build_phi(i64_t, &format!("{op_name}_result"))
+        .map_err(|e| format!("phi {op_name}: {e}"))?;
+    phi.add_incoming(&[
+        (&result_val, fast_end_block),
+        (&slow_result, slow_end_block),
+    ]);
+    Ok(phi.as_basic_value().into_int_value())
 }
 
 /// Emit the post-call abort check. Calls ncl_abort_pending; if
@@ -558,11 +766,73 @@ fn emit_cmp<'ctx>(
 ) -> Result<IntValue<'ctx>, String> {
     let lhs = emit_expr(context, builder, function, helpers, arity, locals, a)?;
     let rhs = emit_expr(context, builder, function, helpers, arity, locals, b)?;
-    let cmp = builder
-        .build_int_compare(pred, lhs, rhs, "cmp")
-        .map_err(|e| format!("icmp: {e}"))?;
     let i64_t = context.i64_type();
-    emit_bool_select(builder, cmp, i64_t)
+    let zero = i64_t.const_zero();
+    let seven = i64_t.const_int(7, false);
+
+    // Both-fixnum tag check.
+    let tag_or = builder
+        .build_or(lhs, rhs, "cmp_tag_or")
+        .map_err(|e| format!("or: {e}"))?;
+    let tag_bits = builder
+        .build_and(tag_or, seven, "cmp_tag_bits")
+        .map_err(|e| format!("and: {e}"))?;
+    let both_fixnum = builder
+        .build_int_compare(IntPredicate::EQ, tag_bits, zero, "cmp_both_fix")
+        .map_err(|e| format!("icmp: {e}"))?;
+
+    let fast_block = context.append_basic_block(*function, "cmp_fast");
+    let slow_block = context.append_basic_block(*function, "cmp_slow");
+    let join_block = context.append_basic_block(*function, "cmp_join");
+
+    builder
+        .build_conditional_branch(both_fixnum, fast_block, slow_block)
+        .map_err(|e| format!("cmp tag-check br: {e}"))?;
+
+    // Fast path: raw i64 compare on tagged values.
+    builder.position_at_end(fast_block);
+    let fast_cmp = builder
+        .build_int_compare(pred, lhs, rhs, "cmp_fast")
+        .map_err(|e| format!("icmp fast: {e}"))?;
+    let fast_result = emit_bool_select(builder, fast_cmp, i64_t)?;
+    builder
+        .build_unconditional_branch(join_block)
+        .map_err(|e| format!("br fast→join cmp: {e}"))?;
+    let fast_end_block = builder.get_insert_block().unwrap();
+
+    // Slow path: ncl_cmp_int returns -1/0/+1; compare against 0
+    // with the original predicate.
+    builder.position_at_end(slow_block);
+    let cmp_call = builder
+        .build_call(
+            helpers.cmp_int,
+            &[lhs.into(), rhs.into()],
+            "cmp_int_call",
+        )
+        .map_err(|e| format!("call ncl_cmp_int: {e}"))?;
+    let cmp_result = cmp_call
+        .try_as_basic_value()
+        .unwrap_basic()
+        .into_int_value();
+    let slow_cmp = builder
+        .build_int_compare(pred, cmp_result, zero, "cmp_slow")
+        .map_err(|e| format!("icmp slow: {e}"))?;
+    let slow_result = emit_bool_select(builder, slow_cmp, i64_t)?;
+    builder
+        .build_unconditional_branch(join_block)
+        .map_err(|e| format!("br slow→join cmp: {e}"))?;
+    let slow_end_block = builder.get_insert_block().unwrap();
+
+    // Join.
+    builder.position_at_end(join_block);
+    let phi = builder
+        .build_phi(i64_t, "cmp_result")
+        .map_err(|e| format!("phi cmp: {e}"))?;
+    phi.add_incoming(&[
+        (&fast_result, fast_end_block),
+        (&slow_result, slow_end_block),
+    ]);
+    Ok(phi.as_basic_value().into_int_value())
 }
 
 /// Tag-equality predicate.
@@ -1023,27 +1293,42 @@ fn emit_expr<'ctx>(
         Expr::Add(a, b) => {
             let lhs = emit_expr(context, builder, function, helpers, arity, locals, a)?;
             let rhs = emit_expr(context, builder, function, helpers, arity, locals, b)?;
-            builder
-                .build_int_add(lhs, rhs, "add")
-                .map_err(|e| format!("build_int_add: {e}"))
+            emit_overflow_op(
+                context, builder, function, helpers,
+                lhs, rhs, lhs, rhs,
+                helpers.sadd_with_overflow, helpers.add_promote,
+                "add",
+            )
         }
         Expr::Sub(a, b) => {
             let lhs = emit_expr(context, builder, function, helpers, arity, locals, a)?;
             let rhs = emit_expr(context, builder, function, helpers, arity, locals, b)?;
-            builder
-                .build_int_sub(lhs, rhs, "sub")
-                .map_err(|e| format!("build_int_sub: {e}"))
+            emit_overflow_op(
+                context, builder, function, helpers,
+                lhs, rhs, lhs, rhs,
+                helpers.ssub_with_overflow, helpers.sub_promote,
+                "sub",
+            )
         }
         Expr::Mul(a, b) => {
             let lhs = emit_expr(context, builder, function, helpers, arity, locals, a)?;
             let rhs = emit_expr(context, builder, function, helpers, arity, locals, b)?;
+            // (a<<3) * (b<<3) overflows the *fixnum* range when a*b
+            // doesn't fit in 61 bits. We pre-shift rhs by 3 so the
+            // intrinsic operates on (a<<3) * b (which equals (a*b)<<3).
+            // smul.with.overflow then catches any overflow of i64 —
+            // i.e., any (a*b) that wouldn't fit in 61 bits given the
+            // <<3. Slow path uses the ORIGINAL tagged operands.
             let three = i64_t.const_int(3, false);
             let rhs_untagged = builder
                 .build_right_shift(rhs, three, true, "untag_rhs")
                 .map_err(|e| format!("ashr: {e}"))?;
-            builder
-                .build_int_mul(lhs, rhs_untagged, "mul")
-                .map_err(|e| format!("build_int_mul: {e}"))
+            emit_overflow_op(
+                context, builder, function, helpers,
+                lhs, rhs_untagged, lhs, rhs,
+                helpers.smul_with_overflow, helpers.mul_promote,
+                "mul",
+            )
         }
         Expr::Truncate(a, b) => {
             // Untag both, sdiv, retag.

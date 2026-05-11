@@ -1237,13 +1237,19 @@ pub extern "C-unwind" fn typep_shim(
         "LIST" => obj.is_nil() || obj.tag() == Tag::Cons,
         "SYMBOL" => obj.tag() == Tag::Symbol || obj.is_nil(),
         "KEYWORD" => is_keyword(obj),
-        "FIXNUM" | "INTEGER" | "RATIONAL" | "REAL" | "NUMBER" => {
-            obj.tag() == Tag::Fixnum
+        "FIXNUM" => obj.tag() == Tag::Fixnum,
+        "BIGNUM" => crate::bignum::is_bignum(obj),
+        "INTEGER" | "RATIONAL" | "REAL" | "NUMBER" => {
+            crate::bignum::is_integer(obj)
         }
         "STRING" | "SIMPLE-STRING" => obj.tag() == Tag::String,
         "CHARACTER" => obj.as_char().is_some(),
         "FUNCTION" => obj.tag() == Tag::Function,
-        "VECTOR" | "SIMPLE-VECTOR" | "ARRAY" => obj.tag() == Tag::Vector,
+        "VECTOR" | "SIMPLE-VECTOR" | "ARRAY" => {
+            // Bignums share Tag::Vector but aren't vectors at the
+            // language level.
+            obj.tag() == Tag::Vector && !crate::bignum::is_bignum(obj)
+        }
         "SEQUENCE" => {
             obj.is_nil()
                 || obj.tag() == Tag::Cons

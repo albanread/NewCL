@@ -691,6 +691,8 @@
 (defun consp (x) (typep x 'cons))
 (defun integerp (x) (typep x 'integer))
 (defun numberp (x) (typep x 'number))
+(defun bignump (x) (typep x 'bignum))
+(defun fixnump (x) (typep x 'fixnum))
 (defun characterp (x) (typep x 'character))
 (defun functionp (x) (typep x 'function))
 

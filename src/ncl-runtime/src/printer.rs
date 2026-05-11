@@ -88,6 +88,11 @@ fn write_vector(out: &mut String, w: Word, readable: bool) {
     let header = crate::heap::HeapHeader::from_raw(unsafe { *p });
     let n = header.length_cells();
 
+    // Bignum check: HeapType::Bignum in the header.
+    if header.ty() == crate::heap::HeapType::Bignum {
+        out.push_str(&crate::bignum::bignum_to_decimal(w));
+        return;
+    }
     // CLOS-instance check: 4 cells, slot 0 = symbol named "%CLOS-INSTANCE".
     if n == 4 {
         let marker = Word::from_raw(unsafe { *p.add(1) });

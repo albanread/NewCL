@@ -334,17 +334,25 @@ impl MutatorState {
     /// payload cells are zero (which is fixnum-tagged 0, not nil —
     /// callers that want nil must initialise explicitly).
     pub fn alloc_vector(&mut self, length_cells: u32) -> Word {
+        self.alloc_typed_vector(crate::heap::HeapType::Vector, length_cells)
+    }
+
+    /// Like alloc_vector but lets the caller pick the HeapType.
+    /// Used for heap kinds that share the Vector tag — currently
+    /// only Bignum (raw u64 limb cells the printer / typep
+    /// recognise via the header type).
+    pub fn alloc_typed_vector(
+        &mut self,
+        ty: crate::heap::HeapType,
+        length_cells: u32,
+    ) -> Word {
         let total = 1 + length_cells as usize;
         if self.tlab.top + total > self.tlab.limit {
             self.refill_tlab(total);
         }
         let p = unsafe { self.tlab.base.add(self.tlab.top) };
         unsafe {
-            *p = crate::heap::HeapHeader::new(
-                crate::heap::HeapType::Vector,
-                length_cells,
-            )
-            .raw();
+            *p = crate::heap::HeapHeader::new(ty, length_cells).raw();
         }
         self.tlab.top += total;
         Word::from_ptr(p as *const u8, Tag::Vector)
