@@ -1717,11 +1717,26 @@
          (gf-name (slot-value method 'name))
          (blk (cond ((symbolp gf-name) gf-name)
                     (t (gensym "METHOD-")))))
+    ;; Always wrap with flet of call-next-method/next-method-p so
+    ;; method bodies can use them. The flet bindings are inert if
+    ;; unreferenced. Closette gates this on a search-tree of the
+    ;; macroexpanded body to skip the flet for bodies that don't
+    ;; mention CNM — purely a perf optimisation.
     (compile nil
              `(lambda (args next-emfun)
-                (apply (lambda ,lambda-list
-                         (block ,blk ,@body))
-                       args)))))
+                (flet ((call-next-method (&rest cnm-args)
+                         (cond
+                           ((null next-emfun)
+                            (error "No next method for generic-function call."))
+                           (t (funcall next-emfun
+                                       (cond (cnm-args cnm-args)
+                                             (t args))))))
+                       (next-method-p ()
+                         (cond ((null next-emfun) nil)
+                               (t t))))
+                  (apply (lambda ,lambda-list
+                           (block ,blk ,@body))
+                         args))))))
 
 ;; -- compute-applicable-methods-using-classes -----------------------------
 
@@ -1781,12 +1796,36 @@
            (funcall (method-function (car methods)) args next))))))
 
 (defun std-compute-effective-method-function (gf methods)
-  (declare (ignore gf))
-  (let ((primaries (remove-if-not #'primary-method-p methods)))
+  (let ((primaries (remove-if-not #'primary-method-p methods))
+        (around    (find-if #'around-method-p methods)))
     (cond
       ((null primaries)
        (error "No primary methods for this generic-function call."))
-      (t (compute-primary-emfun primaries)))))
+      (around
+       ;; The around method runs first; its body decides whether
+       ;; to call-next-method, which delegates to the rest of the
+       ;; method chain (befores → primary chain → afters).
+       (let ((next-emfun
+              (std-compute-effective-method-function
+               gf (remove around methods))))
+         (lambda (args)
+           (funcall (method-function around) args next-emfun))))
+      (t
+       (let ((primary-chain (compute-primary-emfun (cdr primaries)))
+             (most-specific-primary (car primaries))
+             (befores (remove-if-not #'before-method-p methods))
+             ;; CLOS spec: :after methods run from least- to
+             ;; most-specific (reverse of normal precedence).
+             (reverse-afters
+              (reverse (remove-if-not #'after-method-p methods))))
+         (lambda (args)
+           (dolist (b befores)
+             (funcall (method-function b) args nil))
+           (let ((result (funcall (method-function most-specific-primary)
+                                  args primary-chain)))
+             (dolist (a reverse-afters)
+               (funcall (method-function a) args nil))
+             result)))))))
 
 ;; -- discriminating function (real version) ------------------------------
 ;;
