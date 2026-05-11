@@ -1,12 +1,12 @@
-# NewCormanLisp — Manifesto and Declaration of Intent
+# NCL — Manifesto and Declaration of Intent
 
 *Drafted 2026-05-10*
 
 ## What this is
 
-NewCormanLisp is a from-scratch reimplementation of the Corman Lisp
+NCL is a from-scratch reimplementation of the Corman Lisp
 **language and user-facing experience**, not its codebase. It is a faithful
-tribute that runs Corman Lisp programs and demos unmodified, while sharing
+tribute that runs Corman Lisp programs and demos, while sharing
 none of the original implementation.
 
 We keep the language. We keep the demos. We keep the spirit — a Lisp that
@@ -15,24 +15,21 @@ and feels direct. We replace everything underneath.
 
 ## The original, and why we are leaving it behind
 
+Roger Corman created the Lisp I could afford, and it was in many ways that
+count a better Lisp than the ones that didnt even publish a price list.
+
 Roger Corman's Corman Lisp (1996–2015, now maintained as
 [sharplispers/cormanlisp](https://github.com/sharplispers/cormanlisp))
 is a Win32 x86 Common Lisp implementation. Its compiler emits 32-bit x86
 machine code directly, with no intermediate representation. Substantial
 parts of the kernel — the GC barriers, the call sequences, the FFI
-shims — are hand-written x86 assembly. The IDE is built on MFC. The
-build system is Visual Studio `.sln` files from a long-since-deprecated
-toolchain.
+shims — are hand-written x86 assembly. 
 
-This was excellent engineering for its era. It is not a foundation we want
-to extend in 2026. The cost of keeping it alive — 32-bit only, x86 only,
-MSVC-locked, MFC-bound, assembly-laden — exceeds the cost of replacing it.
-
-So we replace it.
+We replace the compiler.
 
 ## Core decisions
 
-NewCormanLisp is **Rust-first**, **LLVM-based**, **64-bit-first**, and
+NCL is **Rust-first**, **LLVM-based**, **64-bit-first**, and
 **Windows-first** — but only the last of those is parochial.
 
 1. **Rust for all native components.** The runtime, GC, image loader,
@@ -48,7 +45,7 @@ NewCormanLisp is **Rust-first**, **LLVM-based**, **64-bit-first**, and
    files.
 
 3. **LLVM is the code generator.** Corman Lisp had no IR; the compiler
-   went straight from Lisp forms to x86. NewCormanLisp goes Lisp →
+   went straight from Lisp forms to x86. NCL goes Lisp →
    our IR → LLVM IR → machine code, JIT-first, with reviewable textual
    dumps at every phase. This buys us optimization, portability,
    debuggability, and a credible path to AOT later.
@@ -66,7 +63,7 @@ NewCormanLisp is **Rust-first**, **LLVM-based**, **64-bit-first**, and
 6. **JIT-first, image-resident, source-of-truth-on-disk.** Modules are
    compiled into the live process on demand. The **image lives in
    memory; the source lives on disk**, and that is the only direction of
-   persistence. There is no image file format. Launching NewCormanLisp
+   persistence. There is no image file format. Launching NCL
    means JIT-ing the image into existence from source — and on a 2026
    machine that is fast enough to be the default.
 
@@ -250,7 +247,7 @@ decide.
 
 4. **The compiler is ours.** Faithful-tribute compatibility is at the
    *language* and *demo* level. The compiler architecture is not. We owe
-   nothing to Corman's compiler internals and will redesign them freely
+   nothing to older compiler internals and will redesign them freely
    wherever a simpler or more honest design exists. Reader → small typed
    IR → LLVM IR — and we resist adding stages between those until a
    real demo forces us to.
@@ -325,7 +322,7 @@ demo end-to-end on every CI build.
 
 ## The GUI
 
-NewCormanLisp borrows its GUI substrate from our sibling project
+NCL borrows its GUI substrate from our sibling project
 [NewCP](file:///E:/NewCP/NewCP) — specifically the `iGui` event-mailbox
 model in `newcp-runtime/src/igui/`. On Windows this sits on Direct2D,
 Direct3D 11, DirectWrite, and DXGI; the Lisp side sees a typed event
@@ -333,7 +330,7 @@ stream (Key, Char, Mouse, Focus, Resize, Paint, Close, Menu, DpiChange,
 ThemeChange) and a drawing surface.
 
 The MFC IDE of the original is not ported. Its replacement is built in
-NewCormanLisp itself, on top of `iGui`. The original IDE's *feel* — the
+NCL itself, on top of `iGui`. The original IDE's *feel* — the
 inline REPL, the workspace, the inspector, the "hot edit and reload"
 loop — is the spec.
 
@@ -346,7 +343,7 @@ X11/Wayland is a future shim swap, not a redesign.
 - A direct-from-Lisp x86 backend (LLVM is the only backend).
 - MFC, ATL, COM beyond what the demos require.
 - Loading the original Corman `.img` or `.fasl` files.
-- A persistent NewCormanLisp image format. There is none. Images live
+- A persistent NCL image format. There is none. Images live
   only in memory; source is the only persistence. The launch-time
   artifact cache is not an image format — it can be deleted at any
   time without loss.
@@ -360,7 +357,7 @@ X11/Wayland is a future shim swap, not a redesign.
 ```
 E:\CL\
   cormanlisp\          upstream — read-only reference, port FROM
-  NewCormanLisp\       this project — port TO
+  NCL\       this project — port TO
     MANIFESTO.md       this file
     src\               Rust workspace
       ncl-driver       compiler + REPL entry point
@@ -380,7 +377,7 @@ E:\CL\
 ## The promise
 
 A user who wrote Corman Lisp code in 2005 should be able to open it in
-NewCormanLisp in 2026, hit compile, and watch it run — faster, on a
+NCL in 2026, hit compile, and watch it run — faster, on a
 64-bit process, on a modern toolchain, with a debugger that understands
 the source — without changing a line.
 
