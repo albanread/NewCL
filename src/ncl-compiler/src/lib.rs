@@ -348,6 +348,17 @@ fn install_native_functions(
                    ncl_runtime::bignum::integer_length_shim, 1);
     install_native(coord, mutator, "LOGBITP",
                    ncl_runtime::bignum::logbitp_shim, 2);
+    // Ratios (Tier 2.B).
+    install_native(coord, mutator, "RATIOP",
+                   ncl_runtime::ratio::ratiop_shim, 1);
+    install_native(coord, mutator, "RATIONALP",
+                   ncl_runtime::ratio::rationalp_shim, 1);
+    install_native(coord, mutator, "NUMERATOR",
+                   ncl_runtime::ratio::numerator_shim, 1);
+    install_native(coord, mutator, "DENOMINATOR",
+                   ncl_runtime::ratio::denominator_shim, 1);
+    install_native(coord, mutator, "RATIONAL",
+                   ncl_runtime::ratio::rational_shim, 1);
     // Floats (Tier 2.A).
     install_native(coord, mutator, "/",
                    ncl_runtime::float::div_shim, 2);

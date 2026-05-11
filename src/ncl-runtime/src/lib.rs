@@ -15,6 +15,7 @@ pub mod bignum;
 pub mod file_sys;
 pub mod float;
 pub mod format;
+pub mod ratio;
 pub mod gc_function;
 pub mod gc_string;
 pub mod gc_symbol;

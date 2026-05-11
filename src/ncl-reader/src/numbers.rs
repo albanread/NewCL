@@ -23,6 +23,12 @@ pub fn try_parse_number(text: &str) -> Option<Value> {
     if let Some(n) = parse_integer(text, 10) {
         return Some(Value::Fixnum(n));
     }
+    // Ratio recognition: `[sign]digits/digits`. Tried before
+    // float so `3/4` doesn't accidentally hit the float parser
+    // (it wouldn't, but order documents intent).
+    if let Some(rat) = parse_ratio(text) {
+        return Some(rat);
+    }
     // Bignum-literal recognition: an integer-shaped text that
     // overflowed parse_integer is still a number.
     if looks_like_integer(text) {
@@ -38,6 +44,29 @@ pub fn try_parse_number(text: &str) -> Option<Value> {
         return Some(Value::Float(f));
     }
     None
+}
+
+/// Recognise a CL ratio literal `[sign]digits/digits`. Both halves
+/// must be integer-shaped; the denominator can't carry a sign (CL
+/// folds the sign onto the numerator). num-rational simplifies the
+/// (num, den) pair on the way through the lowering pass.
+fn parse_ratio(text: &str) -> Option<Value> {
+    let slash = text.find('/')?;
+    let num_part = &text[..slash];
+    let den_part = &text[slash + 1..];
+    if !looks_like_integer(num_part) || !looks_like_integer(den_part) {
+        return None;
+    }
+    if den_part.starts_with('+') || den_part.starts_with('-') {
+        return None;
+    }
+    if num_part.ends_with('.') || den_part.ends_with('.') {
+        return None;
+    }
+    Some(Value::Ratio(
+        std::sync::Arc::new(num_part.to_string()),
+        std::sync::Arc::new(den_part.to_string()),
+    ))
 }
 
 /// True iff TEXT has the shape of a decimal integer literal:

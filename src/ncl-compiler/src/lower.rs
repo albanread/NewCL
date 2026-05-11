@@ -345,6 +345,17 @@ fn lower_in_mut(
             })?;
             Ok(Expr::Word(w.raw()))
         }
+        Value::Ratio(n, d) => {
+            let w = ncl_runtime::ratio::alloc_ratio_in_static(
+                coord.static_area(), coord, n.as_str(), d.as_str(),
+            )
+            .ok_or_else(|| {
+                CompileError::NotImplemented(format!(
+                    "static area exhausted while allocating ratio literal {n}/{d}"
+                ))
+            })?;
+            Ok(Expr::Word(w.raw()))
+        }
         Value::Nil => Ok(Expr::Nil),
         Value::Char(c) => Ok(Expr::Word(ncl_runtime::Word::char(*c).raw())),
         Value::String(s) => {
@@ -435,6 +446,16 @@ fn build_quoted_word(
                 CompileError::NotImplemented(
                     "static area exhausted while allocating quoted float".into(),
                 )
+            })
+        }
+        Value::Ratio(n, d) => {
+            ncl_runtime::ratio::alloc_ratio_in_static(
+                coord.static_area(), coord, n.as_str(), d.as_str(),
+            )
+            .ok_or_else(|| {
+                CompileError::NotImplemented(format!(
+                    "static area exhausted while allocating quoted ratio {n}/{d}"
+                ))
             })
         }
         Value::Nil => Ok(Word::NIL),

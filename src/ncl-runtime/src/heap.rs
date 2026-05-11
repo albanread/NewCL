@@ -126,6 +126,14 @@ pub enum HeapType {
     /// Word; the f64 bits are opaque (probabilistic-correctness
     /// is fine, same as bignum limbs).
     Float = 7,
+    /// Exact rational. Layout under `ratio.rs`:
+    ///   cell 1: %RATIO marker symbol
+    ///   cell 2: numerator (Word — fixnum or bignum)
+    ///   cell 3: denominator (Word — fixnum or bignum, always > 1
+    ///           because we simplify and demote on construction)
+    /// 3-cell payload (4 with header). Both num and den ARE Words,
+    /// so the GC scan path treats them as live pointers naturally.
+    Ratio = 8,
 }
 
 impl HeapType {
@@ -139,6 +147,7 @@ impl HeapType {
             5 => Some(HeapType::Other),
             6 => Some(HeapType::Bignum),
             7 => Some(HeapType::Float),
+            8 => Some(HeapType::Ratio),
             _ => None,
         }
     }

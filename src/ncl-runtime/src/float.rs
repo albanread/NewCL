@@ -82,7 +82,8 @@ pub fn float_value(w: Word) -> f64 {
 
 /// Convert any real-number Word to f64. Returns None for non-real
 /// Words. Fixnums and bignums round to nearest f64 — same behaviour
-/// as `as f64` casts.
+/// as `as f64` casts. Ratios are converted via num-bigint's BigRational
+/// to_f64 — rounds to nearest representable double.
 pub fn to_f64(w: Word) -> Option<f64> {
     if is_float(w) {
         return Some(float_value(w));
@@ -92,6 +93,9 @@ pub fn to_f64(w: Word) -> Option<f64> {
     }
     if crate::bignum::is_bignum(w) {
         return integer_to_bigint(w).and_then(|n| n.to_f64());
+    }
+    if crate::ratio::is_ratio(w) {
+        return crate::ratio::ratio_to_bigrational(w).to_f64();
     }
     None
 }
@@ -266,9 +270,10 @@ pub extern "C" fn ncl_cmp_real(a_raw: u64, b_raw: u64) -> i64 {
 
 // ─── Lisp-callable shims ─────────────────────────────────────────────────
 
-/// `(/ a b)` — Lisp-callable shim wrapping `ncl_div_promote`.
-/// Float operands → float result; integer operands → integer
-/// truncate-toward-zero (until ratios land in Tier 2.B).
+/// `(/ a b)` — Lisp-callable shim wrapping the full-lattice
+/// division. Integer / integer that doesn't divide evenly returns
+/// a ratio (Tier 2.B); float-anywhere returns float; mixed
+/// integer/ratio returns a ratio (or integer if simplified).
 pub extern "C-unwind" fn div_shim(
     mutator: *mut MutatorState,
     _env: u64,
@@ -280,7 +285,7 @@ pub extern "C-unwind" fn div_shim(
     }
     let a = unsafe { *args };
     let b = unsafe { *args.add(1) };
-    ncl_div_promote(mutator, a, b)
+    crate::ratio::ncl_div_full(mutator, a, b)
 }
 
 /// `(floatp x)` — T iff X is a float.

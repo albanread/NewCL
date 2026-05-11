@@ -98,6 +98,11 @@ fn write_vector(out: &mut String, w: Word, readable: bool) {
         out.push_str(&crate::float::float_to_string(crate::float::float_value(w)));
         return;
     }
+    // Ratio check: HeapType::Ratio.
+    if header.ty() == crate::heap::HeapType::Ratio {
+        out.push_str(&crate::ratio::ratio_to_string(w));
+        return;
+    }
     // CLOS-instance check: 4 cells, slot 0 = symbol named "%CLOS-INSTANCE".
     if n == 4 {
         let marker = Word::from_raw(unsafe { *p.add(1) });

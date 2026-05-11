@@ -62,6 +62,16 @@ pub fn value_to_word(
                 )
             ))?
         }
+        Value::Ratio(n, d) => {
+            ncl_runtime::ratio::alloc_ratio_in_static(
+                coord.static_area(), coord, n.as_str(), d.as_str(),
+            )
+            .ok_or_else(|| EvalError::Compile(
+                crate::CompileError::NotImplemented(format!(
+                    "static area exhausted while allocating ratio {n}/{d} in macro input"
+                ))
+            ))?
+        }
         Value::Char(c) => Word::char(*c),
         Value::Symbol(s) if &*s.name == "T" => Word::T,
         Value::Symbol(s) => crate::lower::intern_value_symbol(coord, s),
@@ -128,9 +138,10 @@ pub fn word_to_value(w: Word) -> Result<Value, EvalError> {
             Value::String(Arc::new(s))
         }
         Tag::Vector => {
-            // Bignums and floats share Tag::Vector. Discriminate
-            // via header type and rebuild the corresponding Value
-            // variant so macroexpansion can carry them through.
+            // Bignums, floats, and ratios share Tag::Vector.
+            // Discriminate via header type and rebuild the
+            // corresponding Value variant so macroexpansion can
+            // carry them through.
             if ncl_runtime::bignum::is_bignum(w) {
                 let s = ncl_runtime::bignum::bignum_to_decimal(w);
                 return Ok(Value::Bignum(Arc::new(s)));
@@ -138,8 +149,15 @@ pub fn word_to_value(w: Word) -> Result<Value, EvalError> {
             if ncl_runtime::float::is_float(w) {
                 return Ok(Value::Float(ncl_runtime::float::float_value(w)));
             }
+            if ncl_runtime::ratio::is_ratio(w) {
+                let q = ncl_runtime::ratio::ratio_to_bigrational(w);
+                return Ok(Value::Ratio(
+                    Arc::new(q.numer().to_string()),
+                    Arc::new(q.denom().to_string()),
+                ));
+            }
             return Err(EvalError::Compile(crate::CompileError::NotImplemented(
-                "word_to_value: vector that isn't a bignum or float".into(),
+                "word_to_value: vector that isn't a bignum, float, or ratio".into(),
             )));
         }
         other => {

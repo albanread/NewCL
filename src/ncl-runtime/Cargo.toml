@@ -11,6 +11,9 @@ edition = "2024"
 num-bigint = "0.4"
 num-traits = "0.2"
 num-integer = "0.1"
+# Exact rationals (BigRational = Ratio<BigInt>). Storage layout
+# is ours; arithmetic kernels are num-rational's.
+num-rational = "0.4"
 # Shortest-round-trip float printing. Replaces Dragon4 / Grisu /
 # Steele-White with the simpler Ryū algorithm (Adams 2018).
 ryu = "1.0"

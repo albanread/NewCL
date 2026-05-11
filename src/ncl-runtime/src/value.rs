@@ -37,6 +37,12 @@ pub enum Value {
     /// lowering pass converts to a heap-allocated bignum Word via
     /// `ncl_parse_bignum`. (See `ncl-runtime::bignum`.)
     Bignum(Arc<String>),
+    /// A rational literal `num/den` from the reader. Both parts
+    /// stored as decimal strings so the same Value can carry
+    /// arbitrary-precision numerators / denominators. Lowering
+    /// converts to a heap or static-area ratio Word via
+    /// `ratio::alloc_ratio_in_static`.
+    Ratio(Arc<String>, Arc<String>),
     /// IEEE 754 double. Single-floats and ratios land later.
     Float(f64),
     /// A Unicode scalar. CL `character` semantics.
@@ -95,6 +101,7 @@ impl Value {
             (Value::Symbol(x), Value::Symbol(y)) => Arc::ptr_eq(x, y),
             (Value::Fixnum(x), Value::Fixnum(y)) => x == y,
             (Value::Bignum(x), Value::Bignum(y)) => x == y,
+            (Value::Ratio(xn, xd), Value::Ratio(yn, yd)) => xn == yn && xd == yd,
             (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
             (Value::Char(x), Value::Char(y)) => x == y,
             (Value::String(x), Value::String(y)) => Arc::ptr_eq(x, y),

@@ -29,7 +29,7 @@ use ncl_runtime::{
     bignum::{
         ncl_truncate_promote, ncl_rem_promote,
     },
-    float::{ncl_add_float, ncl_sub_float, ncl_mul_float, ncl_cmp_real},
+    ratio::{ncl_add_full, ncl_sub_full, ncl_mul_full, ncl_cmp_full},
     ncl_abort_pending, ncl_alloc_cons, ncl_apply, ncl_aref_generic, ncl_aset_generic,
     ncl_build_rest_list, ncl_call, ncl_equal, ncl_funcall,
     ncl_length, ncl_load_function, ncl_load_value, ncl_lookup_keyword,
@@ -567,16 +567,16 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(&helpers.aref_generic, ncl_aref_generic as *const () as usize);
     engine.add_global_mapping(&helpers.aset_generic, ncl_aset_generic as *const () as usize);
     engine.add_global_mapping(&helpers.abort_pending, ncl_abort_pending as *const () as usize);
-    // Arithmetic slow paths route to the float-aware helpers,
-    // which dispatch float/bignum/fixnum internally. The
+    // Arithmetic slow paths route to the full-lattice helpers
+    // which dispatch fixnum/bignum/ratio/float internally. The
     // function-cell names in the LLVM module still say
     // "ncl_add_promote" etc. — they're symbolic, not load-bearing.
-    engine.add_global_mapping(&helpers.add_promote, ncl_add_float as *const () as usize);
-    engine.add_global_mapping(&helpers.sub_promote, ncl_sub_float as *const () as usize);
-    engine.add_global_mapping(&helpers.mul_promote, ncl_mul_float as *const () as usize);
+    engine.add_global_mapping(&helpers.add_promote, ncl_add_full as *const () as usize);
+    engine.add_global_mapping(&helpers.sub_promote, ncl_sub_full as *const () as usize);
+    engine.add_global_mapping(&helpers.mul_promote, ncl_mul_full as *const () as usize);
     engine.add_global_mapping(&helpers.truncate_promote, ncl_truncate_promote as *const () as usize);
     engine.add_global_mapping(&helpers.rem_promote, ncl_rem_promote as *const () as usize);
-    engine.add_global_mapping(&helpers.cmp_int, ncl_cmp_real as *const () as usize);
+    engine.add_global_mapping(&helpers.cmp_int, ncl_cmp_full as *const () as usize);
     // sadd/ssub/smul.with.overflow are LLVM intrinsics — no
     // global mapping; LLVM resolves them itself.
 }
