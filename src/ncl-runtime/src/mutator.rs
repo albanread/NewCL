@@ -750,11 +750,15 @@ impl MutatorState {
     }
 
     /// Abandon the current TLAB. The unused tail between
-    /// `tlab.top` and `tlab.limit` becomes ordinary "no start-bit
-    /// set" cells; the bitmap-driven walkers iterate set bits only,
-    /// so they skip the gap for free. No filler header, no payload
-    /// zeroing — the cells stay as-is until the next allocation
-    /// overwrites them.
+    /// `tlab.top` and `tlab.limit` becomes a run of `00` pairs in
+    /// the young start-bit bitmap — bitmap-driven walkers iterate
+    /// set bits only, so they skip the gap for free. This is what
+    /// replaced the old `HeapType::Filler` stamping pass: the
+    /// bitmap encoding subsumes the linear-parseability role the
+    /// Filler header used to provide. See the `StartBits` docs in
+    /// heap.rs for the encoding (and the reserved `10` slot, kept
+    /// in reserve if a future GC phase ever wants an *explicit*
+    /// free-zone marker).
     fn retire_tlab(&mut self) {
         self.tlab = Tlab::default();
     }

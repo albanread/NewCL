@@ -220,20 +220,33 @@ pub enum GcBit {
 ///   bit 0 of pair: "this cell is the start of an object"
 ///   bit 1 of pair: "and that object is a cons (vs header-bearing)"
 /// Encoding:
-///   00 = not a start
+///   00 = not a start (also the canonical "free / unused" state —
+///        abandoned TLAB tails and post-GC dead zones are just
+///        runs of `00`s, invisible to bitmap-driven walkers)
 ///   01 = header-bearing start (length in the cell at idx)
 ///   11 = cons start (2 cells: car at idx, cdr at idx+1)
-///   10 = reserved (candidate uses: forwarded-source / pinned /
-///         opaque-payload — left unused until a real use case bites)
+///   10 = reserved. Together with `00`, this slot subsumes what an
+///        in-heap "Filler" sentinel header used to carry — an
+///        earlier iteration had a `HeapType::Filler` variant
+///        stamped into abandoned TLAB tails to keep linear parsing
+///        safe. The bitmap encoding makes that unnecessary: `00`
+///        does the silent "no object here" job, and `10` is the
+///        natural place to put an *explicit* "free of N cells"
+///        marker if a future GC phase (e.g. a true sweeper) ever
+///        needs one. Don't add another HeapType for this — use
+///        the reserved code first.
+///        Other candidate uses noted as we explored the design:
+///        forwarded-source marker, pinned-header fast-skip,
+///        opaque-payload (skip scanning) hint.
 ///
 /// One `u64` covers 32 cells. For cell index `c`, the pair lives at
 /// bit positions `(c % 32) * 2` and `(c % 32) * 2 + 1` within word
 /// `c / 32`. Both bits set with a single `fetch_or` — no CAS, no
 /// inter-bit ordering. 2 bits / 8-byte cell = 3.125% overhead.
 ///
-/// One bitmap (vs the earlier two parallel bitmaps) gives better
-/// locality: each alloc and each walker step touches exactly one
-/// cache line of metadata for both bits.
+/// One bitmap (vs an earlier prototype with two parallel bitmaps)
+/// gives better locality: each alloc and each walker step touches
+/// exactly one cache line of metadata for both bits.
 pub type StartBits = Arc<[AtomicU64]>;
 
 const CELLS_PER_STARTS_WORD: usize = 32;
