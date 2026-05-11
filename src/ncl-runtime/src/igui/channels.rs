@@ -29,6 +29,7 @@ pub mod kind {
     pub const DPI_CHANGE: i64 = 11;
     pub const SURFACE_REPLY: i64 = 12;
     pub const TICK: i64 = 13;
+    pub const EVAL_BUFFER: i64 = 14;
 }
 
 /// Mouse-event sub-kinds packed into the `mouse_op` field. Each is a
@@ -117,6 +118,17 @@ pub enum IGuiEvent {
     Tick {
         child_id: i64,
         time_ms: i64,
+    },
+    /// "Evaluate this Lisp source." Fired when the user hits Ctrl+R
+    /// inside the ledit (Lisp editor) pane. The pane snapshots its
+    /// buffer (or current selection) and pushes the text as
+    /// `source`. The language thread evaluates it via the
+    /// active session and, if the printed result fits on one
+    /// line, writes that line to the iGui log overlay. The
+    /// event-loop macros in Library/events.lisp dispatch this
+    /// automatically so every iGui app gets the shortcut.
+    EvalBuffer {
+        source: String,
     },
 }
 
@@ -221,7 +233,7 @@ pub fn discard_stashed_events() {
 /// when the filter is non-empty.
 fn matches_filter(ev: &IGuiEvent, filter: &HashSet<i64>) -> bool {
     match ev {
-        IGuiEvent::FrameClose | IGuiEvent::ThemeChange => true,
+        IGuiEvent::FrameClose | IGuiEvent::ThemeChange | IGuiEvent::EvalBuffer { .. } => true,
         IGuiEvent::Menu { .. } => true,
         IGuiEvent::Key { child_id, .. }
         | IGuiEvent::Char { child_id, .. }
@@ -239,7 +251,7 @@ fn matches_filter(ev: &IGuiEvent, filter: &HashSet<i64>) -> bool {
 /// events (FrameClose, ThemeChange, Menu) match every target.
 fn matches_target(ev: &IGuiEvent, target: i64) -> bool {
     match ev {
-        IGuiEvent::FrameClose | IGuiEvent::ThemeChange => true,
+        IGuiEvent::FrameClose | IGuiEvent::ThemeChange | IGuiEvent::EvalBuffer { .. } => true,
         IGuiEvent::Menu { .. } => true,
         IGuiEvent::Key { child_id, .. }
         | IGuiEvent::Char { child_id, .. }

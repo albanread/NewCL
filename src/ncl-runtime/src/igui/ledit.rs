@@ -75,8 +75,9 @@ use windows::Win32::UI::Controls::Dialogs::{
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_DELETE, VK_DOWN, VK_END, VK_F7, VK_F8,
-    VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_UP,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_DELETE, VK_DOWN, VK_END,
+    VK_F5, VK_F7, VK_F8,
+    VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 
 /// `WM_MOUSEMOVE`'s `wparam` low word; bit 0 = left button held. The
@@ -86,19 +87,51 @@ const MK_LBUTTON: u32 = 0x0001;
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, DefMDIChildProcW, GetClientRect, GetWindowLongPtrW, IsWindow, LoadCursorW,
     RegisterClassExW, SendMessageW, SetWindowLongPtrW, CW_USEDEFAULT, GWLP_USERDATA, IDC_IBEAM,
-    MDICREATESTRUCTW, WHEEL_DELTA, WM_CHAR, WM_DPICHANGED_AFTERPARENT, WM_KEYDOWN,
+    MDICREATESTRUCTW, WHEEL_DELTA, WM_CHAR, WM_COMMAND, WM_DPICHANGED_AFTERPARENT, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MDIACTIVATE, WM_MDICREATE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFOCUS, WM_SIZE, WNDCLASSEXW, WNDCLASS_STYLES,
+    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN,
+    WNDCLASSEXW, WNDCLASS_STYLES,
     WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 use super::renderer;
+use super::rope_buffer::{codepoints_to_utf8, RopeBuffer};
 
 /// WM_COMMAND id for the "Tools > ledit" frame menu entry. Outside
 /// the user range (0x1000..=0x1FFF) and the MDI verb range
 /// (0x2000..=0x2010) so it can never collide with a language-thread
 /// menu spec.
 pub const MENU_CMD_ID: u16 = 0x3000;
+
+/// Edit-menu command IDs, dispatched to the active ledit MDI child
+/// via frame WM_COMMAND forwarding. The range is contiguous so the
+/// frame can recognise them with a single `(0x3100..=0x31FF)` check.
+pub const EDIT_CMD_BASE: u16 = 0x3100;
+pub const EDIT_CMD_END: u16 = 0x31FF;
+
+pub const EDIT_CMD_UNDO: u16 = 0x3100;
+pub const EDIT_CMD_REDO: u16 = 0x3101;
+pub const EDIT_CMD_CUT: u16 = 0x3110;
+pub const EDIT_CMD_COPY: u16 = 0x3111;
+pub const EDIT_CMD_PASTE: u16 = 0x3112;
+pub const EDIT_CMD_SELECT_ALL: u16 = 0x3113;
+pub const EDIT_CMD_FORWARD_SEXP: u16 = 0x3120;
+pub const EDIT_CMD_BACKWARD_SEXP: u16 = 0x3121;
+pub const EDIT_CMD_SLURP_FORWARD: u16 = 0x3122;
+pub const EDIT_CMD_BARF_FORWARD: u16 = 0x3123;
+pub const EDIT_CMD_WRAP: u16 = 0x3130;
+pub const EDIT_CMD_SPLICE: u16 = 0x3131;
+pub const EDIT_CMD_RAISE: u16 = 0x3132;
+/// Run-buffer: push the buffer (or selection) at the language
+/// thread as an `EvalBuffer` event. The default event-loop handler
+/// in `events.lisp` calls `eval-string` and writes the result to
+/// the iGui log overlay.
+pub const EDIT_CMD_RUN_BUFFER: u16 = 0x3140;
+/// Run-form-at-point: extract the top-level form the cursor is
+/// currently inside and push just that as an `EvalBuffer` event.
+/// The canonical CL interactive-development action — Emacs's
+/// `C-M-x`, equivalent of "evaluate the defun under the cursor."
+pub const EDIT_CMD_RUN_FORM: u16 = 0x3141;
 
 const LEDIT_CLASS: PCWSTR = w!("NewCL.iGui.Ledit");
 const TITLE_NEW: PCWSTR = w!("ledit — untitled");
@@ -230,31 +263,53 @@ pub fn open(frame: HWND, mdi_client: HWND) {
 
 // ─── State ───────────────────────────────────────────────────────────
 
-type Pos = (usize, usize);
+/// Cursor / anchor / selection bounds are all code-point offsets
+/// into the rope. (row, col) is a presentation concept used only by
+/// the renderer (which paints by visible row) and the status bar
+/// (which displays `L:C` for the user). Everything else speaks
+/// offsets.
+type Pos = usize;
 
 /// Edit operation for undo/redo. Stored after the edit has been
 /// applied; `cursor_after` is the cursor at that point and
 /// `cursor_before` is what it was before.
+///
+/// Offset-canonical. The Zig/Vec<String>-era variants carried
+/// `(start, end)` as `(row, col)` pairs and a `String` payload;
+/// here the payload is the raw code-point sequence so we can
+/// re-splice it into the rope without any UTF-8/UTF-32 round trips
+/// or row/col arithmetic.
 #[derive(Clone, Debug)]
 enum UndoOp {
-    /// Inserted `text` at `start`, ending at `end` (cursor lands at
-    /// `cursor_after` which is normally `end`). Reverse: delete the
-    /// range `[start, end]`.
+    /// `text` was inserted at offset `start`, extending to
+    /// `start + text.len()`. Reverse: delete `text.len()` code
+    /// points at `start`.
     Inserted {
-        start: Pos,
-        end: Pos,
-        text: String,
-        cursor_before: Pos,
-        cursor_after: Pos,
+        start: usize,
+        text: Vec<u32>,
+        cursor_before: usize,
+        cursor_after: usize,
     },
-    /// Deleted `text` (which was at `start`). Reverse: insert `text`
-    /// at `start`. Used for backspace, delete-forward, and selection
-    /// deletion (cut, replace-on-typing).
+    /// `text` was deleted starting at offset `start`. Reverse:
+    /// insert `text` at `start`. Covers backspace, delete-forward,
+    /// and selection deletion (cut, replace-on-typing).
     Deleted {
-        start: Pos,
-        text: String,
-        cursor_before: Pos,
-        cursor_after: Pos,
+        start: usize,
+        text: Vec<u32>,
+        cursor_before: usize,
+        cursor_after: usize,
+    },
+    /// At offset `start`, `removed` was replaced by `inserted` in
+    /// one atomic step. Used by paredit ops (slurp / barf / wrap
+    /// / splice / raise) which logically modify the buffer in a
+    /// single move and want a single Ctrl-Z to undo. Reverse:
+    /// replace `inserted` with `removed` at `start`.
+    Replaced {
+        start: usize,
+        removed: Vec<u32>,
+        inserted: Vec<u32>,
+        cursor_before: usize,
+        cursor_after: usize,
     },
 }
 
@@ -287,14 +342,22 @@ struct ReditState {
     cell_h: f32,
     ascent: f32,
 
-    buffer: Vec<String>,
-    cursor_row: usize,
-    cursor_col: usize,
-    /// Selection anchor. When `(anchor_row, anchor_col) ==
-    /// (cursor_row, cursor_col)` there is no active selection.
-    anchor_row: usize,
-    anchor_col: usize,
+    /// Canonical text storage. UTF-32 code points in an AVL-balanced
+    /// rope; see `igui/rope_buffer.rs`. All positions in `cursor`,
+    /// `anchor`, and the `UndoOp` records are code-point offsets
+    /// into this rope.
+    buffer: RopeBuffer,
+    /// Cursor as a code-point offset. The (row, col) form is derived
+    /// on demand via `buffer.offset_to_line_col(cursor)`.
+    cursor: usize,
+    /// Selection anchor. `anchor == cursor` ⇒ no active selection.
+    anchor: usize,
+    /// Preferred column for vertical motion. A code-point column.
+    /// Set whenever the cursor moves horizontally; preserved across
+    /// up/down so traversing short lines doesn't lose the target.
     pref_col: usize,
+    /// Top visible row. Viewport positioning is a row concept, not
+    /// an offset one — kept as a row index.
     scroll_top: usize,
 
     file_path: Option<PathBuf>,
@@ -343,11 +406,9 @@ impl ReditState {
             cell_w: 8.0,
             cell_h: 16.0,
             ascent: 12.0,
-            buffer: vec![String::new()],
-            cursor_row: 0,
-            cursor_col: 0,
-            anchor_row: 0,
-            anchor_col: 0,
+            buffer: RopeBuffer::new(),
+            cursor: 0,
+            anchor: 0,
             pref_col: 0,
             scroll_top: 0,
             file_path: None,
@@ -456,203 +517,183 @@ impl ReditState {
         (px as f32) * self.dip_scale()
     }
 
-    // ─── Selection ───────────────────────────────────────────────
+    // ─── Selection / cursor helpers ──────────────────────────────
 
-    fn cursor_pos(&self) -> Pos {
-        (self.cursor_row, self.cursor_col)
+    /// Decode the canonical cursor offset to a (row, col) for the
+    /// few places that genuinely need it (the renderer's paint loop
+    /// and the status bar's `L:C` display). The rope answers this in
+    /// O(log n).
+    fn cursor_rc(&self) -> (usize, usize) {
+        self.buffer.offset_to_line_col(self.cursor)
     }
 
-    fn anchor_pos(&self) -> Pos {
-        (self.anchor_row, self.anchor_col)
+    fn cursor_row(&self) -> usize {
+        self.cursor_rc().0
     }
 
-    /// `Some((start, end))` if there's an active selection, else
-    /// `None`. Tuples compare lexicographically, so `start <= end`.
-    fn selection_range(&self) -> Option<(Pos, Pos)> {
-        let cur = self.cursor_pos();
-        let anc = self.anchor_pos();
-        if cur == anc {
+    fn cursor_col(&self) -> usize {
+        self.cursor_rc().1
+    }
+
+    /// `Some((lo, hi))` if there's an active selection, else `None`.
+    /// Offsets satisfy `lo <= hi`.
+    fn selection_range(&self) -> Option<(usize, usize)> {
+        if self.cursor == self.anchor {
             None
-        } else if anc < cur {
-            Some((anc, cur))
+        } else if self.anchor < self.cursor {
+            Some((self.anchor, self.cursor))
         } else {
-            Some((cur, anc))
+            Some((self.cursor, self.anchor))
         }
     }
 
-    /// Move the cursor and either extend the selection (anchor stays)
-    /// or collapse it (anchor follows). All keyboard movement and
-    /// mouse-driven cursor placement go through this so the selection
-    /// model stays consistent.
-    fn set_cursor(&mut self, row: usize, col: usize, extend: bool) {
-        self.cursor_row = row;
-        self.cursor_col = col;
+    /// Move the cursor to an offset and either extend the selection
+    /// (anchor stays) or collapse it (anchor follows).
+    fn set_cursor_offset(&mut self, offset: usize, extend: bool) {
+        let clamped = offset.min(self.buffer.len());
+        self.cursor = clamped;
         if !extend {
-            self.anchor_row = row;
-            self.anchor_col = col;
+            self.anchor = clamped;
         }
         self.coalesce = None;
         self.ensure_cursor_visible();
         self.invalidate();
     }
 
-    /// Extract the text inside the current selection, line by line.
-    /// Returns an empty string when the selection is empty.
+    /// Move the cursor to (row, col). Clamps row to last line and
+    /// col to that line's length. Used by motion methods that
+    /// naturally think in (row, col) — vertical motion, click-to-
+    /// position, page up/down.
+    fn set_cursor_rc(&mut self, row: usize, col: usize, extend: bool) {
+        let last_row = self.buffer.line_count().saturating_sub(1);
+        let r = row.min(last_row);
+        let line_len = self.line_len_cps(r);
+        let c = col.min(line_len);
+        let offset = self.buffer.line_col_to_offset(r, c);
+        self.set_cursor_offset(offset, extend);
+    }
+
+    /// Code-point length of the row's content (not including any
+    /// trailing newline).
+    fn line_len_cps(&self, row: usize) -> usize {
+        match self.buffer.line_range(row) {
+            Some((s, e)) => e - s,
+            None => 0,
+        }
+    }
+
+    /// Fetch the row's content as UTF-8. Used by the tokenizer,
+    /// auto-indent, paren balance, and tab-expansion helpers — all
+    /// of which want a `&str`. The encode is O(line length); paint
+    /// does this once per visible row.
+    fn line_text(&self, row: usize) -> String {
+        codepoints_to_utf8(&self.buffer.get_line(row))
+    }
+
+    /// Extract the text inside the current selection.
     fn selected_text(&self) -> String {
-        let Some((start, end)) = self.selection_range() else {
+        let Some((lo, hi)) = self.selection_range() else {
             return String::new();
         };
-        let (sr, sc) = start;
-        let (er, ec) = end;
-        if sr == er {
-            let line = &self.buffer[sr];
-            let from = char_to_byte(line, sc);
-            let to = char_to_byte(line, ec);
-            return line[from..to].to_string();
-        }
-        let mut out = String::new();
-        let first = &self.buffer[sr];
-        let from = char_to_byte(first, sc);
-        out.push_str(&first[from..]);
-        out.push('\n');
-        for row in (sr + 1)..er {
-            out.push_str(&self.buffer[row]);
-            out.push('\n');
-        }
-        let last = &self.buffer[er];
-        let to = char_to_byte(last, ec);
-        out.push_str(&last[..to]);
-        out
+        codepoints_to_utf8(&self.buffer.slice(lo, hi))
     }
 
     // ─── Mutation primitives (no undo bookkeeping) ───────────────
+    //
+    // The rope handles cross-line work atomically: `insert` and
+    // `delete` are single operations regardless of whether the
+    // affected range straddles line boundaries. The old
+    // `splice_in` / `splice_out` (which manually edited a
+    // `Vec<String>` line by line) collapse to one call each.
 
-    /// Splice `text` into `buffer` at `pos`, returning the position
-    /// just after the inserted text. `text` may contain `\n`s —
-    /// `\r\n` is normalized to `\n` first.
-    fn splice_in(&mut self, pos: Pos, text: &str) -> Pos {
-        let normalized = text.replace("\r\n", "\n");
-        let (mut row, mut col) = pos;
-        if normalized.is_empty() {
-            return pos;
+    /// Insert `text` (as UTF-8) at `offset`, returning the offset
+    /// just after the inserted text. CRLF and lone CR are
+    /// normalised to LF (the rope does this on `insert_utf8`).
+    fn splice_in_utf8(&mut self, offset: usize, text: &str) -> usize {
+        if text.is_empty() {
+            return offset;
         }
+        // Pre-count code points so we can return the post-insert
+        // offset without having to re-derive it. We use the same
+        // normalisation the rope applies internally.
+        let cps = super::rope_buffer::utf8_to_codepoints(text.as_bytes());
         self.tokens_dirty = true;
         self.diagnostics_stale = true;
-        let line = &mut self.buffer[row];
-        let byte_idx = char_to_byte(line, col);
-        let tail = line.split_off(byte_idx);
-        // Pieces of `normalized` separated by '\n'.
-        let mut pieces = normalized.split('\n');
-        // First piece appends to the current line.
-        let first = pieces.next().unwrap_or("");
-        self.buffer[row].push_str(first);
-        col += first.chars().count();
-        // Remaining pieces become new lines after `row`.
-        let rest: Vec<&str> = pieces.collect();
-        if rest.is_empty() {
-            // Single-line insert: re-attach the tail.
-            self.buffer[row].push_str(&tail);
-        } else {
-            for (i, piece) in rest.iter().enumerate() {
-                row += 1;
-                let mut new_line = piece.to_string();
-                if i + 1 == rest.len() {
-                    // Last piece carries the original tail.
-                    new_line.push_str(&tail);
-                    col = piece.chars().count();
-                }
-                self.buffer.insert(row, new_line);
-            }
-        }
-        (row, col)
+        self.buffer.insert(offset, &cps);
+        offset + cps.len()
     }
 
-    /// Remove the text in `[start, end]` and return it. Lines are
-    /// joined with `\n`.
-    fn splice_out(&mut self, start: Pos, end: Pos) -> String {
-        let (sr, sc) = start;
-        let (er, ec) = end;
-        if start == end {
-            return String::new();
+    /// Insert raw code points at `offset`. Used by undo replay where
+    /// the recorded payload is already `Vec<u32>`.
+    fn splice_in_cps(&mut self, offset: usize, text: &[u32]) -> usize {
+        if text.is_empty() {
+            return offset;
         }
         self.tokens_dirty = true;
         self.diagnostics_stale = true;
-        if sr == er {
-            let line = &mut self.buffer[sr];
-            let from = char_to_byte(line, sc);
-            let to = char_to_byte(line, ec);
-            let removed = line[from..to].to_string();
-            line.replace_range(from..to, "");
-            return removed;
-        }
-        // Multi-line: keep the prefix of `sr` and the suffix of `er`,
-        // drop everything in between.
-        let first = std::mem::take(&mut self.buffer[sr]);
-        let from = char_to_byte(&first, sc);
-        let (first_keep, first_drop) = first.split_at(from);
-        self.buffer[sr] = first_keep.to_string();
+        self.buffer.insert(offset, text);
+        offset + text.len()
+    }
 
-        let mut removed = String::new();
-        removed.push_str(first_drop);
-        removed.push('\n');
-
-        // Drain rows (sr+1)..er, then the prefix of row er.
-        for _ in 0..(er - sr - 1) {
-            removed.push_str(&self.buffer.remove(sr + 1));
-            removed.push('\n');
+    /// Delete the range `[lo, hi)` and return the removed text as
+    /// raw code points (for the undo record).
+    fn splice_out(&mut self, lo: usize, hi: usize) -> Vec<u32> {
+        if lo >= hi {
+            return Vec::new();
         }
-        let last = self.buffer.remove(sr + 1);
-        let to = char_to_byte(&last, ec);
-        let (last_drop, last_keep) = last.split_at(to);
-        removed.push_str(last_drop);
-        // Stitch the suffix of `er` onto the prefix of `sr`.
-        self.buffer[sr].push_str(last_keep);
+        self.tokens_dirty = true;
+        self.diagnostics_stale = true;
+        let removed = self.buffer.slice(lo, hi);
+        self.buffer.delete(lo, hi - lo);
         removed
     }
 
     /// Apply an insert and push a coalescible-or-fresh `Inserted`
-    /// undo entry. `kind` controls coalescing (Insert = single-char
-    /// typing, None = paste/newline/etc).
+    /// undo entry. `coalesce = Some(Insert)` enables typing
+    /// coalescence; `None` for paste / newline / programmatic.
     fn do_insert(&mut self, text: &str, coalesce: Option<CoalesceKind>) {
-        // If there's an active selection, replace it (one combined
-        // history entry: a Deleted undo plus an Inserted undo).
+        // Active selection: delete it first (one combined history
+        // entry — Deleted + Inserted, replayed in that order on
+        // undo).
         if self.selection_range().is_some() {
             self.delete_selection_to_undo();
         }
-        let cursor_before = self.cursor_pos();
+        let cursor_before = self.cursor;
         let start = cursor_before;
-        let end = self.splice_in(start, text);
-        self.cursor_row = end.0;
-        self.cursor_col = end.1;
-        self.anchor_row = end.0;
-        self.anchor_col = end.1;
-        self.pref_col = self.cursor_col;
+        let cps = super::rope_buffer::utf8_to_codepoints(text.as_bytes());
+        if cps.is_empty() {
+            return;
+        }
+        let end = self.splice_in_cps(start, &cps);
+        self.cursor = end;
+        self.anchor = end;
+        self.pref_col = self.cursor_col();
         self.dirty = true;
         self.redo.clear();
 
+        // Coalesce contiguous single-character inserts into one undo
+        // entry so typing a word is one Ctrl-Z away.
         let extend_last = coalesce == Some(CoalesceKind::Insert)
             && self.coalesce == Some(CoalesceKind::Insert)
             && matches!(
                 self.undo.last(),
-                Some(UndoOp::Inserted { end: prev_end, .. }) if *prev_end == start
+                Some(UndoOp::Inserted { start: prev_start, text: prev_text, .. })
+                    if prev_start + prev_text.len() == start
             );
         if extend_last {
             if let Some(UndoOp::Inserted {
-                end: prev_end,
                 text: prev_text,
                 cursor_after,
                 ..
             }) = self.undo.last_mut()
             {
-                prev_text.push_str(text);
-                *prev_end = end;
+                prev_text.extend_from_slice(&cps);
                 *cursor_after = end;
             }
         } else {
             self.push_undo(UndoOp::Inserted {
                 start,
-                end,
-                text: text.to_string(),
+                text: cps,
                 cursor_before,
                 cursor_after: end,
             });
@@ -665,22 +706,20 @@ impl ReditState {
     /// Delete the current selection. Pushes a Deleted entry. Caller
     /// is responsible for clearing the redo stack if appropriate.
     fn delete_selection_to_undo(&mut self) -> bool {
-        let Some((start, end)) = self.selection_range() else {
+        let Some((lo, hi)) = self.selection_range() else {
             return false;
         };
-        let cursor_before = self.cursor_pos();
-        let removed = self.splice_out(start, end);
-        self.cursor_row = start.0;
-        self.cursor_col = start.1;
-        self.anchor_row = start.0;
-        self.anchor_col = start.1;
-        self.pref_col = self.cursor_col;
+        let cursor_before = self.cursor;
+        let removed = self.splice_out(lo, hi);
+        self.cursor = lo;
+        self.anchor = lo;
+        self.pref_col = self.cursor_col();
         self.dirty = true;
         self.push_undo(UndoOp::Deleted {
-            start,
+            start: lo,
             text: removed,
             cursor_before,
-            cursor_after: start,
+            cursor_after: lo,
         });
         self.coalesce = None;
         true
@@ -695,21 +734,20 @@ impl ReditState {
 
     fn undo(&mut self) {
         let Some(op) = self.undo.pop() else { return };
-        let restore_cursor: Pos;
+        let restore_cursor: usize;
         let mirror: UndoOp;
         match op {
             UndoOp::Inserted {
                 start,
-                end,
                 text,
                 cursor_before,
                 cursor_after,
             } => {
-                self.splice_out(start, end);
+                let len = text.len();
+                self.splice_out(start, start + len);
                 restore_cursor = cursor_before;
                 mirror = UndoOp::Inserted {
                     start,
-                    end,
                     text,
                     cursor_before,
                     cursor_after,
@@ -721,7 +759,7 @@ impl ReditState {
                 cursor_before,
                 cursor_after,
             } => {
-                self.splice_in(start, &text);
+                self.splice_in_cps(start, &text);
                 restore_cursor = cursor_before;
                 mirror = UndoOp::Deleted {
                     start,
@@ -730,12 +768,31 @@ impl ReditState {
                     cursor_after,
                 };
             }
+            UndoOp::Replaced {
+                start,
+                removed,
+                inserted,
+                cursor_before,
+                cursor_after,
+            } => {
+                // Currently the buffer holds `inserted` at `start`.
+                // Swap it back for `removed`.
+                let hi = start + inserted.len();
+                self.splice_out(start, hi);
+                self.splice_in_cps(start, &removed);
+                restore_cursor = cursor_before;
+                mirror = UndoOp::Replaced {
+                    start,
+                    removed,
+                    inserted,
+                    cursor_before,
+                    cursor_after,
+                };
+            }
         }
-        self.cursor_row = restore_cursor.0;
-        self.cursor_col = restore_cursor.1;
-        self.anchor_row = self.cursor_row;
-        self.anchor_col = self.cursor_col;
-        self.pref_col = self.cursor_col;
+        self.cursor = restore_cursor;
+        self.anchor = restore_cursor;
+        self.pref_col = self.cursor_col();
         self.dirty = true;
         self.coalesce = None;
         self.redo.push(mirror);
@@ -750,13 +807,10 @@ impl ReditState {
     /// useful as a plain editor in environments where the compiler
     /// hasn't been linked in.
     fn run_check(&mut self) {
-        let mut text = String::new();
-        for (i, line) in self.buffer.iter().enumerate() {
-            if i > 0 {
-                text.push('\n');
-            }
-            text.push_str(line);
-        }
+        // Pull the whole buffer as a single UTF-8 string. The rope's
+        // `to_utf8` is O(n) but the checker runs after manual F7 or
+        // post-save, not on every keystroke, so this is fine.
+        let text = self.buffer.to_utf8();
         match run_checker(&text) {
             Some(diags) => {
                 self.diagnostics = diags;
@@ -777,9 +831,10 @@ impl ReditState {
         if self.diagnostics.is_empty() {
             return;
         }
-        // Diagnostics may be unsorted; find the smallest line > cursor_row+1
-        // (1-indexed), else fall back to the smallest overall.
-        let cur = self.cursor_row + 1;
+        // Diagnostics may be unsorted; find the smallest line greater
+        // than the current cursor's 1-indexed row, else fall back to
+        // the smallest overall.
+        let cur = self.cursor_row() + 1;
         let next = self
             .diagnostics
             .iter()
@@ -791,12 +846,11 @@ impl ReditState {
                     .min_by_key(|d| (d.line, d.column))
             });
         if let Some(d) = next {
-            let last = self.buffer.len().saturating_sub(1);
+            let last = self.buffer.line_count().saturating_sub(1);
             let r = d.line.saturating_sub(1).min(last);
-            let line_chars = self.buffer[r].chars().count();
-            let c = d.column.saturating_sub(1).min(line_chars);
-            self.set_cursor(r, c, false);
-            self.pref_col = self.cursor_col;
+            let c = d.column.saturating_sub(1);
+            self.set_cursor_rc(r, c, false);
+            self.pref_col = self.cursor_col();
         }
     }
 
@@ -808,21 +862,19 @@ impl ReditState {
 
     fn redo(&mut self) {
         let Some(op) = self.redo.pop() else { return };
-        let after: Pos;
+        let after: usize;
         let mirror: UndoOp;
         match op {
             UndoOp::Inserted {
                 start,
-                end,
                 text,
                 cursor_before,
                 cursor_after,
             } => {
-                self.splice_in(start, &text);
+                self.splice_in_cps(start, &text);
                 after = cursor_after;
                 mirror = UndoOp::Inserted {
                     start,
-                    end,
                     text,
                     cursor_before,
                     cursor_after,
@@ -834,10 +886,9 @@ impl ReditState {
                 cursor_before,
                 cursor_after,
             } => {
-                let n_chars = text.chars().filter(|c| *c != '\n').count();
-                let n_lines = text.bytes().filter(|c| *c == b'\n').count();
-                let _ = (n_chars, n_lines); // not needed; we compute end from splice_in
-                let _end = self.splice_in(start, &text);
+                // Redoing a deletion = re-delete the same range.
+                let hi = start + text.len();
+                self.splice_out(start, hi);
                 after = cursor_after;
                 mirror = UndoOp::Deleted {
                     start,
@@ -846,12 +897,31 @@ impl ReditState {
                     cursor_after,
                 };
             }
+            UndoOp::Replaced {
+                start,
+                removed,
+                inserted,
+                cursor_before,
+                cursor_after,
+            } => {
+                // Currently the buffer holds `removed` at `start`
+                // (undo restored it). Re-apply the replacement.
+                let hi = start + removed.len();
+                self.splice_out(start, hi);
+                self.splice_in_cps(start, &inserted);
+                after = cursor_after;
+                mirror = UndoOp::Replaced {
+                    start,
+                    removed,
+                    inserted,
+                    cursor_before,
+                    cursor_after,
+                };
+            }
         }
-        self.cursor_row = after.0;
-        self.cursor_col = after.1;
-        self.anchor_row = self.cursor_row;
-        self.anchor_col = self.cursor_col;
-        self.pref_col = self.cursor_col;
+        self.cursor = after;
+        self.anchor = after;
+        self.pref_col = self.cursor_col();
         self.dirty = true;
         self.coalesce = None;
         self.undo.push(mirror);
@@ -922,7 +992,7 @@ impl ReditState {
 
         // Refresh tokens lazily, before any line is laid out.
         if self.tokens_dirty {
-            self.tokens = tokenize_buffer(&self.buffer);
+            self.tokens = tokenize_rope(&self.buffer);
             self.tokens_dirty = false;
         }
 
@@ -949,36 +1019,39 @@ impl ReditState {
         }
 
         // Selection rects, drawn under the text glyphs so the text
-        // stays fully readable on top. Buffer columns are translated
-        // through `buffer_col_to_display` so tabs in the indent line
-        // up with the rendered glyphs.
-        if let (Some((s_start, s_end)), Some(brush)) =
-            (self.selection_range(), sel_brush.as_ref())
+        // stays fully readable on top. The selection is held as a
+        // pair of code-point offsets; we project it back into
+        // (row, col) here for the per-row painting, then run it
+        // through `buffer_col_to_display` so tabs in the indent
+        // line up with the rendered glyphs.
+        if let (Some((lo, hi)), Some(brush)) = (self.selection_range(), sel_brush.as_ref())
         {
+            let (sr, sc) = self.buffer.offset_to_line_col(lo);
+            let (er, ec) = self.buffer.offset_to_line_col(hi);
             for screen_row in 0..visible_rows {
                 let line_idx = self.scroll_top + screen_row;
-                if line_idx >= self.buffer.len() {
+                if line_idx >= self.buffer.line_count() {
                     break;
                 }
-                if line_idx < s_start.0 || line_idx > s_end.0 {
+                if line_idx < sr || line_idx > er {
                     continue;
                 }
-                let line_text = &self.buffer[line_idx];
+                let line_text = self.line_text(line_idx);
                 let line_chars = line_text.chars().count();
-                let from_col = if line_idx == s_start.0 { s_start.1 } else { 0 };
-                let to_col = if line_idx == s_end.0 {
-                    s_end.1
+                let from_col = if line_idx == sr { sc } else { 0 };
+                let to_col = if line_idx == er {
+                    ec
                 } else {
                     // Multi-line selection: paint past end-of-line
                     // out by one cell so the user sees the newline
                     // is part of the selection.
                     line_chars + 1
                 };
-                let from_display = buffer_col_to_display(line_text, from_col);
+                let from_display = buffer_col_to_display(&line_text, from_col);
                 let to_display = if to_col > line_chars {
-                    buffer_col_to_display(line_text, line_chars) + 1
+                    buffer_col_to_display(&line_text, line_chars) + 1
                 } else {
-                    buffer_col_to_display(line_text, to_col)
+                    buffer_col_to_display(&line_text, to_col)
                 };
                 let y = content_top + (screen_row as f32) * self.cell_h;
                 let x0 = gutter_w + (from_display as f32) * self.cell_w;
@@ -997,10 +1070,72 @@ impl ReditState {
             }
         }
 
+        // Bracket flash. Painted between selection rects and line
+        // glyphs so it lives UNDER the text — the user sees the
+        // paren itself plus a soft box around it and its match. The
+        // eye gets pair feedback without losing legibility.
+        //
+        // We highlight when the cursor sits on any delim, OR when
+        // it sits just AFTER a close delim — covers the common case
+        // of "I just typed `)` and want to confirm it landed on the
+        // right open."
+        let mut flash_targets: Vec<usize> = Vec::new();
+        if let Some(cp) = self.buffer.char_at(self.cursor) {
+            if cp == '(' as u32 || cp == ')' as u32 || cp == '[' as u32 || cp == ']' as u32
+            {
+                flash_targets.push(self.cursor);
+            }
+        }
+        if self.cursor > 0 {
+            if let Some(cp) = self.buffer.char_at(self.cursor - 1) {
+                if cp == ')' as u32 || cp == ']' as u32 {
+                    flash_targets.push(self.cursor - 1);
+                }
+            }
+        }
+        if !flash_targets.is_empty() {
+            // Soft slate-blue. Saturation lower than the selection
+            // colour so the two read distinctly when they overlap,
+            // but bright enough to pop against the dark background.
+            let match_brush = solid_brush(&target, 0.28, 0.34, 0.48, 1.0);
+            if let Some(brush) = match_brush.as_ref() {
+                for off in flash_targets {
+                    if let Some(match_off) =
+                        super::sexp_nav::matching_delim(&self.buffer, off)
+                    {
+                        for paint_off in [off, match_off] {
+                            let (r, c) = self.buffer.offset_to_line_col(paint_off);
+                            if r < self.scroll_top
+                                || r >= self.scroll_top + visible_rows
+                            {
+                                continue;
+                            }
+                            let screen_row = r - self.scroll_top;
+                            let line = self.line_text(r);
+                            let display_col = buffer_col_to_display(&line, c);
+                            let x = gutter_w + (display_col as f32) * self.cell_w;
+                            let y = content_top + (screen_row as f32) * self.cell_h;
+                            unsafe {
+                                target.FillRectangle(
+                                    &D2D_RECT_F {
+                                        left: x,
+                                        top: y,
+                                        right: x + self.cell_w,
+                                        bottom: y + self.cell_h,
+                                    },
+                                    brush,
+                                )
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
         // Lines.
         for screen_row in 0..visible_rows {
             let line_idx = self.scroll_top + screen_row;
-            if line_idx >= self.buffer.len() {
+            if line_idx >= self.buffer.line_count() {
                 break;
             }
             let y = content_top + (screen_row as f32) * self.cell_h;
@@ -1046,9 +1181,9 @@ impl ReditState {
             // visual columns; tokens recorded in buffer-char indices
             // are mapped through `buffer_col_to_display` before being
             // applied as drawing effects.
-            let line = &self.buffer[line_idx];
+            let line = self.line_text(line_idx);
             if !line.is_empty() {
-                let expanded = expand_line(line);
+                let expanded = expand_line(&line);
                 let max_w = w_dip - gutter_w;
                 if let (Some(brush), Ok(layout)) = (
                     fg.as_ref(),
@@ -1063,8 +1198,8 @@ impl ReditState {
                                 TokenKind::Comment => cmt_brush.as_ref(),
                             };
                             let Some(b) = kind_brush else { continue };
-                            let disp_start = buffer_col_to_display(line, tok.start);
-                            let disp_end = buffer_col_to_display(line, tok.end);
+                            let disp_start = buffer_col_to_display(&line, tok.start);
+                            let disp_end = buffer_col_to_display(&line, tok.end);
                             let range = DWRITE_TEXT_RANGE {
                                 startPosition: disp_start as u32,
                                 length: (disp_end - disp_start) as u32,
@@ -1087,12 +1222,11 @@ impl ReditState {
         // Cursor. cursor_col is a buffer char index — translate
         // through tab expansion so the bar lines up with the rendered
         // glyph the cursor is sitting before.
-        if self.cursor_row >= self.scroll_top
-            && self.cursor_row < self.scroll_top + visible_rows
-        {
-            let screen_row = self.cursor_row - self.scroll_top;
-            let line = &self.buffer[self.cursor_row];
-            let display_col = buffer_col_to_display(line, self.cursor_col);
+        let (cur_row, cur_col) = self.cursor_rc();
+        if cur_row >= self.scroll_top && cur_row < self.scroll_top + visible_rows {
+            let screen_row = cur_row - self.scroll_top;
+            let line = self.line_text(cur_row);
+            let display_col = buffer_col_to_display(&line, cur_col);
             let cx = gutter_w + (display_col as f32) * self.cell_w;
             let cy = content_top + (screen_row as f32) * self.cell_h;
             if let Some(brush) = cursor_brush.as_ref() {
@@ -1134,7 +1268,7 @@ impl ReditState {
         // line, prefer that error's message; otherwise show the
         // count. "(stale)" annotates the count when the buffer has
         // changed since the last check.
-        let here = self.diagnostic_on_line(self.cursor_row + 1);
+        let here = self.diagnostic_on_line(cur_row + 1);
         let stale = if self.diagnostics_stale && !self.diagnostics.is_empty() {
             " (stale)"
         } else {
@@ -1159,9 +1293,9 @@ impl ReditState {
             " {dirty} {path}   Ln {row:4}, Col {col:2}   {nlines} lines   {parens}   {diag}",
             dirty = dirty_mark,
             path = path_str,
-            row = self.cursor_row + 1,
-            col = self.cursor_col + 1,
-            nlines = self.buffer.len(),
+            row = cur_row + 1,
+            col = cur_col + 1,
+            nlines = self.buffer.line_count(),
             parens = parens_segment,
             diag = diag_segment,
         );
@@ -1188,10 +1322,7 @@ impl ReditState {
     // ─── Editing ─────────────────────────────────────────────────
 
     fn current_line_len(&self) -> usize {
-        self.buffer
-            .get(self.cursor_row)
-            .map(|s| s.chars().count())
-            .unwrap_or(0)
+        self.line_len_cps(self.cursor_row())
     }
 
     fn ensure_cursor_visible(&mut self) {
@@ -1208,10 +1339,11 @@ impl ReditState {
         if visible == 0 {
             return;
         }
-        if self.cursor_row < self.scroll_top {
-            self.scroll_top = self.cursor_row;
-        } else if self.cursor_row >= self.scroll_top + visible {
-            self.scroll_top = self.cursor_row + 1 - visible;
+        let cur_row = self.cursor_row();
+        if cur_row < self.scroll_top {
+            self.scroll_top = cur_row;
+        } else if cur_row >= self.scroll_top + visible {
+            self.scroll_top = cur_row + 1 - visible;
         }
     }
 
@@ -1239,10 +1371,12 @@ impl ReditState {
     }
 
     fn compute_auto_indent(&self) -> String {
-        if self.cursor_row >= self.buffer.len() {
+        let cur_row = self.cursor_row();
+        let cur_col = self.cursor_col();
+        if cur_row >= self.buffer.line_count() {
             return String::new();
         }
-        let line = &self.buffer[self.cursor_row];
+        let line = self.line_text(cur_row);
         let leading: String = line
             .chars()
             .take_while(|&c| c == ' ' || c == '\t')
@@ -1252,7 +1386,7 @@ impl ReditState {
         let mut after_backslash = false;
         let mut in_comment = false;
         for (i, c) in line.chars().enumerate() {
-            if i >= self.cursor_col {
+            if i >= cur_col {
                 break;
             }
             if in_comment {
@@ -1302,9 +1436,20 @@ impl ReditState {
         let mut depth: i32 = 0;
         let mut in_string = false;
         let mut after_backslash = false;
-        for line in &self.buffer {
-            let mut in_comment = false;
-            for c in line.chars() {
+        // Walk the rope's code points directly. We treat `\n` as a
+        // comment terminator (matching the Vec<String> per-line
+        // iteration the old code did).
+        let mut in_comment = false;
+        for cp in self.buffer.chars() {
+            let c = match char::from_u32(cp) {
+                Some(c) => c,
+                None => continue,
+            };
+            if c == '\n' {
+                in_comment = false;
+                continue;
+            }
+            {
                 if in_comment {
                     continue;
                 }
@@ -1354,26 +1499,25 @@ impl ReditState {
             self.invalidate();
             return;
         }
-        if self.cursor_col == 0 && self.cursor_row == 0 {
+        if self.cursor == 0 {
             return;
         }
-        let cursor_before = self.cursor_pos();
-        let start: Pos = if self.cursor_col > 0 {
-            (self.cursor_row, self.cursor_col - 1)
-        } else {
-            let prev_len = self.buffer[self.cursor_row - 1].chars().count();
-            (self.cursor_row - 1, prev_len)
-        };
+        let cursor_before = self.cursor;
+        // One code point back. The rope spans newlines transparently
+        // so we don't need the old "if cursor_col > 0 else previous
+        // line's length" arithmetic.
+        let start = cursor_before - 1;
         let end = cursor_before;
         let removed = self.splice_out(start, end);
-        self.cursor_row = start.0;
-        self.cursor_col = start.1;
-        self.anchor_row = start.0;
-        self.anchor_col = start.1;
-        self.pref_col = self.cursor_col;
+        self.cursor = start;
+        self.anchor = start;
+        self.pref_col = self.cursor_col();
         self.dirty = true;
         self.redo.clear();
 
+        // Coalesce contiguous backspaces: each new deletion is at
+        // `end == prev_start`, so the previous record's prefix
+        // (already at prev_start) extends back one more code point.
         let extend_last = self.coalesce == Some(CoalesceKind::Backspace)
             && matches!(
                 self.undo.last(),
@@ -1388,7 +1532,7 @@ impl ReditState {
             }) = self.undo.last_mut()
             {
                 let mut combined = removed;
-                combined.push_str(prev_text);
+                combined.extend_from_slice(prev_text);
                 *prev_text = combined;
                 *prev_start = start;
                 *cursor_after = start;
@@ -1413,16 +1557,12 @@ impl ReditState {
             self.invalidate();
             return;
         }
-        let line_chars = self.current_line_len();
-        let start = self.cursor_pos();
-        let end: Pos = if self.cursor_col < line_chars {
-            (self.cursor_row, self.cursor_col + 1)
-        } else if self.cursor_row + 1 < self.buffer.len() {
-            (self.cursor_row + 1, 0)
-        } else {
+        if self.cursor >= self.buffer.len() {
             return;
-        };
-        let cursor_before = start;
+        }
+        let cursor_before = self.cursor;
+        let start = cursor_before;
+        let end = cursor_before + 1;
         let removed = self.splice_out(start, end);
         self.dirty = true;
         self.redo.clear();
@@ -1436,118 +1576,408 @@ impl ReditState {
         self.invalidate();
     }
 
+    // ─── Paredit: atomic structural edits ────────────────────────
+    //
+    // Each op produces ONE `Replaced` undo entry so a single Ctrl-Z
+    // reverses the whole structural change. The supporting machinery
+    // lives in `igui/sexp_nav.rs` (cursor → offset translations); the
+    // mutations here are simple `splice_out` + `splice_in_cps` pairs
+    // bracketed by `do_replace`.
+
+    /// Apply a single Replaced edit and record the undo entry.
+    /// `start..end` in the current buffer is replaced by `new_cps`;
+    /// the cursor is moved to `cursor_after`.
+    fn do_replace(
+        &mut self,
+        start: usize,
+        end: usize,
+        new_cps: Vec<u32>,
+        cursor_after: usize,
+    ) {
+        let cursor_before = self.cursor;
+        let removed = self.splice_out(start, end);
+        self.splice_in_cps(start, &new_cps);
+        self.cursor = cursor_after;
+        self.anchor = cursor_after;
+        self.pref_col = self.cursor_col();
+        self.dirty = true;
+        self.redo.clear();
+        self.coalesce = None;
+        self.push_undo(UndoOp::Replaced {
+            start,
+            removed,
+            inserted: new_cps,
+            cursor_before,
+            cursor_after,
+        });
+        self.ensure_cursor_visible();
+        self.invalidate();
+    }
+
+    /// Slurp forward: pull the next sexp outside the enclosing form
+    /// into it. Close-delim moves to after the slurped sexp.
+    ///
+    ///   (foo |bar) baz quux  →  (foo |bar baz) quux
+    fn slurp_forward(&mut self) {
+        let Some((open, close)) = super::sexp_nav::enclosing_form(&self.buffer, self.cursor)
+        else {
+            return;
+        };
+        let _ = open;
+        // Find the end of the next sexp after the close.
+        let Some(next_end) = super::sexp_nav::forward_sexp(&self.buffer, close + 1) else {
+            return; // nothing to slurp
+        };
+        // The close delim itself, as a code point.
+        let close_cp = self.buffer.char_at(close).unwrap_or(')' as u32);
+        // Replace `[close, next_end)` (the close-paren plus the
+        // whitespace+sexp we're slurping) with the slurped material
+        // followed by the close-paren — i.e. the close-paren moves
+        // from `close` to `next_end - 1`.
+        let between = self.buffer.slice(close + 1, next_end);
+        let mut new_cps = between;
+        new_cps.push(close_cp);
+        // Cursor stays at its current offset — it didn't move
+        // textually, only the close-paren around it did.
+        let cursor_after = self.cursor;
+        self.do_replace(close, next_end, new_cps, cursor_after);
+    }
+
+    /// Barf forward: push the last inner sexp out of the enclosing
+    /// form. Close-delim moves to before the last inner sexp.
+    ///
+    ///   (foo |bar baz)  →  (foo |bar) baz
+    fn barf_forward(&mut self) {
+        let Some((open, close)) = super::sexp_nav::enclosing_form(&self.buffer, self.cursor)
+        else {
+            return;
+        };
+        // Walk inner sexps from open+1 forward, recording the start
+        // of the last one. We stop when forward_sexp lands at or
+        // past `close`.
+        let mut last_inner_start: Option<usize> = None;
+        let mut probe = open + 1;
+        loop {
+            // Skip atmosphere to find the next sexp start.
+            let Some(sexp_end) = super::sexp_nav::forward_sexp(&self.buffer, probe) else {
+                break;
+            };
+            if sexp_end > close {
+                break;
+            }
+            // The sexp started somewhere in [probe, sexp_end); find
+            // its actual start by going back one sexp.
+            let sexp_start = match super::sexp_nav::backward_sexp(&self.buffer, sexp_end) {
+                Some(s) => s,
+                None => break,
+            };
+            last_inner_start = Some(sexp_start);
+            probe = sexp_end;
+        }
+        let Some(last_start) = last_inner_start else {
+            return; // nothing inside to barf
+        };
+        let close_cp = self.buffer.char_at(close).unwrap_or(')' as u32);
+        // Trim trailing whitespace between the previous sexp's end
+        // and `last_start` so the result reads as `(foo|bar)` with
+        // single-space separation, not `(foo |bar)`. (Actually no —
+        // we WANT to preserve the original whitespace before the
+        // sexp we're barfing out. Don't trim.)
+        //
+        // Replace `[last_start, close+1)` (last inner sexp through
+        // close-delim) with `) ` followed by the inner sexp.
+        let inner = self.buffer.slice(last_start, close);
+        // Strip trailing whitespace from `inner` so we don't end up
+        // with `(foo bar )`.
+        let mut inner_trim_end = inner.len();
+        while inner_trim_end > 0 && is_ws_cp(inner[inner_trim_end - 1]) {
+            inner_trim_end -= 1;
+        }
+        let inner_trimmed: Vec<u32> = inner[..inner_trim_end].to_vec();
+
+        let mut new_cps = inner_trimmed;
+        new_cps.push(close_cp);
+        new_cps.push(' ' as u32);
+        // Then the barfed sexp itself.
+        let barfed = self.buffer.slice(last_start, close);
+        // Strip leading whitespace from barfed (we already kept the
+        // trimmed inner; the barfed sexp starts at last_start which
+        // is past any leading whitespace).
+        let _ = barfed; // unused — we use last_start..close + final trim above
+        // ACTUALLY: we want to KEEP the original whitespace inside
+        // (between inner_trimmed and what was barfed), so simpler
+        // reformulation:
+        // [open+1 .. close] currently contains "...inner_trim WS sexp"
+        // After:             "...inner_trim) WS sexp"
+        // i.e. just MOVE the close from position `close` to position
+        // `inner_trim_end + open + 1` (the first whitespace cp after
+        // the last inner sexp's predecessors).
+        //
+        // Compute target close position relative to `last_start`:
+        // - inner spans [open+1, close)
+        // - last sexp starts at last_start
+        // - we want close at (the first non-ws after the previous sexp)
+        //
+        // Cleaner: between [open+1, last_start) is "previous content
+        // ending in whitespace". We want to insert ) right after
+        // that content (after trimming trailing whitespace).
+        let before_last_sexp = self.buffer.slice(open + 1, last_start);
+        let mut t_end = before_last_sexp.len();
+        while t_end > 0 && is_ws_cp(before_last_sexp[t_end - 1]) {
+            t_end -= 1;
+        }
+        let kept_prefix: Vec<u32> = before_last_sexp[..t_end].to_vec();
+        let ws_between: Vec<u32> = before_last_sexp[t_end..].to_vec();
+        let barfed_sexp = self.buffer.slice(last_start, close);
+
+        let mut new_cps = kept_prefix;
+        new_cps.push(close_cp);
+        new_cps.extend_from_slice(&ws_between);
+        new_cps.extend_from_slice(&barfed_sexp);
+
+        // Cursor was somewhere in the original (open+1, close)
+        // range. We want it at the equivalent offset in the result.
+        // For simplicity: clamp into the new inner range.
+        let new_inner_end = open + 1 + t_end; // offset of the new close
+        let cursor_after = self.cursor.min(new_inner_end);
+        self.do_replace(open + 1, close + 1, new_cps, cursor_after);
+    }
+
+    /// Wrap the next sexp at point with `( … )`. Cursor lands just
+    /// after the new `(`.
+    ///
+    ///   |foo bar  →  (|foo) bar
+    fn wrap_sexp(&mut self) {
+        // Skip leading whitespace from cursor.
+        let start = self.cursor;
+        let Some(after_atmosphere) =
+            super::sexp_nav::forward_sexp(&self.buffer, start)
+        else {
+            // Nothing to wrap — insert empty `()` at cursor.
+            self.do_replace(start, start, vec!['(' as u32, ')' as u32], start + 1);
+            return;
+        };
+        // We need the actual sexp start, not just its end. Use
+        // backward_sexp from the end to find it.
+        let sexp_start = super::sexp_nav::backward_sexp(&self.buffer, after_atmosphere)
+            .unwrap_or(start);
+        let sexp_end = after_atmosphere;
+        let inner = self.buffer.slice(sexp_start, sexp_end);
+        let mut new_cps = vec!['(' as u32];
+        new_cps.extend_from_slice(&inner);
+        new_cps.push(')' as u32);
+        let cursor_after = sexp_start + 1;
+        self.do_replace(sexp_start, sexp_end, new_cps, cursor_after);
+    }
+
+    /// Push the buffer (or selection if any) at the language thread
+    /// as an `EvalBuffer` event. User-Lisp's `event-loop` macro has
+    /// a built-in handler (`%handle-eval-buffer` in events.lisp)
+    /// that calls `eval-string` on the source and writes the
+    /// printed result to the iGui log overlay. Bound to Ctrl+R, F5,
+    /// and the Edit → Run Buffer menu item.
+    fn run_buffer(&self) {
+        let (src, scope) = {
+            let sel = self.selected_text();
+            if sel.is_empty() {
+                (self.buffer.to_utf8(), "buffer")
+            } else {
+                (sel, "selection")
+            }
+        };
+        // Log immediately so the user sees the keystroke registered
+        // even before the language thread services the event. The
+        // default :eval-buffer handler in events.lisp will follow
+        // up with "[eval] …" once it runs.
+        super::log_view::append(&format!(
+            "[ledit] run {} ({} chars)",
+            scope,
+            src.chars().count()
+        ));
+        crate::igui::channels::push(
+            crate::igui::channels::IGuiEvent::EvalBuffer { source: src },
+        );
+    }
+
+    /// Run only the top-level form the cursor is inside — Emacs's
+    /// `C-M-x`. The standard CL interactive-development action:
+    /// place the cursor anywhere inside a `(defun …)` or
+    /// `(run-foo)` and one keystroke evaluates just that form.
+    ///
+    /// If the cursor is in atmosphere between top-level forms,
+    /// nothing is sent.
+    fn run_form_at_point(&self) {
+        let Some((start, end)) =
+            super::sexp_nav::top_level_form(&self.buffer, self.cursor)
+        else {
+            super::log_view::append(
+                "[ledit] run form: cursor not inside a top-level form",
+            );
+            return;
+        };
+        let cps = self.buffer.slice(start, end);
+        let src = super::rope_buffer::codepoints_to_utf8(&cps);
+        super::log_view::append(&format!(
+            "[ledit] run form ({} chars): {}",
+            src.chars().count(),
+            // Truncate the preview so the log line stays readable.
+            preview_first_line(&src, 60),
+        ));
+        crate::igui::channels::push(
+            crate::igui::channels::IGuiEvent::EvalBuffer { source: src },
+        );
+    }
+
+    /// Splice (unwrap): delete the enclosing parens, leaving the
+    /// inner content. Cursor stays where it was textually.
+    ///
+    ///   (foo |bar baz)  →  foo |bar baz
+    fn splice_enclosing(&mut self) {
+        let Some((open, close)) = super::sexp_nav::enclosing_form(&self.buffer, self.cursor)
+        else {
+            return;
+        };
+        let inner = self.buffer.slice(open + 1, close);
+        // Cursor moves one cp left (the open was deleted before it).
+        let cursor_after = self.cursor.saturating_sub(1);
+        self.do_replace(open, close + 1, inner, cursor_after);
+    }
+
+    /// Raise: replace the enclosing form with the sexp at point.
+    ///
+    ///   (foo |bar baz)  →  |bar
+    fn raise_sexp(&mut self) {
+        let Some((open, close)) = super::sexp_nav::enclosing_form(&self.buffer, self.cursor)
+        else {
+            return;
+        };
+        // Find the sexp at or after the cursor.
+        let Some(sexp_end) = super::sexp_nav::forward_sexp(&self.buffer, self.cursor) else {
+            return;
+        };
+        let sexp_start = super::sexp_nav::backward_sexp(&self.buffer, sexp_end)
+            .unwrap_or(self.cursor);
+        // Clamp to enclosing form bounds.
+        let sexp_start = sexp_start.max(open + 1);
+        let sexp_end = sexp_end.min(close);
+        if sexp_start >= sexp_end {
+            return;
+        }
+        let kept = self.buffer.slice(sexp_start, sexp_end);
+        let cursor_after = open;
+        self.do_replace(open, close + 1, kept, cursor_after);
+    }
+
     fn move_left(&mut self, extend: bool) {
         // If there's a selection and we're not extending, collapse to
         // the start (this is what most editors do — left arrow moves
         // to the beginning of the selection).
         if !extend {
-            if let Some((start, _)) = self.selection_range() {
-                self.set_cursor(start.0, start.1, false);
-                self.pref_col = self.cursor_col;
+            if let Some((lo, _)) = self.selection_range() {
+                self.set_cursor_offset(lo, false);
+                self.pref_col = self.cursor_col();
                 return;
             }
         }
-        let (mut r, mut c) = self.cursor_pos();
-        if c > 0 {
-            c -= 1;
-        } else if r > 0 {
-            r -= 1;
-            c = self.buffer[r].chars().count();
+        if self.cursor > 0 {
+            self.set_cursor_offset(self.cursor - 1, extend);
         }
-        self.set_cursor(r, c, extend);
-        self.pref_col = self.cursor_col;
+        self.pref_col = self.cursor_col();
     }
 
     fn move_right(&mut self, extend: bool) {
         if !extend {
-            if let Some((_, end)) = self.selection_range() {
-                self.set_cursor(end.0, end.1, false);
-                self.pref_col = self.cursor_col;
+            if let Some((_, hi)) = self.selection_range() {
+                self.set_cursor_offset(hi, false);
+                self.pref_col = self.cursor_col();
                 return;
             }
         }
-        let (mut r, mut c) = self.cursor_pos();
-        let n = self.buffer[r].chars().count();
-        if c < n {
-            c += 1;
-        } else if r + 1 < self.buffer.len() {
-            r += 1;
-            c = 0;
+        if self.cursor < self.buffer.len() {
+            self.set_cursor_offset(self.cursor + 1, extend);
         }
-        self.set_cursor(r, c, extend);
-        self.pref_col = self.cursor_col;
+        self.pref_col = self.cursor_col();
+    }
+
+    /// Ctrl-Right: jump over the next s-expression. Skips
+    /// whitespace, line comments, and block comments, then either
+    /// over a balanced `(…)`/`[…]`, a `"…"` string, a `#\X`
+    /// character literal, a reader-macro-prefixed form (`'foo`,
+    /// `` `foo``, `,foo`, `,@foo`, `#'foo`), or an atom. No-op if
+    /// already at end of the enclosing sexp (sitting on a `)` or
+    /// at end-of-buffer).
+    fn move_forward_sexp(&mut self, extend: bool) {
+        if let Some(target) = super::sexp_nav::forward_sexp(&self.buffer, self.cursor) {
+            self.set_cursor_offset(target, extend);
+            self.pref_col = self.cursor_col();
+        }
+    }
+
+    /// Ctrl-Left: jump backward over the previous s-expression.
+    /// Symmetric with `move_forward_sexp`.
+    fn move_backward_sexp(&mut self, extend: bool) {
+        if let Some(target) = super::sexp_nav::backward_sexp(&self.buffer, self.cursor) {
+            self.set_cursor_offset(target, extend);
+            self.pref_col = self.cursor_col();
+        }
     }
 
     fn move_up(&mut self, extend: bool) {
-        let mut r = self.cursor_row;
+        let r = self.cursor_row();
         if r == 0 {
             return;
         }
-        r -= 1;
-        let n = self.buffer[r].chars().count();
-        let c = self.pref_col.min(n);
         // Don't reset pref_col across vertical moves — that's the
         // whole point of remembering it.
         let pref = self.pref_col;
-        self.set_cursor(r, c, extend);
+        self.set_cursor_rc(r - 1, pref, extend);
         self.pref_col = pref;
     }
 
     fn move_down(&mut self, extend: bool) {
-        let mut r = self.cursor_row;
-        if r + 1 >= self.buffer.len() {
+        let r = self.cursor_row();
+        if r + 1 >= self.buffer.line_count() {
             return;
         }
-        r += 1;
-        let n = self.buffer[r].chars().count();
-        let c = self.pref_col.min(n);
         let pref = self.pref_col;
-        self.set_cursor(r, c, extend);
+        self.set_cursor_rc(r + 1, pref, extend);
         self.pref_col = pref;
     }
 
     fn move_home(&mut self, extend: bool) {
-        let r = self.cursor_row;
-        self.set_cursor(r, 0, extend);
+        let r = self.cursor_row();
+        self.set_cursor_rc(r, 0, extend);
         self.pref_col = 0;
     }
 
     fn move_end(&mut self, extend: bool) {
-        let r = self.cursor_row;
-        let n = self.buffer[r].chars().count();
-        self.set_cursor(r, n, extend);
-        self.pref_col = self.cursor_col;
+        let r = self.cursor_row();
+        let n = self.line_len_cps(r);
+        self.set_cursor_rc(r, n, extend);
+        self.pref_col = self.cursor_col();
     }
 
     fn page_up(&mut self, extend: bool) {
         let visible = self.visible_rows().max(1);
-        let r = self.cursor_row.saturating_sub(visible);
-        let n = self.buffer[r].chars().count();
-        let c = self.pref_col.min(n);
+        let r = self.cursor_row().saturating_sub(visible);
         let pref = self.pref_col;
-        self.set_cursor(r, c, extend);
+        self.set_cursor_rc(r, pref, extend);
         self.pref_col = pref;
     }
 
     fn page_down(&mut self, extend: bool) {
         let visible = self.visible_rows().max(1);
-        let last = self.buffer.len().saturating_sub(1);
-        let r = (self.cursor_row + visible).min(last);
-        let n = self.buffer[r].chars().count();
-        let c = self.pref_col.min(n);
+        let last = self.buffer.line_count().saturating_sub(1);
+        let r = (self.cursor_row() + visible).min(last);
         let pref = self.pref_col;
-        self.set_cursor(r, c, extend);
+        self.set_cursor_rc(r, pref, extend);
         self.pref_col = pref;
     }
 
     fn select_all(&mut self) {
-        let last_row = self.buffer.len().saturating_sub(1);
-        let last_col = self.buffer[last_row].chars().count();
-        self.anchor_row = 0;
-        self.anchor_col = 0;
-        self.cursor_row = last_row;
-        self.cursor_col = last_col;
-        self.pref_col = self.cursor_col;
+        self.anchor = 0;
+        self.cursor = self.buffer.len();
+        self.pref_col = self.cursor_col();
         self.coalesce = None;
         self.ensure_cursor_visible();
         self.invalidate();
@@ -1608,7 +2038,7 @@ impl ReditState {
     /// column the click lands on is then mapped back to a buffer
     /// char index via `display_col_to_buffer`, which handles tab
     /// expansion.
-    fn pos_at_pixel(&self, x: i32, y: i32) -> Pos {
+    fn pos_at_pixel(&self, x: i32, y: i32) -> (usize, usize) {
         let gutter_w = 6.0 * self.cell_w;
         let x_dip = self.px_to_dip(x);
         let y_dip = self.px_to_dip(y);
@@ -1622,23 +2052,23 @@ impl ReditState {
         } else {
             self.scroll_top + row_f as usize
         };
-        let row = row.min(self.buffer.len().saturating_sub(1));
+        let row = row.min(self.buffer.line_count().saturating_sub(1));
         let cx = x_dip - gutter_w;
         let display_col = if cx <= 0.0 || self.cell_w <= 0.0 {
             0
         } else {
             (cx / self.cell_w).round() as usize
         };
-        let line = &self.buffer[row];
-        let buf_col = display_col_to_buffer(line, display_col);
+        let line = self.line_text(row);
+        let buf_col = display_col_to_buffer(&line, display_col);
         let n = line.chars().count();
         (row, buf_col.min(n))
     }
 
     fn click(&mut self, x: i32, y: i32, extend: bool) {
         let (r, c) = self.pos_at_pixel(x, y);
-        self.set_cursor(r, c, extend);
-        self.pref_col = self.cursor_col;
+        self.set_cursor_rc(r, c, extend);
+        self.pref_col = self.cursor_col();
     }
 
     fn drag_to(&mut self, x: i32, y: i32) {
@@ -1647,10 +2077,12 @@ impl ReditState {
         }
         let (r, c) = self.pos_at_pixel(x, y);
         // While dragging, anchor stays put (it was set on
-        // mouse-down), cursor follows the pointer.
-        self.cursor_row = r;
-        self.cursor_col = c;
-        self.pref_col = self.cursor_col;
+        // mouse-down), cursor follows the pointer. `set_cursor_rc`
+        // with `extend=true` keeps the anchor pinned.
+        let n = self.line_len_cps(r);
+        let offset = self.buffer.line_col_to_offset(r, c.min(n));
+        self.cursor = offset;
+        self.pref_col = self.cursor_col();
         self.coalesce = None;
         self.ensure_cursor_visible();
         self.invalidate();
@@ -1665,7 +2097,7 @@ impl ReditState {
         if lines == 0 {
             return;
         }
-        let max_top = self.buffer.len().saturating_sub(1);
+        let max_top = self.buffer.line_count().saturating_sub(1);
         let new_top = (self.scroll_top as i32 + lines).max(0) as usize;
         self.scroll_top = new_top.min(max_top);
         self.invalidate();
@@ -1676,22 +2108,14 @@ impl ReditState {
     fn load_from(&mut self, path: PathBuf) {
         match std::fs::read(&path) {
             Ok(bytes) => {
-                let text = decode_utf8_lossy_with_bom(&bytes);
-                let lines: Vec<String> = if text.is_empty() {
-                    vec![String::new()]
-                } else {
-                    let mut v: Vec<String> =
-                        text.split('\n').map(|s| s.trim_end_matches('\r').to_string()).collect();
-                    if v.is_empty() {
-                        v.push(String::new());
-                    }
-                    v
-                };
-                self.buffer = lines;
-                self.cursor_row = 0;
-                self.cursor_col = 0;
-                self.anchor_row = 0;
-                self.anchor_col = 0;
+                // The rope's `from_utf8` handles BOM stripping, CRLF
+                // normalisation, and invalid-sequence U+FFFD
+                // replacement in one pass — same behaviour as the
+                // old hand-rolled `decode_utf8_lossy_with_bom` +
+                // split('\n') + trim_end_matches('\r') pipeline.
+                self.buffer = RopeBuffer::from_utf8(&bytes);
+                self.cursor = 0;
+                self.anchor = 0;
                 self.pref_col = 0;
                 self.scroll_top = 0;
                 self.dirty = false;
@@ -1710,13 +2134,10 @@ impl ReditState {
     }
 
     fn save_to(&mut self, path: PathBuf) -> bool {
-        let mut text = String::new();
-        for (i, line) in self.buffer.iter().enumerate() {
-            if i > 0 {
-                text.push_str("\r\n");
-            }
-            text.push_str(line);
-        }
+        // Convert the rope to UTF-8 with CRLF line endings (Win32
+        // convention). The rope's `to_utf8` emits LF; we replace.
+        let lf_text = self.buffer.to_utf8();
+        let text = lf_text.replace('\n', "\r\n");
         match std::fs::write(&path, text.as_bytes()) {
             Ok(()) => {
                 self.file_path = Some(path);
@@ -1852,6 +2273,28 @@ unsafe extern "system" fn ledit_wnd_proc(
             handle_key(state, wparam.0 as u32);
             LRESULT(0)
         }
+        WM_SYSKEYDOWN => {
+            // Alt-letter chords for the paredit ops. Returning LRESULT(0)
+            // suppresses the default Win32 behaviour (menu activation,
+            // beep on unmapped Alt-letter) so unbound Alt-X falls through
+            // cleanly. Bound chords: Alt-W = wrap, Alt-S = splice,
+            // Alt-R = raise.
+            let vk = wparam.0 as u32;
+            if handle_alt_key(state, vk) {
+                LRESULT(0)
+            } else {
+                unsafe { DefMDIChildProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
+        WM_COMMAND => {
+            // Edit-menu items forwarded from the frame WndProc.
+            let cmd_id = (wparam.0 & 0xFFFF) as u16;
+            if handle_edit_menu(state, cmd_id) {
+                LRESULT(0)
+            } else {
+                unsafe { DefMDIChildProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
         WM_DPICHANGED_AFTERPARENT => {
             let dpi = unsafe { GetDpiForWindow(hwnd) };
             if dpi != 0 {
@@ -1885,13 +2328,80 @@ fn shift_down() -> bool {
     (unsafe { GetKeyState(VK_SHIFT.0 as i32) } as i16) < 0
 }
 
+/// Dispatch an Edit-menu command forwarded from the frame's
+/// WM_COMMAND handler. Returns `true` if we recognised the id.
+fn handle_edit_menu(state: &mut ReditState, cmd_id: u16) -> bool {
+    match cmd_id {
+        EDIT_CMD_UNDO => state.undo(),
+        EDIT_CMD_REDO => state.redo(),
+        EDIT_CMD_CUT => state.cut(),
+        EDIT_CMD_COPY => state.copy(),
+        EDIT_CMD_PASTE => state.paste(),
+        EDIT_CMD_SELECT_ALL => state.select_all(),
+        EDIT_CMD_FORWARD_SEXP => state.move_forward_sexp(false),
+        EDIT_CMD_BACKWARD_SEXP => state.move_backward_sexp(false),
+        EDIT_CMD_SLURP_FORWARD => state.slurp_forward(),
+        EDIT_CMD_BARF_FORWARD => state.barf_forward(),
+        EDIT_CMD_WRAP => state.wrap_sexp(),
+        EDIT_CMD_SPLICE => state.splice_enclosing(),
+        EDIT_CMD_RAISE => state.raise_sexp(),
+        EDIT_CMD_RUN_BUFFER => state.run_buffer(),
+        EDIT_CMD_RUN_FORM => state.run_form_at_point(),
+        _ => return false,
+    }
+    true
+}
+
+/// Dispatch an Alt-letter chord. Returns `true` if we consumed the
+/// key. Alt-W/S/R are the paredit triad (wrap / splice / raise);
+/// anything else falls through to the default handler.
+fn handle_alt_key(state: &mut ReditState, vk: u32) -> bool {
+    // ASCII letter virtual keys are 'A'=0x41 .. 'Z'=0x5A — the same
+    // codes you'd see in a non-Alt WM_KEYDOWN for those keys.
+    match vk {
+        0x57 => {
+            state.wrap_sexp();
+            true
+        }
+        0x53 => {
+            state.splice_enclosing();
+            true
+        }
+        0x52 => {
+            state.raise_sexp();
+            true
+        }
+        _ => false,
+    }
+}
+
+fn ctrl_down() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL;
+    (unsafe { GetKeyState(VK_CONTROL.0 as i32) } as i16) < 0
+}
+
 fn handle_key(state: &mut ReditState, vk: u32) {
     let vk16 = vk as u16;
     let extend = shift_down();
+    let ctrl = ctrl_down();
     if vk16 == VK_LEFT.0 {
-        state.move_left(extend);
+        if ctrl && extend {
+            // Ctrl-Shift-Left → paredit barf forward
+            state.barf_forward();
+        } else if ctrl {
+            state.move_backward_sexp(extend);
+        } else {
+            state.move_left(extend);
+        }
     } else if vk16 == VK_RIGHT.0 {
-        state.move_right(extend);
+        if ctrl && extend {
+            // Ctrl-Shift-Right → paredit slurp forward
+            state.slurp_forward();
+        } else if ctrl {
+            state.move_forward_sexp(extend);
+        } else {
+            state.move_right(extend);
+        }
     } else if vk16 == VK_UP.0 {
         state.move_up(extend);
     } else if vk16 == VK_DOWN.0 {
@@ -1912,6 +2422,14 @@ fn handle_key(state: &mut ReditState, vk: u32) {
         } else {
             state.delete_forward();
         }
+    } else if vk16 == VK_F5.0 {
+        state.run_buffer();
+    } else if vk16 == VK_RETURN.0 && ctrl {
+        // Ctrl-Enter: run the top-level form at cursor. Equivalent
+        // of Emacs C-M-x. WM_CHAR would deliver Ctrl+J (0x0A) for
+        // plain Ctrl+Enter via the typical Win32 mapping, but we
+        // catch it at the VK level here to be unambiguous.
+        state.run_form_at_point();
     } else if vk16 == VK_F7.0 {
         // F7 — run compile check on the current buffer.
         state.run_check();
@@ -1960,6 +2478,14 @@ fn handle_char(state: &mut ReditState, c: char) {
             state.paste();
             return;
         }
+        0x12 => {
+            // Ctrl+R — Run Buffer. Same path as Edit → Run Buffer
+            // and the F5 accelerator: push source at the language
+            // thread, default handler in events.lisp calls
+            // eval-string and writes the result to the log overlay.
+            state.run_buffer();
+            return;
+        }
         0x18 => {
             // Ctrl+X — cut.
             state.cut();
@@ -1989,8 +2515,9 @@ fn handle_char(state: &mut ReditState, c: char) {
         // Soft tab: insert spaces up to the next display tab stop so
         // typed indentation lines up with rendered tabs from
         // existing files. Single insert => one undo entry.
-        let line = &state.buffer[state.cursor_row];
-        let display_col = buffer_col_to_display(line, state.cursor_col);
+        let (cur_row, cur_col) = state.cursor_rc();
+        let line = state.line_text(cur_row);
+        let display_col = buffer_col_to_display(&line, cur_col);
         let pad = TAB_WIDTH - (display_col % TAB_WIDTH);
         let spaces: String = std::iter::repeat(' ').take(pad).collect();
         state.insert_str(&spaces);
@@ -2009,16 +2536,27 @@ fn handle_char(state: &mut ReditState, c: char) {
 
 // ─── File dialogs ───────────────────────────────────────────────────
 
-fn cp_filter() -> Vec<u16> {
-    // Each filter is a pair of NUL-terminated strings, terminated by
-    // an extra NUL.
-    let raw = "Component Pascal (*.cp)\0*.cp\0Text files (*.txt)\0*.txt\0All files (*.*)\0*.*\0\0";
+/// Open/Save dialog filter spec. Win32 wants pairs of NUL-
+/// terminated strings (display label, glob), with an extra NUL at
+/// the end of the list. We default to Lisp; users can drop into
+/// "All files" for everything else.
+fn lisp_filter() -> Vec<u16> {
+    let raw = "Lisp source (*.lisp;*.cl;*.lsp)\0*.lisp;*.cl;*.lsp\0\
+               Text files (*.txt)\0*.txt\0\
+               All files (*.*)\0*.*\0\0";
     raw.encode_utf16().collect()
+}
+
+/// Default extension when the user saves a new file without typing
+/// one. Win32 appends this if the filename has no `.` of its own.
+fn default_ext_lisp() -> Vec<u16> {
+    "lisp\0".encode_utf16().collect()
 }
 
 fn open_file_dialog(owner: HWND) -> Option<PathBuf> {
     let mut buf = vec![0u16; 1024];
-    let filter = cp_filter();
+    let filter = lisp_filter();
+    let def_ext = default_ext_lisp();
     let mut ofn = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
         hwndOwner: owner,
@@ -2026,6 +2564,7 @@ fn open_file_dialog(owner: HWND) -> Option<PathBuf> {
         nFilterIndex: 1,
         lpstrFile: windows::core::PWSTR(buf.as_mut_ptr()),
         nMaxFile: buf.len() as u32,
+        lpstrDefExt: PCWSTR(def_ext.as_ptr()),
         Flags: OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY,
         ..Default::default()
     };
@@ -2044,7 +2583,8 @@ fn save_file_dialog(owner: HWND, suggested: Option<&std::path::Path>) -> Option<
         let n = s.len().min(buf.len() - 1);
         buf[..n].copy_from_slice(&s[..n]);
     }
-    let filter = cp_filter();
+    let filter = lisp_filter();
+    let def_ext = default_ext_lisp();
     let mut ofn = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
         hwndOwner: owner,
@@ -2052,6 +2592,7 @@ fn save_file_dialog(owner: HWND, suggested: Option<&std::path::Path>) -> Option<
         nFilterIndex: 1,
         lpstrFile: windows::core::PWSTR(buf.as_mut_ptr()),
         nMaxFile: buf.len() as u32,
+        lpstrDefExt: PCWSTR(def_ext.as_ptr()),
         Flags: OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_OVERWRITEPROMPT,
         ..Default::default()
     };
@@ -2154,11 +2695,23 @@ fn solid_brush(
     unsafe { target.CreateSolidColorBrush(&color, Some(&props)) }.ok()
 }
 
-fn char_to_byte(s: &str, char_idx: usize) -> usize {
-    s.char_indices()
-        .nth(char_idx)
-        .map(|(b, _)| b)
-        .unwrap_or_else(|| s.len())
+/// First line of `s` truncated to at most `n` characters, with `…`
+/// appended if either truncation happened. Used by the run-form
+/// log line so a 200-line `defun` doesn't fill the log overlay.
+fn preview_first_line(s: &str, n: usize) -> String {
+    let first = s.split('\n').next().unwrap_or("");
+    let mut out: String = first.chars().take(n).collect();
+    if first.chars().count() > n || s.contains('\n') {
+        out.push('…');
+    }
+    out
+}
+
+/// True iff `cp` is one of the whitespace code points the paredit
+/// trim logic treats as separator. Matches the rope's notion of
+/// whitespace (space, tab, LF, CR, FF).
+fn is_ws_cp(cp: u32) -> bool {
+    matches!(cp, 0x20 | 0x09 | 0x0A | 0x0D | 0x0C)
 }
 
 /// Expand `\t` characters in `line` to spaces, padding to the next
@@ -2226,14 +2779,9 @@ fn display_col_to_buffer(line: &str, display_col: usize) -> usize {
     line.chars().count()
 }
 
-fn decode_utf8_lossy_with_bom(bytes: &[u8]) -> String {
-    let stripped = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        &bytes[3..]
-    } else {
-        bytes
-    };
-    String::from_utf8_lossy(stripped).into_owned()
-}
+// `decode_utf8_lossy_with_bom` was removed when `load_from` switched
+// to `RopeBuffer::from_utf8`, which handles BOM, CRLF, and invalid
+// sequences internally.
 
 // ─── Component Pascal tokenizer (R3 syntax highlighting) ───────────
 
@@ -2415,11 +2963,13 @@ fn tokenize_line(line: &str, depth_in: u32) -> (Vec<Token>, u32) {
 
 /// Tokenize the whole buffer. Comment depth is threaded through
 /// lines so a `(* ... \n ... *)` block is one comment.
-fn tokenize_buffer(buffer: &[String]) -> Vec<Vec<Token>> {
-    let mut out = Vec::with_capacity(buffer.len());
+fn tokenize_rope(rope: &RopeBuffer) -> Vec<Vec<Token>> {
+    let n = rope.line_count();
+    let mut out = Vec::with_capacity(n);
     let mut depth: u32 = 0;
-    for line in buffer {
-        let (tokens, next_depth) = tokenize_line(line, depth);
+    for row in 0..n {
+        let line = codepoints_to_utf8(&rope.get_line(row));
+        let (tokens, next_depth) = tokenize_line(&line, depth);
         out.push(tokens);
         depth = next_depth;
     }

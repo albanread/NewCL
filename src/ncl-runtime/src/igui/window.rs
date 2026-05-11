@@ -339,6 +339,37 @@ unsafe extern "system" fn frame_wnd_proc(
                 }
                 return LRESULT(0);
             }
+            // Edit-menu commands: forward to the active MDI child.
+            // ledit's WndProc recognises these IDs in its own
+            // WM_COMMAND handler and dispatches to the right method.
+            // If no child is active or the active child doesn't
+            // care about Edit commands, the message is harmless.
+            if cmd_id >= super::ledit::EDIT_CMD_BASE
+                && cmd_id <= super::ledit::EDIT_CMD_END
+            {
+                if mdi.0 as isize != 0 {
+                    let active_raw = unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                            mdi,
+                            windows::Win32::UI::WindowsAndMessaging::WM_MDIGETACTIVE,
+                            Some(WPARAM(0)),
+                            Some(LPARAM(0)),
+                        )
+                    };
+                    let active = HWND(active_raw.0 as *mut _);
+                    if active.0 as isize != 0 {
+                        unsafe {
+                            windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                                active,
+                                WM_COMMAND,
+                                Some(wparam),
+                                Some(lparam),
+                            )
+                        };
+                    }
+                }
+                return LRESULT(0);
+            }
             // MDI verbs auto-allocated in install_for_frame.
             if let Some(verb) = super::menu::lookup_mdi_verb(cmd_id) {
                 if mdi.0 as isize != 0 {

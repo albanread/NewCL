@@ -471,6 +471,12 @@ fn event_to_plist(
             pairs.push((kw(coord, "CHILD-ID"), Word::fixnum(child_id)));
             pairs.push((kw(coord, "TIME-MS"), Word::fixnum(time_ms)));
         }
+        IGuiEvent::EvalBuffer { source } => {
+            pairs.push((kw(coord, "KIND"), kw(coord, "EVAL-BUFFER")));
+            // Allocate the source text as a Lisp string in young.
+            let s = crate::gc_string::alloc_string_in_young(m, source.as_str());
+            pairs.push((kw(coord, "SOURCE"), s));
+        }
     }
     // Build (k1 v1 k2 v2 ...) right-to-left.
     let mut acc = Word::NIL;

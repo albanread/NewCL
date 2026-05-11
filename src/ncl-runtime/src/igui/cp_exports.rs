@@ -1250,6 +1250,13 @@ fn write_event(
             child = child_id;
             t = time_ms;
         }
+        IGuiEvent::EvalBuffer { .. } => {
+            // The C-export ABI doesn't carry the source string —
+            // EvalBuffer is consumed via the Rust-native path
+            // (event_to_plist allocates a Lisp string). C consumers
+            // see only the kind tag.
+            k = kind::EVAL_BUFFER;
+        }
     }
 
     unsafe {

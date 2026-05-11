@@ -43,6 +43,8 @@ pub mod lisp_shims;
 mod log_view;
 mod menu;
 pub(crate) mod ledit;
+pub(crate) mod rope_buffer;
+pub(crate) mod sexp_nav;
 mod registry;
 mod renderer;
 mod replies;

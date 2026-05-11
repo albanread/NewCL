@@ -87,18 +87,31 @@
        (:mouse       (when (eq (getf ev :op) :left-down)
                        (handle-click (getf ev :x) (getf ev :y))))
        (:tick        (advance) (repaint))
-       (t            nil))"
-  (let ((ev (gensym "EV-"))
-        (kind (gensym "K-")))
+       (t            nil))
+
+   :eval-buffer events from the ledit pane (Ctrl+R) are
+   auto-handled here — the source is evaluated via the active
+   session and a single-line printed result lands in the iGui
+   log overlay. User clauses can override by listing
+   `(:eval-buffer ...)` explicitly."
+  (let* ((ev (gensym "EV-"))
+         (kind (gensym "K-"))
+         (has-eval-buffer
+          (some (lambda (c) (eq (car c) :eval-buffer)) clauses))
+         (default-eval-clause
+          (unless has-eval-buffer
+            (list `((eq ,kind :eval-buffer)
+                    (%handle-eval-buffer (getf ev :source)))))))
     `(loop
        (let ((,ev (next-event -1)))
          (when ,ev
            (let ((,kind (getf ,ev :kind)))
-             ;; Bind the user-facing name `ev' inside each clause's
-             ;; body so handlers can reference event fields without
-             ;; the macro's gensym.
              (let ((ev ,ev))
                (cond
+                 ;; Default :eval-buffer handler (Ctrl+R in ledit).
+                 ;; Suppressed if the user listed their own
+                 ;; (:eval-buffer ...) clause below.
+                 ,@default-eval-clause
                  ,@(mapcar
                      (lambda (clause)
                        (let ((head (car clause))
@@ -107,6 +120,23 @@
                            ((eq head 't) `(t ,@body))
                            (t `((eq ,kind ',head) ,@body)))))
                      clauses)))))))))
+
+(defun %handle-eval-buffer (source)
+  "Evaluate SOURCE via the active session. If the printed result
+   fits on a single line, write it to the iGui log overlay; if
+   it's multi-line or an error, write a short marker (the user
+   can re-run from the editor with their own clause to inspect)."
+  (let ((result
+         (handler-case (eval-string source)
+           (error (c) (format nil "error: ~A" c)))))
+    (cond
+      ((null result) nil)
+      ((position #\Newline result)
+       ;; Multi-line: just hint that it ran.
+       (log-write (format nil "[eval] ~A lines~%"
+                          (1+ (count #\Newline result)))))
+      (t
+       (log-write (format nil "[eval] ~A~%" result))))))
 
 ;; ── event-loop-for: combined filter + dispatch ─────────────────────────
 
