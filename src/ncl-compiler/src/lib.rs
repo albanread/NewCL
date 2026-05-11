@@ -807,8 +807,20 @@ impl Session {
     /// Convenience: a session with the core stdlib + CLOS pre-loaded.
     pub fn with_stdlib() -> Result<Session, EvalError> {
         let mut s = Session::new();
-        s.load_core_stdlib()?;
-        s.load_clos()?;
+        // Activate the session for the duration of stdlib load so
+        // any (compile ...) calls (e.g. CLOS method functions
+        // generated during defmethod expansion) can find the
+        // active session. The caller will (re)activate when they
+        // start using the session for user code.
+        s.activate();
+        let r1 = s.load_core_stdlib();
+        if let Err(e) = r1 {
+            ACTIVE_SESSION.with(|c| c.set(std::ptr::null_mut()));
+            return Err(e);
+        }
+        let r2 = s.load_clos();
+        ACTIVE_SESSION.with(|c| c.set(std::ptr::null_mut()));
+        r2?;
         Ok(s)
     }
 }

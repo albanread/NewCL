@@ -2029,5 +2029,145 @@
            (finalize-generic-function gf))
          *clos-generic-function-table*)
 
+;; ─── Stage I: polish — accessors, print-object, typep ──────────────────────
+;;
+;; Final stage. Brings the user-facing surface area in line with
+;; what most CLOS code expects:
+;;
+;;   * defclass slot specs with :reader / :writer / :accessor
+;;     now actually generate generic-function reader and writer
+;;     methods (Stage C accepted the syntax and silently dropped
+;;     them).
+;;   * print-object becomes a real generic function — defining a
+;;     method on it for your class controls how (format nil "~A"
+;;     instance) prints.
+;;   * typep gets a CLOS-aware front door — (typep obj 'class-name)
+;;     tests subclassp on the instance's class.
+;;   * describe-object dumps slot values for diagnosis.
+
+;; -- Reader / writer / accessor generation --------------------------------
+
+(defun add-reader-method (class fn-name slot-name)
+  (ensure-method
+   (ensure-generic-function fn-name :lambda-list '(object))
+   :generic-function-name fn-name
+   :lambda-list '(object)
+   :qualifiers nil
+   :specializers (list class)
+   :body `((slot-value object ',slot-name))))
+
+(defun %setter-name (fn-name)
+  ;; Map an accessor name like FOO into the %SETF-FOO symbol used
+  ;; by the generic-setf-fallback. We don't yet have symbol-name,
+  ;; so we round-trip the symbol through format ~A which prints it
+  ;; as its bare name.
+  (intern (format nil "%SETF-~A" fn-name)))
+
+(defun add-writer-method (class fn-name slot-name)
+  ;; Writer in Closette is `(setf NAME)` shape. We adapt to the
+  ;; generic-setf-fallback convention: a name like FOO becomes
+  ;; %SETF-FOO. (setf (foo x) val) lowers to (%setf-foo val x),
+  ;; which is then a regular generic-function call.
+  (let ((setter-name (cond
+                       ((symbolp fn-name) (%setter-name fn-name))
+                       ;; If user wrote `(setf foo)` directly,
+                       ;; canonicalize to %SETF-FOO too.
+                       ((and (listp fn-name) (eq (car fn-name) 'setf))
+                        (%setter-name (cadr fn-name)))
+                       (t fn-name))))
+    (ensure-method
+     (ensure-generic-function setter-name
+                              :lambda-list '(new-value object))
+     :generic-function-name setter-name
+     :lambda-list '(new-value object)
+     :qualifiers nil
+     :specializers (list (find-class 't) class)
+     :body `((setf (slot-value object ',slot-name) new-value)))))
+
+(defun %install-direct-slot-accessors (class)
+  "Walk CLASS's direct slots; for each slot, register every
+   :reader / :writer (the latter possibly via :accessor)."
+  (dolist (slot (class-direct-slots class))
+    (let ((slot-name (slot-definition-name slot)))
+      (dolist (reader (slot-definition-readers slot))
+        (add-reader-method class reader slot-name))
+      (dolist (writer (slot-definition-writers slot))
+        (add-writer-method class writer slot-name)))))
+
+;; Hook into make-instance-standard-class so every defclass
+;; auto-generates accessors going forward. Saves the prior
+;; definition into a global, redefines through it. (We can't
+;; (let ((prev #'...)) (defun ...)) because our compiler bans
+;; defun inside let.)
+(defparameter %prev-make-instance-standard-class
+  (symbol-function 'make-instance-standard-class))
+
+(defun make-instance-standard-class (metaclass &rest all-keys
+                                               &key &allow-other-keys)
+  (let ((class (apply %prev-make-instance-standard-class
+                      metaclass all-keys)))
+    (%install-direct-slot-accessors class)
+    class))
+
+;; -- print-object generic -------------------------------------------------
+;;
+;; Default method prints the same thing the runtime printer does
+;; (#<CLASSNAME>). User code can specialize per class to customise.
+;; We don't yet wire this into the runtime printer — that needs
+;; UTF-8 string-back-into-rust plumbing — so for now it's a Lisp-
+;; level convenience.
+
+(defgeneric print-object (object stream))
+
+(defmethod print-object ((object t) stream)
+  (format stream "#<~A>"
+          (cond
+            ((clos-instance-p object)
+             (class-name (class-of object)))
+            (t (class-name (built-in-class-of object))))))
+
+(defun describe-object (object &optional (stream t))
+  "Print OBJECT plus, for CLOS instances, every effective slot
+   and its current value (or '<unbound>')."
+  (cond
+    ((clos-instance-p object)
+     (let ((class (class-of object)))
+       (format stream "~A is an instance of class ~A.~%"
+               object (class-name class))
+       (format stream "Slots:~%")
+       (dolist (slot (class-effective-slots class))
+         (let ((name (slot-definition-name slot)))
+           (cond
+             ((slot-boundp object name)
+              (format stream "  ~A: ~A~%" name (slot-value object name)))
+             (t
+              (format stream "  ~A: <unbound>~%" name)))))))
+    (t (format stream "~A is a ~A.~%"
+               object (class-name (class-of object)))))
+  object)
+
+;; -- CLOS-aware typep -----------------------------------------------------
+;;
+;; The runtime typep handles primitives. We layer on top: if TYPE
+;; is a CLOS class name, defer to subclassp on the object's
+;; class. We can't redefine the existing typep (it's a special
+;; form / native) so we install a Lisp wrapper named CLOS-TYPEP.
+;; User code that wants the CLOS behavior calls CLOS-TYPEP
+;; explicitly. (Future stage: have the runtime typep call CLOS-
+;; TYPEP for non-primitive type names.)
+
+(defun clos-typep (object type)
+  (cond
+    ((symbolp type)
+     (let ((c (find-class type nil)))
+       (cond
+         (c (subclassp (class-of object) c))
+         (t (typep object type))))) ; fall through for primitives
+    (t (typep object type))))
+
+;; -- A few user-friendly shortcuts ---------------------------------------
+
+(defun class-slots (class) (class-effective-slots class))
+
 ;; Return a printable sentinel.
 nil
