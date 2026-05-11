@@ -1517,5 +1517,325 @@
        ,@method-forms
        ',function-name)))
 
+;; ─── Stage F: defmethod + method classes ───────────────────────────────────
+;;
+;; Methods are CLOS instances of standard-method. Each method
+;; carries a compiled "method function" of shape
+;;   (lambda (args next-emfun) ...)
+;; that takes the GF's full argument list and the next method's
+;; effective-method-function. Stage F handles primary-only
+;; dispatch; Stage G layers in :before / :after / :around.
+
+;; -- Method classes --------------------------------------------------------
+
+(defclass method (metaobject) ())
+
+(defclass standard-method (method)
+  ((qualifiers   :initarg :qualifiers)
+   (lambda-list  :initarg :lambda-list)
+   (specializers :initarg :specializers)
+   (body         :initarg :body)
+   (generic-function :initform nil)
+   (function)))
+
+(defparameter the-class-method          (find-class 'method))
+(defparameter the-class-standard-method (find-class 'standard-method))
+
+;; -- Method accessors ------------------------------------------------------
+
+(defun method-qualifiers   (m) (slot-value m 'qualifiers))
+(defun %setf-method-qualifiers   (v m) (setf (slot-value m 'qualifiers) v))
+(defun method-lambda-list  (m) (slot-value m 'lambda-list))
+(defun %setf-method-lambda-list  (v m) (setf (slot-value m 'lambda-list) v))
+(defun method-specializers (m) (slot-value m 'specializers))
+(defun %setf-method-specializers (v m) (setf (slot-value m 'specializers) v))
+(defun method-body         (m) (slot-value m 'body))
+(defun %setf-method-body         (v m) (setf (slot-value m 'body) v))
+(defun method-generic-function (m) (slot-value m 'generic-function))
+(defun %setf-method-generic-function (v m)
+  (setf (slot-value m 'generic-function) v))
+(defun method-function     (m) (slot-value m 'function))
+(defun %setf-method-function     (v m) (setf (slot-value m 'function) v))
+
+;; -- defmethod parsing -----------------------------------------------------
+
+(defun extract-lambda-list (specialized-lambda-list)
+  (let* ((plist (analyze-lambda-list specialized-lambda-list))
+         (requireds (getf plist ':required-names))
+         (rv        (getf plist ':rest-var))
+         (ks        (getf plist ':key-args))
+         (aok       (getf plist ':allow-other-keys))
+         (opts      (getf plist ':optional-args))
+         (auxs      (getf plist ':auxiliary-args))
+         (result requireds))
+    (when opts (setq result (append result (cons '&optional opts))))
+    (when rv   (setq result (append result (list '&rest rv))))
+    (when (or ks aok) (setq result (append result (cons '&key ks))))
+    (when aok  (setq result (append result (list '&allow-other-keys))))
+    (when auxs (setq result (append result (cons '&aux auxs))))
+    result))
+
+(defun extract-specializers (specialized-lambda-list)
+  (getf (analyze-lambda-list specialized-lambda-list) ':specializers))
+
+(defun parse-defmethod (args)
+  "ARGS = (fn-spec [qualifier...] specialized-lambda-list . body)
+   Returns a list (fn-spec qualifiers lambda-list specializers body)."
+  (let ((fn-spec (car args))
+        (rest (cdr args))
+        (qualifiers nil)
+        (slist nil)
+        (body nil))
+    ;; Collect qualifiers (non-list atoms before the lambda list).
+    (loop
+      (cond
+        ((null rest) (return nil))
+        ((and (atom (car rest)) (not (null (car rest))))
+         (setq qualifiers (append qualifiers (list (car rest))))
+         (setq rest (cdr rest)))
+        (t (return nil))))
+    (setq slist (car rest))
+    (setq body (cdr rest))
+    (list fn-spec
+          qualifiers
+          (extract-lambda-list slist)
+          (extract-specializers slist)
+          body)))
+
+;; -- defmethod macro -------------------------------------------------------
+
+(defun canonicalize-specializer (spec)
+  ;; EQL specializers land in stage H.
+  (cond
+    ((and (listp spec) (eq (car spec) 'eql))
+     `(intern-eql-specializer ,(cadr spec)))
+    (t `(find-class ',spec))))
+
+(defun canonicalize-specializers (specs)
+  `(list ,@(mapcar #'canonicalize-specializer specs)))
+
+(defmacro defmethod (&rest args)
+  (let* ((parsed (parse-defmethod args))
+         (fn-name     (car parsed))
+         (qualifiers  (cadr parsed))
+         (lambda-list (caddr parsed))
+         (specs       (cadddr parsed))
+         (body        (car (cddddr parsed))))
+    `(ensure-method (find-generic-function ',fn-name nil)
+                    :generic-function-name ',fn-name
+                    :lambda-list ',lambda-list
+                    :qualifiers ',qualifiers
+                    :specializers ,(canonicalize-specializers specs)
+                    :body ',body)))
+
+;; -- make-instance-standard-method ----------------------------------------
+
+(defun make-instance-standard-method (method-class &key lambda-list qualifiers
+                                                        specializers body
+                                                   &allow-other-keys)
+  (declare (ignore method-class))
+  (let ((method (std-allocate-instance the-class-standard-method)))
+    (setf (slot-value method 'name) nil)
+    (setf (slot-value method 'documentation) nil)
+    (setf (method-lambda-list  method) lambda-list)
+    (setf (method-qualifiers   method) qualifiers)
+    (setf (method-specializers method) specializers)
+    (setf (method-body         method) body)
+    (setf (method-generic-function method) nil)
+    (setf (method-function method) (std-compute-method-function method))
+    method))
+
+;; -- ensure-method / add-method / remove-method ---------------------------
+
+(defun ensure-method (gf &rest all-keys
+                      &key generic-function-name lambda-list
+                      &allow-other-keys)
+  (declare (ignore lambda-list))
+  ;; If gf doesn't exist yet, create one on the fly using the
+  ;; method's lambda-list. This is the path defgeneric-less
+  ;; defmethods take.
+  (let ((real-gf
+         (cond
+           ((null gf)
+            (ensure-generic-function
+             generic-function-name
+             :lambda-list (getf all-keys ':lambda-list)))
+           (t gf))))
+    (let ((method (apply #'make-instance-standard-method
+                         the-class-standard-method
+                         all-keys)))
+      (setf (slot-value method 'name) generic-function-name)
+      (add-method real-gf method)
+      method)))
+
+(defun add-method (gf method)
+  ;; Remove any existing method with the same qualifiers+specializers.
+  (let ((old (find-method gf (method-qualifiers method)
+                          (method-specializers method) nil)))
+    (when old (remove-method gf old)))
+  (setf (method-generic-function method) gf)
+  (setf (generic-function-methods gf)
+        (cons method (generic-function-methods gf)))
+  (dolist (spec (method-specializers method))
+    (let ((existing (class-direct-methods spec)))
+      (unless (member method existing)
+        (setf (class-direct-methods spec) (cons method existing)))))
+  (finalize-generic-function gf)
+  gf)
+
+(defun remove-method (gf method)
+  (setf (generic-function-methods gf)
+        (remove method (generic-function-methods gf)))
+  (setf (method-generic-function method) nil)
+  (dolist (spec (method-specializers method))
+    (setf (class-direct-methods spec)
+          (remove method (class-direct-methods spec))))
+  (finalize-generic-function gf)
+  gf)
+
+(defun find-method (gf qualifiers specializers &optional (errorp t))
+  (let ((m (find-if (lambda (mm)
+                      (and (equal qualifiers (method-qualifiers mm))
+                           (equal specializers (method-specializers mm))))
+                    (generic-function-methods gf))))
+    (cond
+      ((null m)
+       (cond (errorp (error "No such method for ~A." (generic-function-name gf)))
+             (t nil)))
+      (t m))))
+
+;; -- compute-method-function ----------------------------------------------
+;;
+;; Stage F: simplest shape. Method body wraps in a block named
+;; after the gf so RETURN-FROM works, then APPLY'd to args.
+;; next-emfun is bound but unused — Stage G consults it for
+;; call-next-method.
+
+(defun std-compute-method-function (method)
+  (let* ((lambda-list (method-lambda-list method))
+         (body (method-body method))
+         (gf-name (slot-value method 'name))
+         (blk (cond ((symbolp gf-name) gf-name)
+                    (t (gensym "METHOD-")))))
+    (compile nil
+             `(lambda (args next-emfun)
+                (apply (lambda ,lambda-list
+                         (block ,blk ,@body))
+                       args)))))
+
+;; -- compute-applicable-methods-using-classes -----------------------------
+
+(defun %every-pair-subclassp (classes specs)
+  (cond
+    ((and (null classes) (null specs)) t)
+    ((or (null classes) (null specs)) nil)
+    ((subclassp (car classes) (car specs))
+     (%every-pair-subclassp (cdr classes) (cdr specs)))
+    (t nil)))
+
+(defun compute-applicable-methods-using-classes (gf required-classes)
+  (let ((applicable
+         (remove-if-not (lambda (method)
+                          (%every-pair-subclassp
+                           required-classes
+                           (method-specializers method)))
+                        (generic-function-methods gf))))
+    (sort applicable
+          (lambda (m1 m2)
+            (std-method-more-specific-p gf m1 m2 required-classes)))))
+
+;; -- method-more-specific-p ----------------------------------------------
+
+(defun std-method-more-specific-p (gf m1 m2 required-classes)
+  (declare (ignore gf))
+  (let ((s1 (method-specializers m1))
+        (s2 (method-specializers m2))
+        (cs required-classes)
+        (result nil)
+        (done nil))
+    (loop
+      (cond
+        (done (return result))
+        ((or (null s1) (null s2) (null cs)) (return nil))
+        (t
+         (let ((sp1 (car s1)) (sp2 (car s2)) (cl (car cs)))
+           (cond
+             ((eq sp1 sp2)
+              (setq s1 (cdr s1)) (setq s2 (cdr s2)) (setq cs (cdr cs)))
+             (t
+              (setq result (sub-specializer-p sp1 sp2 cl))
+              (setq done t)))))))))
+
+;; -- effective-method-function --------------------------------------------
+
+(defun primary-method-p (m) (null (method-qualifiers m)))
+(defun before-method-p  (m) (equal '(:before) (method-qualifiers m)))
+(defun after-method-p   (m) (equal '(:after)  (method-qualifiers m)))
+(defun around-method-p  (m) (equal '(:around) (method-qualifiers m)))
+
+(defun compute-primary-emfun (methods)
+  (cond
+    ((null methods) nil)
+    (t (let ((next (compute-primary-emfun (cdr methods))))
+         (lambda (args)
+           (funcall (method-function (car methods)) args next))))))
+
+(defun std-compute-effective-method-function (gf methods)
+  (declare (ignore gf))
+  (let ((primaries (remove-if-not #'primary-method-p methods)))
+    (cond
+      ((null primaries)
+       (error "No primary methods for this generic-function call."))
+      (t (compute-primary-emfun primaries)))))
+
+;; -- discriminating function (real version) ------------------------------
+;;
+;; Replaces the Stage E stub. The closure captures `gf` and the
+;; classes-to-emf-table; each call computes the required-portion's
+;; classes, consults the cache, and falls through to
+;; slow-method-lookup on miss. The emf takes the FULL arg list and
+;; returns the result.
+
+(defun %first-n (lst n)
+  (cond
+    ((or (zerop n) (null lst)) nil)
+    (t (cons (car lst) (%first-n (cdr lst) (- n 1))))))
+
+(defun slow-method-lookup (gf table classes args)
+  (declare (ignore args))
+  (let ((methods (compute-applicable-methods-using-classes gf classes)))
+    (cond
+      ((null methods)
+       (error "No applicable method for ~A on classes ~A"
+              (generic-function-name gf)
+              (mapcar #'class-name classes)))
+      (t
+       (let ((emf (std-compute-effective-method-function gf methods)))
+         (add-method-table-method table classes emf)
+         emf)))))
+
+;; Replace the stage-E stub:
+(defun std-compute-discriminating-function (gf)
+  (lambda (&rest args)
+    (let* ((table   (classes-to-emf-table gf))
+           (num     (num-required-args gf))
+           (req     (%first-n args num))
+           (classes (mapcar #'class-of req)))
+      (let ((emf (or (find-method-table-method table classes)
+                     (slow-method-lookup gf table classes args))))
+        (funcall emf args)))))
+
+;; Re-finalize every GF that was created in Stage E with the stub
+;; discriminator so existing GFs pick up the new dispatch path.
+(maphash (lambda (name gf)
+           (declare (ignore name))
+           (finalize-generic-function gf))
+         *clos-generic-function-table*)
+
+;; intern-eql-specializer placeholder (filled in stage H).
+(defun intern-eql-specializer (obj)
+  (declare (ignore obj))
+  (error "EQL specializers are not yet supported (stage H)."))
+
 ;; Return a printable sentinel.
 nil

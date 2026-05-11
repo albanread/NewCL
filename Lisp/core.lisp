@@ -30,6 +30,12 @@
 (defun cadr (lst) (car (cdr lst)))
 (defun cdar (lst) (cdr (car lst)))
 (defun cddr (lst) (cdr (cdr lst)))
+(defun caddr   (lst) (car (cdr (cdr lst))))
+(defun cdddr   (lst) (cdr (cdr (cdr lst))))
+(defun cadddr  (lst) (car (cdr (cdr (cdr lst)))))
+(defun cddddr  (lst) (cdr (cdr (cdr (cdr lst)))))
+(defun cadar   (lst) (car (cdr (car lst))))
+(defun caaar   (lst) (car (car (car lst))))
 
 (defun identity (x) x)
 
@@ -526,6 +532,55 @@
     ((funcall test item (funcall key (car lst)))
      (remove item (cdr lst) :test test :key key))
     (t (cons (car lst) (remove item (cdr lst) :test test :key key)))))
+
+;; -- sort -------------------------------------------------------------------
+;;
+;; Mergesort variant. CL's `sort` is destructive but allowed to
+;; share — we just return a fresh list. Comparator returns T iff
+;; the first arg should come before the second.
+
+(defun %split-list (lst)
+  "Split LST into two halves; returns (cons left right)."
+  (let ((slow lst) (fast lst) (n 0))
+    (loop
+      (cond
+        ((or (null fast) (null (cdr fast))) (return nil))
+        (t (setq slow (cdr slow))
+           (setq fast (cdr (cdr fast)))
+           (setq n (+ n 1)))))
+    (let ((left nil) (rest lst))
+      (loop
+        (cond
+          ((zerop n) (return nil))
+          (t (setq left (cons (car rest) left))
+             (setq rest (cdr rest))
+             (setq n (- n 1)))))
+      (cons (reverse left) rest))))
+
+(defun %merge (a b cmp)
+  (cond
+    ((null a) b)
+    ((null b) a)
+    ((funcall cmp (car a) (car b))
+     (cons (car a) (%merge (cdr a) b cmp)))
+    (t (cons (car b) (%merge a (cdr b) cmp)))))
+
+(defun sort (lst cmp)
+  "Mergesort by CMP. CMP returns true iff its first arg should
+   come before its second. Returns a fresh list (we don't share
+   tails) — CL's destructive variant is harmless here because we
+   never read the input again."
+  (cond
+    ((null lst) nil)
+    ((null (cdr lst)) lst)
+    (t (let* ((split (%split-list lst))
+              (left  (sort (car split) cmp))
+              (right (sort (cdr split) cmp)))
+         (%merge left right cmp)))))
+
+(defun copy-list (lst)
+  (cond ((null lst) nil)
+        (t (cons (car lst) (copy-list (cdr lst))))))
 
 (defun remove-duplicates (lst &key (test #'eql) (key #'identity))
   "Return a fresh list with duplicates removed. CL default
