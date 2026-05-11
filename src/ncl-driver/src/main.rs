@@ -40,6 +40,30 @@ fn main() -> ExitCode {
     let mut session = Box::new(session);
     session.activate();
 
+    // ─── User library bootstrap ──────────────────────────────────────────
+    //
+    // Look for `Library/` next to the executable. If it exists, push
+    // it onto *load-path* and (if Library/init.lisp is present) load
+    // that init file. Failures here are warnings, not fatal — the
+    // user can still drop into the REPL and work with just the baked-
+    // in stdlib.
+    if let Some(library_dir) = find_library_dir() {
+        let setup = format!(
+            "(setq *load-path* (cons \"{}\" *load-path*))",
+            library_dir.replace('\\', "/")
+        );
+        if let Err(e) = session.eval(&setup) {
+            eprintln!("ncl: warning: could not extend *load-path*: {e}");
+        }
+        let init_path = format!("{library_dir}/init.lisp");
+        if std::path::Path::new(&init_path).exists() {
+            let load = format!("(load \"{}\")", init_path.replace('\\', "/"));
+            if let Err(e) = session.eval(&load) {
+                eprintln!("ncl: warning: Library/init.lisp failed: {e}");
+            }
+        }
+    }
+
     let mut last_output: Option<String> = None;
     let mut args = raw_args.into_iter().peekable();
 
@@ -100,6 +124,40 @@ fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// Resolve the path to `Library/` next to the executable. Returns
+/// the absolute path string if the directory exists, else None.
+///
+/// Search order:
+///   1. NCL_LIBRARY env var (override for dev / install bundles)
+///   2. <exe_dir>/Library  (the shipping shape)
+///   3. <exe_dir>/../../Lisp/Library  (developer running cargo run)
+///
+/// Anything not found falls through to None; the loader is optional.
+fn find_library_dir() -> Option<String> {
+    if let Ok(p) = std::env::var("NCL_LIBRARY") {
+        if std::path::Path::new(&p).is_dir() {
+            return Some(p);
+        }
+    }
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    let beside = exe_dir.join("Library");
+    if beside.is_dir() {
+        return Some(beside.to_string_lossy().into_owned());
+    }
+    // Dev fallback: target/release/ncl.exe → repo-root/Lisp/Library
+    let dev = exe_dir
+        .ancestors()
+        .nth(2)
+        .map(|p| p.join("Lisp").join("Library"));
+    if let Some(d) = dev {
+        if d.is_dir() {
+            return Some(d.to_string_lossy().into_owned());
+        }
+    }
+    None
 }
 
 // ─── setjmp/longjmp bindings ────────────────────────────────────────────

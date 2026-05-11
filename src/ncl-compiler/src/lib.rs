@@ -281,6 +281,11 @@ fn install_native_functions(
     // Self-eval bridge: lets Lisp code re-enter the compiler.
     install_native(coord, mutator, "EVAL-STRING",
                    eval_string_shim, 1);
+    // Disk-load bridge: read a .lisp file and eval every form.
+    // The Lisp `load` in core.lisp wraps this with *load-path*
+    // resolution and *modules* recording.
+    install_native(coord, mutator, "%LOAD-FILE",
+                   load_file_shim, 1);
     // (compile name '(lambda (params) body)) — JIT a lambda form
     // at runtime and (optionally) install in name's function cell.
     // Closette uses this to install its discriminating functions.
@@ -403,6 +408,64 @@ extern "C-unwind" fn eval_string_shim(
             ncl_runtime::gc_string::alloc_string_in_young(m, &printed).raw()
         }
         Err(e) => ncl_runtime::abi::signal_condition_string(mutator, &format!("{e}")),
+    }
+}
+
+/// `(%load-file path)` — read PATH as UTF-8 source and run every
+/// top-level form through the active session's evaluator. Returns
+/// T on success, signals on read or eval failure.
+///
+/// The Lisp-level `load` wrapper in core.lisp handles `*load-path*`
+/// resolution and `*modules*` recording (CL's `provide`/`require`
+/// surface). This shim does only the bytes-in → eval bridge.
+///
+/// Requires `Session::activate()`, like eval_string_shim.
+extern "C-unwind" fn load_file_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        return ncl_runtime::abi::signal_condition_string(
+            mutator,
+            "%load-file: expected 1 arg (path)",
+        );
+    }
+    let path_word = Word::from_raw(unsafe { *args });
+    if path_word.tag() != ncl_runtime::Tag::String {
+        return ncl_runtime::abi::signal_condition_string(
+            mutator,
+            "%load-file: argument must be a string",
+        );
+    }
+    let path: String = ncl_runtime::gc_string::chars_of(path_word).collect();
+
+    let src = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            return ncl_runtime::abi::signal_condition_string(
+                mutator,
+                &format!("%load-file: cannot read {path}: {e}"),
+            );
+        }
+    };
+
+    let session_ptr = ACTIVE_SESSION.with(|c| c.get());
+    if session_ptr.is_null() {
+        return ncl_runtime::abi::signal_condition_string(
+            mutator,
+            "%load-file: no active session (call Session::activate first)",
+        );
+    }
+    let session = unsafe { &mut *session_ptr };
+
+    match session.eval(&src) {
+        Ok(_) => Word::T.raw(),
+        Err(e) => ncl_runtime::abi::signal_condition_string(
+            mutator,
+            &format!("%load-file: error while loading {path}: {e}"),
+        ),
     }
 }
 

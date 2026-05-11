@@ -1292,3 +1292,66 @@
     ((null lines) nil)
     (t (write-line stream (car lines))
        (%write-lines-to stream (cdr lines)))))
+
+;; -- Loader: load / require / provide / *load-path* / *modules* --------------
+;;
+;; Closely models CL's load / require / provide. The Rust primitive
+;; %load-file (registered in ncl-compiler) reads a UTF-8 source file
+;; and runs every top-level form through the active session — this
+;; layer adds path resolution and the load-once memo.
+;;
+;; *load-path* is a list of directory strings searched left-to-right
+;; by REQUIRE when a bare module name is passed. The driver mutates
+;; it at startup to point into the exe-relative `Library/` directory;
+;; user code can push extra paths.
+;;
+;; *modules* is a list of symbols REQUIRE has loaded. PROVIDE adds
+;; to it. A REQUIRE for an already-provided module is a no-op.
+
+(defparameter *load-path* '())
+(defparameter *modules* '())
+(defparameter *verbose-load* nil)
+
+(defun load (path)
+  "Read every top-level form from PATH and evaluate it. Returns T
+   on success; the underlying %load-file shim signals on read or
+   eval failure."
+  (when *verbose-load*
+    (format t ";;; loading ~A~%" path))
+  (%load-file path))
+
+(defun provide (module-name)
+  "Record MODULE-NAME (a symbol) as loaded. REQUIRE for the same
+   name afterwards becomes a no-op. Returns MODULE-NAME."
+  (cond
+    ((member module-name *modules*) module-name)
+    (t (setq *modules* (cons module-name *modules*))
+       module-name)))
+
+(defun %require-search (name dirs)
+  "Walk DIRS; return the first existing 'DIR/NAME.lisp' or NIL."
+  (cond
+    ((null dirs) nil)
+    (t (let ((candidate (format nil "~A/~A.lisp" (car dirs) name)))
+         (cond
+           ((file-exists candidate) candidate)
+           (t (%require-search name (cdr dirs))))))))
+
+(defun require (module-name &optional explicit-path)
+  "If MODULE-NAME is in *modules*, do nothing. Otherwise, load it:
+   if EXPLICIT-PATH is given, load that file directly; else search
+   *load-path* for MODULE-NAME.lisp. Returns MODULE-NAME on
+   successful load, NIL if already provided."
+  (cond
+    ((member module-name *modules*) nil)
+    (explicit-path
+     (load explicit-path)
+     (provide module-name))
+    (t
+     (let ((found (%require-search module-name *load-path*)))
+       (cond
+         (found
+          (load found)
+          (provide module-name))
+         (t (error "require: cannot find ~A.lisp in *load-path* (~A)"
+                   module-name *load-path*)))))))
