@@ -72,6 +72,28 @@ pub fn value_to_word(
                 ))
             ))?
         }
+        Value::Vector(items) => {
+            // Allocate a static-area Vector and fill each cell with
+            // the recursively-converted Word of each item. Matches
+            // the lower.rs Value::Vector branch.
+            let n = items.len() as u32;
+            let header_ptr = coord
+                .static_area()
+                .try_alloc_with_header(ncl_runtime::HeapType::Vector, n)
+                .ok_or_else(|| EvalError::Compile(
+                    crate::CompileError::NotImplemented(
+                        "static area exhausted while allocating vector in macro input".into()
+                    )
+                ))?;
+            let p = header_ptr.as_ptr() as *mut u64;
+            for (i, item) in items.iter().enumerate() {
+                let w = value_to_word(item, m, coord)?;
+                unsafe { *p.add(1 + i) = w.raw(); }
+            }
+            ncl_runtime::Word::from_ptr(
+                p as *const u8, ncl_runtime::Tag::Vector,
+            )
+        }
         Value::Char(c) => Word::char(*c),
         Value::Symbol(s) if &*s.name == "T" => Word::T,
         Value::Symbol(s) => crate::lower::intern_value_symbol(coord, s),
@@ -167,9 +189,23 @@ pub fn word_to_value(w: Word) -> Result<Value, EvalError> {
                     "word_to_value: complex number in macro expansion not supported".into(),
                 )));
             }
-            return Err(EvalError::Compile(crate::CompileError::NotImplemented(
-                "word_to_value: vector that isn't a bignum, float, ratio, or complex".into(),
-            )));
+            // Plain Tag::Vector heap object — walk cells and rebuild
+            // Value::Vector. Used when a macro returns a vector
+            // literal expansion.
+            let p = w.as_ptr::<u64>(Tag::Vector)
+                .ok_or_else(|| EvalError::Compile(
+                    crate::CompileError::NotImplemented(
+                        "word_to_value: vector ptr was null".into()
+                    )
+                ))?;
+            let header = ncl_runtime::heap::HeapHeader::from_raw(unsafe { *p });
+            let n = header.length_cells() as usize;
+            let mut items = Vec::with_capacity(n);
+            for i in 0..n {
+                let cell = unsafe { *p.add(1 + i) };
+                items.push(word_to_value(Word::from_raw(cell))?);
+            }
+            return Ok(Value::Vector(Arc::new(items)));
         }
         other => {
             return Err(EvalError::Compile(crate::CompileError::NotImplemented(

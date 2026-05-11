@@ -356,6 +356,15 @@ fn lower_in_mut(
             })?;
             Ok(Expr::Word(w.raw()))
         }
+        Value::Vector(items) => {
+            // Allocate a Vector heap object in static and fill each
+            // cell with the lowered word of each item. Items must
+            // be quotable — fixnums, bignums, chars, strings,
+            // symbols, conses, nested vectors — i.e., values that
+            // build_quoted_word handles.
+            let w = lower_vector_literal(items, coord)?;
+            Ok(Expr::Word(w.raw()))
+        }
         Value::Nil => Ok(Expr::Nil),
         Value::Char(c) => Ok(Expr::Word(ncl_runtime::Word::char(*c).raw())),
         Value::String(s) => {
@@ -397,6 +406,37 @@ fn lower_in_mut(
         Value::Cons(_) => lower_call_in_mut(v, env, coord),
         other => Err(CompileError::NotImplemented(format!("{other:?}"))),
     }
+}
+
+/// Build a Vector-tagged Word in the static area whose cells are
+/// the quoted-word version of each item. Used for `#(...)` literals
+/// (Value::Vector). Items are recursively built via
+/// `build_quoted_word`, so nested literal vectors / quoted lists /
+/// numbers / strings all work.
+fn lower_vector_literal(
+    items: &std::sync::Arc<Vec<Value>>,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Word, CompileError> {
+    let n = items.len() as u32;
+    let header_ptr = coord
+        .static_area()
+        .try_alloc_with_header(ncl_runtime::HeapType::Vector, n)
+        .ok_or_else(|| {
+            CompileError::NotImplemented(
+                "static area exhausted while allocating vector literal".into(),
+            )
+        })?;
+    let p = header_ptr.as_ptr() as *mut u64;
+    for (i, item) in items.iter().enumerate() {
+        let w = build_quoted_word(item, coord)?;
+        unsafe {
+            *p.add(1 + i) = w.raw();
+        }
+    }
+    Ok(ncl_runtime::Word::from_ptr(
+        p as *const u8,
+        ncl_runtime::Tag::Vector,
+    ))
 }
 
 /// Lower a quoted form `(quote x)`. Symbols are interned in the
@@ -458,6 +498,7 @@ fn build_quoted_word(
                 ))
             })
         }
+        Value::Vector(items) => lower_vector_literal(items, coord),
         Value::Nil => Ok(Word::NIL),
         Value::Symbol(s) if &*s.name == "T" => Ok(Word::T),
         Value::Symbol(s) => Ok(intern_value_symbol(coord, s)),
