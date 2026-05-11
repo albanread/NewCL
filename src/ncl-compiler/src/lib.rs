@@ -520,6 +520,11 @@ fn install_native_functions(
                    ncl_runtime::sleep_shim, 1);
     install_native(coord, mutator, "GET-INTERNAL-REAL-TIME",
                    ncl_runtime::get_internal_real_time_shim, 0);
+    // (random limit) — fixnum-limit only for v1 (no float, no
+    // explicit random-state arg). Process-global xoshiro256**
+    // seeded once from time + PID + TID + ASLR + RDTSC.
+    install_native(coord, mutator, "RANDOM",
+                   ncl_runtime::random_shim, 1);
 
     // Atomic counters (lock-free shared integers).
     install_native(coord, mutator, "MAKE-ATOMIC-COUNTER",

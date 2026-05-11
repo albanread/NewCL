@@ -26,6 +26,7 @@ pub mod heap;
 pub mod igui;
 pub mod mutator;
 pub mod printer;
+pub mod random;
 pub mod stack_map;
 pub mod static_area;
 pub mod sym_names;
@@ -76,6 +77,7 @@ pub use igui::lisp_shims::{
     text_write_char_shim, text_write_shim,
 };
 pub use printer::{format_word, format_word_aesthetic};
+pub use random::random_shim;
 
 pub use threads::{
     allocate_critical_section_shim, atomic_cas_shim, atomic_get_shim,
