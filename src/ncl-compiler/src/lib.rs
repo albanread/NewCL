@@ -320,6 +320,19 @@ fn install_native_functions(
                    ncl_runtime::equal_shim, 2);
     install_native(coord, mutator, "TYPEP",
                    ncl_runtime::typep_shim, 2);
+    // Bignum math (Tier 1.D.2): gcd / lcm / expt / abs / isqrt.
+    // Truncate / rem stay as special forms; these are stand-alone
+    // numeric primitives.
+    install_native(coord, mutator, "GCD",
+                   ncl_runtime::bignum::gcd_shim, 2);
+    install_native(coord, mutator, "LCM",
+                   ncl_runtime::bignum::lcm_shim, 2);
+    install_native(coord, mutator, "EXPT",
+                   ncl_runtime::bignum::expt_shim, 2);
+    install_native(coord, mutator, "ABS",
+                   ncl_runtime::bignum::abs_shim, 1);
+    install_native(coord, mutator, "ISQRT",
+                   ncl_runtime::bignum::isqrt_shim, 1);
     // Multi-value support — `(values ...)` itself is a special form
     // lowered in lower.rs; this is the primitive used by the
     // multiple-value-bind / multiple-value-list macros to read the

@@ -253,6 +253,253 @@ pub fn bignum_to_decimal(w: Word) -> String {
     bignum_to_bigint(w).to_str_radix(10)
 }
 
+// ─── D.2: division, remainder, gcd, expt ────────────────────────────────
+
+/// Truncate (round-toward-zero) integer division. Returns the
+/// quotient as a Word. Called by the JIT slow path when either
+/// operand is a bignum.
+///
+/// Signals a Lisp error on division by zero (via the error_shim
+/// pathway) — the JIT slow path will then unwind through the
+/// abort-pending mechanism.
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_truncate_promote(
+    mutator: *mut MutatorState,
+    a_raw: u64,
+    b_raw: u64,
+) -> u64 {
+    let m = unsafe { &mut *mutator };
+    let a = Word::from_raw(a_raw);
+    let b = Word::from_raw(b_raw);
+    let na = integer_to_bigint(a)
+        .unwrap_or_else(|| panic!("truncate: non-integer: {a:?}"));
+    let nb = integer_to_bigint(b)
+        .unwrap_or_else(|| panic!("truncate: non-integer: {b:?}"));
+    if nb.is_zero() {
+        return crate::abi::signal_condition_string(mutator, "division by zero");
+    }
+    // num-bigint::BigInt::Div is truncated-toward-zero, matching
+    // CL's truncate semantics.
+    bigint_to_word(m, &(na / nb)).raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_rem_promote(
+    mutator: *mut MutatorState,
+    a_raw: u64,
+    b_raw: u64,
+) -> u64 {
+    let m = unsafe { &mut *mutator };
+    let a = Word::from_raw(a_raw);
+    let b = Word::from_raw(b_raw);
+    let na = integer_to_bigint(a)
+        .unwrap_or_else(|| panic!("rem: non-integer: {a:?}"));
+    let nb = integer_to_bigint(b)
+        .unwrap_or_else(|| panic!("rem: non-integer: {b:?}"));
+    if nb.is_zero() {
+        return crate::abi::signal_condition_string(mutator, "division by zero");
+    }
+    bigint_to_word(m, &(na % nb)).raw()
+}
+
+/// Floor division — rounds toward negative infinity. Returns
+/// quotient.
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_floor_promote(
+    mutator: *mut MutatorState,
+    a_raw: u64,
+    b_raw: u64,
+) -> u64 {
+    use num_integer::Integer;
+    let m = unsafe { &mut *mutator };
+    let a = Word::from_raw(a_raw);
+    let b = Word::from_raw(b_raw);
+    let na = integer_to_bigint(a)
+        .unwrap_or_else(|| panic!("floor: non-integer: {a:?}"));
+    let nb = integer_to_bigint(b)
+        .unwrap_or_else(|| panic!("floor: non-integer: {b:?}"));
+    if nb.is_zero() {
+        return crate::abi::signal_condition_string(mutator, "division by zero");
+    }
+    bigint_to_word(m, &na.div_floor(&nb)).raw()
+}
+
+/// Floor remainder (mod). Always has the same sign as the divisor.
+#[unsafe(no_mangle)]
+pub extern "C" fn ncl_mod_promote(
+    mutator: *mut MutatorState,
+    a_raw: u64,
+    b_raw: u64,
+) -> u64 {
+    use num_integer::Integer;
+    let m = unsafe { &mut *mutator };
+    let a = Word::from_raw(a_raw);
+    let b = Word::from_raw(b_raw);
+    let na = integer_to_bigint(a)
+        .unwrap_or_else(|| panic!("mod: non-integer: {a:?}"));
+    let nb = integer_to_bigint(b)
+        .unwrap_or_else(|| panic!("mod: non-integer: {b:?}"));
+    if nb.is_zero() {
+        return crate::abi::signal_condition_string(mutator, "division by zero");
+    }
+    bigint_to_word(m, &na.mod_floor(&nb)).raw()
+}
+
+// ─── Lisp-callable math shims (registered via install_native) ────────────
+
+/// `(gcd a b)` — non-negative greatest common divisor. Returns a
+/// fixnum or bignum.
+pub extern "C-unwind" fn gcd_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    use num_integer::Integer;
+    if n_args != 2 {
+        return crate::abi::signal_condition_string(
+            mutator, "gcd: expected 2 args",
+        );
+    }
+    let m = unsafe { &mut *mutator };
+    let a = Word::from_raw(unsafe { *args });
+    let b = Word::from_raw(unsafe { *args.add(1) });
+    let na = match integer_to_bigint(a) {
+        Some(n) => n,
+        None => return crate::abi::signal_condition_string(
+            mutator, "gcd: first arg is not an integer",
+        ),
+    };
+    let nb = match integer_to_bigint(b) {
+        Some(n) => n,
+        None => return crate::abi::signal_condition_string(
+            mutator, "gcd: second arg is not an integer",
+        ),
+    };
+    bigint_to_word(m, &na.gcd(&nb)).raw()
+}
+
+/// `(lcm a b)` — least common multiple.
+pub extern "C-unwind" fn lcm_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    use num_integer::Integer;
+    if n_args != 2 {
+        return crate::abi::signal_condition_string(mutator, "lcm: expected 2 args");
+    }
+    let m = unsafe { &mut *mutator };
+    let a = Word::from_raw(unsafe { *args });
+    let b = Word::from_raw(unsafe { *args.add(1) });
+    let na = match integer_to_bigint(a) {
+        Some(n) => n,
+        None => return crate::abi::signal_condition_string(
+            mutator, "lcm: first arg is not an integer",
+        ),
+    };
+    let nb = match integer_to_bigint(b) {
+        Some(n) => n,
+        None => return crate::abi::signal_condition_string(
+            mutator, "lcm: second arg is not an integer",
+        ),
+    };
+    bigint_to_word(m, &na.lcm(&nb)).raw()
+}
+
+/// `(expt base power)` — integer base, non-negative integer power.
+/// Returns a fixnum or bignum. Errors on negative powers (those
+/// would need ratios).
+pub extern "C-unwind" fn expt_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    use num_traits::{ToPrimitive, Pow};
+    if n_args != 2 {
+        return crate::abi::signal_condition_string(mutator, "expt: expected 2 args");
+    }
+    let m = unsafe { &mut *mutator };
+    let base_w = Word::from_raw(unsafe { *args });
+    let exp_w = Word::from_raw(unsafe { *args.add(1) });
+    let base = match integer_to_bigint(base_w) {
+        Some(n) => n,
+        None => return crate::abi::signal_condition_string(
+            mutator, "expt: base must be an integer",
+        ),
+    };
+    // Exponent must be a fixnum that fits in u32 (BigInt::pow takes
+    // u32). 2^32 is more headroom than any reasonable Lisp program
+    // will use — a million-digit result happens at exponent ~17000.
+    let exp = match exp_w.as_fixnum() {
+        Some(n) if n >= 0 => n,
+        Some(_) => return crate::abi::signal_condition_string(
+            mutator, "expt: negative exponent not yet supported (needs ratios)",
+        ),
+        None => return crate::abi::signal_condition_string(
+            mutator, "expt: exponent must be a fixnum",
+        ),
+    };
+    if exp > u32::MAX as i64 {
+        return crate::abi::signal_condition_string(
+            mutator, "expt: exponent too large",
+        );
+    }
+    let result = base.pow(exp as u32);
+    bigint_to_word(m, &result).raw()
+}
+
+/// `(abs n)` — magnitude. Integer-only for now.
+pub extern "C-unwind" fn abs_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        return crate::abi::signal_condition_string(mutator, "abs: expected 1 arg");
+    }
+    let m = unsafe { &mut *mutator };
+    let w = Word::from_raw(unsafe { *args });
+    let n = match integer_to_bigint(w) {
+        Some(n) => n,
+        None => return crate::abi::signal_condition_string(
+            mutator, "abs: argument is not an integer",
+        ),
+    };
+    bigint_to_word(m, &n.abs()).raw()
+}
+
+/// `(isqrt n)` — integer square root (largest k with k*k <= n).
+/// Errors on negative input.
+pub extern "C-unwind" fn isqrt_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    use num_integer::Roots;
+    if n_args != 1 {
+        return crate::abi::signal_condition_string(mutator, "isqrt: expected 1 arg");
+    }
+    let m = unsafe { &mut *mutator };
+    let w = Word::from_raw(unsafe { *args });
+    let n = match integer_to_bigint(w) {
+        Some(n) => n,
+        None => return crate::abi::signal_condition_string(
+            mutator, "isqrt: argument is not an integer",
+        ),
+    };
+    if n.is_negative() {
+        return crate::abi::signal_condition_string(
+            mutator, "isqrt: argument is negative",
+        );
+    }
+    bigint_to_word(m, &n.sqrt()).raw()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

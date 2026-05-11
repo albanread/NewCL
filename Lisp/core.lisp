@@ -227,6 +227,42 @@
         (- q 1)
         q)))
 
+;; ceiling: smallest integer k such that k*b >= a (when b > 0).
+;; Mirror of floor — if there's a non-zero remainder AND r matches
+;; the sign of b, bump the quotient up by 1.
+(defun ceiling (a b)
+  (let ((q (truncate a b))
+        (r (rem a b)))
+    (if (and (not (zerop r))
+             (eq (minusp r) (minusp b)))
+        (+ q 1)
+        q)))
+
+;; round: round to nearest integer; ties go to even. Equivalent
+;; to (truncate (+ a (/ b 2)) b) for positive, but we don't have
+;; rationals — so handle the tie-to-even case explicitly.
+(defun round (a b)
+  (let ((q (truncate a b))
+        (r (rem a b))
+        (half-b (truncate b 2)))
+    (cond
+      ;; |r| < |half-b| — quotient is closest.
+      ((< (abs r) (abs half-b)) q)
+      ;; |r| > |half-b| — round away from zero by adding sign(r).
+      ((> (abs r) (abs half-b))
+       (if (eq (minusp r) (minusp b)) (+ q 1) (- q 1)))
+      ;; |r| == |half-b| — exact tie. Round to even.
+      ;; Tie can only happen when b is even.
+      (t (if (zerop (rem q 2))
+             q
+             (if (eq (minusp r) (minusp b)) (+ q 1) (- q 1)))))))
+
+(defun signum (n)
+  "CL signum — returns -1, 0, or +1 with the sign of N."
+  (cond ((zerop n) 0)
+        ((minusp n) -1)
+        (t 1)))
+
 (defun 1+ (n) (+ n 1))
 (defun 1- (n) (- n 1))
 

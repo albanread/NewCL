@@ -26,7 +26,10 @@ use inkwell::values::{FunctionValue, IntValue};
 
 use ncl_ir::Expr;
 use ncl_runtime::{
-    bignum::{ncl_add_promote, ncl_sub_promote, ncl_mul_promote, ncl_cmp_int},
+    bignum::{
+        ncl_add_promote, ncl_sub_promote, ncl_mul_promote,
+        ncl_truncate_promote, ncl_rem_promote, ncl_cmp_int,
+    },
     ncl_abort_pending, ncl_alloc_cons, ncl_apply, ncl_aref_generic, ncl_aset_generic,
     ncl_build_rest_list, ncl_call, ncl_equal, ncl_funcall,
     ncl_length, ncl_load_function, ncl_load_value, ncl_lookup_keyword,
@@ -231,6 +234,8 @@ struct Helpers<'ctx> {
     add_promote: FunctionValue<'ctx>,
     sub_promote: FunctionValue<'ctx>,
     mul_promote: FunctionValue<'ctx>,
+    truncate_promote: FunctionValue<'ctx>,
+    rem_promote: FunctionValue<'ctx>,
     /// Cross-type integer comparison. Returns -1, 0, or +1 (i64).
     cmp_int: FunctionValue<'ctx>,
     /// LLVM intrinsic for signed-add-with-overflow. Returns
@@ -462,6 +467,16 @@ fn declare_runtime_helpers<'ctx>(
         promote_type,
         Some(Linkage::External),
     );
+    let truncate_promote = module.add_function(
+        "ncl_truncate_promote",
+        promote_type,
+        Some(Linkage::External),
+    );
+    let rem_promote = module.add_function(
+        "ncl_rem_promote",
+        promote_type,
+        Some(Linkage::External),
+    );
     let cmp_type = i64_t.fn_type(&[i64_t.into(), i64_t.into()], false);
     let cmp_int = module.add_function(
         "ncl_cmp_int",
@@ -520,6 +535,8 @@ fn declare_runtime_helpers<'ctx>(
         add_promote,
         sub_promote,
         mul_promote,
+        truncate_promote,
+        rem_promote,
         cmp_int,
         sadd_with_overflow,
         ssub_with_overflow,
@@ -553,6 +570,8 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(&helpers.add_promote, ncl_add_promote as *const () as usize);
     engine.add_global_mapping(&helpers.sub_promote, ncl_sub_promote as *const () as usize);
     engine.add_global_mapping(&helpers.mul_promote, ncl_mul_promote as *const () as usize);
+    engine.add_global_mapping(&helpers.truncate_promote, ncl_truncate_promote as *const () as usize);
+    engine.add_global_mapping(&helpers.rem_promote, ncl_rem_promote as *const () as usize);
     engine.add_global_mapping(&helpers.cmp_int, ncl_cmp_int as *const () as usize);
     // sadd/ssub/smul.with.overflow are LLVM intrinsics — no
     // global mapping; LLVM resolves them itself.
@@ -683,6 +702,110 @@ fn emit_overflow_op<'ctx>(
         .map_err(|e| format!("phi {op_name}: {e}"))?;
     phi.add_incoming(&[
         (&result_val, fast_end_block),
+        (&slow_result, slow_end_block),
+    ]);
+    Ok(phi.as_basic_value().into_int_value())
+}
+
+/// Emit a tag-checked integer division or remainder. Fast path
+/// uses inline sdiv / srem on tagged fixnums; slow path calls a
+/// bignum-aware helper that also signals division-by-zero.
+///
+/// `is_rem = false` → truncate (sdiv on untagged, retag the
+///                    quotient).
+/// `is_rem = true`  → remainder ((a<<3) srem (b<<3) is already
+///                    correctly tagged: (a rem b) << 3).
+fn emit_div_op<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    lhs: IntValue<'ctx>,
+    rhs: IntValue<'ctx>,
+    promote_helper: FunctionValue<'ctx>,
+    is_rem: bool,
+    op_name: &str,
+) -> Result<IntValue<'ctx>, String> {
+    let i64_t = context.i64_type();
+    let zero = i64_t.const_zero();
+    let seven = i64_t.const_int(7, false);
+
+    let tag_or = builder
+        .build_or(lhs, rhs, &format!("{op_name}_tag_or"))
+        .map_err(|e| format!("or: {e}"))?;
+    let tag_bits = builder
+        .build_and(tag_or, seven, &format!("{op_name}_tag_bits"))
+        .map_err(|e| format!("and: {e}"))?;
+    let both_fixnum = builder
+        .build_int_compare(
+            inkwell::IntPredicate::EQ,
+            tag_bits,
+            zero,
+            &format!("{op_name}_both_fix"),
+        )
+        .map_err(|e| format!("icmp: {e}"))?;
+
+    let fast_block = context.append_basic_block(*function, &format!("{op_name}_fast"));
+    let slow_block = context.append_basic_block(*function, &format!("{op_name}_slow"));
+    let join_block = context.append_basic_block(*function, &format!("{op_name}_join"));
+
+    builder
+        .build_conditional_branch(both_fixnum, fast_block, slow_block)
+        .map_err(|e| format!("br {op_name} tag-check: {e}"))?;
+
+    // Fast path.
+    builder.position_at_end(fast_block);
+    let three = i64_t.const_int(3, false);
+    let fast_result = if is_rem {
+        // srem on tagged fixnums returns a tagged result by
+        // construction.
+        builder
+            .build_int_signed_rem(lhs, rhs, &format!("{op_name}_fast"))
+            .map_err(|e| format!("srem: {e}"))?
+    } else {
+        let lhs_u = builder
+            .build_right_shift(lhs, three, true, "untag_lhs")
+            .map_err(|e| format!("ashr lhs: {e}"))?;
+        let rhs_u = builder
+            .build_right_shift(rhs, three, true, "untag_rhs")
+            .map_err(|e| format!("ashr rhs: {e}"))?;
+        let q = builder
+            .build_int_signed_div(lhs_u, rhs_u, "trunc")
+            .map_err(|e| format!("sdiv: {e}"))?;
+        builder
+            .build_left_shift(q, three, "retag")
+            .map_err(|e| format!("shl: {e}"))?
+    };
+    builder
+        .build_unconditional_branch(join_block)
+        .map_err(|e| format!("br fast→join: {e}"))?;
+    let fast_end_block = builder.get_insert_block().unwrap();
+
+    // Slow path: bignum-aware helper.
+    builder.position_at_end(slow_block);
+    let mutator_arg = function.get_nth_param(0).unwrap();
+    let slow_call = builder
+        .build_call(
+            promote_helper,
+            &[mutator_arg.into(), lhs.into(), rhs.into()],
+            &format!("{op_name}_promote"),
+        )
+        .map_err(|e| format!("call {op_name}_promote: {e}"))?;
+    let slow_result = slow_call
+        .try_as_basic_value()
+        .unwrap_basic()
+        .into_int_value();
+    builder
+        .build_unconditional_branch(join_block)
+        .map_err(|e| format!("br slow→join: {e}"))?;
+    let slow_end_block = builder.get_insert_block().unwrap();
+
+    builder.position_at_end(join_block);
+    let phi = builder
+        .build_phi(i64_t, &format!("{op_name}_result"))
+        .map_err(|e| format!("phi: {e}"))?;
+    phi.add_incoming(&[
+        (&fast_result, fast_end_block),
         (&slow_result, slow_end_block),
     ]);
     Ok(phi.as_basic_value().into_int_value())
@@ -1331,31 +1454,23 @@ fn emit_expr<'ctx>(
             )
         }
         Expr::Truncate(a, b) => {
-            // Untag both, sdiv, retag.
             let lhs = emit_expr(context, builder, function, helpers, arity, locals, a)?;
             let rhs = emit_expr(context, builder, function, helpers, arity, locals, b)?;
-            let three = i64_t.const_int(3, false);
-            let lhs_u = builder
-                .build_right_shift(lhs, three, true, "untag_lhs")
-                .map_err(|e| format!("ashr: {e}"))?;
-            let rhs_u = builder
-                .build_right_shift(rhs, three, true, "untag_rhs")
-                .map_err(|e| format!("ashr: {e}"))?;
-            let q = builder
-                .build_int_signed_div(lhs_u, rhs_u, "trunc")
-                .map_err(|e| format!("build_int_signed_div: {e}"))?;
-            builder
-                .build_left_shift(q, three, "trunc_tag")
-                .map_err(|e| format!("shl: {e}"))
+            // Build fast path inline (untag both, sdiv, retag) and
+            // fall through to the bignum promote helper for any
+            // non-fixnum operand.
+            emit_div_op(
+                context, builder, function, helpers,
+                lhs, rhs, helpers.truncate_promote, false, "trunc",
+            )
         }
         Expr::Rem(a, b) => {
-            // srem of two tagged fixnums returns an already-tagged
-            // fixnum: (a<<3) srem (b<<3) = (a rem b) << 3.
             let lhs = emit_expr(context, builder, function, helpers, arity, locals, a)?;
             let rhs = emit_expr(context, builder, function, helpers, arity, locals, b)?;
-            builder
-                .build_int_signed_rem(lhs, rhs, "rem")
-                .map_err(|e| format!("build_int_signed_rem: {e}"))
+            emit_div_op(
+                context, builder, function, helpers,
+                lhs, rhs, helpers.rem_promote, true, "rem",
+            )
         }
         Expr::Cons(car, cdr) => {
             let car_val = emit_expr(context, builder, function, helpers, arity, locals, car)?;
