@@ -20,7 +20,7 @@
 
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::word::{Tag, Word};
 
@@ -142,6 +142,15 @@ pub enum HeapType {
     ///           imag-zero would demote to the real part)
     /// 3-cell payload, identical shape to Ratio.
     Complex = 9,
+    /// Dead-zone sentinel. Stamped by `MutatorState::retire_tlab` into
+    /// the unused tail of an abandoned TLAB so the young heap stays
+    /// linearly parseable. Never traced, never pinned, never copied.
+    /// Payload is zero-filled at stamp time. Walkers that advance by
+    /// `1 + length_cells` (count_pinned, clear_pinned_bits) skip the
+    /// whole gap in one step; walkers that advance cell-by-cell
+    /// (rewind_past_pinned) see zero cells as "Symbol type, length 0"
+    /// and advance one cell at a time, which is correct.
+    Filler = 10,
 }
 
 impl HeapType {
@@ -157,6 +166,7 @@ impl HeapType {
             7 => Some(HeapType::Float),
             8 => Some(HeapType::Ratio),
             9 => Some(HeapType::Complex),
+            10 => Some(HeapType::Filler),
             _ => None,
         }
     }
@@ -216,8 +226,25 @@ pub enum GcBit {
 
 // -- Semispace ---------------------------------------------------------------
 
+/// Two parallel bitmaps over a Semispace's cells. Together they let
+/// GC walkers iterate young precisely instead of guessing object
+/// boundaries from cell contents (which doesn't work when cons cells
+/// are headerless and a cons-car value can coincidentally decode as
+/// a header).
+///
+/// For each cell index `i`:
+///   - `starts[i]`      set IFF `i` is the first cell of an object.
+///   - `cons_starts[i]` set IFF that object is a cons pair
+///                      (so it spans cells `i` and `i+1`).
+/// A walker iterates `starts`; for each bit, it checks `cons_starts`
+/// to decide "2-cell cons" vs "header at this cell, length in the
+/// header word". 2 bits per 8-byte cell = 3.125% memory overhead.
+pub type StartBits = Arc<[AtomicU64]>;
+
 pub struct Semispace {
     cells: Box<[u64]>,
+    starts: StartBits,
+    cons_starts: StartBits,
     top: usize,
 }
 
@@ -225,7 +252,73 @@ impl Semispace {
     pub fn new(size_bytes: usize) -> Semispace {
         let n_cells = size_bytes / 8;
         let cells = vec![0u64; n_cells].into_boxed_slice();
-        Semispace { cells, top: 0 }
+        let n_bitmap_words = n_cells.div_ceil(64);
+        let mk = || -> StartBits {
+            let v: Vec<AtomicU64> = (0..n_bitmap_words).map(|_| AtomicU64::new(0)).collect();
+            Arc::from(v.into_boxed_slice())
+        };
+        Semispace { cells, starts: mk(), cons_starts: mk(), top: 0 }
+    }
+
+    /// Cheap clone of the bitmap handles for mutators that need to
+    /// flip bits from their alloc fast path without taking the heap
+    /// lock. The mutator caches a pair at registration and flips
+    /// bits via the static `set_*_bit_at` helpers below.
+    pub fn starts_handle(&self) -> StartBits { Arc::clone(&self.starts) }
+    pub fn cons_starts_handle(&self) -> StartBits { Arc::clone(&self.cons_starts) }
+
+    /// Mark cell `idx` as the start of a header-bearing heap object.
+    /// Lock-free; safe from a mutator's alloc fast path.
+    pub fn set_start_bit_at(starts: &[AtomicU64], idx: usize) {
+        let w = idx >> 6;
+        let b = idx & 63;
+        starts[w].fetch_or(1u64 << b, Ordering::Relaxed);
+    }
+
+    /// Mark cell `idx` as the start of a 2-cell cons pair. Sets both
+    /// `starts` (so the iterator visits it) and `cons_starts` (so
+    /// the visitor knows to treat it as a cons rather than a
+    /// header).
+    pub fn set_cons_start_bit_at(
+        starts: &[AtomicU64],
+        cons_starts: &[AtomicU64],
+        idx: usize,
+    ) {
+        let w = idx >> 6;
+        let b = idx & 63;
+        let mask = 1u64 << b;
+        starts[w].fetch_or(mask, Ordering::Relaxed);
+        cons_starts[w].fetch_or(mask, Ordering::Relaxed);
+    }
+
+    /// Used by inside-Semispace alloc paths.
+    pub fn set_start(&self, idx: usize) {
+        Semispace::set_start_bit_at(&self.starts, idx);
+    }
+    pub fn set_cons_start(&self, idx: usize) {
+        Semispace::set_cons_start_bit_at(&self.starts, &self.cons_starts, idx);
+    }
+
+    pub fn is_start(&self, idx: usize) -> bool {
+        let w = idx >> 6;
+        let b = idx & 63;
+        (self.starts[w].load(Ordering::Relaxed) & (1u64 << b)) != 0
+    }
+    fn is_cons_start(&self, idx: usize) -> bool {
+        let w = idx >> 6;
+        let b = idx & 63;
+        (self.cons_starts[w].load(Ordering::Relaxed) & (1u64 << b)) != 0
+    }
+
+    /// Zero every bit in both bitmaps below `end_cells`. Called when
+    /// `top` resets to 0; stale bits would otherwise survive into
+    /// the next cycle and the walker would visit ghost objects.
+    fn clear_start_bits_below(&self, end_cells: usize) {
+        let words = end_cells.div_ceil(64);
+        for w in 0..words {
+            self.starts[w].store(0, Ordering::Relaxed);
+            self.cons_starts[w].store(0, Ordering::Relaxed);
+        }
     }
 
     pub fn capacity_cells(&self) -> usize { self.cells.len() }
@@ -235,7 +328,13 @@ impl Semispace {
     pub fn free_cells(&self) -> usize { self.cells.len() - self.top }
     pub fn free_bytes(&self) -> usize { self.free_cells() * 8 }
 
-    pub fn reset(&mut self) { self.top = 0; }
+    pub fn reset(&mut self) {
+        // Clear start-bits up to the old top before zeroing top —
+        // otherwise stale "object starts" linger and the next walker
+        // visits ghost objects from the previous cycle.
+        self.clear_start_bits_below(self.top);
+        self.top = 0;
+    }
 
     pub fn contains_ptr(&self, ptr: *const u8) -> bool {
         let base = self.cells.as_ptr() as usize;
@@ -287,10 +386,12 @@ impl Semispace {
 
     pub fn alloc_cons(&mut self, car: Word, cdr: Word) -> Word {
         let p = self.alloc_cells(2);
+        let idx = self.cell_index_of(p.as_ptr() as *const u8).expect("alloc'd in self");
         unsafe {
             *p.as_ptr() = car.raw();
             *p.as_ptr().add(1) = cdr.raw();
         }
+        self.set_cons_start(idx);
         Word::from_ptr(p.as_ptr() as *const u8, Tag::Cons)
     }
 
@@ -301,7 +402,9 @@ impl Semispace {
     ) -> NonNull<HeapHeader> {
         let total = 1 + length_cells as usize;
         let p = self.alloc_cells(total);
+        let idx = self.cell_index_of(p.as_ptr() as *const u8).expect("alloc'd in self");
         unsafe { *p.as_ptr() = HeapHeader::new(ty, length_cells).raw(); }
+        self.set_start(idx);
         unsafe { NonNull::new_unchecked(p.as_ptr() as *mut HeapHeader) }
     }
 
@@ -341,6 +444,14 @@ impl Semispace {
             ) {
                 let target = (raw & crate::word::PAYLOAD_MASK) as usize;
                 if target >= base && target < end_addr {
+                    let target_cell_idx = (target - base) / 8;
+                    // Only pin if this cell is actually the start of
+                    // a real heap object. Without the start-bit check
+                    // we'd happily mark Pinned bits into cons-payload
+                    // cells that coincidentally match a heap-pointer
+                    // bit pattern; downstream walkers would then read
+                    // garbage lengths and stampede.
+                    if !self.is_start(target_cell_idx) { p = unsafe { p.add(1) }; continue; }
                     let header_ptr = target as *mut u64;
                     let header = unsafe { HeapHeader::from_raw(*header_ptr) };
                     // Don't try to pin an already-forwarded cell (a
@@ -358,62 +469,121 @@ impl Semispace {
         }
     }
 
-    /// After a minor GC, instead of `reset()` (which discards the
-    /// whole semispace), keep pinned objects in place and rewind
+    /// Dump a window of cells around `idx` and panic. Called by the
+    /// linear walkers when they catch a header that would extend past
+    /// `self.top` — that's a parseability violation (almost always:
+    /// an abandoned-TLAB gap that wasn't filled with a Filler header,
+    /// see `MutatorState::retire_tlab`). Loud failure beats silent
+    /// loop-truncation or infinite-spin every time.
+    fn dump_and_panic(
+        &self,
+        walker: &str,
+        idx: usize,
+        header_cell: u64,
+        len: usize,
+    ) -> ! {
+        let ty_bits = ((header_cell >> TYPE_SHIFT) & TYPE_MASK) as u8;
+        let ty = HeapType::from_bits(ty_bits);
+        let gc_bits = ((header_cell >> GC_SHIFT) & GC_MASK) as u8;
+        let mut ctx = String::new();
+        let lo = idx.saturating_sub(4);
+        let hi = (idx + 5).min(self.top);
+        for i in lo..hi {
+            let c = unsafe { *self.cells.as_ptr().add(i) };
+            let marker = if i == idx { "  <<<" } else { "" };
+            ctx.push_str(&format!(
+                "    [{i:>6}] 0x{c:016x}{marker}\n",
+            ));
+        }
+        panic!(
+            "heap walker `{walker}` hit unparseable cell:\n\
+             \x20 idx        = {idx}\n\
+             \x20 cell       = 0x{header_cell:016x}\n\
+             \x20 type bits  = {ty_bits} ({:?})\n\
+             \x20 length     = {len}\n\
+             \x20 gc bits    = 0b{gc_bits:08b}\n\
+             \x20 top        = {top}\n\
+             \x20 capacity   = {cap}\n\
+             \x20 would jump to {jump}, past top by {over} cells\n\
+             context:\n{ctx}",
+            ty,
+            top = self.top,
+            cap = self.cells.len(),
+            jump = idx.wrapping_add(1).wrapping_add(len),
+            over = idx.wrapping_add(1).wrapping_add(len).saturating_sub(self.top),
+        );
+    }
+
+    /// Iterate the cell-indices that are flagged as object starts,
+    /// in ascending order, restricted to `[0, self.top)`. Used by
+    /// the structural walkers — replaces the older "decode-as-
+    /// header" approach which couldn't distinguish a header from a
+    /// headerless cons payload and would stampede on the latter.
+    fn for_each_start<F: FnMut(usize)>(&self, mut f: F) {
+        let top = self.top;
+        let n_words = (top + 63) >> 6;
+        for w in 0..n_words {
+            let mut bits = self.starts[w].load(Ordering::Relaxed);
+            let base = w << 6;
+            while bits != 0 {
+                let b = bits.trailing_zeros() as usize;
+                let idx = base + b;
+                if idx >= top { return; }
+                f(idx);
+                bits &= bits - 1;
+            }
+        }
+    }
+
+    /// After a minor GC, keep pinned objects in place and rewind
     /// `top` to one cell past the highest pinned object. Free cells
     /// below pinned objects are wasted until those objects are
     /// unpinned (next cycle if no conservative ref still points at
     /// them). Returns the number of cells still occupied.
     pub fn rewind_past_pinned(&mut self) -> usize {
+        let old_top = self.top;
         let mut highest_end: usize = 0;
-        let mut idx = 0;
-        while idx < self.top {
+        self.for_each_start(|idx| {
+            // Cons cells are headerless and never carry a Pinned bit.
+            // Skip them outright — they're either forwarded or dead.
+            if self.is_cons_start(idx) {
+                return;
+            }
             let cell = unsafe { *self.cells.as_ptr().add(idx) };
             let word = Word::from_raw(cell);
-            // Headerless cons: 2 cells. Can't be pinned through
-            // this path (no header to carry the bit), so always
-            // treat as garbage post-GC and skip.
-            // BUT — we can't reliably tell a cons cell from a header
-            // word by looking at the cell alone. Cons cells aren't
-            // pinned, so they'd never block a rewind; we can advance
-            // past them by reading the slot speculatively as a header
-            // and checking whether it looks like a valid one. In
-            // practice the structure is: every non-cons heap object
-            // starts with a HeapHeader cell (recognisable by its
-            // type-tag field), and the cell before/after is either
-            // another header or part of an object's payload. To keep
-            // this simple and conservative, we walk one cell at a time
-            // checking for the Pinned bit on EVERY cell — if any cell
-            // happens to look like a header with Pinned, we treat it
-            // as the start of a pinned object and advance by its
-            // declared length. The false-positive case (a payload
-            // cell that happens to have the Pinned bit set in the GC-
-            // bits slot) is benign: we just over-skip by one object's
-            // worth, slightly more cells stay live.
             if word.is_forward() {
-                // Forwarding pointer left over from a copy. Cell has
-                // no further structure; advance by 1.
-                idx += 1;
-                continue;
+                return; // Source of a copied object — gone.
             }
             let header = HeapHeader::from_raw(cell);
-            // A valid header has a recognisable type tag. If the
-            // type byte decodes to something invalid, this cell is
-            // payload, not a header — advance by 1.
-            let ty_bits = ((cell >> TYPE_SHIFT) & TYPE_MASK) as u8;
-            if HeapType::from_bits(ty_bits).is_none() {
-                idx += 1;
-                continue;
+            if !header.has_gc_bit(GcBit::Pinned) {
+                return;
             }
-            if header.has_gc_bit(GcBit::Pinned) {
-                let len = header.length_cells() as usize;
-                let end = idx + 1 + len;
-                if end > highest_end {
-                    highest_end = end;
-                }
-                idx = end;
+            let len = header.length_cells() as usize;
+            if 1 + len > old_top - idx {
+                self.dump_and_panic("rewind_past_pinned", idx, cell, len);
+            }
+            let end = idx + 1 + len;
+            if end > highest_end {
+                highest_end = end;
+            }
+        });
+        // Drop bits above the new top in BOTH bitmaps so the next
+        // cycle starts with a clean tail.
+        if highest_end < old_top {
+            let from_word = highest_end >> 6;
+            let bits_in_first_word_to_keep = highest_end & 63;
+            if bits_in_first_word_to_keep != 0 {
+                let mask = (1u64 << bits_in_first_word_to_keep) - 1;
+                self.starts[from_word].fetch_and(mask, Ordering::Relaxed);
+                self.cons_starts[from_word].fetch_and(mask, Ordering::Relaxed);
             } else {
-                idx += 1;
+                self.starts[from_word].store(0, Ordering::Relaxed);
+                self.cons_starts[from_word].store(0, Ordering::Relaxed);
+            }
+            let to_word = old_top.div_ceil(64);
+            for w in (from_word + 1)..to_word {
+                self.starts[w].store(0, Ordering::Relaxed);
+                self.cons_starts[w].store(0, Ordering::Relaxed);
             }
         }
         self.top = highest_end;
@@ -423,31 +593,30 @@ impl Semispace {
     /// Count distinct pinned objects and total cells they occupy
     /// (header + payload, summed). Used by the GC stats path to
     /// report per-cycle "how much did conservative scanning keep
-    /// alive." Walks the same shape as rewind_past_pinned.
+    /// alive." Walks via the start-bit bitmap.
     pub fn count_pinned(&self) -> (usize, usize) {
         let mut n_objs = 0usize;
         let mut n_cells = 0usize;
-        let mut idx = 0;
-        while idx < self.top {
+        let old_top = self.top;
+        self.for_each_start(|idx| {
+            if self.is_cons_start(idx) {
+                return;
+            }
             let cell = unsafe { *self.cells.as_ptr().add(idx) };
             let word = Word::from_raw(cell);
             if word.is_forward() {
-                idx += 1;
-                continue;
-            }
-            let ty_bits = ((cell >> TYPE_SHIFT) & TYPE_MASK) as u8;
-            if HeapType::from_bits(ty_bits).is_none() {
-                idx += 1;
-                continue;
+                return;
             }
             let header = HeapHeader::from_raw(cell);
             let len = header.length_cells() as usize;
+            if 1 + len > old_top - idx {
+                self.dump_and_panic("count_pinned", idx, cell, len);
+            }
             if header.has_gc_bit(GcBit::Pinned) {
                 n_objs += 1;
                 n_cells += 1 + len;
             }
-            idx += 1 + len;
-        }
+        });
         (n_objs, n_cells)
     }
 
@@ -455,28 +624,28 @@ impl Semispace {
     /// semispace. Called at the end of a GC cycle so the next
     /// conservative scan starts from a clean slate.
     pub fn clear_pinned_bits(&mut self) {
-        let mut idx = 0;
-        while idx < self.top {
-            let cell_ptr = unsafe { self.cells.as_mut_ptr().add(idx) };
+        let old_top = self.top;
+        let cells_ptr = self.cells.as_mut_ptr();
+        self.for_each_start(|idx| {
+            if self.is_cons_start(idx) {
+                return;
+            }
+            let cell_ptr = unsafe { cells_ptr.add(idx) };
             let cell = unsafe { *cell_ptr };
             let word = Word::from_raw(cell);
             if word.is_forward() {
-                idx += 1;
-                continue;
-            }
-            let ty_bits = ((cell >> TYPE_SHIFT) & TYPE_MASK) as u8;
-            if HeapType::from_bits(ty_bits).is_none() {
-                idx += 1;
-                continue;
+                return;
             }
             let mut header = HeapHeader::from_raw(cell);
+            let len = header.length_cells() as usize;
+            if 1 + len > old_top - idx {
+                self.dump_and_panic("clear_pinned_bits", idx, cell, len);
+            }
             if header.has_gc_bit(GcBit::Pinned) {
                 header.clear_gc_bit(GcBit::Pinned);
                 unsafe { *cell_ptr = header.raw() };
             }
-            let len = header.length_cells() as usize;
-            idx += 1 + len;
-        }
+        });
     }
 }
 
@@ -605,6 +774,20 @@ impl Heap {
 
     pub fn young_capacity_bytes(&self) -> usize { self.young.capacity_bytes() }
     pub fn old_capacity_bytes(&self) -> usize { self.old.live().capacity_bytes() }
+
+    /// Base pointer of young's cell storage. Cached by mutators at
+    /// registration so they can compute cell-indices on the alloc
+    /// fast path without taking the heap lock.
+    pub fn young_base_ptr(&self) -> *const u64 { self.young.cells.as_ptr() }
+
+    /// Lock-free handle to young's start-bit bitmap. Mutators flip
+    /// bits via `Semispace::set_start_bit_at` (relaxed atomic).
+    pub fn young_starts_handle(&self) -> StartBits { self.young.starts_handle() }
+
+    /// Parallel handle to the cons-start bitmap — set by mutators
+    /// on cons-only alloc paths so walkers can distinguish a 2-cell
+    /// cons from a header'd object.
+    pub fn young_cons_starts_handle(&self) -> StartBits { self.young.cons_starts_handle() }
 
     pub fn young_contains(&self, ptr: *const u8) -> bool {
         self.young.contains_ptr(ptr)
@@ -1032,6 +1215,15 @@ fn copy_into(
                     dest_ptr.as_ptr(),
                     size,
                 );
+            }
+            // Mark the destination object's start cell. Cons cells
+            // need the cons-start bit too so walkers know to treat
+            // them as 2-cell pairs rather than try to decode them as
+            // header'd objects.
+            if is_cons {
+                dest.set_cons_start(to_offset);
+            } else {
+                dest.set_start(to_offset);
             }
             // Forwarding pointer at the source.
             unsafe {
