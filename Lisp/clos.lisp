@@ -1235,5 +1235,287 @@
               accessor-bindings)
          ,@body))))
 
+;; ─── Stage E: defgeneric + dispatch skeleton ───────────────────────────────
+;;
+;; Generic functions are CLOS instances of standard-generic-function
+;; that carry a method list, a method-class, and a *discriminating
+;; function* — the actual Lisp function that gets stored in the
+;; symbol's function cell so plain `(gf x y)` calls dispatch
+;; through it.
+;;
+;; This stage builds the scaffolding but doesn't yet install any
+;; primary methods. defmethod (stage F) registers methods;
+;; finalize-generic-function recomputes the discriminating function
+;; whenever the method set changes.
+;;
+;; The dispatch path looks like:
+;;
+;;   (my-gf a b)
+;;     → (symbol-function 'my-gf) === gf's discriminating function
+;;     → (lambda (&rest args)
+;;          (let* ((classes (mapcar #'class-of (required-portion args)))
+;;                 (emf (or (find-method-table-method table classes)
+;;                          (slow-method-lookup ...))))
+;;            (funcall emf args)))
+;;
+;; The classes-to-emf-table is the per-gf cache; on a miss
+;; slow-method-lookup runs compute-applicable-methods-using-classes
+;; + std-compute-effective-method-function, then primes the cache.
+
+;; -- analyze-lambda-list ---------------------------------------------------
+;;
+;; Tedious but boring. Reused by defgeneric and defmethod to extract
+;; required-names / required-args / specializers / rest-var / keys /
+;; optionals / aux / allow-other-keys from a (possibly specialized)
+;; lambda list.
+
+(defun %make-keyword (sym)
+  ;; intern in :keyword. Our intern shim accepts (symbol-name pkg-name).
+  (intern (symbol-name sym) "KEYWORD"))
+
+(defun %get-keyword-from-arg (arg)
+  (cond
+    ((listp arg)
+     (cond
+       ((listp (car arg)) (caar arg))
+       (t (%make-keyword (car arg)))))
+    (t (%make-keyword arg))))
+
+(defun analyze-lambda-list (lambda-list)
+  (let ((keys nil)
+        (key-args nil)
+        (required-names nil)
+        (required-args nil)
+        (specializers nil)
+        (rest-var nil)
+        (optionals nil)
+        (auxs nil)
+        (allow-other-keys nil)
+        (state ':parsing-required))
+    (dolist (arg lambda-list)
+      (cond
+        ((eq arg '&optional) (setq state ':parsing-optional))
+        ((eq arg '&rest)     (setq state ':parsing-rest))
+        ((eq arg '&key)      (setq state ':parsing-key))
+        ((eq arg '&allow-other-keys) (setq allow-other-keys 't))
+        ((eq arg '&aux)      (setq state ':parsing-aux))
+        (t
+         (case state
+           (:parsing-required
+            (push-on-end arg required-args)
+            (cond
+              ((listp arg)
+               (push-on-end (car arg) required-names)
+               (push-on-end (cadr arg) specializers))
+              (t
+               (push-on-end arg required-names)
+               (push-on-end 't specializers))))
+           (:parsing-optional (push-on-end arg optionals))
+           (:parsing-rest     (setq rest-var arg))
+           (:parsing-key
+            (push-on-end (%get-keyword-from-arg arg) keys)
+            (push-on-end arg key-args))
+           (:parsing-aux      (push-on-end arg auxs))))))
+    (list :required-names required-names
+          :required-args required-args
+          :specializers specializers
+          :rest-var rest-var
+          :keywords keys
+          :key-args key-args
+          :auxiliary-args auxs
+          :optional-args optionals
+          :allow-other-keys allow-other-keys)))
+
+;; -- Generic-function metaclass --------------------------------------------
+
+(defclass generic-function (metaobject) ())
+
+(defclass standard-generic-function (generic-function)
+  ((lambda-list :initarg :lambda-list)
+   (required-args :initarg :required-args)
+   (methods :initform nil)
+   (method-class :initarg :method-class)
+   (discriminating-function)
+   (classes-to-emf-table)
+   (method-combination :initarg :method-combination :initform 'standard)
+   (method-combination-order :initform ':most-specific-first)))
+
+(defparameter the-class-gf          (find-class 'generic-function))
+(defparameter the-class-standard-gf (find-class 'standard-generic-function))
+
+;; -- Generic-function slot accessors ---------------------------------------
+
+(defun generic-function-name (gf) (slot-value gf 'name))
+(defun %setf-generic-function-name (new-value gf)
+  (setf (slot-value gf 'name) new-value))
+
+(defun generic-function-lambda-list (gf) (slot-value gf 'lambda-list))
+(defun %setf-generic-function-lambda-list (new-value gf)
+  (setf (slot-value gf 'lambda-list) new-value)
+  (setf (slot-value gf 'required-args)
+        (getf (analyze-lambda-list new-value) ':required-args))
+  new-value)
+
+(defun generic-function-required-args (gf)
+  (slot-value gf 'required-args))
+(defun %setf-generic-function-required-args (new-value gf)
+  (setf (slot-value gf 'required-args) new-value))
+
+(defun generic-function-methods (gf) (slot-value gf 'methods))
+(defun %setf-generic-function-methods (new-value gf)
+  (setf (slot-value gf 'methods) new-value))
+
+(defun generic-function-method-class (gf) (slot-value gf 'method-class))
+(defun %setf-generic-function-method-class (new-value gf)
+  (setf (slot-value gf 'method-class) new-value))
+
+(defun generic-function-discriminating-function (gf)
+  (slot-value gf 'discriminating-function))
+(defun %setf-generic-function-discriminating-function (new-value gf)
+  (setf (slot-value gf 'discriminating-function) new-value))
+
+(defun classes-to-emf-table (gf) (slot-value gf 'classes-to-emf-table))
+(defun %setf-classes-to-emf-table (new-value gf)
+  (setf (slot-value gf 'classes-to-emf-table) new-value))
+
+(defun num-required-args (gf)
+  (length (generic-function-required-args gf)))
+
+;; -- standard-generic-function predicate (promoted) ------------------------
+
+(defun standard-generic-function-p (x)
+  (and (clos-instance-p x)
+       (eq (class-of x) the-class-standard-gf)))
+
+;; -- find-generic-function ------------------------------------------------
+
+(defun find-generic-function (name &optional (errorp t))
+  (let ((gf (gethash name *clos-generic-function-table*)))
+    (cond
+      (gf gf)
+      (errorp (error "No generic function named ~A." name))
+      (t nil))))
+
+(defun %setf-find-generic-function (gf name)
+  (setf (gethash name *clos-generic-function-table*) gf)
+  gf)
+
+;; -- make-instance-standard-generic-function -------------------------------
+
+(defun make-instance-standard-generic-function (gf-class &key name documentation
+                                                              lambda-list
+                                                              method-class
+                                                              (method-combination 'standard)
+                                                              (method-combination-order ':most-specific-first)
+                                                         &allow-other-keys)
+  (declare (ignore gf-class))
+  (let ((gf (std-allocate-instance the-class-standard-gf)))
+    (setf (generic-function-name gf) name)
+    (setf (slot-value gf 'documentation) documentation)
+    (setf (generic-function-lambda-list gf) lambda-list)
+    (setf (generic-function-methods gf) nil)
+    (setf (generic-function-method-class gf) method-class)
+    (setf (classes-to-emf-table gf) (make-method-table))
+    (setf (slot-value gf 'method-combination) method-combination)
+    (setf (slot-value gf 'method-combination-order) method-combination-order)
+    (finalize-generic-function gf)
+    gf))
+
+;; -- ensure-generic-function -----------------------------------------------
+
+(defparameter %ensure-gf-no-method-class (list 'no-method-class))
+
+(defun ensure-generic-function (name &rest all-keys
+                                &key
+                                (generic-function-class the-class-standard-gf)
+                                (method-class %ensure-gf-no-method-class)
+                                lambda-list
+                                &allow-other-keys)
+  (declare (ignore generic-function-class))
+  (let ((existing (find-generic-function name nil)))
+    (cond
+      (existing existing)
+      (t
+       (let* ((mc (cond ((eq method-class %ensure-gf-no-method-class) nil)
+                        (t method-class)))
+              (req (getf (analyze-lambda-list lambda-list) ':required-args))
+              (gf (apply #'make-instance-standard-generic-function
+                         the-class-standard-gf
+                         :name name
+                         :method-class mc
+                         :required-args req
+                         all-keys)))
+         (setf (find-generic-function name) gf)
+         ;; Install discriminating function as the symbol's
+         ;; function so `(name arg ...)` dispatches through it.
+         (when (symbolp name)
+           (setf (symbol-function name)
+                 (generic-function-discriminating-function gf)))
+         gf)))))
+
+;; -- finalize-generic-function --------------------------------------------
+;;
+;; Rebuilds the discriminating function whenever the method set
+;; changes. Also clears the per-gf classes-to-emf cache. The
+;; new discriminating function picks up the latest method list
+;; via closure-over `gf`.
+
+(defun finalize-generic-function (gf)
+  (setf (generic-function-discriminating-function gf)
+        (std-compute-discriminating-function gf))
+  (clear-method-table (classes-to-emf-table gf))
+  (when (symbolp (generic-function-name gf))
+    (setf (symbol-function (generic-function-name gf))
+          (generic-function-discriminating-function gf)))
+  nil)
+
+(defun std-compute-discriminating-function (gf)
+  ;; Stage E version: no method dispatch yet. The lambda just
+  ;; errors with "no applicable methods" — Stage F replaces this
+  ;; with one that actually consults the method list.
+  (lambda (&rest args)
+    (declare (ignore args))
+    (error "No applicable method for generic function ~A."
+           (generic-function-name gf))))
+
+;; -- defgeneric macro ------------------------------------------------------
+;;
+;; Surface syntax:
+;;   (defgeneric foo (a b) [options...])
+;;
+;; Options include :method-class, :documentation, :method
+;; (each :method becomes a defmethod — stage F handles them).
+;; For Stage E we just accept and discard :method options.
+
+(defun canonicalize-defgeneric-option (option)
+  (case (car option)
+    (:generic-function-class
+     (list ':generic-function-class `(find-class ',(cadr option))))
+    (:method-class
+     (list ':method-class `(find-class ',(cadr option))))
+    (:method-combination
+     (list ':method-combination `',(cadr option)))
+    (:documentation
+     (list ':documentation `',(cadr option)))
+    (otherwise
+     (list `',(car option) `',(cadr option)))))
+
+(defun canonicalize-defgeneric-options (options)
+  (mapappend #'canonicalize-defgeneric-option options))
+
+(defmacro defgeneric (function-name lambda-list &rest options)
+  (let ((non-method-options
+         (remove-if (lambda (o) (eq (car o) ':method)) options))
+        (method-forms
+         (mapcar (lambda (o) `(defmethod ,function-name ,@(cdr o)))
+                 (remove-if-not (lambda (o) (eq (car o) ':method)) options))))
+    `(progn
+       (ensure-generic-function ',function-name
+                                :lambda-list ',lambda-list
+                                ,@(canonicalize-defgeneric-options
+                                   non-method-options))
+       ,@method-forms
+       ',function-name)))
+
 ;; Return a printable sentinel.
 nil
