@@ -312,17 +312,18 @@ pub extern "C-unwind" fn next_event_shim(
     let Some(timeout) = arg_fixnum(args, 0) else {
         panic!("next-event: timeout-ms must be a fixnum");
     };
-    let m = unsafe { &mut *mutator };
-    // Park while we're blocked in the channel wait — otherwise a
-    // peer mutator that triggers GC waits forever for us to reach
-    // a safepoint we'll never hit until an event arrives.
-    let do_park = timeout != 0;
-    if do_park { m.enter_blocked(); }
-    let ev_opt = channels::next_event(timeout);
-    if do_park { m.leave_blocked(); }
-    let Some(ev) = ev_opt else {
+    // Park-on-block (m.enter_blocked() / m.leave_blocked() around the
+    // channel wait) was tried here — it's the standard fix for the
+    // case where a peer mutator triggers stop-the-world GC while we
+    // sleep in recv(). With it enabled, the bouncing demo wedged
+    // after ~30 ticks (deterministic, no panic). Diagnosis incomplete;
+    // backed out until the interaction with leave_blocked's TLAB
+    // invalidation is understood. Currently safe because every demo
+    // is single-mutator.
+    let Some(ev) = channels::next_event(timeout) else {
         return Word::NIL.raw();
     };
+    let m = unsafe { &mut *mutator };
     let coord = std::sync::Arc::clone(m.coord());
     event_to_plist(m, &coord, ev).raw()
 }
@@ -346,14 +347,11 @@ pub extern "C-unwind" fn next_event_for_shim(
     let Some(timeout) = arg_fixnum(args, 1) else {
         panic!("next-event-for: timeout-ms must be a fixnum");
     };
-    let m = unsafe { &mut *mutator };
-    let do_park = timeout != 0;
-    if do_park { m.enter_blocked(); }
-    let ev_opt = channels::next_event_for(child_id, timeout);
-    if do_park { m.leave_blocked(); }
-    let Some(ev) = ev_opt else {
+    // See next_event_shim above for why park-on-block is not used here.
+    let Some(ev) = channels::next_event_for(child_id, timeout) else {
         return Word::NIL.raw();
     };
+    let m = unsafe { &mut *mutator };
     let coord = std::sync::Arc::clone(m.coord());
     event_to_plist(m, &coord, ev).raw()
 }
