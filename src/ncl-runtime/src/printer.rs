@@ -103,6 +103,11 @@ fn write_vector(out: &mut String, w: Word, readable: bool) {
         out.push_str(&crate::ratio::ratio_to_string(w));
         return;
     }
+    // Complex check: HeapType::Complex.
+    if header.ty() == crate::heap::HeapType::Complex {
+        out.push_str(&crate::complex::complex_to_string(w));
+        return;
+    }
     // CLOS-instance check: 4 cells, slot 0 = symbol named "%CLOS-INSTANCE".
     if n == 4 {
         let marker = Word::from_raw(unsafe { *p.add(1) });

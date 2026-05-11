@@ -279,7 +279,11 @@
   (if (null r) a (%max-of (max2 a (car r)) (cdr r))))
 (defun max (a &rest r) (%max-of a r))
 
-(defun abs (n) (if (< n 0) (- n) n))
+;; abs lives as a native shim that handles fixnum/bignum/ratio/
+;; float/complex uniformly (see ncl-runtime/src/complex.rs).
+;; The earlier (defun abs ...) using `<` couldn't handle complex
+;; arguments — comparison isn't defined on complex. Keep this
+;; comment so future readers know the native is intentional.
 
 ;; -- Loops -------------------------------------------------------------------
 ;;

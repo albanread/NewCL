@@ -12,6 +12,7 @@
 
 pub mod abi;
 pub mod bignum;
+pub mod complex;
 pub mod file_sys;
 pub mod float;
 pub mod format;

@@ -156,8 +156,19 @@ pub fn word_to_value(w: Word) -> Result<Value, EvalError> {
                     Arc::new(q.denom().to_string()),
                 ));
             }
+            if ncl_runtime::complex::is_complex(w) {
+                // Complex doesn't currently have a Value variant —
+                // we'd need to round-trip through the reader's #C
+                // form. For now, signal: complex values shouldn't
+                // appear in macro EXPANSIONS in practice (they live
+                // as values at runtime, not source). If this fires
+                // in real code, add a Value::Complex variant.
+                return Err(EvalError::Compile(crate::CompileError::NotImplemented(
+                    "word_to_value: complex number in macro expansion not supported".into(),
+                )));
+            }
             return Err(EvalError::Compile(crate::CompileError::NotImplemented(
-                "word_to_value: vector that isn't a bignum, float, or ratio".into(),
+                "word_to_value: vector that isn't a bignum, float, ratio, or complex".into(),
             )));
         }
         other => {

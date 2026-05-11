@@ -1244,18 +1244,20 @@ pub extern "C-unwind" fn typep_shim(
         "RATIONAL" => crate::ratio::is_rational(obj),
         "FLOAT" | "SHORT-FLOAT" | "SINGLE-FLOAT" | "DOUBLE-FLOAT" |
         "LONG-FLOAT" => crate::float::is_float(obj),
+        "COMPLEX" => crate::complex::is_complex(obj),
         "REAL" => crate::float::is_real(obj) || crate::ratio::is_ratio(obj),
-        "NUMBER" => crate::float::is_real(obj) || crate::ratio::is_ratio(obj),
+        "NUMBER" => crate::complex::is_number(obj),
         "STRING" | "SIMPLE-STRING" => obj.tag() == Tag::String,
         "CHARACTER" => obj.as_char().is_some(),
         "FUNCTION" => obj.tag() == Tag::Function,
         "VECTOR" | "SIMPLE-VECTOR" | "ARRAY" => {
-            // Bignums, floats, ratios share Tag::Vector but aren't
-            // vectors at the language level.
+            // Bignums, floats, ratios, complex share Tag::Vector
+            // but aren't vectors at the language level.
             obj.tag() == Tag::Vector
                 && !crate::bignum::is_bignum(obj)
                 && !crate::float::is_float(obj)
                 && !crate::ratio::is_ratio(obj)
+                && !crate::complex::is_complex(obj)
         }
         "SEQUENCE" => {
             obj.is_nil()

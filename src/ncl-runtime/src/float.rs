@@ -285,7 +285,7 @@ pub extern "C-unwind" fn div_shim(
     }
     let a = unsafe { *args };
     let b = unsafe { *args.add(1) };
-    crate::ratio::ncl_div_full(mutator, a, b)
+    crate::complex::ncl_div_complex(mutator, a, b)
 }
 
 /// `(floatp x)` — T iff X is a float.

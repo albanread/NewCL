@@ -134,6 +134,14 @@ pub enum HeapType {
     /// 3-cell payload (4 with header). Both num and den ARE Words,
     /// so the GC scan path treats them as live pointers naturally.
     Ratio = 8,
+    /// Complex number. Layout under `complex.rs`:
+    ///   cell 1: %COMPLEX marker symbol
+    ///   cell 2: real part (Word — any real-number subtype)
+    ///   cell 3: imaginary part (Word — any real-number subtype,
+    ///           guaranteed non-zero after canonicalisation —
+    ///           imag-zero would demote to the real part)
+    /// 3-cell payload, identical shape to Ratio.
+    Complex = 9,
 }
 
 impl HeapType {
@@ -148,6 +156,7 @@ impl HeapType {
             6 => Some(HeapType::Bignum),
             7 => Some(HeapType::Float),
             8 => Some(HeapType::Ratio),
+            9 => Some(HeapType::Complex),
             _ => None,
         }
     }

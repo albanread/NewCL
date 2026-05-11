@@ -348,6 +348,25 @@ fn install_native_functions(
                    ncl_runtime::bignum::integer_length_shim, 1);
     install_native(coord, mutator, "LOGBITP",
                    ncl_runtime::bignum::logbitp_shim, 2);
+    // Complex numbers (Tier 2.C).
+    install_native(coord, mutator, "COMPLEX",
+                   ncl_runtime::complex::complex_shim, 2);
+    install_native(coord, mutator, "COMPLEXP",
+                   ncl_runtime::complex::complexp_shim, 1);
+    install_native(coord, mutator, "NUMBERP",
+                   ncl_runtime::complex::numberp_shim, 1);
+    install_native(coord, mutator, "REALPART",
+                   ncl_runtime::complex::realpart_shim, 1);
+    install_native(coord, mutator, "IMAGPART",
+                   ncl_runtime::complex::imagpart_shim, 1);
+    install_native(coord, mutator, "CONJUGATE",
+                   ncl_runtime::complex::conjugate_shim, 1);
+    install_native(coord, mutator, "PHASE",
+                   ncl_runtime::complex::phase_shim, 1);
+    // ABS gets the complex-aware override (falls through to
+    // bignum's abs for real arguments).
+    install_native(coord, mutator, "ABS",
+                   ncl_runtime::complex::abs_complex_shim, 1);
     // Ratios (Tier 2.B).
     install_native(coord, mutator, "RATIOP",
                    ncl_runtime::ratio::ratiop_shim, 1);
@@ -366,8 +385,9 @@ fn install_native_functions(
                    ncl_runtime::float::floatp_shim, 1);
     install_native(coord, mutator, "FLOAT",
                    ncl_runtime::float::float_shim, 1);
+    // SQRT routes to the complex-aware version so (sqrt -1) → #C(0 1).
     install_native(coord, mutator, "SQRT",
-                   ncl_runtime::float::sqrt_shim, 1);
+                   ncl_runtime::complex::sqrt_complex_shim, 1);
     install_native(coord, mutator, "SIN",
                    ncl_runtime::float::sin_shim, 1);
     install_native(coord, mutator, "COS",

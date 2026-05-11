@@ -29,7 +29,8 @@ use ncl_runtime::{
     bignum::{
         ncl_truncate_promote, ncl_rem_promote,
     },
-    ratio::{ncl_add_full, ncl_sub_full, ncl_mul_full, ncl_cmp_full},
+    complex::{ncl_add_complex, ncl_sub_complex, ncl_mul_complex},
+    ratio::ncl_cmp_full,
     ncl_abort_pending, ncl_alloc_cons, ncl_apply, ncl_aref_generic, ncl_aset_generic,
     ncl_build_rest_list, ncl_call, ncl_equal, ncl_funcall,
     ncl_length, ncl_load_function, ncl_load_value, ncl_lookup_keyword,
@@ -571,9 +572,9 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     // which dispatch fixnum/bignum/ratio/float internally. The
     // function-cell names in the LLVM module still say
     // "ncl_add_promote" etc. — they're symbolic, not load-bearing.
-    engine.add_global_mapping(&helpers.add_promote, ncl_add_full as *const () as usize);
-    engine.add_global_mapping(&helpers.sub_promote, ncl_sub_full as *const () as usize);
-    engine.add_global_mapping(&helpers.mul_promote, ncl_mul_full as *const () as usize);
+    engine.add_global_mapping(&helpers.add_promote, ncl_add_complex as *const () as usize);
+    engine.add_global_mapping(&helpers.sub_promote, ncl_sub_complex as *const () as usize);
+    engine.add_global_mapping(&helpers.mul_promote, ncl_mul_complex as *const () as usize);
     engine.add_global_mapping(&helpers.truncate_promote, ncl_truncate_promote as *const () as usize);
     engine.add_global_mapping(&helpers.rem_promote, ncl_rem_promote as *const () as usize);
     engine.add_global_mapping(&helpers.cmp_int, ncl_cmp_full as *const () as usize);
