@@ -494,6 +494,115 @@ pub extern "C-unwind" fn sqrt_complex_shim(
     crate::float::alloc_float(m, f.sqrt()).raw()
 }
 
+/// Macro generating a unary transcendental shim that lifts to
+/// complex when the real method would return NaN.
+///
+/// For each function: try the real f64 method first. If the result
+/// is NaN (or the input is complex), use num-complex's Complex64
+/// version. Result type is complex if a complex result was needed,
+/// else float.
+macro_rules! unary_lifted_shim {
+    ($name:ident, $real:ident, $complex:ident, $err:literal) => {
+        pub extern "C-unwind" fn $name(
+            mutator: *mut MutatorState,
+            _env: u64,
+            args: *const u64,
+            n_args: u64,
+        ) -> u64 {
+            if n_args != 1 {
+                return crate::abi::signal_condition_string(
+                    mutator, concat!($err, ": expected 1 arg"),
+                );
+            }
+            let m = unsafe { &mut *mutator };
+            let w = Word::from_raw(unsafe { *args });
+            if is_complex(w) {
+                let re = crate::float::to_f64(complex_real(w)).unwrap_or(0.0);
+                let im = crate::float::to_f64(complex_imag(w)).unwrap_or(0.0);
+                let r = Complex64::new(re, im).$complex();
+                let re_w = crate::float::alloc_float(m, r.re);
+                let im_w = crate::float::alloc_float(m, r.im);
+                return alloc_complex_raw(m, re_w, im_w).raw();
+            }
+            let f = match crate::float::to_f64(w) {
+                Some(f) => f,
+                None => return crate::abi::signal_condition_string(
+                    mutator, concat!($err, ": argument is not a number"),
+                ),
+            };
+            let r = f.$real();
+            if r.is_nan() && !f.is_nan() {
+                // Real method failed (negative arg into log, etc.).
+                // Lift to complex and retry.
+                let rc = Complex64::new(f, 0.0).$complex();
+                let re_w = crate::float::alloc_float(m, rc.re);
+                let im_w = crate::float::alloc_float(m, rc.im);
+                return alloc_complex_raw(m, re_w, im_w).raw();
+            }
+            crate::float::alloc_float(m, r).raw()
+        }
+    };
+}
+
+unary_lifted_shim!(log_complex_shim,  ln,   ln,   "log");
+unary_lifted_shim!(exp_complex_shim,  exp,  exp,  "exp");
+unary_lifted_shim!(sin_complex_shim,  sin,  sin,  "sin");
+unary_lifted_shim!(cos_complex_shim,  cos,  cos,  "cos");
+unary_lifted_shim!(tan_complex_shim,  tan,  tan,  "tan");
+unary_lifted_shim!(asin_complex_shim, asin, asin, "asin");
+unary_lifted_shim!(acos_complex_shim, acos, acos, "acos");
+unary_lifted_shim!(atan_complex_shim, atan, atan, "atan");
+unary_lifted_shim!(sinh_complex_shim, sinh, sinh, "sinh");
+unary_lifted_shim!(cosh_complex_shim, cosh, cosh, "cosh");
+unary_lifted_shim!(tanh_complex_shim, tanh, tanh, "tanh");
+
+/// `(log x [base])` — natural log if base omitted, log_base(x)
+/// otherwise. Complex-aware for x; base must be real (CL spec).
+pub extern "C-unwind" fn log_complex_base_shim(
+    mutator: *mut MutatorState,
+    env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    let m = unsafe { &mut *mutator };
+    match n_args {
+        1 => log_complex_shim(mutator, env, args, 1),
+        2 => {
+            let x = Word::from_raw(unsafe { *args });
+            let b = Word::from_raw(unsafe { *args.add(1) });
+            let fb = match crate::float::to_f64(b) {
+                Some(f) => f,
+                None => return crate::abi::signal_condition_string(
+                    mutator, "log: base is not a real number",
+                ),
+            };
+            if is_complex(x) {
+                let re = crate::float::to_f64(complex_real(x)).unwrap_or(0.0);
+                let im = crate::float::to_f64(complex_imag(x)).unwrap_or(0.0);
+                let r = Complex64::new(re, im).log(fb);
+                let re_w = crate::float::alloc_float(m, r.re);
+                let im_w = crate::float::alloc_float(m, r.im);
+                return alloc_complex_raw(m, re_w, im_w).raw();
+            }
+            let fx = match crate::float::to_f64(x) {
+                Some(f) => f,
+                None => return crate::abi::signal_condition_string(
+                    mutator, "log: argument is not a number",
+                ),
+            };
+            let r = fx.log(fb);
+            if r.is_nan() && !fx.is_nan() && !fb.is_nan() {
+                let rc = Complex64::new(fx, 0.0).log(fb);
+                let re_w = crate::float::alloc_float(m, rc.re);
+                let im_w = crate::float::alloc_float(m, rc.im);
+                return alloc_complex_raw(m, re_w, im_w).raw();
+            }
+            crate::float::alloc_float(m, r).raw()
+        }
+        _ => crate::abi::signal_condition_string(mutator, "log: expected 1 or 2 args"),
+    }
+}
+
 /// `(phase c)` — argument / angle of a complex number, in radians.
 /// Always returns a float.
 pub extern "C-unwind" fn phase_shim(

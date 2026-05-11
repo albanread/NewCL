@@ -385,31 +385,32 @@ fn install_native_functions(
                    ncl_runtime::float::floatp_shim, 1);
     install_native(coord, mutator, "FLOAT",
                    ncl_runtime::float::float_shim, 1);
-    // SQRT routes to the complex-aware version so (sqrt -1) → #C(0 1).
+    // Transcendentals route to the complex-aware shims that lift
+    // negative-real / complex inputs to complex results.
     install_native(coord, mutator, "SQRT",
                    ncl_runtime::complex::sqrt_complex_shim, 1);
     install_native(coord, mutator, "SIN",
-                   ncl_runtime::float::sin_shim, 1);
+                   ncl_runtime::complex::sin_complex_shim, 1);
     install_native(coord, mutator, "COS",
-                   ncl_runtime::float::cos_shim, 1);
+                   ncl_runtime::complex::cos_complex_shim, 1);
     install_native(coord, mutator, "TAN",
-                   ncl_runtime::float::tan_shim, 1);
+                   ncl_runtime::complex::tan_complex_shim, 1);
     install_native(coord, mutator, "ASIN",
-                   ncl_runtime::float::asin_shim, 1);
+                   ncl_runtime::complex::asin_complex_shim, 1);
     install_native(coord, mutator, "ACOS",
-                   ncl_runtime::float::acos_shim, 1);
+                   ncl_runtime::complex::acos_complex_shim, 1);
     install_native(coord, mutator, "ATAN",
-                   ncl_runtime::float::atan_base_shim, 1);
+                   ncl_runtime::complex::atan_complex_shim, 1);
     install_native(coord, mutator, "SINH",
-                   ncl_runtime::float::sinh_shim, 1);
+                   ncl_runtime::complex::sinh_complex_shim, 1);
     install_native(coord, mutator, "COSH",
-                   ncl_runtime::float::cosh_shim, 1);
+                   ncl_runtime::complex::cosh_complex_shim, 1);
     install_native(coord, mutator, "TANH",
-                   ncl_runtime::float::tanh_shim, 1);
+                   ncl_runtime::complex::tanh_complex_shim, 1);
     install_native(coord, mutator, "EXP",
-                   ncl_runtime::float::exp_shim, 1);
+                   ncl_runtime::complex::exp_complex_shim, 1);
     install_native(coord, mutator, "LOG",
-                   ncl_runtime::float::log_base_shim, 1);
+                   ncl_runtime::complex::log_complex_base_shim, 1);
     install_native(coord, mutator, "EXPT-FLOAT",
                    ncl_runtime::float::expt_float_shim, 2);
     install_native(coord, mutator, "TRUNCATE-FLOAT",

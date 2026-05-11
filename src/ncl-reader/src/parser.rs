@@ -299,14 +299,7 @@ impl<'a> Parser<'a> {
                 },
                 Some(span),
             )),
-            ('C' | 'c', None) => Err(self.err_at(
-                ReaderErrorKind::UnsupportedSharpDispatch {
-                    ch: 'C',
-                    prefix,
-                    reason: "complex numbers (#C) not supported in Phase 1c",
-                },
-                Some(span),
-            )),
+            ('C' | 'c', None) => self.read_complex_literal(span).map(Some),
             _ => Err(self.err_at(
                 ReaderErrorKind::UnknownSharpDispatch { ch, prefix },
                 Some(span),
@@ -327,6 +320,64 @@ impl<'a> Parser<'a> {
             }
             items.push(self.read_form()?);
         }
+    }
+
+    /// `#C(re im)` — complex literal. We don't carry a Value::Complex
+    /// variant; instead, emit a `(complex re im)` Cons that the
+    /// lowering / evaluation pass turns into a heap-allocated
+    /// complex Word. The COMPLEX function (registered by
+    /// ncl-compiler) handles auto-demote of exact-zero imag.
+    fn read_complex_literal(&mut self, _span: crate::token::Span)
+        -> Result<Value, ReaderError>
+    {
+        // Expect `(re im)` next — read the list as a regular form.
+        let inner = self.read_form()?;
+        // Walk the cons: extract first and second.
+        let (re, im) = match &inner {
+            Value::Cons(c1) => {
+                let re = c1.car.clone();
+                match &c1.cdr {
+                    Value::Cons(c2) => {
+                        let im = c2.car.clone();
+                        if !matches!(c2.cdr, Value::Nil) {
+                            return Err(self.err_at(
+                                ReaderErrorKind::UnsupportedSharpDispatch {
+                                    ch: 'C',
+                                    prefix: None,
+                                    reason: "#C requires exactly (re im)",
+                                },
+                                None,
+                            ));
+                        }
+                        (re, im)
+                    }
+                    _ => return Err(self.err_at(
+                        ReaderErrorKind::UnsupportedSharpDispatch {
+                            ch: 'C',
+                            prefix: None,
+                            reason: "#C requires (re im)",
+                        },
+                        None,
+                    )),
+                }
+            }
+            _ => return Err(self.err_at(
+                ReaderErrorKind::UnsupportedSharpDispatch {
+                    ch: 'C',
+                    prefix: None,
+                    reason: "#C requires a list",
+                },
+                None,
+            )),
+        };
+        // Build the cons `(COMPLEX re im)`. Use the current-package
+        // symbol resolution so COMPLEX picks up the user-facing
+        // function correctly.
+        let complex_sym = self.current_package.intern_external("COMPLEX");
+        Ok(Value::cons(
+            Value::Symbol(complex_sym),
+            Value::cons(re, Value::cons(im, Value::Nil)),
+        ))
     }
 
     fn read_feature_test_then_form(&mut self, want: bool) -> Result<Option<Value>, ReaderError> {

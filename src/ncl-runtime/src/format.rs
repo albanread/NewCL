@@ -69,6 +69,27 @@ enum Directive {
         previous: bool, // `:` modifier
         y_form: bool,   // `@` modifier
     },
+    /// `~F` — fixed-format float. `~w,dF` = width w, d decimal places.
+    /// Width and decimals both optional; if absent we fall back to
+    /// ryu's shortest representation.
+    FixedFloat {
+        width: Option<usize>,
+        decimals: Option<usize>,
+        force_sign: bool,
+    },
+    /// `~E` — exponential / scientific notation.
+    ExpFloat {
+        width: Option<usize>,
+        decimals: Option<usize>,
+        force_sign: bool,
+    },
+    /// `~G` — general format: ~F for reasonable magnitudes,
+    /// ~E for very large or very small.
+    GenFloat {
+        width: Option<usize>,
+        decimals: Option<usize>,
+        force_sign: bool,
+    },
     Tab {
         column: usize,
     },
@@ -313,6 +334,21 @@ fn directive_for(dc: char, pa: &PrefixArgs) -> Option<Directive> {
         'P' => Some(Directive::Plural {
             previous: pa.colon,
             y_form: pa.at_sign,
+        }),
+        'F' => Some(Directive::FixedFloat {
+            width: pa.num(0).map(|n| n.max(0) as usize),
+            decimals: pa.num(1).map(|n| n.max(0) as usize),
+            force_sign: pa.at_sign,
+        }),
+        'E' => Some(Directive::ExpFloat {
+            width: pa.num(0).map(|n| n.max(0) as usize),
+            decimals: pa.num(1).map(|n| n.max(0) as usize),
+            force_sign: pa.at_sign,
+        }),
+        'G' => Some(Directive::GenFloat {
+            width: pa.num(0).map(|n| n.max(0) as usize),
+            decimals: pa.num(1).map(|n| n.max(0) as usize),
+            force_sign: pa.at_sign,
         }),
         'T' => Some(Directive::Tab {
             column: pa.num(0).unwrap_or(1).max(0) as usize,
@@ -569,6 +605,54 @@ fn exec(
                     out.push(' ');
                 }
             }
+            Directive::FixedFloat { width, decimals, force_sign } => {
+                let arg = cur.pop()?;
+                let f = match crate::float::to_f64(arg) {
+                    Some(f) => f,
+                    None => return Err(format!("~F: not a real number: {arg:?}")),
+                };
+                let body = match decimals {
+                    Some(d) => format!("{:.1$}", f, d),
+                    None => format!("{}", f),
+                };
+                emit_float(out, &body, f, *width, *force_sign, ' ');
+            }
+            Directive::ExpFloat { width, decimals, force_sign } => {
+                let arg = cur.pop()?;
+                let f = match crate::float::to_f64(arg) {
+                    Some(f) => f,
+                    None => return Err(format!("~E: not a real number: {arg:?}")),
+                };
+                let body = match decimals {
+                    Some(d) => format!("{:.1$E}", f, d),
+                    None => format!("{:E}", f),
+                };
+                emit_float(out, &body, f, *width, *force_sign, ' ');
+            }
+            Directive::GenFloat { width, decimals, force_sign } => {
+                let arg = cur.pop()?;
+                let f = match crate::float::to_f64(arg) {
+                    Some(f) => f,
+                    None => return Err(format!("~G: not a real number: {arg:?}")),
+                };
+                // CL ~G rule: use fixed if the result fits and the
+                // magnitude is reasonable, else exponential.
+                let abs_f = f.abs();
+                let use_exp =
+                    abs_f != 0.0 && (abs_f < 1e-4 || abs_f >= 1e16);
+                let body = if use_exp {
+                    match decimals {
+                        Some(d) => format!("{:.1$E}", f, d),
+                        None => format!("{:E}", f),
+                    }
+                } else {
+                    match decimals {
+                        Some(d) => format!("{:.1$}", f, d),
+                        None => format!("{}", f),
+                    }
+                };
+                emit_float(out, &body, f, *width, *force_sign, ' ');
+            }
             Directive::IterStart { end_idx } => {
                 run_iter(ds, i + 1, *end_idx, cur, out, m)?;
                 i = *end_idx; // jump past the ~}
@@ -741,6 +825,24 @@ fn run_cond(
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+/// Render a float body with optional width and force-sign. The body
+/// is the already-formatted number text (from Rust's `{:.5}` or
+/// `{:E}`); we just add a `+` if needed and right-pad to width.
+fn emit_float(out: &mut String, body: &str, f: f64, width: Option<usize>, force_sign: bool, pad: char) {
+    let mut s = String::new();
+    if force_sign && f.is_sign_positive() && !body.starts_with('+') {
+        s.push('+');
+    }
+    s.push_str(body);
+    let len = s.chars().count();
+    if let Some(w) = width {
+        if w > len {
+            for _ in 0..(w - len) { out.push(pad); }
+        }
+    }
+    out.push_str(&s);
+}
 
 fn emit_padded(out: &mut String, s: &str, p: &PadSpec) {
     let len = s.chars().count();
