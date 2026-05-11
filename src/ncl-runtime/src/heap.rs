@@ -304,6 +304,149 @@ impl Semispace {
         unsafe { *p.as_ptr() = HeapHeader::new(ty, length_cells).raw(); }
         unsafe { NonNull::new_unchecked(p.as_ptr() as *mut HeapHeader) }
     }
+
+    /// Conservative pin pass. Walk `[range_lo, range_hi)` 8-byte
+    /// aligned slot by slot, interpret each as a `Word`, and if it
+    /// looks like a tagged pointer into this semispace, set the
+    /// Pinned bit on the target object's header. Used at GC stop-
+    /// the-world to pin objects that JIT'd stack frames may be
+    /// holding pointers to (we can't tell from the slot bits alone
+    /// whether the value is really a pointer or just garbage that
+    /// happens to look like one, so we pin and accept the false-
+    /// positive cost of keeping a few extra objects alive).
+    ///
+    /// Cons cells are headerless so they can't be pinned through
+    /// this mechanism — they get treated as precise references and
+    /// may move. For the JIT-stack scan this is acceptable: a stale
+    /// cons-tagged Word on the stack will still copy correctly via
+    /// the normal forward path (the from-space cons cell holds the
+    /// forwarding pointer for the rest of this GC cycle).
+    pub fn pin_pointers_in_range(&mut self, range_lo: usize, range_hi: usize) {
+        if range_lo >= range_hi { return; }
+        let base = self.cells.as_ptr() as usize;
+        let end_addr = base + self.cells.len() * 8;
+        let scan_start = (range_lo + 7) & !7;
+        let scan_end = range_hi & !7;
+        let mut p = scan_start as *const u64;
+        let end = scan_end as *const u64;
+        while p < end {
+            let raw = unsafe { *p };
+            let w = Word::from_raw(raw);
+            let tag = w.tag();
+            // Only header-bearing heap pointers can be pinned —
+            // cons cells have no header.
+            if matches!(
+                tag,
+                Tag::Symbol | Tag::Vector | Tag::Function | Tag::String
+            ) {
+                let target = (raw & crate::word::PAYLOAD_MASK) as usize;
+                if target >= base && target < end_addr {
+                    let header_ptr = target as *mut u64;
+                    let header = unsafe { HeapHeader::from_raw(*header_ptr) };
+                    // Don't try to pin an already-forwarded cell (a
+                    // stale ref to an object that another root-path
+                    // already copied this cycle — the forward keeps
+                    // it valid).
+                    if !Word::from_raw(unsafe { *header_ptr }).is_forward() {
+                        let mut h = header;
+                        h.set_gc_bit(GcBit::Pinned);
+                        unsafe { *header_ptr = h.raw() };
+                    }
+                }
+            }
+            p = unsafe { p.add(1) };
+        }
+    }
+
+    /// After a minor GC, instead of `reset()` (which discards the
+    /// whole semispace), keep pinned objects in place and rewind
+    /// `top` to one cell past the highest pinned object. Free cells
+    /// below pinned objects are wasted until those objects are
+    /// unpinned (next cycle if no conservative ref still points at
+    /// them). Returns the number of cells still occupied.
+    pub fn rewind_past_pinned(&mut self) -> usize {
+        let mut highest_end: usize = 0;
+        let mut idx = 0;
+        while idx < self.top {
+            let cell = unsafe { *self.cells.as_ptr().add(idx) };
+            let word = Word::from_raw(cell);
+            // Headerless cons: 2 cells. Can't be pinned through
+            // this path (no header to carry the bit), so always
+            // treat as garbage post-GC and skip.
+            // BUT — we can't reliably tell a cons cell from a header
+            // word by looking at the cell alone. Cons cells aren't
+            // pinned, so they'd never block a rewind; we can advance
+            // past them by reading the slot speculatively as a header
+            // and checking whether it looks like a valid one. In
+            // practice the structure is: every non-cons heap object
+            // starts with a HeapHeader cell (recognisable by its
+            // type-tag field), and the cell before/after is either
+            // another header or part of an object's payload. To keep
+            // this simple and conservative, we walk one cell at a time
+            // checking for the Pinned bit on EVERY cell — if any cell
+            // happens to look like a header with Pinned, we treat it
+            // as the start of a pinned object and advance by its
+            // declared length. The false-positive case (a payload
+            // cell that happens to have the Pinned bit set in the GC-
+            // bits slot) is benign: we just over-skip by one object's
+            // worth, slightly more cells stay live.
+            if word.is_forward() {
+                // Forwarding pointer left over from a copy. Cell has
+                // no further structure; advance by 1.
+                idx += 1;
+                continue;
+            }
+            let header = HeapHeader::from_raw(cell);
+            // A valid header has a recognisable type tag. If the
+            // type byte decodes to something invalid, this cell is
+            // payload, not a header — advance by 1.
+            let ty_bits = ((cell >> TYPE_SHIFT) & TYPE_MASK) as u8;
+            if HeapType::from_bits(ty_bits).is_none() {
+                idx += 1;
+                continue;
+            }
+            if header.has_gc_bit(GcBit::Pinned) {
+                let len = header.length_cells() as usize;
+                let end = idx + 1 + len;
+                if end > highest_end {
+                    highest_end = end;
+                }
+                idx = end;
+            } else {
+                idx += 1;
+            }
+        }
+        self.top = highest_end;
+        highest_end
+    }
+
+    /// Clear the Pinned bit on every header-bearing object in the
+    /// semispace. Called at the end of a GC cycle so the next
+    /// conservative scan starts from a clean slate.
+    pub fn clear_pinned_bits(&mut self) {
+        let mut idx = 0;
+        while idx < self.top {
+            let cell_ptr = unsafe { self.cells.as_mut_ptr().add(idx) };
+            let cell = unsafe { *cell_ptr };
+            let word = Word::from_raw(cell);
+            if word.is_forward() {
+                idx += 1;
+                continue;
+            }
+            let ty_bits = ((cell >> TYPE_SHIFT) & TYPE_MASK) as u8;
+            if HeapType::from_bits(ty_bits).is_none() {
+                idx += 1;
+                continue;
+            }
+            let mut header = HeapHeader::from_raw(cell);
+            if header.has_gc_bit(GcBit::Pinned) {
+                header.clear_gc_bit(GcBit::Pinned);
+                unsafe { *cell_ptr = header.raw() };
+            }
+            let len = header.length_cells() as usize;
+            idx += 1 + len;
+        }
+    }
 }
 
 // -- OldGen (two semispaces, swap on full GC) -------------------------------
@@ -470,15 +613,33 @@ impl Heap {
     /// area for static→young pointers. Used by the GcCoordinator at
     /// runtime; tests that don't have a static area use the simpler
     /// `collect_minor` above.
+    ///
+    /// `pin_stack_ranges` is a slice of `(rsp, stack_hi)` pairs —
+    /// one per mutator whose stack may hold tagged-pointer Words in
+    /// JIT-emitted local slots at GC-stop time. Each range is
+    /// conservatively scanned BEFORE the precise copy pass, and any
+    /// 8-byte slot that decodes as a heap-pointer Word into young
+    /// causes the target object to be pinned (skipped by the
+    /// copier). Pass an empty slice for the legacy
+    /// "explicit-roots-only" behaviour.
     pub fn collect_minor_with_static(
         &mut self,
         static_cards: &CardTable,
         static_base: *mut u64,
         static_cells: usize,
+        pin_stack_ranges: &[(usize, usize)],
         mut visit_roots: impl FnMut(&mut RootScanner<'_, '_>),
     ) {
         let cards = Arc::clone(&self.old.cards);
         let live_base = self.old.live_base_ptr() as usize;
+
+        // Conservative pin pass over each mutator's stack window.
+        // Pinning targets stay at their original young addresses;
+        // they're left untouched by the copier and `rewind_past_pinned`
+        // preserves the cells they occupy.
+        for &(lo, hi) in pin_stack_ranges {
+            self.young.pin_pointers_in_range(lo, hi);
+        }
 
         let mut state = MinorState {
             young: &mut self.young,
@@ -496,7 +657,17 @@ impl Heap {
         // we promote those targets and update the slots in place.
         state.scan_dirty_cards_in(static_cards, static_base, static_cells);
         state.scan_to_completion();
-        self.young.reset();
+        // Rewind young past the highest pinned object instead of
+        // resetting top=0. Pinned objects stay at their addresses
+        // (so stack slots that pointed at them remain valid). Then
+        // clear the Pinned bit on every survivor so the next cycle
+        // observes a fresh canvas.
+        if pin_stack_ranges.is_empty() {
+            self.young.reset();
+        } else {
+            self.young.rewind_past_pinned();
+            self.young.clear_pinned_bits();
+        }
         cards.clear_all();
         static_cards.clear_all();
     }
@@ -768,6 +939,21 @@ fn copy_into(
                 }
             }
             let (src_idx, from_idx) = source_idx_and_cell?;
+
+            // Pinned by a conservative stack scan? Don't copy or
+            // forward — the object stays at its current address so
+            // the (possibly-bogus) stack slot that referenced it
+            // remains a valid pointer for the rest of this GC cycle
+            // (and beyond, until a future cycle observes no
+            // conservative refs and reclaims it normally). Cons
+            // cells are headerless so they're never pinned by this
+            // path — they're always treated as precise references.
+            if !matches!(tag, Tag::Cons) {
+                let header_word = unsafe { *sources[src_idx].cell_ptr(from_idx) };
+                if HeapHeader::from_raw(header_word).has_gc_bit(GcBit::Pinned) {
+                    return Some(w);
+                }
+            }
 
             // Forwarding pointer already there?
             let header_word = unsafe { *sources[src_idx].cell_ptr(from_idx) };

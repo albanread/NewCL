@@ -220,9 +220,13 @@ impl GcCoordinator {
     /// thread) but `!Sync` (only owned by one thread at a time).
     /// On drop, the mutator deregisters from the coordinator.
     pub fn register_mutator(self: &Arc<Self>) -> MutatorState {
+        let (lo, hi) = current_thread_stack_range();
         let handle = Arc::new(MutatorHandle {
             parked: AtomicBool::new(false),
             roots: Mutex::new(Vec::new()),
+            stack_lo: AtomicUsize::new(lo),
+            stack_hi: AtomicUsize::new(hi),
+            parked_rsp: AtomicUsize::new(0),
         });
         self.park_state
             .lock()
@@ -269,6 +273,18 @@ impl GcCoordinator {
 pub struct MutatorHandle {
     parked: AtomicBool,
     roots: Mutex<Vec<Word>>,
+    /// Range of this thread's stack, captured once at registration
+    /// time via `GetCurrentThreadStackLimits` (Win32). The full
+    /// committed stack lies in `[stack_lo, stack_hi)`. The GC needs
+    /// these to bound a conservative pin scan when a mutator parks.
+    stack_lo: AtomicUsize,
+    stack_hi: AtomicUsize,
+    /// Snapshot of RSP captured at the instant this thread parked.
+    /// 0 when not parked. The GC scans `[parked_rsp, stack_hi)`
+    /// conservatively — every 8-byte slot in that range that looks
+    /// like a pointer into young/old causes the target object to be
+    /// pinned (skipped by the copier this cycle).
+    parked_rsp: AtomicUsize,
 }
 
 // -- Tlab --------------------------------------------------------------------
@@ -460,6 +476,28 @@ impl MutatorState {
                 .collect()
         };
 
+        // Gather stack-range conservative-scan windows. We include:
+        //   - the trigger thread's own current frame, snapshotted by
+        //     reading RSP right here (we're about to drive the GC,
+        //     so any Lisp values our caller had in stack locals are
+        //     potentially live);
+        //   - every parked mutator's `[parked_rsp, stack_hi)`.
+        // The pin pass marks any candidate young pointers found in
+        // these ranges so the copier leaves their targets in place.
+        let mut pin_ranges: Vec<(usize, usize)> = Vec::with_capacity(other_handles.len() + 1);
+        let my_rsp = current_rsp();
+        let my_stack_hi = self.handle.stack_hi.load(Ordering::Acquire);
+        if my_stack_hi > my_rsp {
+            pin_ranges.push((my_rsp, my_stack_hi));
+        }
+        for h in &other_handles {
+            let rsp = h.parked_rsp.load(Ordering::Acquire);
+            let hi = h.stack_hi.load(Ordering::Acquire);
+            if rsp != 0 && hi > rsp {
+                pin_ranges.push((rsp, hi));
+            }
+        }
+
         // All others parked. Run the GC. Pass the static area so
         // dirty static cards are scanned for static→young pointers.
         let my_handle = Arc::clone(&self.handle);
@@ -472,6 +510,7 @@ impl MutatorState {
                 &static_cards,
                 static_base,
                 static_cells,
+                &pin_ranges,
                 |scanner| {
                     // My own roots first.
                     {
@@ -505,6 +544,13 @@ impl MutatorState {
     /// observed `stop_requested == true`. Returns when the GC
     /// completes and clears the flag.
     fn park(&mut self) {
+        // Snapshot RSP BEFORE acquiring any lock so the GC's
+        // conservative pin pass sees every live Lisp value the
+        // JIT'd code had on the stack at this safepoint. Values
+        // born inside `park()` after this point are GC-internal
+        // (no Lisp-Word pointers) so we don't care about them.
+        let rsp = current_rsp();
+        self.handle.parked_rsp.store(rsp, Ordering::Release);
         self.handle.parked.store(true, Ordering::Release);
         let mut state = self.coord.park_state.lock().unwrap();
         state.parked_count += 1;
@@ -518,6 +564,7 @@ impl MutatorState {
         }
         state.parked_count -= 1;
         self.handle.parked.store(false, Ordering::Release);
+        self.handle.parked_rsp.store(0, Ordering::Release);
         drop(state);
 
         // Our TLAB is now invalid (young was cleared).
@@ -630,6 +677,67 @@ impl MutatorState {
     /// Force a minor GC. The current thread becomes the trigger.
     pub fn collect_minor(&mut self) {
         self.trigger_minor_gc();
+    }
+}
+
+// ─── Stack-range capture for conservative pin scans ───────────────────────
+//
+// To pin Lisp values that JIT'd code is holding in stack-resident
+// locals at GC-stop time, the collector needs each parked thread's
+// stack range. We capture two things per mutator:
+//
+//   - stack_lo / stack_hi: the full committed stack range, taken
+//     once when the MutatorHandle is registered. On Windows this
+//     is `GetCurrentThreadStackLimits`. The returned values bound
+//     the thread's full reserved stack; the GC scans only the
+//     portion currently in use (RSP..stack_hi).
+//
+//   - parked_rsp: a snapshot of RSP at the instant `park()` was
+//     called, taken via inline asm before any further frames are
+//     pushed. Cleared back to 0 on unpark.
+//
+// Conservative scan range for a parked mutator = [parked_rsp, stack_hi).
+// Any 8-byte slot in there that decodes as a tagged pointer to
+// young/old causes that target to be pinned by the GC.
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn GetCurrentThreadStackLimits(LowLimit: *mut usize, HighLimit: *mut usize);
+}
+
+fn current_thread_stack_range() -> (usize, usize) {
+    #[cfg(windows)]
+    {
+        let mut lo: usize = 0;
+        let mut hi: usize = 0;
+        unsafe { GetCurrentThreadStackLimits(&mut lo, &mut hi) };
+        (lo, hi)
+    }
+    #[cfg(not(windows))]
+    {
+        // Best-effort fallback: tag a local variable's address as
+        // an approximate "current frame depth," and use a generous
+        // 8 MiB ceiling for the upper bound. Refine when we wire
+        // up the Mac/Linux ports (pthread_get_stackaddr_np /
+        // pthread_attr_getstack).
+        let local = 0u64;
+        let p = &local as *const u64 as usize;
+        (p.saturating_sub(8 * 1024 * 1024), p + 64)
+    }
+}
+
+#[inline(always)]
+fn current_rsp() -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let rsp: usize;
+        unsafe { std::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, preserves_flags)) };
+        rsp
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let local = 0u64;
+        &local as *const u64 as usize
     }
 }
 
