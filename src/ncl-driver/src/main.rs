@@ -9,19 +9,29 @@ use std::sync::Mutex;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn usage() {
-    eprintln!("usage: ncl [--version | --lean] [--repl | (--eval <src> | --load <file>)...] [--repl]");
-    eprintln!("  --eval, -e <src>   evaluate a source string");
-    eprintln!("  --load, -l <file>  read and evaluate the file");
-    eprintln!("  --repl, -r         enter the interactive REPL (default if no flags given)");
-    eprintln!("  --lean, -L         start with core only (no CLOS, no Library/init.lisp)");
+    eprintln!("usage: ncl [--lean] [--repl | (--eval <src> | --load <file>)...] [--repl]");
+    eprintln!("       ncl --version | --help");
+    eprintln!("  --eval, -e <src>     evaluate a source string");
+    eprintln!("  --load, -l <file>    read and evaluate the file");
+    eprintln!("  --repl, -r           enter the interactive REPL (default if no flags given)");
+    eprintln!("  --lean, -L           start with core only (no CLOS, no Library/init.lisp)");
+    eprintln!("  --version, -V        print version and exit");
+    eprintln!("  --help, -h           print this message and exit");
     eprintln!("  multiple --eval / --load can be chained; --repl runs after them");
 }
 
 fn main() -> ExitCode {
     let raw_args: Vec<String> = env::args().skip(1).collect();
 
-    if matches!(raw_args.first().map(String::as_str), Some("--version") | Some("-V")) {
+    // Early-exit flags. Scan ALL of argv so position doesn't matter —
+    // `ncl --version`, `ncl --lean --version`, `ncl -e foo -V` all
+    // print version-and-exit before any session work.
+    if raw_args.iter().any(|a| a == "--version" || a == "-V") {
         println!("NewCormanLisp {VERSION}");
+        return ExitCode::SUCCESS;
+    }
+    if raw_args.iter().any(|a| a == "--help" || a == "-h") {
+        usage();
         return ExitCode::SUCCESS;
     }
 
