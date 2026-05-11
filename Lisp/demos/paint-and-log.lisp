@@ -1,22 +1,26 @@
-;;;; Lisp/demos/paint-and-log.lisp — two windows, one event loop.
+;;;; Lisp/demos/paint-and-log.lisp — canvas-owned events + log sink.
 ;;;;
-;;;; Port of NewBCPL's examples/paint-and-log.bcl. Demonstrates a
-;;;; multi-window iGui app:
+;;;; Two windows, one event loop on the canvas.
 ;;;;
 ;;;;   * a graphics canvas where left-clicks drop coloured dots
-;;;;   * a text-pane log that prints the click number + coords
+;;;;   * a passive text-pane log the canvas writes click numbers
+;;;;     and coordinates into via `text-write`
 ;;;;
-;;;; Both windows register with the persistent event filter so the
-;;;; main loop only sees their events (plus globals like
-;;;; :frame-close). Events for other children (a separate REPL pane,
-;;;; the iGui log overlay, etc.) park in the stash and never
-;;;; pollute the dispatch.
+;;;; Design — "the app listens for its own events":
+;;;;
+;;;; The canvas is the app. It registers as the filter window via
+;;;; `event-loop-for`; events for any other child (including the log
+;;;; child) stash and are ignored. The log is treated like stdout —
+;;;; the canvas writes to it, but the log doesn't drive anything.
+;;;;
+;;;; If the user closes the log child on its own, subsequent
+;;;; (text-write log …) calls return NIL silently and the canvas
+;;;; keeps running. To exit, close the canvas (or the whole frame).
 ;;;;
 ;;;; Run:
 ;;;;
-;;;;   ncl --load Lisp/demos/paint-and-log.lisp --eval "(run-paint-and-log)"
-;;;;
-;;;; Close either window to exit.
+;;;;   ncl --eval "(igui-start)" --load Lisp/demos/paint-and-log.lisp \
+;;;;       --eval "(run-paint-and-log)"
 
 (defparameter +canvas-bg+ (rgb 20 25 41))      ; very dark blue
 (defparameter +log-bg+    (rgb 32 40 64))
@@ -42,10 +46,12 @@
   (text-write log "+--------------------------+~%")
   (text-reset-pen log)
   (text-write log "Click the canvas to drop dots.~%")
-  (text-write log "Close either window to exit.~%~%"))
+  (text-write log "Close the canvas to exit.~%~%"))
 
 (defun run-paint-and-log ()
-  "Open the canvas and log windows, run the unified event loop."
+  "Open the canvas and log windows. The canvas is the app; the
+   log is a passive sink it writes click messages into. Returns
+   :done when the canvas (or the whole frame) closes."
   (igui-start)
   (let ((canvas (open-child "Canvas"))
         (log    (open-text-window "Log")))
@@ -54,34 +60,17 @@
        (format t "** failed to open windows (canvas=~A log=~A)~%" canvas log)
        :failed)
       (t
-       ;; Register both windows with the persistent filter. After
-       ;; this, plain (next-event) only sees events for these two
-       ;; (plus globals).
-       (filter-on-window canvas)
-       (filter-on-window log)
-
        ;; Initial canvas paint.
        (with-batch canvas
          (clear +canvas-bg+))
-
        ;; Banner in the log.
        (paint-and-log-banner log)
-
        (let ((count 0))
-         ;; We use plain event-loop (not event-loop-for) because
-         ;; we're watching TWO child windows; dispatch by :child-id
-         ;; inside the :mouse clause picks the canvas.
-         (event-loop
-           (:frame-close
-            (clear-event-filter)
-            (return :done))
-           (:close
-            ;; Either window closed → exit.
-            (clear-event-filter)
-            (return :done))
+         (event-loop-for canvas
+           (:frame-close (return :done))
+           (:close       (close-child canvas) (return :done))
            (:mouse
-            (when (and (eq (getf ev :op) :LEFT-DOWN)
-                       (= (getf ev :child-id) canvas))
+            (when (eq (getf ev :op) :LEFT-DOWN)
               (setq count (+ count 1))
               ;; Draw a new dot on the canvas.
               (with-batch canvas

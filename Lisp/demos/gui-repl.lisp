@@ -138,15 +138,7 @@
      (text-clear *repl-id*)
      (repl-banner)
      (repl-write-prompt)
-     (loop
-       (let ((ev (next-event -1)))
-         (cond
-           ((null ev) nil)
-           ((eq (getf ev :kind) :frame-close) (return :done))
-           ((and (eq (getf ev :kind) :char)
-                 (= (getf ev :child-id) *repl-id*))
-            (repl-handle-char (getf ev :char) (getf ev :codepoint)))
-           ((and (eq (getf ev :kind) :close)
-                 (= (getf ev :child-id) *repl-id*))
-            (return :done))
-           (t nil)))))))
+     (event-loop-for *repl-id*
+       (:frame-close (return :done))
+       (:close       (return :done))
+       (:char        (repl-handle-char (getf ev :char) (getf ev :codepoint)))))))

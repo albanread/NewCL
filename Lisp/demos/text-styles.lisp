@@ -37,15 +37,7 @@
   (igui-start)
   (let ((id (open-child "text styles")))
     (paint-styles id 600 320)
-    (loop
-      (let ((ev (next-event -1)))
-        (cond
-          ((null ev) nil)
-          ((eq (getf ev :kind) :frame-close) (return :done))
-          ((and (eq (getf ev :kind) :resize)
-                (= (getf ev :child-id) id))
-           (paint-styles id (getf ev :width) (getf ev :height)))
-          ((and (eq (getf ev :kind) :close)
-                (= (getf ev :child-id) id))
-           (close-child id) (return :done))
-          (t nil))))))
+    (event-loop-for id
+      (:frame-close (return :done))
+      (:close       (close-child id) (return :done))
+      (:resize      (paint-styles id (getf ev :width) (getf ev :height))))))
