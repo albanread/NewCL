@@ -1871,10 +1871,163 @@
            (finalize-generic-function gf))
          *clos-generic-function-table*)
 
-;; intern-eql-specializer placeholder (filled in stage H).
+;; ─── Stage H: EQL specializers ─────────────────────────────────────────────
+;;
+;; Method specializers can be `(eql obj)` instead of a class. Such
+;; methods only apply when their argument is EQL to the captured
+;; object. EQL specializers are MORE SPECIFIC than any class
+;; specializer for the matching object.
+;;
+;; Closette stores singleton specializers in
+;; *clos-singleton-specializers* (declared in stage A). Each EQL
+;; spec is a CLOS instance of class EQL-SPECIALIZER, with an
+;; `object` slot holding the eql target.
+
+(defclass eql-specializer (specializer)
+  ((object :initarg :object)))
+
+(defparameter the-class-eql-specializer (find-class 'eql-specializer))
+
+(defun eql-specializer-p (x)
+  (and (clos-instance-p x)
+       (eq (class-of x) the-class-eql-specializer)))
+
+(defun eql-specializer-object (s) (slot-value s 'object))
+
 (defun intern-eql-specializer (obj)
-  (declare (ignore obj))
-  (error "EQL specializers are not yet supported (stage H)."))
+  "Find or create the canonical EQL specializer for OBJ. Two
+   defmethods that name `(eql 'foo)` get the SAME spec instance,
+   which is what the dispatch code keys on."
+  (let ((existing (gethash obj *clos-singleton-specializers*)))
+    (cond
+      (existing existing)
+      (t
+       (let ((s (std-allocate-instance the-class-eql-specializer)))
+         ;; Populate the inherited specializer/metaobject slots so
+         ;; class-direct-methods (which add-method writes to)
+         ;; doesn't blow up. EQL specs aren't real classes — they
+         ;; have no superclasses or CPL beyond themselves.
+         (setf (slot-value s 'name) nil)
+         (setf (slot-value s 'documentation) nil)
+         (setf (slot-value s 'direct-superclasses) nil)
+         (setf (slot-value s 'class-precedence-list) (list s))
+         (setf (slot-value s 'direct-methods) nil)
+         (setf (slot-value s 'direct-subclasses) nil)
+         (setf (slot-value s 'object) obj)
+         (setf (gethash obj *clos-singleton-specializers*) s)
+         s)))))
+
+;; -- EQL-aware dispatch ---------------------------------------------------
+;;
+;; subclassp / sub-specializer-p / compute-applicable-methods need
+;; to be EQL-aware. We patch them in place rather than splitting
+;; into "with-classes" and "with-args" variants.
+
+(defun %collect-eql-targets (gf)
+  "Walk GF's methods and return every EQL specializer that
+   appears. Used by the discriminating function to decide
+   whether each argument should match an EQL spec."
+  (let ((result nil))
+    (dolist (m (generic-function-methods gf))
+      (dolist (s (method-specializers m))
+        (when (eql-specializer-p s)
+          (unless (member s result)
+            (setq result (cons s result))))))
+    result))
+
+(defun %dispatch-key-for-arg (arg eql-targets)
+  ;; If ARG eql's any captured EQL target, the dispatch key is
+  ;; that spec; otherwise (class-of arg).
+  (let ((spec (find-if (lambda (s) (eql arg (eql-specializer-object s)))
+                       eql-targets)))
+    (cond (spec spec) (t (class-of arg)))))
+
+(defun %method-applicable-p (method args)
+  "Walk METHOD's specializers + ARGS in lockstep. Each pair must
+   match: EQL spec ↔ arg eql target; class spec ↔ class-of arg
+   subclassp class spec."
+  (let ((specs (method-specializers method))
+        (a args))
+    (block done
+      (loop
+        (cond
+          ((null specs) (return-from done t))
+          ((null a) (return-from done nil))
+          ((eql-specializer-p (car specs))
+           (cond
+             ((eql (car a) (eql-specializer-object (car specs)))
+              (setq specs (cdr specs)) (setq a (cdr a)))
+             (t (return-from done nil))))
+          (t
+           (cond
+             ((subclassp (class-of (car a)) (car specs))
+              (setq specs (cdr specs)) (setq a (cdr a)))
+             (t (return-from done nil)))))))))
+
+(defun %sub-spec-p (sp1 sp2 arg)
+  "True if SP1 is more specific than SP2 for ARG. EQL spec is
+   always more specific than class. Otherwise class spec uses
+   sub-specializer-p w.r.t. the arg's class-of."
+  (cond
+    ((eql-specializer-p sp1) t)
+    ((eql-specializer-p sp2) nil)
+    (t (sub-specializer-p sp1 sp2 (class-of arg)))))
+
+(defun %method-more-specific-p (m1 m2 args)
+  (let ((s1 (method-specializers m1))
+        (s2 (method-specializers m2))
+        (a args))
+    (block done
+      (loop
+        (cond
+          ((or (null s1) (null s2) (null a)) (return-from done nil))
+          ((eq (car s1) (car s2))
+           (setq s1 (cdr s1)) (setq s2 (cdr s2)) (setq a (cdr a)))
+          (t (return-from done (%sub-spec-p (car s1) (car s2) (car a)))))))))
+
+(defun compute-applicable-methods (gf args)
+  (let ((applicable
+         (remove-if-not (lambda (m) (%method-applicable-p m args))
+                        (generic-function-methods gf))))
+    (sort applicable
+          (lambda (m1 m2) (%method-more-specific-p m1 m2 args)))))
+
+;; Re-define the discriminating function to be EQL-aware. The
+;; cache key per arg is the EQL spec it matches (if any), else
+;; (class-of arg) — that key list is what the per-gf method
+;; table is indexed by.
+
+(defun std-compute-discriminating-function (gf)
+  (lambda (&rest args)
+    (let* ((table       (classes-to-emf-table gf))
+           (num         (num-required-args gf))
+           (req         (%first-n args num))
+           (eql-targets (%collect-eql-targets gf))
+           (keys (cond
+                   (eql-targets
+                    (mapcar (lambda (a) (%dispatch-key-for-arg a eql-targets))
+                            req))
+                   (t (mapcar #'class-of req)))))
+      (let ((cached (find-method-table-method table keys)))
+        (cond
+          (cached (funcall cached args))
+          (t
+           (let* ((methods (compute-applicable-methods gf req))
+                  (emf (cond
+                         ((null methods)
+                          (error "No applicable method for ~A on ~A"
+                                 (generic-function-name gf) keys))
+                         (t
+                          (std-compute-effective-method-function gf methods)))))
+             (add-method-table-method table keys emf)
+             (funcall emf args))))))))
+
+;; Re-finalize every GF so existing ones pick up EQL-aware
+;; dispatch.
+(maphash (lambda (name gf)
+           (declare (ignore name))
+           (finalize-generic-function gf))
+         *clos-generic-function-table*)
 
 ;; Return a printable sentinel.
 nil
