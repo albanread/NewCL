@@ -25,6 +25,7 @@
 (require 'conditions)                    ; define-condition, restart-case, typed handler-case
 (require 'loop)                          ; extended LOOP macro
 (require 'sequences)                     ; generic position/find/count/etc.
+(require 'events)                        ; iGui event-loop / with-events-from
 (require 'hot-reload)                    ; (start-hot-reload), (check-reloads)
 
 ;;; Example user-side hook: load a personal utilities module if

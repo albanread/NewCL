@@ -8,9 +8,10 @@
 
 #![cfg(windows)]
 
+use std::collections::{HashSet, VecDeque};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Stable enum tags exported to CP as `iGui.Ev*` constants.
 pub mod kind {
@@ -159,14 +160,197 @@ pub fn push(ev: IGuiEvent) {
     }
 }
 
+// ─── Per-window event filtering / stash ────────────────────────────────
+//
+// Pattern ported from NewBCPL. Lisp programs typically open one child
+// window and only care about its events plus globals like FrameClose.
+// Without filtering, events for OTHER children (e.g. an embedded log
+// view or REPL pane) pollute the loop and force every clause to write
+// (= (getf ev :child-id) win).
+//
+// The runtime now offers two filtering shapes:
+//
+//   * `next_event_for(target, timeout)` — one-shot. Block until an
+//     event matches target (or is a global). Non-matches park in
+//     the stash so they're not lost.
+//
+//   * `filter_on_window(child_id)` / `unfilter_window` /
+//     `clear_filter` — persistent. Any `next_event` calls while the
+//     filter set is non-empty only return matching events; the rest
+//     stash. The language thread typically sets up the filter on
+//     start and clears it on shutdown.
+
+/// Stash of events that arrived but didn't match the current
+/// consumer's interest. Drained ahead of the channel by every
+/// consumer.
+static EVENT_STASH: Mutex<VecDeque<IGuiEvent>> = Mutex::new(VecDeque::new());
+
+/// Persistent set of windows the language thread is interested in.
+/// Initialised on first access.
+static EVENT_FILTER: OnceLock<Mutex<HashSet<i64>>> = OnceLock::new();
+
+fn filter_lock() -> &'static Mutex<HashSet<i64>> {
+    EVENT_FILTER.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub fn filter_on_window(child_id: i64) {
+    if let Ok(mut filter) = filter_lock().lock() {
+        filter.insert(child_id);
+    }
+}
+
+pub fn unfilter_window(child_id: i64) {
+    if let Ok(mut filter) = filter_lock().lock() {
+        filter.remove(&child_id);
+    }
+}
+
+pub fn clear_filter() {
+    if let Ok(mut filter) = filter_lock().lock() {
+        filter.clear();
+    }
+}
+
+pub fn discard_stashed_events() {
+    if let Ok(mut stash) = EVENT_STASH.lock() {
+        stash.clear();
+    }
+}
+
+/// Does `ev` match the registered-interest set? Used by `next_event`
+/// when the filter is non-empty.
+fn matches_filter(ev: &IGuiEvent, filter: &HashSet<i64>) -> bool {
+    match ev {
+        IGuiEvent::FrameClose | IGuiEvent::ThemeChange => true,
+        IGuiEvent::Menu { .. } => true,
+        IGuiEvent::Key { child_id, .. }
+        | IGuiEvent::Char { child_id, .. }
+        | IGuiEvent::Mouse { child_id, .. }
+        | IGuiEvent::Focus { child_id, .. }
+        | IGuiEvent::Resize { child_id, .. }
+        | IGuiEvent::Close { child_id }
+        | IGuiEvent::DpiChange { child_id, .. }
+        | IGuiEvent::Tick { child_id, .. } => filter.contains(child_id),
+    }
+}
+
+/// Does `ev` belong to the consumer that asked for `target`?
+/// Per-window events match when their `child_id` == `target`. Global
+/// events (FrameClose, ThemeChange, Menu) match every target.
+fn matches_target(ev: &IGuiEvent, target: i64) -> bool {
+    match ev {
+        IGuiEvent::FrameClose | IGuiEvent::ThemeChange => true,
+        IGuiEvent::Menu { .. } => true,
+        IGuiEvent::Key { child_id, .. }
+        | IGuiEvent::Char { child_id, .. }
+        | IGuiEvent::Mouse { child_id, .. }
+        | IGuiEvent::Focus { child_id, .. }
+        | IGuiEvent::Resize { child_id, .. }
+        | IGuiEvent::Close { child_id }
+        | IGuiEvent::DpiChange { child_id, .. }
+        | IGuiEvent::Tick { child_id, .. } => *child_id == target,
+    }
+}
+
 /// Pop from the language thread. `timeout_ms < 0` blocks indefinitely.
+///
+/// Semantics depend on the EVENT_FILTER:
+///   * filter empty:     return next event (stash, then channel)
+///   * filter non-empty: return next event matching the set; non-
+///                       matches park in stash.
 pub fn next_event(timeout_ms: i64) -> Option<IGuiEvent> {
+    let filter_snapshot: Option<HashSet<i64>> = filter_lock()
+        .lock()
+        .ok()
+        .map(|f| f.clone())
+        .filter(|f| !f.is_empty());
+
+    // Drain stash first.
+    {
+        let mut stash = EVENT_STASH.lock().expect("EVENT_STASH poisoned");
+        match &filter_snapshot {
+            None => {
+                if let Some(ev) = stash.pop_front() {
+                    return Some(ev);
+                }
+            }
+            Some(filter) => {
+                for i in 0..stash.len() {
+                    if matches_filter(&stash[i], filter) {
+                        return stash.remove(i);
+                    }
+                }
+            }
+        }
+    }
+
     let mb = MAILBOX.get()?;
     let rx = mb.rx.lock().ok()?;
-    if timeout_ms < 0 {
-        rx.recv().ok()
+    let deadline = if timeout_ms < 0 {
+        None
     } else {
-        rx.recv_timeout(Duration::from_millis(timeout_ms as u64))
-            .ok()
+        Some(Instant::now() + Duration::from_millis(timeout_ms as u64))
+    };
+    loop {
+        let ev = match deadline {
+            None => rx.recv().ok()?,
+            Some(deadline) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return None;
+                }
+                rx.recv_timeout(deadline - now).ok()?
+            }
+        };
+        match &filter_snapshot {
+            None => return Some(ev),
+            Some(filter) => {
+                if matches_filter(&ev, filter) {
+                    return Some(ev);
+                }
+                if let Ok(mut stash) = EVENT_STASH.lock() {
+                    stash.push_back(ev);
+                }
+            }
+        }
+    }
+}
+
+/// Block until an event matches `target` (or is a global). Non-
+/// matches park into EVENT_STASH for later consumers.
+/// `timeout_ms < 0` blocks indefinitely; the deadline is wall-clock,
+/// not reset by non-matches.
+pub fn next_event_for(target: i64, timeout_ms: i64) -> Option<IGuiEvent> {
+    if let Ok(mut stash) = EVENT_STASH.lock() {
+        for i in 0..stash.len() {
+            if matches_target(&stash[i], target) {
+                return stash.remove(i);
+            }
+        }
+    }
+    let mb = MAILBOX.get()?;
+    let rx = mb.rx.lock().ok()?;
+    let deadline = if timeout_ms < 0 {
+        None
+    } else {
+        Some(Instant::now() + Duration::from_millis(timeout_ms as u64))
+    };
+    loop {
+        let ev = match deadline {
+            None => rx.recv().ok()?,
+            Some(deadline) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return None;
+                }
+                rx.recv_timeout(deadline - now).ok()?
+            }
+        };
+        if matches_target(&ev, target) {
+            return Some(ev);
+        }
+        if let Ok(mut stash) = EVENT_STASH.lock() {
+            stash.push_back(ev);
+        }
     }
 }

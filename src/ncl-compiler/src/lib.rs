@@ -900,6 +900,16 @@ fn install_igui(coord: &Arc<GcCoordinator>, mutator: &mut MutatorState) {
                    ncl_runtime::set_title_shim, 2);
     install_native(coord, mutator, "NEXT-EVENT",
                    ncl_runtime::next_event_shim, 1);
+    install_native(coord, mutator, "NEXT-EVENT-FOR",
+                   ncl_runtime::next_event_for_shim, 2);
+    install_native(coord, mutator, "FILTER-ON-WINDOW",
+                   ncl_runtime::filter_on_window_shim, 1);
+    install_native(coord, mutator, "UNFILTER-WINDOW",
+                   ncl_runtime::unfilter_window_shim, 1);
+    install_native(coord, mutator, "CLEAR-EVENT-FILTER",
+                   ncl_runtime::clear_event_filter_shim, 0);
+    install_native(coord, mutator, "DISCARD-STASHED-EVENTS",
+                   ncl_runtime::discard_stashed_events_shim, 0);
     install_native(coord, mutator, "SET-REDRAW-RATE",
                    ncl_runtime::set_redraw_rate_shim, 2);
 

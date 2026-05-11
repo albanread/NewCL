@@ -85,25 +85,18 @@
        ;; ~60 fps. Win32 coalesces pending WM_TIMERs, so a backed-up
        ;; language thread still sees at most one :tick per drain.
        (set-redraw-rate id 16)
-       (loop
-         (let ((ev (next-event -1)))
-           (cond
-             ((null ev) nil)
-             ((eq (getf ev :kind) :frame-close) (return :done))
-             ((and (eq (getf ev :kind) :close)
-                   (= (getf ev :child-id) id))
-              (return :done))
-             ((and (eq (getf ev :kind) :resize)
-                   (= (getf ev :child-id) id))
-              (resize-ball (getf ev :width) (getf ev :height)))
-             ((and (eq (getf ev :kind) :tick)
-                   (= (getf ev :child-id) id))
-              (advance-ball)
-              (paint-ball id))
-             ((and (eq (getf ev :kind) :mouse)
-                   (= (getf ev :child-id) id)
-                   (eq (getf ev :op) :LEFT-DOWN))
-              (setq *ball-x* (getf ev :x))
-              (setq *ball-y* (getf ev :y))
-              (paint-ball id))
-             (t nil))))))))
+       ;; The new event-loop-for: install a persistent filter on
+       ;; the bouncing-ball child, then dispatch by :kind. Events
+       ;; for other children (a log view, REPL pane, etc.) park
+       ;; in the stash. No more (= (getf ev :child-id) id) on
+       ;; every clause.
+       (event-loop-for id
+         (:frame-close (return :done))
+         (:close       (return :done))
+         (:resize      (resize-ball (getf ev :width) (getf ev :height)))
+         (:tick        (advance-ball)
+                       (paint-ball id))
+         (:mouse       (when (eq (getf ev :op) :LEFT-DOWN)
+                         (setq *ball-x* (getf ev :x))
+                         (setq *ball-y* (getf ev :y))
+                         (paint-ball id))))))))

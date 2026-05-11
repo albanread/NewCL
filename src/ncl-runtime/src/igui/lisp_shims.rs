@@ -296,6 +296,96 @@ pub extern "C-unwind" fn next_event_shim(
     event_to_plist(m, &coord, ev).raw()
 }
 
+/// `(next-event-for child-id timeout-ms)` — block until an event
+/// arrives for CHILD-ID (or a global event like :FRAME-CLOSE).
+/// Other children's events park in a stash and are visible to
+/// later consumers. NIL on timeout.
+pub extern "C-unwind" fn next_event_for_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("next-event-for: expected 2 args (child-id timeout-ms), got {n_args}");
+    }
+    let Some(child_id) = arg_fixnum(args, 0) else {
+        panic!("next-event-for: child-id must be a fixnum");
+    };
+    let Some(timeout) = arg_fixnum(args, 1) else {
+        panic!("next-event-for: timeout-ms must be a fixnum");
+    };
+    let Some(ev) = channels::next_event_for(child_id, timeout) else {
+        return Word::NIL.raw();
+    };
+    let m = unsafe { &mut *mutator };
+    let coord = std::sync::Arc::clone(m.coord());
+    event_to_plist(m, &coord, ev).raw()
+}
+
+/// `(filter-on-window child-id)` — add CHILD-ID to the persistent
+/// event-interest set. While the set is non-empty, plain
+/// (next-event) only returns events for member windows (plus
+/// globals). Returns T.
+pub extern "C-unwind" fn filter_on_window_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("filter-on-window: expected 1 arg (child-id)");
+    }
+    let Some(child_id) = arg_fixnum(args, 0) else {
+        panic!("filter-on-window: child-id must be a fixnum");
+    };
+    channels::filter_on_window(child_id);
+    Word::T.raw()
+}
+
+/// `(unfilter-window child-id)` — remove CHILD-ID from the
+/// interest set. Returns T.
+pub extern "C-unwind" fn unfilter_window_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("unfilter-window: expected 1 arg (child-id)");
+    }
+    let Some(child_id) = arg_fixnum(args, 0) else {
+        panic!("unfilter-window: child-id must be a fixnum");
+    };
+    channels::unfilter_window(child_id);
+    Word::T.raw()
+}
+
+/// `(clear-event-filter)` — drop every window from the interest
+/// set. Returns T.
+pub extern "C-unwind" fn clear_event_filter_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    _args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    channels::clear_filter();
+    Word::T.raw()
+}
+
+/// `(discard-stashed-events)` — drop every event currently in the
+/// stash. Useful on mode transitions (close one app, start another)
+/// where carry-over events would be confusing.
+pub extern "C-unwind" fn discard_stashed_events_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    _args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    channels::discard_stashed_events();
+    Word::T.raw()
+}
+
 // -- event → plist conversion ------------------------------------------------
 
 fn event_to_plist(
