@@ -504,6 +504,8 @@ fn install_native_functions(
                    ncl_runtime::thread_safepoint_shim, 0);
     install_native(coord, mutator, "%TEST-PANIC",
                    ncl_runtime::test_panic_shim, 0);
+    install_native(coord, mutator, "GC-STATS",
+                   ncl_runtime::gc_stats_shim, 0);
     install_native(coord, mutator, "JOIN-THREAD",
                    ncl_runtime::join_thread_shim, 1);
     install_native(coord, mutator, "SLEEP",

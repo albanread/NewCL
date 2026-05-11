@@ -22,7 +22,7 @@
 //! then, the explicit root API is the contract.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::heap::{CardTable, Heap};
@@ -107,6 +107,37 @@ pub struct GcCoordinator {
     /// cell so calling `(macro-name ...)` and `(funcall #'macro-name)`
     /// can stay distinct (the latter would error per CL).
     macros: Mutex<HashMap<Arc<str>, u64>>,
+
+    /// Cumulative GC counters. All atomics so the trigger thread
+    /// can publish updates without anyone else's lock. Exposed to
+    /// Lisp via `(gc-stats)`.
+    pub stats: GcStats,
+}
+
+/// Process-global GC counters. Reset never (cumulative over the
+/// run). The pin counter measures *unique* pinned objects per
+/// minor cycle, summed — useful as a rough "how much memory is
+/// our conservative scan keeping live" signal. The peak young
+/// gauge resets only when set higher; over a long run it
+/// converges on the high-water mark the workload demanded.
+pub struct GcStats {
+    pub minor_gcs: AtomicU64,
+    pub bytes_promoted_total: AtomicU64,
+    pub objects_pinned_total: AtomicU64,
+    pub peak_young_used_bytes: AtomicU64,
+    pub pinned_residual_cells: AtomicU64,
+}
+
+impl Default for GcStats {
+    fn default() -> Self {
+        GcStats {
+            minor_gcs: AtomicU64::new(0),
+            bytes_promoted_total: AtomicU64::new(0),
+            objects_pinned_total: AtomicU64::new(0),
+            peak_young_used_bytes: AtomicU64::new(0),
+            pinned_residual_cells: AtomicU64::new(0),
+        }
+    }
 }
 
 struct ParkState {
@@ -136,6 +167,7 @@ impl GcCoordinator {
             static_area,
             intern_table: Mutex::new(HashMap::new()),
             macros: Mutex::new(HashMap::new()),
+            stats: GcStats::default(),
         })
     }
 
@@ -504,6 +536,25 @@ impl MutatorState {
         let static_base = self.coord.static_area.base_ptr() as *mut u64;
         let static_cells = self.coord.static_area.used_cells();
         let static_cards = Arc::clone(self.coord.static_area.cards());
+        // Stats: snapshot young usage now so we can compute bytes
+        // promoted as (young_before - young_after).
+        let young_before = {
+            let heap = self.coord.heap.lock().unwrap();
+            heap.young_used_bytes()
+        };
+        let peak = &self.coord.stats.peak_young_used_bytes;
+        let mut prev = peak.load(Ordering::Relaxed);
+        while (young_before as u64) > prev {
+            match peak.compare_exchange(
+                prev,
+                young_before as u64,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(now) => prev = now,
+            }
+        }
         {
             let mut heap = self.coord.heap.lock().unwrap();
             heap.collect_minor_with_static(
@@ -529,6 +580,32 @@ impl MutatorState {
                 },
             );
         }
+
+        // Stats: count this GC and compute promotion delta. The
+        // pin counter / residual is published by the heap layer
+        // via `last_pin_summary()` since it's the one that knows.
+        let (pinned_count, pinned_cells) = {
+            let heap = self.coord.heap.lock().unwrap();
+            heap.last_pin_summary()
+        };
+        let young_after = {
+            let heap = self.coord.heap.lock().unwrap();
+            heap.young_used_bytes()
+        };
+        let bytes_promoted = young_before.saturating_sub(young_after) as u64;
+        self.coord.stats.minor_gcs.fetch_add(1, Ordering::Relaxed);
+        self.coord
+            .stats
+            .bytes_promoted_total
+            .fetch_add(bytes_promoted, Ordering::Relaxed);
+        self.coord
+            .stats
+            .objects_pinned_total
+            .fetch_add(pinned_count as u64, Ordering::Relaxed);
+        self.coord
+            .stats
+            .pinned_residual_cells
+            .store(pinned_cells as u64, Ordering::Relaxed);
 
         // My TLAB pointed into young, which is now empty.
         // Reset so the next refill attempt reads a fresh slab.
@@ -580,6 +657,50 @@ impl MutatorState {
         if self.coord.stop_requested.load(Ordering::Acquire) {
             self.park();
         }
+    }
+
+    /// Mark the calling thread as parked for the duration of a
+    /// blocking native call (`sleep`, `join-thread`, mailbox
+    /// receive, condvar wait, etc.). Pair every `enter_blocked`
+    /// with exactly one `leave_blocked`.
+    ///
+    /// Without this, a thread that blocks inside Rust without going
+    /// through a safepoint stays in the GC coordinator's "unparked"
+    /// count forever. If every other mutator does park, the
+    /// GC trigger waits for a target that's no longer reachable
+    /// and hangs the whole process.
+    ///
+    /// While `enter_blocked`, the GC may run; we publish RSP and
+    /// the `parked` flag so the conservative pin scan covers this
+    /// thread's stack. `leave_blocked` waits out any in-progress
+    /// GC before returning (so the caller doesn't race with a
+    /// concurrent collection while resuming work).
+    pub fn enter_blocked(&mut self) {
+        let rsp = current_rsp();
+        self.handle.parked_rsp.store(rsp, Ordering::Release);
+        self.handle.parked.store(true, Ordering::Release);
+        let state = self.coord.park_state.lock().unwrap();
+        let mut state = state;
+        state.parked_count += 1;
+        // Wake a trigger that was waiting on us.
+        self.coord.park_cv.notify_all();
+        drop(state);
+    }
+
+    pub fn leave_blocked(&mut self) {
+        let mut state = self.coord.park_state.lock().unwrap();
+        // If a GC is in progress, wait for it to finish before
+        // resuming Lisp work — otherwise we'd race with the
+        // trigger's heap manipulations.
+        while self.coord.stop_requested.load(Ordering::Acquire) {
+            state = self.coord.park_cv.wait(state).unwrap();
+        }
+        state.parked_count -= 1;
+        self.handle.parked.store(false, Ordering::Release);
+        self.handle.parked_rsp.store(0, Ordering::Release);
+        drop(state);
+        // TLAB may have been invalidated by the GC.
+        self.tlab = Tlab::default();
     }
 
     /// Lock-free write barrier. Mark the card containing `addr` as
@@ -724,6 +845,54 @@ fn current_thread_stack_range() -> (usize, usize) {
         let p = &local as *const u64 as usize;
         (p.saturating_sub(8 * 1024 * 1024), p + 64)
     }
+}
+
+/// `(gc-stats)` — return a plist of current GC counters. Useful
+/// for observing how a workload exercises the heap:
+///
+///   :minor-gcs              count of minor GC cycles run
+///   :bytes-promoted-total   cumulative bytes copied young → old
+///   :objects-pinned-total   cumulative pinned-object count over
+///                           all cycles (sum, so divide by
+///                           :minor-gcs for an average)
+///   :pinned-residual-cells  cells still pinned in young after
+///                           the most recent cycle
+///   :peak-young-bytes       highest young usage observed at any
+///                           GC trigger point
+///   :young-used / :young-cap / :old-used / :old-cap   current
+///
+/// Values are fixnums (cells/bytes/counts).
+pub extern "C-unwind" fn gc_stats_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    _args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    let m = unsafe { &mut *mutator };
+    let coord = Arc::clone(m.coord());
+    let s = &coord.stats;
+
+    let pairs: [(&str, i64); 9] = [
+        ("MINOR-GCS",             s.minor_gcs.load(Ordering::Relaxed) as i64),
+        ("BYTES-PROMOTED-TOTAL",  s.bytes_promoted_total.load(Ordering::Relaxed) as i64),
+        ("OBJECTS-PINNED-TOTAL",  s.objects_pinned_total.load(Ordering::Relaxed) as i64),
+        ("PINNED-RESIDUAL-CELLS", s.pinned_residual_cells.load(Ordering::Relaxed) as i64),
+        ("PEAK-YOUNG-BYTES",      s.peak_young_used_bytes.load(Ordering::Relaxed) as i64),
+        ("YOUNG-USED",            coord.young_used_bytes() as i64),
+        ("YOUNG-CAP",             coord.config.young_bytes as i64),
+        ("OLD-USED",              coord.old_used_bytes() as i64),
+        ("OLD-CAP",               coord.config.old_bytes as i64),
+    ];
+
+    // Build the plist `(:key1 v1 :key2 v2 ... )` from the end.
+    let mut result = Word::NIL;
+    for (name, value) in pairs.iter().rev() {
+        let kw = coord.intern(&format!(":{name}"));
+        let v = Word::fixnum(*value);
+        result = m.alloc_cons(v, result);
+        result = m.alloc_cons(kw, result);
+    }
+    result.raw()
 }
 
 #[inline(always)]

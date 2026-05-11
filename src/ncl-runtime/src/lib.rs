@@ -95,7 +95,7 @@ pub use heap::{
     CardTable, GcBit, Heap, HeapHeader, HeapType, CARD_SIZE_BYTES, CARD_SIZE_CELLS,
     MAX_OBJECT_CELLS,
 };
-pub use mutator::{GcConfig, GcCoordinator, MutatorHandle, MutatorState};
+pub use mutator::{gc_stats_shim, GcConfig, GcCoordinator, GcStats, MutatorHandle, MutatorState};
 pub use stack_map::{LiveSlot, ParkedFrame, StackMap, StackMapEntry, walk_parked_frame};
 pub use static_area::StaticArea;
 pub use symbol::{Package, Symbol, Visibility};

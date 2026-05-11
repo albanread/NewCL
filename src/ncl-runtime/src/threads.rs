@@ -1043,25 +1043,40 @@ pub extern "C-unwind" fn leave_critical_section_shim(
 /// loop), NIL otherwise. Always performs the GC + suspend poll
 /// regardless of return value.
 pub extern "C-unwind" fn join_thread_shim(
-    _mutator: *mut MutatorState,
+    mutator: *mut MutatorState,
     _env: u64,
     args: *const u64,
     _n_args: u64,
 ) -> u64 {
     let tid = unsafe { arg_fixnum_or(args, 0, -1) };
-    if join_thread(tid) { Word::T.raw() } else { Word::NIL.raw() }
+    // Park while waiting — see comment on sleep_shim.
+    let m = unsafe { &mut *mutator };
+    m.enter_blocked();
+    let ok = join_thread(tid);
+    m.leave_blocked();
+    if ok { Word::T.raw() } else { Word::NIL.raw() }
 }
 
 /// `(sleep seconds)` — accepts fixnum or float seconds.
+///
+/// Marks the thread as parked for the duration so a peer GC
+/// trigger isn't waiting for us to reach a safepoint we'll never
+/// hit. Without this, eight workers + one sleeping main thread
+/// would deadlock the first time young fills up: the worker that
+/// becomes the trigger waits for `parked_count` to reach 8, but
+/// main never parks because it's blocked in OS sleep.
 pub extern "C-unwind" fn sleep_shim(
-    _mutator: *mut MutatorState,
+    mutator: *mut MutatorState,
     _env: u64,
     args: *const u64,
     _n_args: u64,
 ) -> u64 {
     let w = unsafe { arg(args, 0) };
     let seconds = crate::float::to_f64(w).unwrap_or(0.0);
+    let m = unsafe { &mut *mutator };
+    m.enter_blocked();
     sleep_seconds(seconds);
+    m.leave_blocked();
     Word::T.raw()
 }
 
@@ -1187,14 +1202,26 @@ pub extern "C-unwind" fn mailbox_send_shim(
 /// the immediate value `(values nil :timeout)` is represented here
 /// as just `NIL` — Lisp wrappers distinguish via `mailbox-len`.
 pub extern "C-unwind" fn mailbox_receive_shim(
-    _mutator: *mut MutatorState,
+    mutator: *mut MutatorState,
     _env: u64,
     args: *const u64,
     _n_args: u64,
 ) -> u64 {
     let id = unsafe { arg_fixnum_or(args, 0, -1) };
     let timeout_ms = unsafe { arg_fixnum_or(args, 1, -1) };
-    match mailbox_receive(id, timeout_ms) {
+    let m = unsafe { &mut *mutator };
+    // Park if we're going to actually wait. (Non-blocking
+    // try-receive — timeout 0 — doesn't need to park.)
+    if timeout_ms == 0 {
+        return match mailbox_receive(id, 0) {
+            Some(v) => v,
+            None => Word::NIL.raw(),
+        };
+    }
+    m.enter_blocked();
+    let result = mailbox_receive(id, timeout_ms);
+    m.leave_blocked();
+    match result {
         Some(v) => v,
         None => Word::NIL.raw(),
     }
@@ -1233,7 +1260,7 @@ pub extern "C-unwind" fn release_condvar_shim(
 }
 
 pub extern "C-unwind" fn condvar_wait_shim(
-    _mutator: *mut MutatorState,
+    mutator: *mut MutatorState,
     _env: u64,
     args: *const u64,
     _n_args: u64,
@@ -1241,7 +1268,14 @@ pub extern "C-unwind" fn condvar_wait_shim(
     let cv_id = unsafe { arg_fixnum_or(args, 0, -1) };
     let cs_id = unsafe { arg_fixnum_or(args, 1, -1) };
     let timeout_ms = unsafe { arg_fixnum_or(args, 2, -1) };
-    if condvar_wait(cv_id, cs_id, timeout_ms) { Word::T.raw() } else { Word::NIL.raw() }
+    let m = unsafe { &mut *mutator };
+    if timeout_ms == 0 {
+        return if condvar_wait(cv_id, cs_id, 0) { Word::T.raw() } else { Word::NIL.raw() };
+    }
+    m.enter_blocked();
+    let result = condvar_wait(cv_id, cs_id, timeout_ms);
+    m.leave_blocked();
+    if result { Word::T.raw() } else { Word::NIL.raw() }
 }
 
 pub extern "C-unwind" fn condvar_notify_shim(

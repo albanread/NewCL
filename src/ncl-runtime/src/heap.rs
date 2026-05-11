@@ -420,6 +420,37 @@ impl Semispace {
         highest_end
     }
 
+    /// Count distinct pinned objects and total cells they occupy
+    /// (header + payload, summed). Used by the GC stats path to
+    /// report per-cycle "how much did conservative scanning keep
+    /// alive." Walks the same shape as rewind_past_pinned.
+    pub fn count_pinned(&self) -> (usize, usize) {
+        let mut n_objs = 0usize;
+        let mut n_cells = 0usize;
+        let mut idx = 0;
+        while idx < self.top {
+            let cell = unsafe { *self.cells.as_ptr().add(idx) };
+            let word = Word::from_raw(cell);
+            if word.is_forward() {
+                idx += 1;
+                continue;
+            }
+            let ty_bits = ((cell >> TYPE_SHIFT) & TYPE_MASK) as u8;
+            if HeapType::from_bits(ty_bits).is_none() {
+                idx += 1;
+                continue;
+            }
+            let header = HeapHeader::from_raw(cell);
+            let len = header.length_cells() as usize;
+            if header.has_gc_bit(GcBit::Pinned) {
+                n_objs += 1;
+                n_cells += 1 + len;
+            }
+            idx += 1 + len;
+        }
+        (n_objs, n_cells)
+    }
+
     /// Clear the Pinned bit on every header-bearing object in the
     /// semispace. Called at the end of a GC cycle so the next
     /// conservative scan starts from a clean slate.
@@ -518,6 +549,10 @@ impl OldGen {
 pub struct Heap {
     young: Semispace,
     old: OldGen,
+    /// Last cycle's pin pass: (objects_pinned, total_cells_pinned).
+    /// Reset at the start of each cycle, published at the end.
+    last_pinned_objects: usize,
+    last_pinned_cells: usize,
 }
 
 impl Heap {
@@ -525,7 +560,20 @@ impl Heap {
         Heap {
             young: Semispace::new(young_bytes),
             old: OldGen::new(old_bytes),
+            last_pinned_objects: 0,
+            last_pinned_cells: 0,
         }
+    }
+
+    /// Most recent pin pass result: `(objects_pinned, cells_pinned)`.
+    /// `objects_pinned` is the count of distinct header-bearing
+    /// objects that were left in young because at least one
+    /// conservative reference pointed at them. `cells_pinned` is
+    /// the total number of cells those objects occupy (sum of
+    /// header + payload cells). Reset to (0, 0) at the start of
+    /// each minor GC.
+    pub fn last_pin_summary(&self) -> (usize, usize) {
+        (self.last_pinned_objects, self.last_pinned_cells)
     }
 
     /// All allocation goes into the young heap.
@@ -661,10 +709,16 @@ impl Heap {
         // resetting top=0. Pinned objects stay at their addresses
         // (so stack slots that pointed at them remain valid). Then
         // clear the Pinned bit on every survivor so the next cycle
-        // observes a fresh canvas.
+        // observes a fresh canvas. Publish the per-cycle pin
+        // summary to last_pinned_* for the stats path.
         if pin_stack_ranges.is_empty() {
             self.young.reset();
+            self.last_pinned_objects = 0;
+            self.last_pinned_cells = 0;
         } else {
+            let (n_objs, n_cells) = self.young.count_pinned();
+            self.last_pinned_objects = n_objs;
+            self.last_pinned_cells = n_cells;
             self.young.rewind_past_pinned();
             self.young.clear_pinned_bits();
         }
