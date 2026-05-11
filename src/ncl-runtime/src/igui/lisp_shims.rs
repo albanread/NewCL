@@ -197,6 +197,30 @@ pub extern "C-unwind" fn open_child_shim(
     }
 }
 
+/// `(open-child-sized title width height)` — open a new MDI child
+/// with an explicit initial pixel size. Pass 0 for either
+/// dimension to fall back to the Windows-default size for that
+/// axis. Returns the child-id fixnum, or NIL on failure.
+pub extern "C-unwind" fn open_child_sized_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 3 {
+        panic!("open-child-sized: expected 3 args (title width height), got {n_args}");
+    }
+    let Some(title) = arg_string(args, 0) else {
+        panic!("open-child-sized: title must be a string");
+    };
+    let w = arg_fixnum(args, 1).unwrap_or(0) as i32;
+    let h = arg_fixnum(args, 2).unwrap_or(0) as i32;
+    match window::open_child_sized(&title, w, h) {
+        Some(id) => Word::fixnum(id).raw(),
+        None => Word::NIL.raw(),
+    }
+}
+
 /// `(close-child child-id)` — close the named child. Returns T on
 /// success, NIL if the child id is unknown.
 pub extern "C-unwind" fn close_child_shim(
@@ -288,10 +312,17 @@ pub extern "C-unwind" fn next_event_shim(
     let Some(timeout) = arg_fixnum(args, 0) else {
         panic!("next-event: timeout-ms must be a fixnum");
     };
-    let Some(ev) = channels::next_event(timeout) else {
+    let m = unsafe { &mut *mutator };
+    // Park while we're blocked in the channel wait — otherwise a
+    // peer mutator that triggers GC waits forever for us to reach
+    // a safepoint we'll never hit until an event arrives.
+    let do_park = timeout != 0;
+    if do_park { m.enter_blocked(); }
+    let ev_opt = channels::next_event(timeout);
+    if do_park { m.leave_blocked(); }
+    let Some(ev) = ev_opt else {
         return Word::NIL.raw();
     };
-    let m = unsafe { &mut *mutator };
     let coord = std::sync::Arc::clone(m.coord());
     event_to_plist(m, &coord, ev).raw()
 }
@@ -315,10 +346,14 @@ pub extern "C-unwind" fn next_event_for_shim(
     let Some(timeout) = arg_fixnum(args, 1) else {
         panic!("next-event-for: timeout-ms must be a fixnum");
     };
-    let Some(ev) = channels::next_event_for(child_id, timeout) else {
+    let m = unsafe { &mut *mutator };
+    let do_park = timeout != 0;
+    if do_park { m.enter_blocked(); }
+    let ev_opt = channels::next_event_for(child_id, timeout);
+    if do_park { m.leave_blocked(); }
+    let Some(ev) = ev_opt else {
         return Word::NIL.raw();
     };
-    let m = unsafe { &mut *mutator };
     let coord = std::sync::Arc::clone(m.coord());
     event_to_plist(m, &coord, ev).raw()
 }

@@ -510,14 +510,18 @@ fn handle_open_child(req: &OpenChildRequest) -> Option<i64> {
     let h_module = unsafe { GetModuleHandleW(None) }.ok()?;
     let h_owner = windows::Win32::Foundation::HANDLE(h_module.0);
 
+    // Width/height of 0 means "use the Windows default size";
+    // otherwise honour what the caller asked for.
+    let cx = if req.width  > 0 { req.width  } else { CW_USEDEFAULT };
+    let cy = if req.height > 0 { req.height } else { CW_USEDEFAULT };
     let mdi_create = MDICREATESTRUCTW {
         szClass: MDI_CHILD_CLASS,
         szTitle: PCWSTR::from_raw(req.title.as_ptr()),
         hOwner: h_owner,
         x: CW_USEDEFAULT,
         y: CW_USEDEFAULT,
-        cx: CW_USEDEFAULT,
-        cy: CW_USEDEFAULT,
+        cx,
+        cy,
         style: WS_VISIBLE | WS_OVERLAPPEDWINDOW,
         lParam: LPARAM(bootstrap as isize),
     };
@@ -600,6 +604,10 @@ pub(crate) fn push_mouse(child_id: i64, op: i64, button: i64, lparam: LPARAM) {
 
 pub(crate) struct OpenChildRequest {
     pub title: Vec<u16>,
+    /// Initial pixel size. (0, 0) means "let Windows pick" via
+    /// CW_USEDEFAULT (the existing behaviour).
+    pub width: i32,
+    pub height: i32,
     pub out: Option<i64>,
 }
 
@@ -649,12 +657,20 @@ fn mdi_verb_to_tag(verb: super::menu::MdiVerb) -> u8 {
 /// Called from the language thread. Marshals to the GUI thread via
 /// SendMessageW; blocks until the child has been created.
 pub fn open_child(title: &str) -> Option<i64> {
+    open_child_sized(title, 0, 0)
+}
+
+/// Open a child with an explicit initial pixel size. Pass 0 for
+/// either dimension to fall back to Windows' CW_USEDEFAULT.
+pub fn open_child_sized(title: &str, width: i32, height: i32) -> Option<i64> {
     let frame_raw = *FRAME_HWND.get()?;
     let frame = HWND(frame_raw as *mut _);
     let mut title_w: Vec<u16> = title.encode_utf16().collect();
     title_w.push(0);
     let mut req = OpenChildRequest {
         title: title_w,
+        width,
+        height,
         out: None,
     };
     unsafe {

@@ -983,6 +983,8 @@ fn install_igui(coord: &Arc<GcCoordinator>, mutator: &mut MutatorState) {
                    ncl_runtime::igui_quit_shim, 0);
     install_native(coord, mutator, "OPEN-CHILD",
                    ncl_runtime::open_child_shim, 1);
+    install_native(coord, mutator, "OPEN-CHILD-SIZED",
+                   ncl_runtime::open_child_sized_shim, 3);
     install_native(coord, mutator, "CLOSE-CHILD",
                    ncl_runtime::close_child_shim, 1);
     install_native(coord, mutator, "SET-TITLE",
