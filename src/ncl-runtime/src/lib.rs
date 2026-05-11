@@ -30,6 +30,7 @@ pub mod stack_map;
 pub mod static_area;
 pub mod sym_names;
 pub mod symbol;
+pub mod threads;
 pub mod universe;
 pub mod value;
 pub mod word;
@@ -74,6 +75,15 @@ pub use igui::lisp_shims::{
     text_write_char_shim, text_write_shim,
 };
 pub use printer::{format_word, format_word_aesthetic};
+
+pub use threads::{
+    allocate_critical_section_shim, create_thread_shim,
+    current_process_id_shim, current_thread_id_shim,
+    deallocate_critical_section_shim, enter_critical_section_shim,
+    exit_thread_shim, leave_critical_section_shim, resume_thread_shim,
+    suspend_thread_shim, terminate_thread_shim, thread_handle_shim,
+    thread_safepoint_shim,
+};
 
 pub use heap::{
     CardTable, GcBit, Heap, HeapHeader, HeapType, CARD_SIZE_BYTES, CARD_SIZE_CELLS,

@@ -470,6 +470,39 @@ fn install_native_functions(
     install_native(coord, mutator, "STRING-SPLIT-NEWLINES",
                    string_split_newlines_shim, 1);
 
+    // THREADS package — Roger Corman's API, cross-platform.
+    // Lisp-side wrappers in Library/threads.lisp expose the public
+    // names (create-thread, with-synchronization, critical-section
+    // class, etc.) on top of these primitives. We install the
+    // primitives unconditionally so `(require 'threads)` works on
+    // every platform; the underlying OS support is `std::thread`.
+    install_native(coord, mutator, "%CREATE-THREAD",
+                   ncl_runtime::create_thread_shim, 1);
+    install_native(coord, mutator, "EXIT-THREAD",
+                   ncl_runtime::exit_thread_shim, 1);
+    install_native(coord, mutator, "THREAD-HANDLE",
+                   ncl_runtime::thread_handle_shim, 1);
+    install_native(coord, mutator, "SUSPEND-THREAD",
+                   ncl_runtime::suspend_thread_shim, 1);
+    install_native(coord, mutator, "RESUME-THREAD",
+                   ncl_runtime::resume_thread_shim, 1);
+    install_native(coord, mutator, "TERMINATE-THREAD",
+                   ncl_runtime::terminate_thread_shim, 1);
+    install_native(coord, mutator, "CURRENT-THREAD-ID",
+                   ncl_runtime::current_thread_id_shim, 0);
+    install_native(coord, mutator, "CURRENT-PROCESS-ID",
+                   ncl_runtime::current_process_id_shim, 0);
+    install_native(coord, mutator, "ALLOCATE-CRITICAL-SECTION",
+                   ncl_runtime::allocate_critical_section_shim, 0);
+    install_native(coord, mutator, "DEALLOCATE-CRITICAL-SECTION",
+                   ncl_runtime::deallocate_critical_section_shim, 1);
+    install_native(coord, mutator, "ENTER-CRITICAL-SECTION",
+                   ncl_runtime::enter_critical_section_shim, 1);
+    install_native(coord, mutator, "LEAVE-CRITICAL-SECTION",
+                   ncl_runtime::leave_critical_section_shim, 1);
+    install_native(coord, mutator, "THREAD-SAFEPOINT",
+                   ncl_runtime::thread_safepoint_shim, 0);
+
     // iGui (Windows only). Spawns the GUI thread and exposes the
     // window-management trio + event poll. Drawing primitives
     // come in a follow-up commit.
