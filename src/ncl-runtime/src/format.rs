@@ -290,6 +290,25 @@ fn directive_for(dc: char, pa: &PrefixArgs) -> Option<Directive> {
         'B' => Some(Directive::Integer(int_spec(pa, 2))),
         'O' => Some(Directive::Integer(int_spec(pa, 8))),
         'X' => Some(Directive::Integer(int_spec(pa, 16))),
+        'R' => {
+            // ~nR — output in radix N. Prefix arg 0 is the radix
+            // (2..=36); subsequent prefix args follow the same
+            // shape as ~D (mincol, pad, comma, comma-interval).
+            let radix = pa.num(0).unwrap_or(10);
+            if !(2..=36).contains(&radix) {
+                return Some(Directive::Unsupported('R'));
+            }
+            // Shift prefix args: the radix takes slot 0, so the
+            // standard mincol etc. start at slot 1.
+            let mut s = IntSpec::for_radix(radix as u32);
+            if let Some(n) = pa.num(1) { s.mincol = n.max(0) as usize; }
+            if let Some(c) = pa.ch(2)  { s.pad_char = c; }
+            if let Some(c) = pa.ch(3)  { s.comma_char = c; }
+            if let Some(n) = pa.num(4) { s.comma_interval = n.max(1) as usize; }
+            s.use_commas = pa.colon;
+            s.force_sign = pa.at_sign;
+            Some(Directive::Integer(s))
+        }
         'C' => Some(Directive::Character { spelled: pa.colon }),
         'P' => Some(Directive::Plural {
             previous: pa.colon,
@@ -736,22 +755,24 @@ fn emit_padded(out: &mut String, s: &str, p: &PadSpec) {
 }
 
 fn render_integer(arg: Word, spec: &IntSpec) -> Result<String, String> {
-    let n = arg
-        .as_fixnum()
-        .ok_or_else(|| format!("integer directive expected a fixnum: {arg:?}"))?;
-    let abs = n.unsigned_abs();
-    let mut digits = match spec.radix {
-        2 => format!("{abs:b}"),
-        8 => format!("{abs:o}"),
-        16 => format!("{abs:x}").to_uppercase(),
-        10 => abs.to_string(),
-        _ => return Err(format!("unsupported radix {}", spec.radix)),
+    // Accept fixnums and bignums uniformly. num-bigint's
+    // to_str_radix handles all radices 2..=36.
+    use num_traits::Signed;
+    let n = match crate::bignum::integer_to_bigint(arg) {
+        Some(n) => n,
+        None => return Err(format!("integer directive expected an integer: {arg:?}")),
     };
+    let abs_n = n.abs();
+    let mut digits = abs_n.to_str_radix(spec.radix);
+    // num-bigint produces lowercase hex; CL ~X uses uppercase.
+    if spec.radix > 10 {
+        digits = digits.to_uppercase();
+    }
     if spec.use_commas {
         digits = insert_commas(&digits, spec.comma_char, spec.comma_interval);
     }
     let mut s = String::new();
-    if n < 0 {
+    if n.sign() == num_bigint::Sign::Minus {
         s.push('-');
     } else if spec.force_sign {
         s.push('+');

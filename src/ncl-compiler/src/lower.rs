@@ -323,6 +323,17 @@ fn lower_in_mut(
 ) -> Result<Expr, CompileError> {
     match v {
         Value::Fixnum(n) => Ok(Expr::Const(*n)),
+        Value::Bignum(s) => {
+            let w = ncl_runtime::bignum::alloc_bignum_in_static(
+                coord.static_area(), coord, s.as_str(),
+            )
+            .ok_or_else(|| {
+                CompileError::NotImplemented(format!(
+                    "static area exhausted while allocating bignum literal {s}"
+                ))
+            })?;
+            Ok(Expr::Word(w.raw()))
+        }
         Value::Nil => Ok(Expr::Nil),
         Value::Char(c) => Ok(Expr::Word(ncl_runtime::Word::char(*c).raw())),
         Value::String(s) => {
@@ -395,6 +406,16 @@ fn build_quoted_word(
 ) -> Result<Word, CompileError> {
     match v {
         Value::Fixnum(n) => Ok(Word::fixnum(*n)),
+        Value::Bignum(s) => {
+            ncl_runtime::bignum::alloc_bignum_in_static(
+                coord.static_area(), coord, s.as_str(),
+            )
+            .ok_or_else(|| {
+                CompileError::NotImplemented(format!(
+                    "static area exhausted while allocating quoted bignum {s}"
+                ))
+            })
+        }
         Value::Nil => Ok(Word::NIL),
         Value::Symbol(s) if &*s.name == "T" => Ok(Word::T),
         Value::Symbol(s) => Ok(intern_value_symbol(coord, s)),

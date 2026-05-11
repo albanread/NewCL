@@ -38,6 +38,20 @@ pub fn value_to_word(
     Ok(match v {
         Value::Nil => Word::NIL,
         Value::Fixnum(n) => Word::fixnum(*n),
+        Value::Bignum(s) => {
+            // Allocate a fresh bignum in static — same as
+            // lower's Value::Bignum path. This is on the
+            // macro-input shuttle so the bignum literal
+            // survives across passes.
+            ncl_runtime::bignum::alloc_bignum_in_static(
+                coord.static_area(), coord, s.as_str(),
+            )
+            .ok_or_else(|| EvalError::Compile(
+                crate::CompileError::NotImplemented(format!(
+                    "static area exhausted while allocating bignum {s} in macro input"
+                ))
+            ))?
+        }
         Value::Char(c) => Word::char(*c),
         Value::Symbol(s) if &*s.name == "T" => Word::T,
         Value::Symbol(s) => crate::lower::intern_value_symbol(coord, s),

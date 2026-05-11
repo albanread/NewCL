@@ -253,6 +253,70 @@ pub fn bignum_to_decimal(w: Word) -> String {
     bignum_to_bigint(w).to_str_radix(10)
 }
 
+/// Allocate a bignum in the STATIC area from a decimal-string
+/// representation. Used by the compiler to embed literal bignum
+/// constants — same lifetime as string literals.
+///
+/// Returns `None` if the string can't be parsed as an integer or
+/// the static area is exhausted.
+pub fn alloc_bignum_in_static(
+    static_area: &crate::static_area::StaticArea,
+    coord: &crate::mutator::GcCoordinator,
+    decimal: &str,
+) -> Option<Word> {
+    use num_traits::{Signed, ToPrimitive};
+    let n: BigInt = decimal.parse().ok()?;
+
+    // If it fits in fixnum, just return that — no static alloc needed.
+    if let Some(small) = n.to_i64() {
+        if small >= FIXNUM_MIN && small <= FIXNUM_MAX {
+            return Some(Word::fixnum(small));
+        }
+    }
+
+    let sign: i8 = if n.is_negative() { -1 } else { 1 };
+    let mag = n.magnitude();
+    let u32_limbs: Vec<u32> = mag.to_u32_digits();
+    let mut u64_limbs: Vec<u64> = Vec::with_capacity((u32_limbs.len() + 1) / 2);
+    let mut i = 0;
+    while i < u32_limbs.len() {
+        let lo = u32_limbs[i] as u64;
+        let hi = if i + 1 < u32_limbs.len() {
+            u32_limbs[i + 1] as u64
+        } else {
+            0
+        };
+        u64_limbs.push((hi << 32) | lo);
+        i += 2;
+    }
+    while u64_limbs.len() > 1 && *u64_limbs.last().unwrap() == 0 {
+        u64_limbs.pop();
+    }
+    if u64_limbs.is_empty() {
+        return Some(Word::fixnum(0));
+    }
+
+    let total_cells = BIGNUM_HEADER_CELLS + u64_limbs.len();
+    let header_ptr = static_area.try_alloc_with_header(
+        HeapType::Bignum,
+        total_cells as u32,
+    )?;
+    // The header lives at the allocation's first cell. The Word
+    // tag bits get added by Word::from_ptr.
+    let p = header_ptr.as_ptr() as *mut u64;
+    let marker = coord.intern("%BIGNUM");
+    unsafe {
+        *p.add(1) = marker.raw();
+        *p.add(2) = Word::fixnum(sign as i64).raw();
+        *p.add(3) = Word::fixnum(u64_limbs.len() as i64).raw();
+        *p.add(4) = Word::NIL.raw();
+        for (i, &limb) in u64_limbs.iter().enumerate() {
+            *p.add(BIGNUM_HEADER_CELLS + i) = limb;
+        }
+    }
+    Some(Word::from_ptr(p as *const u8, Tag::Vector))
+}
+
 // ─── D.2: division, remainder, gcd, expt ────────────────────────────────
 
 /// Truncate (round-toward-zero) integer division. Returns the
@@ -498,6 +562,219 @@ pub extern "C-unwind" fn isqrt_shim(
         );
     }
     bigint_to_word(m, &n.sqrt()).raw()
+}
+
+// ─── D.3: bit operations ────────────────────────────────────────────────
+
+/// `(ash int shift)` — arithmetic shift. Positive SHIFT shifts
+/// left; negative shifts right (sign-extending). CL semantics:
+/// (ash 5 2) => 20, (ash 20 -2) => 5, (ash -1 1) => -2.
+pub extern "C-unwind" fn ash_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    use num_traits::Signed;
+    if n_args != 2 {
+        return crate::abi::signal_condition_string(mutator, "ash: expected 2 args");
+    }
+    let m = unsafe { &mut *mutator };
+    let int_w = Word::from_raw(unsafe { *args });
+    let shift_w = Word::from_raw(unsafe { *args.add(1) });
+    let n = match integer_to_bigint(int_w) {
+        Some(n) => n,
+        None => return crate::abi::signal_condition_string(
+            mutator, "ash: first arg must be an integer",
+        ),
+    };
+    let shift = match shift_w.as_fixnum() {
+        Some(n) => n,
+        None => return crate::abi::signal_condition_string(
+            mutator, "ash: shift count must be a fixnum",
+        ),
+    };
+    let result = if shift >= 0 {
+        if shift > u32::MAX as i64 {
+            return crate::abi::signal_condition_string(
+                mutator, "ash: shift count too large",
+            );
+        }
+        n << (shift as usize)
+    } else {
+        let s = (-shift) as usize;
+        // num-bigint's >> rounds toward minus infinity for
+        // negative values, matching CL's ash.
+        if n.is_negative() {
+            // num-bigint's >> on negative might truncate toward
+            // zero instead. Use the floor-shift identity:
+            // (ash n -k) = (floor n (expt 2 k)).
+            use num_traits::Pow;
+            use num_integer::Integer;
+            let two: BigInt = BigInt::from(2);
+            let divisor = two.pow(s as u32);
+            n.div_floor(&divisor)
+        } else {
+            n >> s
+        }
+    };
+    bigint_to_word(m, &result).raw()
+}
+
+/// `(logand a b)` — bitwise AND.
+pub extern "C-unwind" fn logand_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    bit_op_2(mutator, args, n_args, "logand", |a, b| a & b)
+}
+
+/// `(logior a b)` — bitwise OR.
+pub extern "C-unwind" fn logior_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    bit_op_2(mutator, args, n_args, "logior", |a, b| a | b)
+}
+
+/// `(logxor a b)` — bitwise XOR.
+pub extern "C-unwind" fn logxor_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    bit_op_2(mutator, args, n_args, "logxor", |a, b| a ^ b)
+}
+
+fn bit_op_2(
+    mutator: *mut MutatorState,
+    args: *const u64,
+    n_args: u64,
+    name: &str,
+    op: impl Fn(BigInt, BigInt) -> BigInt,
+) -> u64 {
+    if n_args != 2 {
+        return crate::abi::signal_condition_string(
+            mutator, &format!("{name}: expected 2 args"),
+        );
+    }
+    let m = unsafe { &mut *mutator };
+    let a = Word::from_raw(unsafe { *args });
+    let b = Word::from_raw(unsafe { *args.add(1) });
+    let na = match integer_to_bigint(a) {
+        Some(n) => n,
+        None => return crate::abi::signal_condition_string(
+            mutator, &format!("{name}: first arg is not an integer"),
+        ),
+    };
+    let nb = match integer_to_bigint(b) {
+        Some(n) => n,
+        None => return crate::abi::signal_condition_string(
+            mutator, &format!("{name}: second arg is not an integer"),
+        ),
+    };
+    bigint_to_word(m, &op(na, nb)).raw()
+}
+
+/// `(lognot n)` — bitwise complement (-n - 1 in two's complement).
+pub extern "C-unwind" fn lognot_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        return crate::abi::signal_condition_string(mutator, "lognot: expected 1 arg");
+    }
+    let m = unsafe { &mut *mutator };
+    let w = Word::from_raw(unsafe { *args });
+    let n = match integer_to_bigint(w) {
+        Some(n) => n,
+        None => return crate::abi::signal_condition_string(
+            mutator, "lognot: argument is not an integer",
+        ),
+    };
+    bigint_to_word(m, &!n).raw()
+}
+
+/// `(integer-length n)` — number of bits needed to represent
+/// (abs n), excluding sign. (integer-length 0) = 0,
+/// (integer-length 255) = 8, (integer-length -1) = 0.
+pub extern "C-unwind" fn integer_length_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        return crate::abi::signal_condition_string(
+            mutator, "integer-length: expected 1 arg",
+        );
+    }
+    let w = Word::from_raw(unsafe { *args });
+    let n = match integer_to_bigint(w) {
+        Some(n) => n,
+        None => return crate::abi::signal_condition_string(
+            mutator, "integer-length: argument is not an integer",
+        ),
+    };
+    // CL: (integer-length n) is the number of bits in n's two's-
+    // complement representation, not counting leading zeros (or
+    // leading ones for negative). For non-negative n,
+    // num-bigint's `bits()` matches. For negative n, CL says
+    // (integer-length -1) = 0, (integer-length -256) = 8 — i.e.,
+    // (integer-length n) = (integer-length (lognot n)).
+    let m = if n.sign() == num_bigint::Sign::Minus {
+        (!n).bits()
+    } else {
+        n.bits()
+    };
+    Word::fixnum(m as i64).raw()
+}
+
+/// `(logbitp index n)` — T iff bit INDEX of N (with infinite
+/// two's-complement sign extension) is 1.
+pub extern "C-unwind" fn logbitp_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    use num_traits::Signed;
+    if n_args != 2 {
+        return crate::abi::signal_condition_string(
+            mutator, "logbitp: expected 2 args",
+        );
+    }
+    let idx_w = Word::from_raw(unsafe { *args });
+    let n_w = Word::from_raw(unsafe { *args.add(1) });
+    let idx = match idx_w.as_fixnum() {
+        Some(n) if n >= 0 => n as u64,
+        _ => return crate::abi::signal_condition_string(
+            mutator, "logbitp: index must be a non-negative fixnum",
+        ),
+    };
+    let n = match integer_to_bigint(n_w) {
+        Some(n) => n,
+        None => return crate::abi::signal_condition_string(
+            mutator, "logbitp: second arg is not an integer",
+        ),
+    };
+    // For n >= 0: test bit i of n.
+    // For n  < 0: in CL's notional two's complement, the bit is
+    //             the complement of bit i of (- -n 1).
+    let bit_set = if n.is_negative() {
+        let abs_minus_one = (-&n) - BigInt::from(1);
+        !abs_minus_one.bit(idx)
+    } else {
+        n.bit(idx)
+    };
+    if bit_set { Word::T.raw() } else { Word::NIL.raw() }
 }
 
 #[cfg(test)]

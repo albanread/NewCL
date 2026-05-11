@@ -30,8 +30,13 @@ pub enum Value {
     /// An interned symbol. `Arc::ptr_eq` is `eq`.
     Symbol(Arc<Symbol>),
     /// A tagged 63-bit integer in the final representation; for Phase 1
-    /// we use the native `i64` directly. The bignum tower lands later.
+    /// we use the native `i64` directly.
     Fixnum(i64),
+    /// An integer too big to fit in the fixnum range. Stored as a
+    /// decimal-string representation at the reader/Value level; the
+    /// lowering pass converts to a heap-allocated bignum Word via
+    /// `ncl_parse_bignum`. (See `ncl-runtime::bignum`.)
+    Bignum(Arc<String>),
     /// IEEE 754 double. Single-floats and ratios land later.
     Float(f64),
     /// A Unicode scalar. CL `character` semantics.
@@ -89,6 +94,7 @@ impl Value {
             (Value::Cons(x), Value::Cons(y)) => Arc::ptr_eq(x, y),
             (Value::Symbol(x), Value::Symbol(y)) => Arc::ptr_eq(x, y),
             (Value::Fixnum(x), Value::Fixnum(y)) => x == y,
+            (Value::Bignum(x), Value::Bignum(y)) => x == y,
             (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
             (Value::Char(x), Value::Char(y)) => x == y,
             (Value::String(x), Value::String(y)) => Arc::ptr_eq(x, y),

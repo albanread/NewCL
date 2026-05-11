@@ -15,14 +15,44 @@ use ncl_runtime::Value;
 
 /// Try to read `text` as a number. Returns `None` if it's not a
 /// number — caller should fall through to symbol resolution.
+///
+/// Integer-looking inputs that overflow i64 become `Value::Bignum`
+/// carrying the literal as a decimal string; the lowering pass
+/// converts it to a heap-allocated bignum at compile time.
 pub fn try_parse_number(text: &str) -> Option<Value> {
     if let Some(n) = parse_integer(text, 10) {
         return Some(Value::Fixnum(n));
+    }
+    // Bignum-literal recognition: an integer-shaped text that
+    // overflowed parse_integer is still a number.
+    if looks_like_integer(text) {
+        // Strip trailing `.` if present (the integer-with-dot CL quirk).
+        let normalised = if text.ends_with('.') {
+            &text[..text.len() - 1]
+        } else {
+            text
+        };
+        return Some(Value::Bignum(std::sync::Arc::new(normalised.to_string())));
     }
     if let Some(f) = parse_float(text) {
         return Some(Value::Float(f));
     }
     None
+}
+
+/// True iff TEXT has the shape of a decimal integer literal:
+/// optional sign + at least one digit + optional trailing `.`.
+fn looks_like_integer(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() { return false; }
+    let mut i = 0;
+    if bytes[0] == b'+' || bytes[0] == b'-' { i += 1; }
+    let digits_start = i;
+    while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
+    if i == digits_start { return false; }
+    // Optional trailing `.`
+    if i == bytes.len() - 1 && bytes[i] == b'.' { i += 1; }
+    i == bytes.len()
 }
 
 /// Parse an integer in the given radix. Allows optional leading `+`

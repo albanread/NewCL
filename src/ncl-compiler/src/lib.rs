@@ -333,6 +333,21 @@ fn install_native_functions(
                    ncl_runtime::bignum::abs_shim, 1);
     install_native(coord, mutator, "ISQRT",
                    ncl_runtime::bignum::isqrt_shim, 1);
+    // Bit operations (Tier 1.D.3).
+    install_native(coord, mutator, "ASH",
+                   ncl_runtime::bignum::ash_shim, 2);
+    install_native(coord, mutator, "LOGAND",
+                   ncl_runtime::bignum::logand_shim, 2);
+    install_native(coord, mutator, "LOGIOR",
+                   ncl_runtime::bignum::logior_shim, 2);
+    install_native(coord, mutator, "LOGXOR",
+                   ncl_runtime::bignum::logxor_shim, 2);
+    install_native(coord, mutator, "LOGNOT",
+                   ncl_runtime::bignum::lognot_shim, 1);
+    install_native(coord, mutator, "INTEGER-LENGTH",
+                   ncl_runtime::bignum::integer_length_shim, 1);
+    install_native(coord, mutator, "LOGBITP",
+                   ncl_runtime::bignum::logbitp_shim, 2);
     // Multi-value support — `(values ...)` itself is a special form
     // lowered in lower.rs; this is the primitive used by the
     // multiple-value-bind / multiple-value-list macros to read the
