@@ -886,6 +886,26 @@ impl Session {
         r2?;
         Ok(s)
     }
+
+    /// Minimal session: core stdlib only, no CLOS. The driver's
+    /// `--lean` flag uses this — small enough for scripting or
+    /// sandboxing where the user explicitly does not want CLOS
+    /// and the Library/init.lisp auto-load.
+    ///
+    /// What's in: cons / car / cdr / arithmetic / let / cond / loop /
+    /// format / mapcar / file I/O / hash tables / defstruct / sort /
+    /// typep / handler-case / load / require / provide — everything
+    /// in core.lisp.
+    /// What's not: defclass / defmethod / defgeneric / make-instance
+    /// / slot-value / standard-class — anything CLOS.
+    pub fn with_minimal_stdlib() -> Result<Session, EvalError> {
+        let mut s = Session::new();
+        s.activate();
+        let r = s.load_core_stdlib();
+        ACTIVE_SESSION.with(|c| c.set(std::ptr::null_mut()));
+        r?;
+        Ok(s)
+    }
 }
 
 /// Recognise `(defun name (params...) body...)`. Returns `Some` if

@@ -9,10 +9,11 @@ use std::sync::Mutex;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn usage() {
-    eprintln!("usage: ncl [--version | --repl | (--eval <src> | --load <file>)... [--repl]]");
+    eprintln!("usage: ncl [--version | --lean] [--repl | (--eval <src> | --load <file>)...] [--repl]");
     eprintln!("  --eval, -e <src>   evaluate a source string");
     eprintln!("  --load, -l <file>  read and evaluate the file");
     eprintln!("  --repl, -r         enter the interactive REPL (default if no flags given)");
+    eprintln!("  --lean, -L         start with core only (no CLOS, no Library/init.lisp)");
     eprintln!("  multiple --eval / --load can be chained; --repl runs after them");
 }
 
@@ -28,7 +29,17 @@ fn main() -> ExitCode {
     let want_repl = raw_args.is_empty()
         || raw_args.iter().any(|a| a == "--repl" || a == "-r");
 
-    let mut session = match ncl_compiler::Session::with_stdlib() {
+    // --lean: skip CLOS, skip Library/init.lisp. User explicitly opted
+    // out of the standard auto-loaded surface. Useful for scripts or
+    // sandboxing.
+    let lean = raw_args.iter().any(|a| a == "--lean" || a == "-L");
+
+    let session_result = if lean {
+        ncl_compiler::Session::with_minimal_stdlib()
+    } else {
+        ncl_compiler::Session::with_stdlib()
+    };
+    let session = match session_result {
         Ok(s) => s,
         Err(e) => {
             eprintln!("ncl: stdlib load failed: {e}");
@@ -47,19 +58,27 @@ fn main() -> ExitCode {
     // that init file. Failures here are warnings, not fatal — the
     // user can still drop into the REPL and work with just the baked-
     // in stdlib.
-    if let Some(library_dir) = find_library_dir() {
-        let setup = format!(
-            "(setq *load-path* (cons \"{}\" *load-path*))",
-            library_dir.replace('\\', "/")
-        );
-        if let Err(e) = session.eval(&setup) {
-            eprintln!("ncl: warning: could not extend *load-path*: {e}");
-        }
-        let init_path = format!("{library_dir}/init.lisp");
-        if std::path::Path::new(&init_path).exists() {
-            let load = format!("(load \"{}\")", init_path.replace('\\', "/"));
-            if let Err(e) = session.eval(&load) {
-                eprintln!("ncl: warning: Library/init.lisp failed: {e}");
+    //
+    // Skipped entirely when --lean is set. In lean mode there's no
+    // load / require / *load-path* in the session at all (those live
+    // in the bottom of core.lisp — still loaded, since they don't
+    // depend on CLOS — so library bootstrap is suppressed by choice,
+    // not by absence).
+    if !lean {
+        if let Some(library_dir) = find_library_dir() {
+            let setup = format!(
+                "(setq *load-path* (cons \"{}\" *load-path*))",
+                library_dir.replace('\\', "/")
+            );
+            if let Err(e) = session.eval(&setup) {
+                eprintln!("ncl: warning: could not extend *load-path*: {e}");
+            }
+            let init_path = format!("{library_dir}/init.lisp");
+            if std::path::Path::new(&init_path).exists() {
+                let load = format!("(load \"{}\")", init_path.replace('\\', "/"));
+                if let Err(e) = session.eval(&load) {
+                    eprintln!("ncl: warning: Library/init.lisp failed: {e}");
+                }
             }
         }
     }
@@ -106,6 +125,9 @@ fn main() -> ExitCode {
             }
             "--repl" | "-r" => {
                 // Handled below; just accept and continue scanning.
+            }
+            "--lean" | "-L" => {
+                // Handled at session-construction time above; accept here.
             }
             other => {
                 eprintln!("ncl: unknown argument '{other}'");
