@@ -25,6 +25,7 @@
       shapes         exercise all primitive drawing ops
       buttons        clickable buttons
       gui-repl       in-frame REPL
+      heap-monitor   live GC bars (worker thread polls (gc-stats))
 
 .PARAMETER Lean
     Start without the auto-loaded Library (--lean). CLOS / events /
