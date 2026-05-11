@@ -314,9 +314,10 @@ pub extern "C-unwind" fn next_event_shim(
     };
     // Park while we're blocked in the channel wait — otherwise a
     // peer mutator that triggers GC waits forever for us to reach
-    // a safepoint we'll never hit until an event arrives. The TLAB
-    // gap left by `leave_blocked` is stamped with a Filler header
-    // by `retire_tlab` so the next linear heap walk parses cleanly.
+    // a safepoint we'll never hit until an event arrives. Safe
+    // because young is walked via the start-bit bitmap, not by
+    // linearly parsing cells — an abandoned TLAB tail is just a
+    // run of "no-bit-set" cells and the walker skips it for free.
     let m = unsafe { &mut *mutator };
     let do_park = timeout != 0;
     if do_park { m.enter_blocked(); }

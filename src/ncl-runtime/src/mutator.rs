@@ -265,13 +265,9 @@ impl GcCoordinator {
             .unwrap()
             .handles
             .push(Arc::clone(&handle));
-        let (young_base, young_starts, young_cons_starts) = {
+        let (young_base, young_starts) = {
             let heap = self.heap.lock().unwrap();
-            (
-                heap.young_base_ptr(),
-                heap.young_starts_handle(),
-                heap.young_cons_starts_handle(),
-            )
+            (heap.young_base_ptr(), heap.young_starts_handle())
         };
         MutatorState {
             coord: Arc::clone(self),
@@ -279,7 +275,6 @@ impl GcCoordinator {
             tlab: Tlab::default(),
             young_base,
             young_starts,
-            young_cons_starts,
         }
     }
 
@@ -366,17 +361,14 @@ pub struct MutatorState {
     handle: Arc<MutatorHandle>,
     tlab: Tlab,
     /// Cached at registration so the alloc fast path can flip the
-    /// young start-bit bitmaps without taking the heap lock. The
+    /// young start-bit bitmap without taking the heap lock. The
     /// young semispace's storage doesn't move for the lifetime of
     /// the coordinator (and the coordinator outlives every mutator
     /// via Arc), so these stay valid as long as `self` exists.
-    /// Two parallel bitmaps: `young_starts` is set on every object's
-    /// first cell; `young_cons_starts` is set iff that object is a
-    /// 2-cell cons. Walkers consult both to distinguish a real
-    /// header from a cons whose car value happens to decode as one.
+    /// `young_starts` is a single packed bitmap with 2 bits per
+    /// cell — see the Semispace docs for the encoding.
     young_base: *const u64,
     young_starts: crate::heap::StartBits,
-    young_cons_starts: crate::heap::StartBits,
 }
 
 // SAFETY: MutatorState contains a `*mut u64` (in Tlab) and a
@@ -483,15 +475,14 @@ impl MutatorState {
         crate::heap::Semispace::set_start_bit_at(&self.young_starts, cell_idx);
     }
 
-    /// Set BOTH start bits for a cons whose car lives at `p`. The
-    /// cons_starts bit lets walkers know to skip past 2 cells without
+    /// Set the cons-start bit pair for a cons whose car lives at
+    /// `p`. The "is-cons" bit lets walkers skip past 2 cells without
     /// trying to decode the car value as a header word.
     #[inline]
     fn mark_young_cons_start(&self, p: *const u64) {
         let cell_idx = (p as usize - self.young_base as usize) / 8;
         crate::heap::Semispace::set_cons_start_bit_at(
             &self.young_starts,
-            &self.young_cons_starts,
             cell_idx,
         );
     }
@@ -659,10 +650,8 @@ impl MutatorState {
             .store(pinned_cells as u64, Ordering::Relaxed);
 
         // My TLAB pointed into young, which is now empty (or
-        // rewound past pinned survivors). Stamp a Filler in the
-        // abandoned tail then reset, so the gap stays parseable for
-        // any subsequent linear walk that may visit those cells
-        // before they're overwritten.
+        // rewound past pinned survivors). Abandon it; the next
+        // alloc will refill from the fresh young.
         self.retire_tlab();
 
         // Clear the flag and wake parked threads. They'll each
@@ -699,9 +688,7 @@ impl MutatorState {
         drop(state);
 
         // Our TLAB is now invalid (young was cleared or rewound).
-        // Stamp a Filler before abandoning so the gap stays
-        // parseable for any walker that visits these cells before
-        // they're reused.
+        // Abandon it; next alloc will refill.
         self.retire_tlab();
     }
 
@@ -756,43 +743,19 @@ impl MutatorState {
         self.handle.parked.store(false, Ordering::Release);
         self.handle.parked_rsp.store(0, Ordering::Release);
         drop(state);
-        // Stamp a Filler in the abandoned tail before dropping the
-        // TLAB; otherwise the next linear heap walk reads the gap
-        // as garbage and either jumps past `top` (silently dropping
-        // live objects) or spins on a bogus length. See the GC TLAB
-        // parseability note in feedback memory.
+        // Abandon the TLAB. The unused tail is invisible to the
+        // bitmap-driven walkers (no start-bits set), so leaving the
+        // cells as-is is safe.
         self.retire_tlab();
     }
 
-    /// Abandon the current TLAB after stamping a `HeapType::Filler`
-    /// object into the unused tail and zero-filling the payload.
-    /// Keeps young space linearly parseable across the abandonment.
-    ///
-    /// Safe to call when the TLAB is already empty (`base.is_null()`
-    /// or `top == limit`) — does nothing in that case.
+    /// Abandon the current TLAB. The unused tail between
+    /// `tlab.top` and `tlab.limit` becomes ordinary "no start-bit
+    /// set" cells; the bitmap-driven walkers iterate set bits only,
+    /// so they skip the gap for free. No filler header, no payload
+    /// zeroing — the cells stay as-is until the next allocation
+    /// overwrites them.
     fn retire_tlab(&mut self) {
-        if !self.tlab.base.is_null() {
-            let gap = self.tlab.limit.saturating_sub(self.tlab.top);
-            if gap >= 1 {
-                let dst = unsafe { self.tlab.base.add(self.tlab.top) };
-                let payload_cells = (gap - 1) as u32;
-                unsafe {
-                    *dst = crate::heap::HeapHeader::new(
-                        crate::heap::HeapType::Filler,
-                        payload_cells,
-                    )
-                    .raw();
-                    if payload_cells > 0 {
-                        std::ptr::write_bytes(
-                            dst.add(1),
-                            0u8,
-                            payload_cells as usize,
-                        );
-                    }
-                }
-                self.mark_young_start(dst);
-            }
-        }
         self.tlab = Tlab::default();
     }
 

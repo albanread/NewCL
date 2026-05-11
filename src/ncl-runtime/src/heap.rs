@@ -142,15 +142,6 @@ pub enum HeapType {
     ///           imag-zero would demote to the real part)
     /// 3-cell payload, identical shape to Ratio.
     Complex = 9,
-    /// Dead-zone sentinel. Stamped by `MutatorState::retire_tlab` into
-    /// the unused tail of an abandoned TLAB so the young heap stays
-    /// linearly parseable. Never traced, never pinned, never copied.
-    /// Payload is zero-filled at stamp time. Walkers that advance by
-    /// `1 + length_cells` (count_pinned, clear_pinned_bits) skip the
-    /// whole gap in one step; walkers that advance cell-by-cell
-    /// (rewind_past_pinned) see zero cells as "Symbol type, length 0"
-    /// and advance one cell at a time, which is correct.
-    Filler = 10,
 }
 
 impl HeapType {
@@ -166,7 +157,6 @@ impl HeapType {
             7 => Some(HeapType::Float),
             8 => Some(HeapType::Ratio),
             9 => Some(HeapType::Complex),
-            10 => Some(HeapType::Filler),
             _ => None,
         }
     }
@@ -226,25 +216,37 @@ pub enum GcBit {
 
 // -- Semispace ---------------------------------------------------------------
 
-/// Two parallel bitmaps over a Semispace's cells. Together they let
-/// GC walkers iterate young precisely instead of guessing object
-/// boundaries from cell contents (which doesn't work when cons cells
-/// are headerless and a cons-car value can coincidentally decode as
-/// a header).
+/// Per-cell start metadata for a Semispace, packed 2 bits per cell:
+///   bit 0 of pair: "this cell is the start of an object"
+///   bit 1 of pair: "and that object is a cons (vs header-bearing)"
+/// Encoding:
+///   00 = not a start
+///   01 = header-bearing start (length in the cell at idx)
+///   11 = cons start (2 cells: car at idx, cdr at idx+1)
+///   10 = reserved (candidate uses: forwarded-source / pinned /
+///         opaque-payload — left unused until a real use case bites)
 ///
-/// For each cell index `i`:
-///   - `starts[i]`      set IFF `i` is the first cell of an object.
-///   - `cons_starts[i]` set IFF that object is a cons pair
-///                      (so it spans cells `i` and `i+1`).
-/// A walker iterates `starts`; for each bit, it checks `cons_starts`
-/// to decide "2-cell cons" vs "header at this cell, length in the
-/// header word". 2 bits per 8-byte cell = 3.125% memory overhead.
+/// One `u64` covers 32 cells. For cell index `c`, the pair lives at
+/// bit positions `(c % 32) * 2` and `(c % 32) * 2 + 1` within word
+/// `c / 32`. Both bits set with a single `fetch_or` — no CAS, no
+/// inter-bit ordering. 2 bits / 8-byte cell = 3.125% overhead.
+///
+/// One bitmap (vs the earlier two parallel bitmaps) gives better
+/// locality: each alloc and each walker step touches exactly one
+/// cache line of metadata for both bits.
 pub type StartBits = Arc<[AtomicU64]>;
+
+const CELLS_PER_STARTS_WORD: usize = 32;
+const STARTS_PAIR_HEADER: u64 = 0b01;
+const STARTS_PAIR_CONS: u64 = 0b11;
+/// Mask of the "is-start" bits (every even position) within a packed
+/// bitmap word. Used by walkers to isolate object starts before
+/// classifying them with the adjacent "is-cons" bit.
+const STARTS_BITS_MASK: u64 = 0x5555_5555_5555_5555;
 
 pub struct Semispace {
     cells: Box<[u64]>,
     starts: StartBits,
-    cons_starts: StartBits,
     top: usize,
 }
 
@@ -252,72 +254,62 @@ impl Semispace {
     pub fn new(size_bytes: usize) -> Semispace {
         let n_cells = size_bytes / 8;
         let cells = vec![0u64; n_cells].into_boxed_slice();
-        let n_bitmap_words = n_cells.div_ceil(64);
-        let mk = || -> StartBits {
-            let v: Vec<AtomicU64> = (0..n_bitmap_words).map(|_| AtomicU64::new(0)).collect();
-            Arc::from(v.into_boxed_slice())
-        };
-        Semispace { cells, starts: mk(), cons_starts: mk(), top: 0 }
+        let n_bitmap_words = n_cells.div_ceil(CELLS_PER_STARTS_WORD);
+        let v: Vec<AtomicU64> = (0..n_bitmap_words).map(|_| AtomicU64::new(0)).collect();
+        let starts: Arc<[AtomicU64]> = Arc::from(v.into_boxed_slice());
+        Semispace { cells, starts, top: 0 }
     }
 
-    /// Cheap clone of the bitmap handles for mutators that need to
+    /// Cheap clone of the bitmap handle for mutators that need to
     /// flip bits from their alloc fast path without taking the heap
-    /// lock. The mutator caches a pair at registration and flips
-    /// bits via the static `set_*_bit_at` helpers below.
+    /// lock. The mutator caches one of these at registration.
     pub fn starts_handle(&self) -> StartBits { Arc::clone(&self.starts) }
-    pub fn cons_starts_handle(&self) -> StartBits { Arc::clone(&self.cons_starts) }
+
+    /// Cell index → (word_index, bit_offset_of_pair).
+    #[inline]
+    fn pair_position(idx: usize) -> (usize, u32) {
+        let w = idx / CELLS_PER_STARTS_WORD;
+        let b = ((idx % CELLS_PER_STARTS_WORD) * 2) as u32;
+        (w, b)
+    }
 
     /// Mark cell `idx` as the start of a header-bearing heap object.
+    /// Sets the pair to `01` (idempotent re-set is a no-op via OR).
     /// Lock-free; safe from a mutator's alloc fast path.
     pub fn set_start_bit_at(starts: &[AtomicU64], idx: usize) {
-        let w = idx >> 6;
-        let b = idx & 63;
-        starts[w].fetch_or(1u64 << b, Ordering::Relaxed);
+        let (w, bit) = Self::pair_position(idx);
+        starts[w].fetch_or(STARTS_PAIR_HEADER << bit, Ordering::Relaxed);
     }
 
-    /// Mark cell `idx` as the start of a 2-cell cons pair. Sets both
-    /// `starts` (so the iterator visits it) and `cons_starts` (so
-    /// the visitor knows to treat it as a cons rather than a
-    /// header).
-    pub fn set_cons_start_bit_at(
-        starts: &[AtomicU64],
-        cons_starts: &[AtomicU64],
-        idx: usize,
-    ) {
-        let w = idx >> 6;
-        let b = idx & 63;
-        let mask = 1u64 << b;
-        starts[w].fetch_or(mask, Ordering::Relaxed);
-        cons_starts[w].fetch_or(mask, Ordering::Relaxed);
+    /// Mark cell `idx` as the start of a 2-cell cons pair. Sets the
+    /// pair to `11`. Single `fetch_or`, no inter-bit race.
+    pub fn set_cons_start_bit_at(starts: &[AtomicU64], idx: usize) {
+        let (w, bit) = Self::pair_position(idx);
+        starts[w].fetch_or(STARTS_PAIR_CONS << bit, Ordering::Relaxed);
     }
 
-    /// Used by inside-Semispace alloc paths.
     pub fn set_start(&self, idx: usize) {
         Semispace::set_start_bit_at(&self.starts, idx);
     }
     pub fn set_cons_start(&self, idx: usize) {
-        Semispace::set_cons_start_bit_at(&self.starts, &self.cons_starts, idx);
+        Semispace::set_cons_start_bit_at(&self.starts, idx);
     }
 
     pub fn is_start(&self, idx: usize) -> bool {
-        let w = idx >> 6;
-        let b = idx & 63;
-        (self.starts[w].load(Ordering::Relaxed) & (1u64 << b)) != 0
+        let (w, bit) = Self::pair_position(idx);
+        (self.starts[w].load(Ordering::Relaxed) >> bit) & 1 != 0
     }
     fn is_cons_start(&self, idx: usize) -> bool {
-        let w = idx >> 6;
-        let b = idx & 63;
-        (self.cons_starts[w].load(Ordering::Relaxed) & (1u64 << b)) != 0
+        let (w, bit) = Self::pair_position(idx);
+        (self.starts[w].load(Ordering::Relaxed) >> (bit + 1)) & 1 != 0
     }
 
-    /// Zero every bit in both bitmaps below `end_cells`. Called when
-    /// `top` resets to 0; stale bits would otherwise survive into
-    /// the next cycle and the walker would visit ghost objects.
+    /// Zero every pair below `end_cells`, rounded up to a whole word
+    /// boundary. Called on `young.reset()`.
     fn clear_start_bits_below(&self, end_cells: usize) {
-        let words = end_cells.div_ceil(64);
+        let words = end_cells.div_ceil(CELLS_PER_STARTS_WORD);
         for w in 0..words {
             self.starts[w].store(0, Ordering::Relaxed);
-            self.cons_starts[w].store(0, Ordering::Relaxed);
         }
     }
 
@@ -470,11 +462,11 @@ impl Semispace {
     }
 
     /// Dump a window of cells around `idx` and panic. Called by the
-    /// linear walkers when they catch a header that would extend past
-    /// `self.top` — that's a parseability violation (almost always:
-    /// an abandoned-TLAB gap that wasn't filled with a Filler header,
-    /// see `MutatorState::retire_tlab`). Loud failure beats silent
-    /// loop-truncation or infinite-spin every time.
+    /// linear walkers when they catch a header whose declared length
+    /// would extend past `self.top` — that's a parseability violation
+    /// (the bitmap claims this cell is an object start, but the
+    /// header word at that cell decodes to garbage). Loud failure
+    /// beats silent loop-truncation or infinite-spin every time.
     fn dump_and_panic(
         &self,
         walker: &str,
@@ -514,23 +506,27 @@ impl Semispace {
         );
     }
 
-    /// Iterate the cell-indices that are flagged as object starts,
-    /// in ascending order, restricted to `[0, self.top)`. Used by
-    /// the structural walkers — replaces the older "decode-as-
-    /// header" approach which couldn't distinguish a header from a
-    /// headerless cons payload and would stampede on the latter.
+    /// Iterate cell-indices flagged as object starts, in ascending
+    /// order, restricted to `[0, self.top)`. Used by every structural
+    /// walker — replaces the older "decode-as-header" approach
+    /// which couldn't distinguish a header from a headerless cons
+    /// payload and would stampede on the latter.
     fn for_each_start<F: FnMut(usize)>(&self, mut f: F) {
         let top = self.top;
-        let n_words = (top + 63) >> 6;
+        let n_words = top.div_ceil(CELLS_PER_STARTS_WORD);
         for w in 0..n_words {
-            let mut bits = self.starts[w].load(Ordering::Relaxed);
-            let base = w << 6;
-            while bits != 0 {
-                let b = bits.trailing_zeros() as usize;
-                let idx = base + b;
+            let word = self.starts[w].load(Ordering::Relaxed);
+            // Keep only the even bits — those mark object starts.
+            // The adjacent odd bit is the "is-cons" classifier and
+            // is read separately by callers via `is_cons_start`.
+            let mut starts_only = word & STARTS_BITS_MASK;
+            let base = w * CELLS_PER_STARTS_WORD;
+            while starts_only != 0 {
+                let b = starts_only.trailing_zeros() as usize;
+                let idx = base + (b >> 1);
                 if idx >= top { return; }
                 f(idx);
-                bits &= bits - 1;
+                starts_only &= starts_only - 1;
             }
         }
     }
@@ -567,23 +563,23 @@ impl Semispace {
                 highest_end = end;
             }
         });
-        // Drop bits above the new top in BOTH bitmaps so the next
-        // cycle starts with a clean tail.
+        // Drop pairs above the new top so the next cycle starts
+        // with a clean tail. Cell c's pair occupies bits c*2 and
+        // c*2+1 within word c/32, so the boundary inside the
+        // first word is at bit (highest_end % 32) * 2.
         if highest_end < old_top {
-            let from_word = highest_end >> 6;
-            let bits_in_first_word_to_keep = highest_end & 63;
-            if bits_in_first_word_to_keep != 0 {
-                let mask = (1u64 << bits_in_first_word_to_keep) - 1;
+            let from_word = highest_end / CELLS_PER_STARTS_WORD;
+            let cells_to_keep = highest_end % CELLS_PER_STARTS_WORD;
+            let bits_to_keep = cells_to_keep * 2;
+            if bits_to_keep != 0 {
+                let mask = (1u64 << bits_to_keep) - 1;
                 self.starts[from_word].fetch_and(mask, Ordering::Relaxed);
-                self.cons_starts[from_word].fetch_and(mask, Ordering::Relaxed);
             } else {
                 self.starts[from_word].store(0, Ordering::Relaxed);
-                self.cons_starts[from_word].store(0, Ordering::Relaxed);
             }
-            let to_word = old_top.div_ceil(64);
+            let to_word = old_top.div_ceil(CELLS_PER_STARTS_WORD);
             for w in (from_word + 1)..to_word {
                 self.starts[w].store(0, Ordering::Relaxed);
-                self.cons_starts[w].store(0, Ordering::Relaxed);
             }
         }
         self.top = highest_end;
@@ -780,14 +776,11 @@ impl Heap {
     /// fast path without taking the heap lock.
     pub fn young_base_ptr(&self) -> *const u64 { self.young.cells.as_ptr() }
 
-    /// Lock-free handle to young's start-bit bitmap. Mutators flip
-    /// bits via `Semispace::set_start_bit_at` (relaxed atomic).
+    /// Lock-free handle to young's packed start-bit bitmap. Mutators
+    /// flip pairs via `Semispace::set_start_bit_at` (header) or
+    /// `set_cons_start_bit_at` (cons), both single relaxed atomic
+    /// OR. See `StartBits` docs for the per-cell encoding.
     pub fn young_starts_handle(&self) -> StartBits { self.young.starts_handle() }
-
-    /// Parallel handle to the cons-start bitmap — set by mutators
-    /// on cons-only alloc paths so walkers can distinguish a 2-cell
-    /// cons from a header'd object.
-    pub fn young_cons_starts_handle(&self) -> StartBits { self.young.cons_starts_handle() }
 
     pub fn young_contains(&self, ptr: *const u8) -> bool {
         self.young.contains_ptr(ptr)
