@@ -32,10 +32,14 @@ pub extern "C" fn ncl_alloc_cons(mutator: *mut MutatorState, car: u64, cdr: u64)
 /// untag-and-load directly without calling here, but this is also
 /// exposed for use from FFI / debugger / tests.
 ///
-/// SAFETY: `cons` must be a valid Cons-tagged `Word`.
+/// SAFETY: `cons` is a Cons-tagged `Word` OR `nil`. (CL spec:
+/// `(car nil) = (cdr nil) = nil`.)
 #[unsafe(no_mangle)]
 pub extern "C" fn ncl_car(cons: u64) -> u64 {
     let w = Word::from_raw(cons);
+    if w.is_nil() {
+        return Word::NIL.raw();
+    }
     let p = w.as_ptr::<u64>(Tag::Cons).expect("ncl_car called on non-cons");
     unsafe { *p }
 }
@@ -44,6 +48,9 @@ pub extern "C" fn ncl_car(cons: u64) -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn ncl_cdr(cons: u64) -> u64 {
     let w = Word::from_raw(cons);
+    if w.is_nil() {
+        return Word::NIL.raw();
+    }
     let p = w.as_ptr::<u64>(Tag::Cons).expect("ncl_cdr called on non-cons");
     unsafe { *p.add(1) }
 }

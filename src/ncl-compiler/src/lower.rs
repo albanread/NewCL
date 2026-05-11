@@ -950,6 +950,22 @@ fn lower_let(
     let mut binding_exprs: Vec<Expr> = Vec::new();
     let mut binding_names: Vec<Arc<str>> = Vec::new();
 
+    // Each binding's init is lowered in the OUTER env (CL parallel
+    // semantics). BUT — the LLVM emit of Expr::Let pushes init
+    // values to the locals vec one by one, so when we lower init[i],
+    // emit-time locals already contains the values of init[0..i-1].
+    // Any nested Expr::Let inside init[i] (e.g. produced by `or` /
+    // `and` / `cond`) computes Local(idx) using `env.local_count`
+    // at lower time. If we don't reserve placeholder slots for the
+    // earlier inits, those nested Locals get the wrong index.
+    //
+    // We push an anonymous placeholder for each completed init.
+    // Those placeholders are NOT named, so sibling inits can't
+    // resolve them (parallel-semantics preserved), but they push
+    // env.local_count up so nested constructs see the right slot
+    // count. We pop them all before the second loop that creates
+    // the real named bindings.
+    let placeholder_cp = env.checkpoint();
     for binding in &bindings_list {
         let pair = list_to_vec(binding)?;
         if pair.len() != 2 {
@@ -965,11 +981,16 @@ fn lower_let(
                 )));
             }
         };
-        // Evaluate value in OUTER env (parallel binding semantics).
         let val_expr = lower_in_mut(&pair[1], env, coord)?;
         binding_exprs.push(val_expr);
         binding_names.push(name);
+        // Reserve a slot so subsequent inits' nested-let indices
+        // match emit time. Use a name that can't collide with a
+        // real symbol.
+        env.push_local(Arc::from("__let_placeholder__"));
     }
+    // Drop the placeholders; the real bindings are pushed below.
+    env.restore(placeholder_cp);
 
     // Determine which of OUR bindings are mutated anywhere reachable
     // from the body — including from inside nested lambdas. Those

@@ -816,6 +816,76 @@ fn emit_div_op<'ctx>(
     Ok(phi.as_basic_value().into_int_value())
 }
 
+/// `(car nil) = (cdr nil) = nil` per CL spec. Emit a nil-check
+/// branch around the inline pointer load so we don't dereference
+/// nil's bit pattern as a heap pointer.
+fn emit_car_or_cdr<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    cons_val: IntValue<'ctx>,
+    is_cdr: bool,
+) -> Result<IntValue<'ctx>, String> {
+    let i64_t = context.i64_type();
+    let ptr_t = context.ptr_type(AddressSpace::default());
+    let nil_raw = i64_t.const_int(Word::NIL.raw(), false);
+    let mask = i64_t.const_int(!0b111u64, false);
+
+    let is_nil = builder
+        .build_int_compare(IntPredicate::EQ, cons_val, nil_raw, "car_is_nil")
+        .map_err(|e| format!("icmp: {e}"))?;
+
+    let nil_block = context.append_basic_block(*function, "car_nil");
+    let cons_block = context.append_basic_block(*function, "car_cons");
+    let join_block = context.append_basic_block(*function, "car_join");
+
+    builder
+        .build_conditional_branch(is_nil, nil_block, cons_block)
+        .map_err(|e| format!("br car: {e}"))?;
+
+    // nil → return nil
+    builder.position_at_end(nil_block);
+    builder
+        .build_unconditional_branch(join_block)
+        .map_err(|e| format!("br nil→join: {e}"))?;
+    let nil_end = builder.get_insert_block().unwrap();
+
+    // cons → load car/cdr
+    builder.position_at_end(cons_block);
+    let untagged = builder
+        .build_and(cons_val, mask, "untag_cons")
+        .map_err(|e| format!("and: {e}"))?;
+    let ptr = builder
+        .build_int_to_ptr(untagged, ptr_t, "as_ptr")
+        .map_err(|e| format!("int_to_ptr: {e}"))?;
+    let load_ptr = if is_cdr {
+        let one = i64_t.const_int(1, false);
+        unsafe {
+            builder
+                .build_gep(i64_t, ptr, &[one], "cdr_ptr")
+                .map_err(|e| format!("gep cdr: {e}"))?
+        }
+    } else {
+        ptr
+    };
+    let loaded = builder
+        .build_load(i64_t, load_ptr, if is_cdr { "cdr" } else { "car" })
+        .map_err(|e| format!("load: {e}"))?;
+    let loaded_val = loaded.into_int_value();
+    builder
+        .build_unconditional_branch(join_block)
+        .map_err(|e| format!("br cons→join: {e}"))?;
+    let cons_end = builder.get_insert_block().unwrap();
+
+    // Join with phi
+    builder.position_at_end(join_block);
+    let phi = builder
+        .build_phi(i64_t, "car_result")
+        .map_err(|e| format!("phi: {e}"))?;
+    phi.add_incoming(&[(&nil_raw, nil_end), (&loaded_val, cons_end)]);
+    Ok(phi.as_basic_value().into_int_value())
+}
+
 /// Emit the post-call abort check. Calls ncl_abort_pending; if
 /// non-zero, branches to a fresh "early return" block that
 /// returns NIL; otherwise positions at a fresh "continue" block
@@ -1492,37 +1562,11 @@ fn emit_expr<'ctx>(
         }
         Expr::Car(x) => {
             let cons_val = emit_expr(context, builder, function, helpers, arity, locals, x)?;
-            let mask = i64_t.const_int(!0b111u64, false);
-            let untagged = builder
-                .build_and(cons_val, mask, "untag_cons")
-                .map_err(|e| format!("and: {e}"))?;
-            let ptr = builder
-                .build_int_to_ptr(untagged, ptr_t, "as_ptr")
-                .map_err(|e| format!("int_to_ptr: {e}"))?;
-            let loaded = builder
-                .build_load(i64_t, ptr, "car")
-                .map_err(|e| format!("load car: {e}"))?;
-            Ok(loaded.into_int_value())
+            emit_car_or_cdr(context, builder, function, cons_val, /*is_cdr=*/false)
         }
         Expr::Cdr(x) => {
             let cons_val = emit_expr(context, builder, function, helpers, arity, locals, x)?;
-            let mask = i64_t.const_int(!0b111u64, false);
-            let untagged = builder
-                .build_and(cons_val, mask, "untag_cons")
-                .map_err(|e| format!("and: {e}"))?;
-            let ptr = builder
-                .build_int_to_ptr(untagged, ptr_t, "as_ptr")
-                .map_err(|e| format!("int_to_ptr: {e}"))?;
-            let one = i64_t.const_int(1, false);
-            let cdr_ptr = unsafe {
-                builder
-                    .build_gep(i64_t, ptr, &[one], "cdr_ptr")
-                    .map_err(|e| format!("gep cdr: {e}"))?
-            };
-            let loaded = builder
-                .build_load(i64_t, cdr_ptr, "cdr")
-                .map_err(|e| format!("load cdr: {e}"))?;
-            Ok(loaded.into_int_value())
+            emit_car_or_cdr(context, builder, function, cons_val, /*is_cdr=*/true)
         }
         Expr::Eq(a, b) => emit_cmp(context, builder, function, helpers, arity, locals, a, b, IntPredicate::EQ),
         Expr::Lt(a, b) => emit_cmp(context, builder, function, helpers, arity, locals, a, b, IntPredicate::SLT),
