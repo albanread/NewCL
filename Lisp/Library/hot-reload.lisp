@@ -64,21 +64,35 @@
 (defun check-reloads ()
   "Drain the watcher's pending queue and (load) each file. Safe
    to call at any time; no-op if no files have changed. The
-   driver calls this between REPL prompts automatically."
+   driver calls this between REPL prompts automatically.
+
+   Each file is parse-validated BEFORE we load it. If the file
+   doesn't parse — typo, unbalanced paren, half-saved buffer —
+   we report the problem and SKIP the reload. The previous
+   definitions stay in place; nothing in the running session
+   is touched. The next save will retry."
   (cond
     ((null *hot-reload-enabled*) nil)
     (t
      (let ((paths (%watcher-pending)))
        (dolist (path paths)
-         (when *hot-reload-trace*
-           (format t ";;; hot-reload: ~A~%" path))
-         ;; Wrap in handler-case so a broken file doesn't take
-         ;; the REPL down. A load error during hot reload is
-         ;; almost never the user's intent; they'd rather see
-         ;; the error and keep going than have the session die.
-         (handler-case (load path)
-           (error (c)
-             (format t ";;; hot-reload: error loading ~A: ~A~%" path c))))))))
+         (let ((parsed (%file-parses-p path)))
+           (cond
+             ((eq parsed t)
+              (when *hot-reload-trace*
+                (format t ";;; hot-reload: ~A~%" path))
+              ;; Even with a clean parse, evaluation can still
+              ;; fail (undefined function reference, wrong arity,
+              ;; etc.). Catch those too so the REPL doesn't die.
+              (handler-case (load path)
+                (error (c)
+                  (format t ";;; hot-reload: load failed for ~A: ~A~%"
+                          path c))))
+             ((null parsed)
+              (format t ";;; hot-reload: cannot read ~A — skipped~%" path))
+             (t
+              (format t ";;; hot-reload: SKIP ~A — parse error: ~A~%"
+                      path parsed)))))))))
 
 (provide 'hot-reload)
 nil

@@ -286,6 +286,8 @@ fn install_native_functions(
     // resolution and *modules* recording.
     install_native(coord, mutator, "%LOAD-FILE",
                    load_file_shim, 1);
+    install_native(coord, mutator, "%FILE-PARSES-P",
+                   file_parses_p_shim, 1);
     // Hot-reload watcher (Tier "fun extension").
     install_native(coord, mutator, "%WATCHER-START",
                    ncl_runtime::hot_reload::watcher_start_shim, 1);
@@ -572,6 +574,51 @@ extern "C-unwind" fn load_file_shim(
             mutator,
             &format!("%load-file: error while loading {path}: {e}"),
         ),
+    }
+}
+
+/// `(%file-parses-p path)` — return T iff PATH reads as a sequence
+/// of well-formed Lisp forms (every parenthesis balanced, no
+/// dangling quotes, etc.). Returns a string describing the
+/// problem if it doesn't parse, NIL if the file can't be read.
+///
+/// Used by hot-reload to skip reloading a half-written file. The
+/// notify watcher debounces 500ms but editors can still race the
+/// pre-save lockfile dance; a parse-check is the cheap correctness
+/// boundary.
+extern "C-unwind" fn file_parses_p_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        return ncl_runtime::abi::signal_condition_string(
+            mutator,
+            "%file-parses-p: expected 1 arg (path)",
+        );
+    }
+    let path_word = Word::from_raw(unsafe { *args });
+    if path_word.tag() != ncl_runtime::Tag::String {
+        return ncl_runtime::abi::signal_condition_string(
+            mutator,
+            "%file-parses-p: argument must be a string",
+        );
+    }
+    let path: String = ncl_runtime::gc_string::chars_of(path_word).collect();
+    let src = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return Word::NIL.raw(),
+    };
+    match ncl_reader::read_all(&src) {
+        Ok(_) => Word::T.raw(),
+        Err(e) => {
+            // Return the error description as a string so the
+            // hot-reload trace can show what's wrong.
+            let m = unsafe { &mut *mutator };
+            let msg = format!("{:?}", e.kind);
+            ncl_runtime::gc_string::alloc_string_in_young(m, &msg).raw()
+        }
     }
 }
 
