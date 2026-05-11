@@ -6,3 +6,11 @@
 # same install as our sibling project NewCP.
 [env]
 LLVM_SYS_221_PREFIX = "C:\\projects\\LLVM\\install"
+
+# Windows debug builds need a fatter main-thread stack. The default
+# 1 MiB is fine for release (optimized frames are tight), but debug
+# frames blow it during stdlib bootstrap — every defmacro and defclass
+# in conditions.lisp / clos.lisp recurses through unoptimized macro
+# expansion. 16 MiB matches what Corman ships and is plenty.
+[target.'cfg(target_os = "windows")']
+rustflags = ["-C", "link-arg=/STACK:16777216"]

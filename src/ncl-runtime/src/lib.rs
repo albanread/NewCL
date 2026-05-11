@@ -44,6 +44,7 @@ pub use abi::{
     gensym_shim, handler_case_shim, intern_shim,
     set_symbol_function_shim, symbol_function_shim,
     loop_return_shim, make_array_shim, multiple_value_list_of_shim, mv_clear_shim,
+    values_shim, values_list_shim,
     native_block_shim, native_loop_shim,
     return_from_shim,
     ncl_abort_pending, ncl_alloc_cons, ncl_apply, ncl_aref_generic, ncl_aset_generic,
@@ -78,7 +79,7 @@ pub use printer::{format_word, format_word_aesthetic};
 
 pub use threads::{
     allocate_critical_section_shim, atomic_cas_shim, atomic_get_shim,
-    atomic_incf_shim, atomic_set_shim, condvar_broadcast_shim, test_panic_shim,
+    atomic_incf_shim, atomic_set_shim, condvar_broadcast_shim, get_internal_real_time_shim, test_panic_shim,
     condvar_notify_shim, condvar_wait_shim, create_thread_shim,
     current_process_id_shim, current_thread_id_shim,
     deallocate_critical_section_shim, enter_critical_section_shim,

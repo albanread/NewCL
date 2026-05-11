@@ -1348,6 +1348,57 @@ pub extern "C-unwind" fn ncl_set_mv_single(v: u64) {
     });
 }
 
+/// `(values v1 v2 ... vN)` as a Lisp-callable FUNCTION — so
+/// `#'values` works and `(apply #'values list)` does the right
+/// thing. The compiler keeps its special-form fast path for
+/// direct `(values …)` calls; this shim exists for the
+/// function-value path.
+pub extern "C-unwind" fn values_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args == 0 {
+        MV_VALUES.with(|c| c.borrow_mut().clear());
+        return Word::NIL.raw();
+    }
+    unsafe { ncl_set_mv_many(args, n_args) };
+    unsafe { *args }
+}
+
+/// `(values-list list)` — splay LIST as multiple values. Returns
+/// the first element (or NIL on empty list).
+pub extern "C-unwind" fn values_list_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("values-list: expected 1 arg (list), got {n_args}");
+    }
+    // Walk the list, collecting raw words into a Vec.
+    let mut collected: Vec<u64> = Vec::new();
+    let mut cur = Word::from_raw(unsafe { *args });
+    while !cur.is_nil() {
+        if cur.tag() != Tag::Cons {
+            panic!("values-list: argument is not a proper list");
+        }
+        let p = cur.as_ptr::<u64>(Tag::Cons).expect("cons ptr");
+        collected.push(unsafe { *p });
+        cur = Word::from_raw(unsafe { *p.add(1) });
+    }
+    MV_VALUES.with(|cell| {
+        let mut b = cell.borrow_mut();
+        b.clear();
+        for &v in &collected {
+            b.push(v);
+        }
+    });
+    collected.first().copied().unwrap_or(Word::NIL.raw())
+}
+
 /// Write `args[0..n]` into the multi-value slot. Used by
 /// `Expr::Values` for `(values v1 v2 ... vN)` in tail position.
 ///

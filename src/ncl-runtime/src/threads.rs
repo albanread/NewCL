@@ -444,6 +444,22 @@ pub fn sleep_seconds(seconds: f64) {
     std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
 }
 
+// ─── High-resolution monotonic clock ────────────────────────────────────
+//
+// Backs `(get-internal-real-time)` for the Lisp-level `time` macro.
+// Returns nanoseconds since process start as a fixnum. 60-bit signed
+// fixnum reach is 1.15×10^18 ns ≈ 36 years, so the wrap-around is a
+// theoretical concern only.
+
+fn process_start() -> std::time::Instant {
+    static T0: OnceLock<std::time::Instant> = OnceLock::new();
+    *T0.get_or_init(std::time::Instant::now)
+}
+
+pub fn get_internal_real_time_ns() -> i64 {
+    process_start().elapsed().as_nanos() as i64
+}
+
 // ─── Atomic counters ────────────────────────────────────────────────────
 //
 // Lock-free integer cells shared across threads. The canonical
@@ -1078,6 +1094,18 @@ pub extern "C-unwind" fn sleep_shim(
     sleep_seconds(seconds);
     m.leave_blocked();
     Word::T.raw()
+}
+
+/// `(get-internal-real-time)` — monotonic nanoseconds since process
+/// start, as a fixnum. Pair with `INTERNAL-TIME-UNITS-PER-SECOND`
+/// (= 1_000_000_000) to get seconds.
+pub extern "C-unwind" fn get_internal_real_time_shim(
+    _mutator: *mut MutatorState,
+    _env: u64,
+    _args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    Word::fixnum(get_internal_real_time_ns()).raw()
 }
 
 pub extern "C-unwind" fn make_atomic_counter_shim(

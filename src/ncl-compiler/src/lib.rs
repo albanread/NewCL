@@ -436,6 +436,14 @@ fn install_native_functions(
                    ncl_runtime::multiple_value_list_of_shim, 1);
     install_native(coord, mutator, "%MV-CLEAR",
                    ncl_runtime::mv_clear_shim, 0);
+    // VALUES and VALUES-LIST as installed natives so #'values and
+    // (apply #'values list) work. The compiler keeps its special-
+    // form fast path for direct `(values ...)` calls — this is the
+    // function-value-of-VALUES path.
+    install_native(coord, mutator, "VALUES",
+                   ncl_runtime::values_shim, 0);
+    install_native(coord, mutator, "VALUES-LIST",
+                   ncl_runtime::values_list_shim, 1);
     // Vectors. AREF and SVREF are special forms (lowered directly
     // to Expr::Aref); MAKE-ARRAY and VECTOR go through Lisp-callable
     // shims.
@@ -510,6 +518,8 @@ fn install_native_functions(
                    ncl_runtime::join_thread_shim, 1);
     install_native(coord, mutator, "SLEEP",
                    ncl_runtime::sleep_shim, 1);
+    install_native(coord, mutator, "GET-INTERNAL-REAL-TIME",
+                   ncl_runtime::get_internal_real_time_shim, 0);
 
     // Atomic counters (lock-free shared integers).
     install_native(coord, mutator, "MAKE-ATOMIC-COUNTER",
