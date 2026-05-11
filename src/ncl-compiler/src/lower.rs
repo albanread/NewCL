@@ -1481,7 +1481,15 @@ fn lower_defparameter(
     };
     let sym_word = coord.intern(&name);
     let value = lower_in_mut(&args[1], env, coord)?;
-    Ok(Expr::store_global(sym_word.raw(), value))
+    // CL spec: (defparameter name ...) returns the symbol, not the
+    // new value. Returning the value tripped the REPL printer when
+    // a CLOS class instance was bound — its circular metaclass
+    // back-link blew the printer's stack. Returning the symbol is
+    // also the spec-correct shape.
+    Ok(Expr::progn(vec![
+        Expr::store_global(sym_word.raw(), value),
+        Expr::Word(sym_word.raw()),
+    ]))
 }
 
 /// Lower a `(lambda (params...) body...)` form. Builds an inner

@@ -7,6 +7,7 @@
 //! `*print-circle*` and friends land later.
 
 use crate::word::{Tag, Word};
+use std::sync::Arc;
 
 /// Format `w` as a CL-style printed value (readable / `prin1`-style):
 /// strings get wrapped in `"..."`, characters as `#\X`. This is the
@@ -68,6 +69,14 @@ fn write_word(out: &mut String, w: Word, readable: bool) {
 /// element is recursively formatted with the same `readable`
 /// flag. Skips the heap header (cell 0) and walks the
 /// `length_cells` payload cells.
+///
+/// Special case: CLOS instances are 4-cell vectors whose first
+/// cell is the symbol `%CLOS-INSTANCE`. Their second cell is the
+/// metaclass, which is itself a CLOS instance with a circular
+/// metaclass back-link — recursing into it would stack-overflow.
+/// We render them as `#<NAME>` where NAME is the class's class-
+/// name slot, if reachable in two hops without crossing back into
+/// CLOS-instance territory.
 fn write_vector(out: &mut String, w: Word, readable: bool) {
     let p = match w.as_ptr::<u64>(Tag::Vector) {
         Some(p) => p,
@@ -78,6 +87,20 @@ fn write_vector(out: &mut String, w: Word, readable: bool) {
     };
     let header = crate::heap::HeapHeader::from_raw(unsafe { *p });
     let n = header.length_cells();
+
+    // CLOS-instance check: 4 cells, slot 0 = symbol named "%CLOS-INSTANCE".
+    if n == 4 {
+        let marker = Word::from_raw(unsafe { *p.add(1) });
+        if marker.tag() == Tag::Symbol {
+            if let Some(name) = crate::sym_names::lookup(marker.raw()) {
+                if &*name == "%CLOS-INSTANCE" {
+                    write_clos_instance(out, p);
+                    return;
+                }
+            }
+        }
+    }
+
     out.push_str("#(");
     for i in 0..n {
         if i > 0 {
@@ -87,6 +110,52 @@ fn write_vector(out: &mut String, w: Word, readable: bool) {
         write_word(out, Word::from_raw(cell), readable);
     }
     out.push(')');
+}
+
+/// Render a CLOS instance as `#<CLASSNAME>` without recursing into
+/// its metaclass (which would cycle). Given `p` is the
+/// vector-tagged-pointer payload (cell 0 = header, cell 1 = marker,
+/// cell 2 = class, cell 3 = slot-storage, cell 4 = signature).
+///
+/// The class itself is a CLOS instance whose slot[10] is its name
+/// (per `*standard-class-slot-names*`). We pull that out directly.
+/// If anything looks off we fall back to a bare `#<CLOS-INSTANCE>`.
+fn write_clos_instance(out: &mut String, p: *const u64) {
+    // cell layout in `p`: [header, marker, class, slots, signature]
+    let class = Word::from_raw(unsafe { *p.add(2) });
+    let name = clos_class_name(class);
+    out.push_str("#<");
+    match name {
+        Some(s) => out.push_str(&*s),
+        None => out.push_str("CLOS-INSTANCE"),
+    }
+    out.push('>');
+}
+
+/// Pull the class-name out of a class (itself a CLOS instance).
+/// Returns None if the class doesn't have the expected shape — we
+/// silently fall back to a generic label rather than crash. The
+/// shape assumed here is the post-bootstrap one defined in
+/// `the-defclass-standard-class`: slot vector cell 10 holds the
+/// class's name. We walk: class-ptr → slot-storage (vector at
+/// cell 3) → vector cell 11 (skip header).
+fn clos_class_name(class: Word) -> Option<Arc<str>> {
+    let p = class.as_ptr::<u64>(Tag::Vector)?;
+    let header = crate::heap::HeapHeader::from_raw(unsafe { *p });
+    if header.length_cells() != 4 {
+        return None;
+    }
+    let slots = Word::from_raw(unsafe { *p.add(3) });
+    let sp = slots.as_ptr::<u64>(Tag::Vector)?;
+    let sheader = crate::heap::HeapHeader::from_raw(unsafe { *sp });
+    if sheader.length_cells() < 11 {
+        return None;
+    }
+    let name = Word::from_raw(unsafe { *sp.add(1 + 10) });
+    if name.tag() != Tag::Symbol {
+        return None;
+    }
+    crate::sym_names::lookup(name.raw())
 }
 
 /// Print a string. Readable form wraps in `"..."` with `\` and `"`

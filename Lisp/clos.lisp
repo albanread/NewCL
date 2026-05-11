@@ -737,12 +737,18 @@
 ;; -- defclass macro --------------------------------------------------------
 
 (defmacro defclass (name direct-superclasses slot-definitions &rest options)
-  `(ensure-class ',name
-                 :direct-superclasses
-                 ,(canonicalize-direct-superclasses direct-superclasses)
-                 :direct-slots
-                 ,(canonicalize-direct-slots slot-definitions)
-                 ,@(canonicalize-defclass-options options)))
+  ;; Spec says defclass returns the class object. Our printer doesn't
+  ;; cycle-detect yet so returning the class crashes the REPL when its
+  ;; metaclass back-link is followed. Return the class NAME instead —
+  ;; defstruct does the same. Stage I (printer polish) lifts this.
+  `(progn
+     (ensure-class ',name
+                   :direct-superclasses
+                   ,(canonicalize-direct-superclasses direct-superclasses)
+                   :direct-slots
+                   ,(canonicalize-direct-slots slot-definitions)
+                   ,@(canonicalize-defclass-options options))
+     ',name))
 
 ;; -- ensure-class ----------------------------------------------------------
 ;;
@@ -956,18 +962,18 @@
    (direct-methods :initform nil)))
 (defclass class (specializer) ())
 
-;; Step 7: define the full standard-class via defclass. Re-point
-;; the global the-class-standard-class to this new value, then
-;; (step 8) update every existing class's class-of link to it.
-(setq the-class-standard-class
-      (defclass standard-class (class)
-        (direct-slots
-         effective-slots
-         (shared-slot-definitions :initform nil)
-         (shared-slots :initform nil)
-         (direct-default-initargs
-          :initform nil :initarg :direct-default-initargs)
-         (effective-default-initargs :initform nil))))
+;; Step 7: define the full standard-class via defclass, then
+;; re-point the global the-class-standard-class to the new
+;; class object (defclass returns the NAME, not the class).
+(defclass standard-class (class)
+  (direct-slots
+   effective-slots
+   (shared-slot-definitions :initform nil)
+   (shared-slots :initform nil)
+   (direct-default-initargs
+    :initform nil :initarg :direct-default-initargs)
+   (effective-default-initargs :initform nil)))
+(setq the-class-standard-class (find-class 'standard-class))
 
 ;; Step 8: every previously-allocated class instance still points
 ;; at the SKELETON standard-class from stage B; rewrite each one
@@ -1013,4 +1019,221 @@
 ;; Return a printable sentinel so Session::eval's last-value
 ;; format_word doesn't try to render a circular class instance
 ;; (printer cycle handling lands in stage I).
+
+;; ─── Stage D: make-instance + slot-value polish ────────────────────────────
+;;
+;; Closette splits instance creation across allocate-instance,
+;; make-instance, initialize-instance and shared-initialize, all
+;; eventually as generic functions. Stage D ships them as plain
+;; functions so they're usable now; Stage I (or later) re-defines
+;; the user-facing ones as generic-function-method tuples once
+;; defmethod exists.
+;;
+;; What we provide:
+;;   * slot-boundp / slot-makunbound / slot-exists-p
+;;   * std-allocate-instance + allocate-instance dispatch
+;;   * make-instance / initialize-instance / shared-initialize
+;;     (plain-function flavour)
+;;   * default-initargs handling on the class side
+;;   * with-slots (read + write via slot-value)
+;;   * with-accessors (calls user-named accessor functions)
+
+;; -- slot-boundp / -makunbound / -exists-p ---------------------------------
+
+(defun std-slot-boundp (instance slot-name)
+  (let ((class (class-of instance)))
+    (let ((location (slot-location class slot-name)))
+      (cond
+        (location
+         (not (eq secret-unbound-value
+                  (slot-contents (std-instance-slots instance) location))))
+        (t
+         (let ((sloc (shared-slot-location class slot-name)))
+           (cond
+             (sloc
+              (not (eq secret-unbound-value
+                       (car (slot-contents (class-shared-slots class) sloc)))))
+             (t (error "The slot ~A is missing from the class ~A."
+                       slot-name class)))))))))
+
+(defun slot-boundp (object slot-name)
+  (std-slot-boundp object slot-name))
+
+(defun std-slot-makunbound (instance slot-name)
+  (let ((class (class-of instance)))
+    (let ((location (slot-location class slot-name)))
+      (cond
+        (location
+         (setf (slot-contents (std-instance-slots instance) location)
+               secret-unbound-value))
+        (t
+         (let ((sloc (shared-slot-location class slot-name)))
+           (cond
+             (sloc
+              (setf (car (slot-contents (class-shared-slots class) sloc))
+                    secret-unbound-value))
+             (t (error "The slot ~A is missing from the class ~A."
+                       slot-name class))))))))
+  instance)
+
+(defun slot-makunbound (object slot-name)
+  (std-slot-makunbound object slot-name))
+
+(defun std-slot-exists-p (instance slot-name)
+  (not (null (find slot-name (class-effective-slots (class-of instance))
+                   :key #'slot-definition-name))))
+
+(defun slot-exists-p (object slot-name)
+  (std-slot-exists-p object slot-name))
+
+;; -- allocate-instance -----------------------------------------------------
+;;
+;; Closette's generic version dispatches on metaclass. We have no
+;; defgeneric yet so allocate-instance is a plain function that
+;; picks the standard path. Stage E or later upgrades this to a gf.
+
+(defun allocate-instance (class)
+  (std-allocate-instance class))
+
+;; -- default-initargs ------------------------------------------------------
+
+(defun class-default-initargs (class)
+  (slot-value class 'effective-default-initargs))
+
+(defun %setf-class-default-initargs (new-value class)
+  (setf (slot-value class 'effective-default-initargs) new-value))
+
+(defun class-direct-default-initargs (class)
+  (slot-value class 'direct-default-initargs))
+
+(defun %setf-class-direct-default-initargs (new-value class)
+  (setf (slot-value class 'direct-default-initargs) new-value))
+
+(defun compute-default-initargs (class)
+  "Walk the CPL once, collecting each class's direct-default-
+   initargs in turn. Earlier (more specific) wins on duplicates."
+  (let ((result nil))
+    (dolist (super (class-precedence-list class))
+      (dolist (entry (class-direct-default-initargs super))
+        (let ((key (car entry)))
+          (unless (member key result :key #'car)
+            (setq result (append result (list entry)))))))
+    result))
+
+;; -- shared-initialize -----------------------------------------------------
+;;
+;; Walks every effective slot of the instance's class. For each
+;; slot, checks whether any of its initargs appears in the
+;; supplied initargs plist; if so, uses that value. Otherwise, if
+;; the slot is in the SLOT-NAMES set (or SLOT-NAMES is T) and not
+;; already bound, evaluates the slot's initfunction.
+;;
+;; SLOT-NAMES = T   →   initialise every unbound slot from initform
+;; SLOT-NAMES = ()  →   skip initforms entirely
+;; otherwise         →   only initialise slots whose name appears
+
+(defun %lookup-initarg (initargs slot-initargs)
+  "Return (cons VALUE T) if any of SLOT-INITARGS is present as a
+   key in INITARGS (a plist), else NIL. cons-form so callers can
+   distinguish a found NIL value from absent."
+  (let ((result nil))
+    (block done
+      (dolist (key slot-initargs)
+        (let ((tail (member key initargs)))
+          (when tail
+            (setq result (cons (cadr tail) t))
+            (return-from done nil)))))
+    result))
+
+(defun shared-initialize (instance slot-names &rest all-keys)
+  (dolist (slot (class-effective-slots (class-of instance)))
+    (let* ((slot-name (slot-definition-name slot))
+           (slot-initargs (slot-definition-initargs slot))
+           (found (%lookup-initarg all-keys slot-initargs)))
+      (cond
+        (found
+         (setf (slot-value instance slot-name) (car found)))
+        (t
+         (when (and (not (slot-boundp instance slot-name))
+                    (not (null (slot-definition-initfunction slot)))
+                    (or (eq slot-names 't)
+                        (member slot-name slot-names)))
+           (setf (slot-value instance slot-name)
+                 (funcall (slot-definition-initfunction slot))))))))
+  instance)
+
+(defun initialize-instance (instance &rest all-keys)
+  (apply #'shared-initialize instance 't all-keys))
+
+(defun reinitialize-instance (instance &rest all-keys)
+  (apply #'shared-initialize instance nil all-keys))
+
+;; -- merge-default-initargs ------------------------------------------------
+
+(defun %merge-default-initargs (class initargs)
+  "Add each of CLASS's effective-default-initargs to INITARGS
+   only when no entry with the same key is already present.
+   Default initforms are funcalled lazily (their initfunction is
+   the third element of each (key value initfn) triple)."
+  (let ((result initargs))
+    (dolist (entry (class-default-initargs class))
+      (let ((key (car entry)))
+        (unless (member key result)
+          (let ((initfn (caddr entry)))
+            (setq result (append result
+                                 (list key (funcall initfn))))))))
+    result))
+
+;; -- make-instance ---------------------------------------------------------
+;;
+;; Plain-function form. Accepts either a class object or a class
+;; name (symbol). Effective-default-initargs are merged BEFORE
+;; passing the keys to initialize-instance — that's what the
+;; AMOP says, and Closette's late-stage make-instance gf does it
+;; too via shared-initialize's :default-initargs handling.
+
+(defun make-instance (class-or-name &rest initargs)
+  (let ((class (cond
+                 ((symbolp class-or-name) (find-class class-or-name))
+                 (t class-or-name))))
+    (let ((merged (%merge-default-initargs class initargs)))
+      (let ((instance (allocate-instance class)))
+        (apply #'initialize-instance instance merged)
+        instance))))
+
+;; -- with-slots ------------------------------------------------------------
+;;
+;; Vassili Bykov's classic shape: each binding name becomes a
+;; symbol-macro (here: a let-binding for the read form, plus a
+;; setf-method indirection). We don't have define-symbol-macro
+;; yet, so simulate by expanding (with-slots (a b) instance . body)
+;; into (let ((a (slot-value instance 'a)) (b (slot-value instance 'b)))
+;;        body...)
+;; — read-only. A future stage can promote to symbol-macros.
+
+(defmacro with-slots (slot-bindings instance-form &rest body)
+  (let ((inst-var (gensym "INSTANCE-")))
+    `(let ((,inst-var ,instance-form))
+       (let ,(mapcar
+              (lambda (b)
+                (cond
+                  ((symbolp b)
+                   `(,b (slot-value ,inst-var ',b)))
+                  (t
+                   `(,(car b) (slot-value ,inst-var ',(cadr b))))))
+              slot-bindings)
+         ,@body))))
+
+(defmacro with-accessors (accessor-bindings instance-form &rest body)
+  "Read-only flavour — bind each name to the call of its accessor
+   function on INSTANCE-FORM."
+  (let ((inst-var (gensym "INSTANCE-")))
+    `(let ((,inst-var ,instance-form))
+       (let ,(mapcar
+              (lambda (b)
+                `(,(car b) (,(cadr b) ,inst-var)))
+              accessor-bindings)
+         ,@body))))
+
+;; Return a printable sentinel.
 nil
