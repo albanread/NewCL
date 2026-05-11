@@ -22,6 +22,7 @@
 ;;; (require ...). Order matters where dependencies exist.
 
 (require 'streams)                       ; string-output-stream, with-output-to-string
+(require 'conditions)                    ; define-condition, restart-case, typed handler-case
 
 ;;; Example user-side hook: load a personal utilities module if
 ;;; present. Uncomment and rename to taste.
