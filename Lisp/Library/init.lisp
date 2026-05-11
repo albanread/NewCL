@@ -16,8 +16,15 @@
 ;;;; loaded automatically. Modules are loaded exactly once per
 ;;;; session (REQUIRE checks *modules*).
 
-;;; Example: load a personal utilities module if present.
-;;; Uncomment and rename to taste.
+;;; ─── Standard Library modules ────────────────────────────────────────────
+;;; Tier-1-and-beyond modules layered on top of core+CLOS. Each
+;;; lives in its own Library/foo.lisp and is loaded once via
+;;; (require ...). Order matters where dependencies exist.
+
+(require 'streams)                       ; string-output-stream, with-output-to-string
+
+;;; Example user-side hook: load a personal utilities module if
+;;; present. Uncomment and rename to taste.
 ;; (require 'my-utils)
 
 ;;; A user can verify the loader picked this file up by checking
