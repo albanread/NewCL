@@ -21,7 +21,7 @@ use crate::word::{Tag, Word};
 /// entry function, and the entry function threads it through every
 /// call.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_alloc_cons(mutator: *mut MutatorState, car: u64, cdr: u64) -> u64 {
+pub extern "C-unwind" fn ncl_alloc_cons(mutator: *mut MutatorState, car: u64, cdr: u64) -> u64 {
     let m = unsafe { &mut *mutator };
     let car_w = Word::from_raw(car);
     let cdr_w = Word::from_raw(cdr);
@@ -35,7 +35,7 @@ pub extern "C" fn ncl_alloc_cons(mutator: *mut MutatorState, car: u64, cdr: u64)
 /// SAFETY: `cons` is a Cons-tagged `Word` OR `nil`. (CL spec:
 /// `(car nil) = (cdr nil) = nil`.)
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_car(cons: u64) -> u64 {
+pub extern "C-unwind" fn ncl_car(cons: u64) -> u64 {
     let w = Word::from_raw(cons);
     if w.is_nil() {
         return Word::NIL.raw();
@@ -46,7 +46,7 @@ pub extern "C" fn ncl_car(cons: u64) -> u64 {
 
 /// Read the cdr field of a cons cell. As `ncl_car` but at offset 1.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_cdr(cons: u64) -> u64 {
+pub extern "C-unwind" fn ncl_cdr(cons: u64) -> u64 {
     let w = Word::from_raw(cons);
     if w.is_nil() {
         return Word::NIL.raw();
@@ -84,7 +84,7 @@ pub extern "C-unwind" fn ncl_load_value(
 /// call here. Returns the stored value (CL's `setq` returns the
 /// last value assigned).
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_store_value(
+pub extern "C-unwind" fn ncl_store_value(
     mutator: *mut crate::mutator::MutatorState,
     sym_word: u64,
     new_value: u64,
@@ -98,7 +98,7 @@ pub extern "C" fn ncl_store_value(
 /// Length of a String or proper list (in codepoints / cons cells).
 /// JIT'd `(length …)` lowers to a call here. Polymorphic on tag.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_length(w: u64) -> u64 {
+pub extern "C-unwind" fn ncl_length(w: u64) -> u64 {
     let word = Word::from_raw(w);
     if word.is_nil() {
         return Word::fixnum(0).raw();
@@ -159,7 +159,7 @@ fn set_vector_cell(
 /// strings codepoint-by-codepoint, falls back to eq for atoms.
 /// JIT'd `(equal a b)` lowers to a call here.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_equal(a: u64, b: u64) -> u64 {
+pub extern "C-unwind" fn ncl_equal(a: u64, b: u64) -> u64 {
     if equal_recursive(Word::from_raw(a), Word::from_raw(b)) {
         Word::T.raw()
     } else {
@@ -197,7 +197,7 @@ fn equal_recursive(a: Word, b: Word) -> bool {
 /// String equality. Both args must be Tag::String. Returns Word::T
 /// or Word::NIL.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_string_eq(a: u64, b: u64) -> u64 {
+pub extern "C-unwind" fn ncl_string_eq(a: u64, b: u64) -> u64 {
     let wa = Word::from_raw(a);
     let wb = Word::from_raw(b);
     if wa.tag() != Tag::String || wb.tag() != Tag::String {
@@ -213,7 +213,7 @@ pub extern "C" fn ncl_string_eq(a: u64, b: u64) -> u64 {
 /// Read the i-th codepoint of a string as a character Word.
 /// `(char s i)` and `(aref s i)` both lower here for strings.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_string_char(s: u64, idx: u64) -> u64 {
+pub extern "C-unwind" fn ncl_string_char(s: u64, idx: u64) -> u64 {
     let ws = Word::from_raw(s);
     if ws.tag() != Tag::String {
         panic!("string-char: argument must be a string");
@@ -317,7 +317,7 @@ pub extern "C-unwind" fn ncl_funcall(
 /// expression in outer scope, packs the values into a stack
 /// buffer, and calls here to materialise the function value.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_make_closure(
+pub extern "C-unwind" fn ncl_make_closure(
     mutator: *mut crate::mutator::MutatorState,
     code_ptr: u64,
     arity: u64,
@@ -372,7 +372,7 @@ pub extern "C" fn ncl_make_closure(
 /// inter-generational scan picks up any old→young pointer this
 /// store may have created.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_set_car(
+pub extern "C-unwind" fn ncl_set_car(
     mutator: *mut crate::mutator::MutatorState,
     cons: u64,
     new_value: u64,
@@ -390,7 +390,7 @@ pub extern "C" fn ncl_set_car(
 /// Mutate the cdr field of a cons cell. As `ncl_set_car` but at
 /// offset 1.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_set_cdr(
+pub extern "C-unwind" fn ncl_set_cdr(
     mutator: *mut crate::mutator::MutatorState,
     cons: u64,
     new_value: u64,
@@ -976,7 +976,7 @@ pub extern "C-unwind" fn ncl_apply(
 /// Allocation goes through the mutator's TLAB, so the resulting
 /// list lives in the young heap and participates in normal GC.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_build_rest_list(
+pub extern "C-unwind" fn ncl_build_rest_list(
     mutator: *mut crate::mutator::MutatorState,
     args: *const u64,
     start: u64,
@@ -1003,7 +1003,7 @@ pub extern "C" fn ncl_build_rest_list(
 /// No write barrier: strings hold scalar codepoints, so a string
 /// store can never create an old→young pointer.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_string_set(s: u64, idx: u64, ch: u64) -> u64 {
+pub extern "C-unwind" fn ncl_string_set(s: u64, idx: u64, ch: u64) -> u64 {
     let ws = Word::from_raw(s);
     if ws.tag() != Tag::String {
         panic!("(setf (aref string ...)): argument is not a string: {ws:?}");
@@ -1340,7 +1340,7 @@ pub extern "C-unwind" fn mv_clear_shim(
 /// EnsureSingleMv epilogue around any function body whose tail
 /// expression isn't `(values ...)`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_set_mv_single(v: u64) {
+pub extern "C-unwind" fn ncl_set_mv_single(v: u64) {
     MV_VALUES.with(|cell| {
         let mut b = cell.borrow_mut();
         b.clear();
@@ -1353,7 +1353,7 @@ pub extern "C" fn ncl_set_mv_single(v: u64) {
 ///
 /// SAFETY: `args` must point to at least `n` valid `u64`s.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_set_mv_many(args: *const u64, n: u64) {
+pub extern "C-unwind" fn ncl_set_mv_many(args: *const u64, n: u64) {
     MV_VALUES.with(|cell| {
         let mut b = cell.borrow_mut();
         b.clear();
@@ -1456,7 +1456,7 @@ thread_local! {
 /// pending; 0 otherwise. Lowered as an inline call after every
 /// Expr::Call / Funcall / Apply.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_abort_pending() -> i32 {
+pub extern "C-unwind" fn ncl_abort_pending() -> i32 {
     if ABORT_PENDING.with(|c| c.get()) {
         1
     } else {
@@ -1841,7 +1841,7 @@ pub extern "C-unwind" fn vector_shim(
 /// Words. `v` must be Vector- or String-tagged for the dispatch
 /// to make sense.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_aref_generic(v: u64, i: u64) -> u64 {
+pub extern "C-unwind" fn ncl_aref_generic(v: u64, i: u64) -> u64 {
     let vw = Word::from_raw(v);
     let iw = Word::from_raw(i);
     let idx = match iw.as_fixnum() {
@@ -1866,7 +1866,7 @@ pub extern "C" fn ncl_aref_generic(v: u64, i: u64) -> u64 {
 /// dispatch. Returns `val`. Card-marks for vectors (strings have
 /// their own GC story).
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_aset_generic(
+pub extern "C-unwind" fn ncl_aset_generic(
     mutator: *mut crate::mutator::MutatorState,
     v: u64,
     i: u64,
@@ -1908,7 +1908,7 @@ pub extern "C" fn ncl_aset_generic(
 ///
 /// SAFETY: `args` must point to at least `n_args` valid `u64`s.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_lookup_keyword(
+pub extern "C-unwind" fn ncl_lookup_keyword(
     args: *const u64,
     key_start: u64,
     n_args: u64,

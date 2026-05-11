@@ -199,6 +199,7 @@ name = "ncl-llvm"
 version = "0.0.0"
 dependencies = [
  "inkwell",
+ "llvm-sys",
  "ncl-ir",
  "ncl-runtime",
 ]

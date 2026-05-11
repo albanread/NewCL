@@ -22,7 +22,9 @@ use inkwell::context::Context;
 use inkwell::execution_engine::{ExecutionEngine, JitFunction};
 use inkwell::module::{Linkage, Module};
 use inkwell::attributes::AttributeLoc;
-use inkwell::values::{FunctionValue, IntValue};
+use inkwell::values::{AsValueRef, FunctionValue, IntValue};
+
+pub(crate) mod jit_mm;
 
 use ncl_ir::Expr;
 use ncl_runtime::{
@@ -125,8 +127,13 @@ pub fn jit_add(a: i64, b: i64) -> Result<i64, String> {
 /// a tagged `Word`.
 pub fn jit_eval(expr: &Expr, mutator: *mut MutatorState) -> Result<Word, String> {
     let code = build_lisp_function(expr, 0)?;
+    // C-unwind so a Rust panic raised in a runtime helper can
+    // propagate through the JIT frame back to whatever
+    // catch_unwind boundary called us. Without -unwind, Rust 1.71+
+    // inserts a __fastfail (STATUS_STACK_BUFFER_OVERRUN) when a
+    // panic escapes the extern "C" boundary.
     type EntryFn =
-        unsafe extern "C" fn(*mut MutatorState, u64, *const u64, u64) -> u64;
+        unsafe extern "C-unwind" fn(*mut MutatorState, u64, *const u64, u64) -> u64;
     let f: EntryFn = unsafe { std::mem::transmute(code) };
     Ok(Word::from_raw(unsafe {
         f(mutator, Word::NIL.raw(), std::ptr::null(), 0)
@@ -170,8 +177,13 @@ fn build_lisp_function(body: &Expr, arity: u32) -> Result<usize, String> {
     // the JIT frame to the matching `handler-case`. Without this
     // the unwinder hits the JIT frame and the panic escapes to the
     // OS (MSVC SEH 0xe06d7363 = "C++ exception not caught").
+    // uwtable=2 emits async (full) unwind tables — usable at any PC,
+    // not only call sites. uwtable=1 is enough for synchronous
+    // panic-at-call-site unwinds but LLVM 22 sometimes elides
+    // unwind info for "leaf-ish" sequences with =1; =2 is the safe
+    // setting for code that may be unwound through.
     let kind_id = inkwell::attributes::Attribute::get_named_enum_kind_id("uwtable");
-    let attr = context.create_enum_attribute(kind_id, 1);
+    let attr = context.create_enum_attribute(kind_id, 2);
     function.add_attribute(AttributeLoc::Function, attr);
     let entry_block = context.append_basic_block(function, "entry");
     builder.position_at_end(entry_block);
@@ -192,19 +204,196 @@ fn build_lisp_function(body: &Expr, arity: u32) -> Result<usize, String> {
         .build_return(Some(&result))
         .map_err(|e| format!("build_return: {e}"))?;
 
-    let engine = module
-        .create_jit_execution_engine(OptimizationLevel::None)
-        .map_err(|e| format!("create_jit_execution_engine: {e}"))?;
-    register_runtime_helpers(&engine, &helpers);
+    // Debug aid: `NCL_DUMP_IR=1` writes the LLVM IR for every
+    // JIT'd module to ncl-dump.<n>.ll. Lets us audit attributes
+    // (`uwtable`, calling convention, etc.) and produce object
+    // files for `dumpbin /unwindinfo` validation of SEH unwind
+    // info emission. Not for production builds; the path is
+    // process-relative and the file gets overwritten module by
+    // module. Counter is per-process via an atomic.
+    if std::env::var_os("NCL_DUMP_IR").is_some() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let idx = N.fetch_add(1, Ordering::Relaxed);
+        let ll_path = std::path::PathBuf::from(format!("ncl-dump.{idx:03}.ll"));
+        if let Err(e) = module.print_to_file(&ll_path) {
+            eprintln!("[ncl-llvm] IR dump failed: {e}");
+        }
+        // Also emit the object file via TargetMachine so the user
+        // can `dumpbin /unwindinfo` and verify .pdata is populated
+        // (i.e. that uwtable on the IR side actually produced unwind
+        // tables in the emitted COFF object).
+        use inkwell::targets::{
+            CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
+            TargetTriple,
+        };
+        Target::initialize_native(&InitializationConfig::default())
+            .expect("initialize_native");
+        let triple = TargetMachine::get_default_triple();
+        if let Ok(target) = Target::from_triple(&triple) {
+            let tm = target
+                .create_target_machine(
+                    &triple,
+                    "generic",
+                    "",
+                    OptimizationLevel::None,
+                    RelocMode::PIC,
+                    CodeModel::Default,
+                )
+                .expect("create_target_machine");
+            let obj_path = std::path::PathBuf::from(format!("ncl-dump.{idx:03}.obj"));
+            if let Err(e) = tm.write_to_file(&module, FileType::Object, &obj_path) {
+                eprintln!("[ncl-llvm] obj emit failed: {e}");
+            }
+            // Quiet unused warning for TargetTriple in this scope.
+            let _ = TargetTriple::create("");
+        }
+    }
 
-    let addr = engine
-        .get_function_address("the_fn")
-        .map_err(|e| format!("get_function_address: {e}"))?;
+    // Build the MCJIT engine ourselves via llvm-sys so we can pass
+    // a custom memory manager that captures .pdata/.xdata/.text and
+    // registers Windows SEH unwind tables on finalize. inkwell 0.9
+    // doesn't expose the `MCJMM` slot on `LLVMMCJITCompilerOptions`,
+    // so we drop one layer down. The trade-off is that we no longer
+    // get back an `inkwell::ExecutionEngine` — we hold a raw
+    // `LLVMExecutionEngineRef` and call `LLVMAddGlobalMapping` /
+    // `LLVMGetFunctionAddress` directly. We leak both the module
+    // and the engine to match the existing `keep_forever` contract.
+    let addr = build_engine_and_get_fn_addr(&module, &helpers, "the_fn")?;
 
     let _ = keep_forever(module);
-    let _ = keep_forever(engine);
-
     Ok(addr)
+}
+
+/// Construct an MCJIT engine over `module` with our JIT memory
+/// manager, bind all runtime helpers via `LLVMAddGlobalMapping`,
+/// and return the machine-code address of `fn_name`. The engine
+/// is intentionally leaked — the loader holds JIT'd code forever
+/// in v1.
+fn build_engine_and_get_fn_addr(
+    module: &Module<'_>,
+    helpers: &Helpers<'_>,
+    fn_name: &str,
+) -> Result<usize, String> {
+    use llvm_sys::execution_engine::{
+        LLVMAddGlobalMapping, LLVMCreateMCJITCompilerForModule,
+        LLVMExecutionEngineRef, LLVMGetFunctionAddress, LLVMInitializeMCJITCompilerOptions,
+        LLVMLinkInMCJIT, LLVMMCJITCompilerOptions,
+    };
+
+    // First-time MCJIT setup. Calling these more than once is
+    // documented as a no-op. inkwell's `create_jit_execution_engine`
+    // does these internally; we dropped one layer down so we have
+    // to do them ourselves.
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        use inkwell::targets::{InitializationConfig, Target};
+        unsafe {
+            LLVMLinkInMCJIT();
+        }
+        Target::initialize_native(&InitializationConfig::default())
+            .expect("Target::initialize_native");
+    });
+
+    // Initialise an options struct, drop in our custom memory mgr.
+    let mut opts: LLVMMCJITCompilerOptions = unsafe { std::mem::zeroed() };
+    unsafe {
+        LLVMInitializeMCJITCompilerOptions(
+            &mut opts,
+            std::mem::size_of::<LLVMMCJITCompilerOptions>(),
+        );
+    }
+    opts.MCJMM = unsafe { jit_mm::make_mm() };
+
+    let mut engine: LLVMExecutionEngineRef = std::ptr::null_mut();
+    let mut err_msg: *mut std::ffi::c_char = std::ptr::null_mut();
+    let rc = unsafe {
+        LLVMCreateMCJITCompilerForModule(
+            &mut engine,
+            module.as_mut_ptr(),
+            &mut opts,
+            std::mem::size_of::<LLVMMCJITCompilerOptions>(),
+            &mut err_msg,
+        )
+    };
+    if rc != 0 || engine.is_null() {
+        let msg = if err_msg.is_null() {
+            "LLVMCreateMCJITCompilerForModule failed with no message".to_string()
+        } else {
+            let s = unsafe { std::ffi::CStr::from_ptr(err_msg) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { llvm_sys::core::LLVMDisposeMessage(err_msg) };
+            s
+        };
+        return Err(format!("LLVMCreateMCJITCompilerForModule: {msg}"));
+    }
+
+    // Bind every runtime helper. The pattern: each Helpers field
+    // is an inkwell FunctionValue whose underlying LLVMValueRef we
+    // hand to LLVMAddGlobalMapping along with the host function
+    // pointer's numeric address.
+    unsafe fn bind(
+        engine: LLVMExecutionEngineRef,
+        f: inkwell::values::FunctionValue<'_>,
+        addr: usize,
+    ) {
+        unsafe {
+            LLVMAddGlobalMapping(engine, f.as_value_ref(), addr as *mut std::ffi::c_void);
+        }
+    }
+    unsafe {
+        bind(engine, helpers.alloc_cons, ncl_alloc_cons as usize);
+        bind(engine, helpers.call_fn, ncl_call as usize);
+        bind(engine, helpers.funcall_fn, ncl_funcall as usize);
+        bind(engine, helpers.make_closure, ncl_make_closure as usize);
+        bind(engine, helpers.load_value, ncl_load_value as usize);
+        bind(engine, helpers.load_function, ncl_load_function as usize);
+        bind(engine, helpers.store_value, ncl_store_value as usize);
+        bind(engine, helpers.length, ncl_length as usize);
+        bind(engine, helpers.equal, ncl_equal as usize);
+        bind(engine, helpers.string_eq, ncl_string_eq as usize);
+        bind(engine, helpers.string_char, ncl_string_char as usize);
+        bind(engine, helpers.set_car, ncl_set_car as usize);
+        bind(engine, helpers.set_cdr, ncl_set_cdr as usize);
+        bind(engine, helpers.string_set, ncl_string_set as usize);
+        bind(engine, helpers.build_rest_list, ncl_build_rest_list as usize);
+        bind(engine, helpers.apply, ncl_apply as usize);
+        bind(engine, helpers.lookup_keyword, ncl_lookup_keyword as usize);
+        bind(engine, helpers.set_mv_single, ncl_set_mv_single as usize);
+        bind(engine, helpers.set_mv_many, ncl_set_mv_many as usize);
+        bind(engine, helpers.aref_generic, ncl_aref_generic as usize);
+        bind(engine, helpers.aset_generic, ncl_aset_generic as usize);
+        bind(engine, helpers.abort_pending, ncl_abort_pending as usize);
+        bind(engine, helpers.add_promote, ncl_add_complex as usize);
+        bind(engine, helpers.sub_promote, ncl_sub_complex as usize);
+        bind(engine, helpers.mul_promote, ncl_mul_complex as usize);
+        bind(engine, helpers.truncate_promote, ncl_truncate_promote as usize);
+        bind(engine, helpers.rem_promote, ncl_rem_promote as usize);
+        bind(engine, helpers.cmp_int, ncl_cmp_full as usize);
+    }
+    // sadd/ssub/smul.with.overflow are LLVM intrinsics — LLVM
+    // resolves them itself, no mapping needed.
+
+    // Force code emission + finalize (this is what triggers our
+    // memory manager's `finalize_memory` callback and therefore the
+    // SEH registration). LLVMGetFunctionAddress is the canonical
+    // trigger.
+    let fn_name_cstr =
+        std::ffi::CString::new(fn_name).expect("fn_name has no interior NUL");
+    let raw_addr = unsafe { LLVMGetFunctionAddress(engine, fn_name_cstr.as_ptr()) };
+    if raw_addr == 0 {
+        return Err(format!("LLVMGetFunctionAddress({fn_name}) returned 0"));
+    }
+
+    // Leak the engine. Drop would call LLVMDisposeExecutionEngine
+    // which tears down our memory manager and unregisters nothing
+    // — we'd be left with stale SEH function tables in the OS.
+    let engine_box = Box::new(engine);
+    let _ = Box::leak(engine_box);
+
+    Ok(raw_addr as usize)
 }
 
 struct Helpers<'ctx> {
@@ -1942,7 +2131,7 @@ mod tests {
         let mut m = coord.register_mutator();
         let body = Expr::Param(0);
         let code = jit_compile_function(1, &body).unwrap();
-        type Fn1 = unsafe extern "C" fn(*mut MutatorState, u64, *const u64, u64) -> u64;
+        type Fn1 = unsafe extern "C-unwind" fn(*mut MutatorState, u64, *const u64, u64) -> u64;
         let f: Fn1 = unsafe { std::mem::transmute(code) };
         let arg = Word::fixnum(42).raw();
         let r = unsafe { f(&mut m as *mut _, Word::NIL.raw(), &arg as *const u64, 1) };
@@ -1956,7 +2145,7 @@ mod tests {
         let mut m = coord.register_mutator();
         let body = Expr::add(Expr::Param(0), Expr::Param(0));
         let code = jit_compile_function(1, &body).unwrap();
-        type Fn1 = unsafe extern "C" fn(*mut MutatorState, u64, *const u64, u64) -> u64;
+        type Fn1 = unsafe extern "C-unwind" fn(*mut MutatorState, u64, *const u64, u64) -> u64;
         let f: Fn1 = unsafe { std::mem::transmute(code) };
         let arg = Word::fixnum(21).raw();
         let r = unsafe { f(&mut m as *mut _, Word::NIL.raw(), &arg as *const u64, 1) };

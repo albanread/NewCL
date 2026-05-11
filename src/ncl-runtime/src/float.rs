@@ -137,7 +137,7 @@ pub fn float_to_string(f: f64) -> String {
 /// If neither operand is real, falls through to bignum's add
 /// promote, which signals on non-integers.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_add_float(
+pub extern "C-unwind" fn ncl_add_float(
     mutator: *mut MutatorState,
     a_raw: u64,
     b_raw: u64,
@@ -160,7 +160,7 @@ pub extern "C" fn ncl_add_float(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_sub_float(
+pub extern "C-unwind" fn ncl_sub_float(
     mutator: *mut MutatorState,
     a_raw: u64,
     b_raw: u64,
@@ -180,7 +180,7 @@ pub extern "C" fn ncl_sub_float(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_mul_float(
+pub extern "C-unwind" fn ncl_mul_float(
     mutator: *mut MutatorState,
     a_raw: u64,
     b_raw: u64,
@@ -204,7 +204,7 @@ pub extern "C" fn ncl_mul_float(
 /// truncated-toward-zero quotient as an integer (matching `truncate`
 /// for now — proper ratios land with Tier 2.B).
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_div_promote(
+pub extern "C-unwind" fn ncl_div_promote(
     mutator: *mut MutatorState,
     a_raw: u64,
     b_raw: u64,
@@ -237,7 +237,7 @@ pub extern "C" fn ncl_div_promote(
 /// the bignum-aware `ncl_cmp_int` when either operand is a float;
 /// for integer-only inputs the bignum path handles it directly.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_cmp_real(a_raw: u64, b_raw: u64) -> i64 {
+pub extern "C-unwind" fn ncl_cmp_real(a_raw: u64, b_raw: u64) -> i64 {
     let a = Word::from_raw(a_raw);
     let b = Word::from_raw(b_raw);
     // Both floats — direct compare. (Total order, NaN handling

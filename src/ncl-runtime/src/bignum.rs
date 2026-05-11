@@ -161,7 +161,7 @@ pub fn bigint_to_word(m: &mut MutatorState, n: &BigInt) -> Word {
 /// `(+ a b)` slow path. Called from the JIT when the inline fixnum
 /// add overflowed, OR when either operand is a bignum.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_add_promote(
+pub extern "C-unwind" fn ncl_add_promote(
     mutator: *mut MutatorState,
     a_raw: u64,
     b_raw: u64,
@@ -181,7 +181,7 @@ pub extern "C" fn ncl_add_promote(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_sub_promote(
+pub extern "C-unwind" fn ncl_sub_promote(
     mutator: *mut MutatorState,
     a_raw: u64,
     b_raw: u64,
@@ -195,7 +195,7 @@ pub extern "C" fn ncl_sub_promote(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_mul_promote(
+pub extern "C-unwind" fn ncl_mul_promote(
     mutator: *mut MutatorState,
     a_raw: u64,
     b_raw: u64,
@@ -219,7 +219,7 @@ pub extern "C" fn ncl_mul_promote(
 /// lot of pre-existing library code that uses `=` opportunistically
 /// on tagged words.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_cmp_int(
+pub extern "C-unwind" fn ncl_cmp_int(
     a_raw: u64,
     b_raw: u64,
 ) -> i64 {
@@ -327,7 +327,7 @@ pub fn alloc_bignum_in_static(
 /// pathway) — the JIT slow path will then unwind through the
 /// abort-pending mechanism.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_truncate_promote(
+pub extern "C-unwind" fn ncl_truncate_promote(
     mutator: *mut MutatorState,
     a_raw: u64,
     b_raw: u64,
@@ -348,7 +348,7 @@ pub extern "C" fn ncl_truncate_promote(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_rem_promote(
+pub extern "C-unwind" fn ncl_rem_promote(
     mutator: *mut MutatorState,
     a_raw: u64,
     b_raw: u64,
@@ -369,7 +369,7 @@ pub extern "C" fn ncl_rem_promote(
 /// Floor division — rounds toward negative infinity. Returns
 /// quotient.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_floor_promote(
+pub extern "C-unwind" fn ncl_floor_promote(
     mutator: *mut MutatorState,
     a_raw: u64,
     b_raw: u64,
@@ -390,7 +390,7 @@ pub extern "C" fn ncl_floor_promote(
 
 /// Floor remainder (mod). Always has the same sign as the divisor.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_mod_promote(
+pub extern "C-unwind" fn ncl_mod_promote(
     mutator: *mut MutatorState,
     a_raw: u64,
     b_raw: u64,

@@ -239,6 +239,13 @@ impl GcCoordinator {
     fn deregister(&self, handle: &Arc<MutatorHandle>) {
         let mut state = self.park_state.lock().unwrap();
         state.handles.retain(|h| !Arc::ptr_eq(h, handle));
+        // A GC trigger could be waiting on parked_count to catch up
+        // to (total - 1). If the deregistering thread was one of
+        // the threads the trigger was waiting on, we owe it a wake
+        // so it re-evaluates `target` against the now-smaller handle
+        // set.
+        drop(state);
+        self.park_cv.notify_all();
     }
 
     pub fn used_bytes(&self) -> usize {
@@ -431,16 +438,20 @@ impl MutatorState {
         // through safe points without parking.
         self.coord.stop_requested.store(true, Ordering::Release);
 
-        // Wait for every other mutator to park.
+        // Wait for every other live mutator to park. `target` has
+        // to be recomputed each pass — mutators deregistering on
+        // their way out shrink the live set, and we'd otherwise
+        // wait for a parked-count that's no longer achievable.
+        // `deregister` posts to park_cv to wake us in that case.
         let other_handles: Vec<Arc<MutatorHandle>> = {
             let mut state = self.coord.park_state.lock().unwrap();
-            let total = state.handles.len();
-            // We are not parked; we're total - 1 from done.
-            let target = total.saturating_sub(1);
-            while state.parked_count < target {
+            loop {
+                let target = state.handles.len().saturating_sub(1);
+                if state.parked_count >= target {
+                    break;
+                }
                 state = self.coord.park_cv.wait(state).unwrap();
             }
-            // Snapshot of other handles for root scanning.
             state
                 .handles
                 .iter()

@@ -198,7 +198,7 @@ fn parts(w: Word) -> (Word, Word) {
 /// `(a+bi) + (c+di) = (a+c) + (b+d)i`. The `make_complex` call
 /// auto-demotes when the imag part is an exact zero — so adding
 /// `1 + 0i` to `2 + 0i` returns the real `3`.
-pub extern "C" fn ncl_add_complex(
+pub extern "C-unwind" fn ncl_add_complex(
     mutator: *mut MutatorState,
     a_raw: u64,
     b_raw: u64,
@@ -216,7 +216,7 @@ pub extern "C" fn ncl_add_complex(
     make_complex(m, re, im).raw()
 }
 
-pub extern "C" fn ncl_sub_complex(
+pub extern "C-unwind" fn ncl_sub_complex(
     mutator: *mut MutatorState,
     a_raw: u64,
     b_raw: u64,
@@ -235,7 +235,7 @@ pub extern "C" fn ncl_sub_complex(
 }
 
 /// `(a+bi)(c+di) = (ac − bd) + (ad + bc)i`.
-pub extern "C" fn ncl_mul_complex(
+pub extern "C-unwind" fn ncl_mul_complex(
     mutator: *mut MutatorState,
     a_raw: u64,
     b_raw: u64,
@@ -259,7 +259,7 @@ pub extern "C" fn ncl_mul_complex(
 
 /// `(a+bi) / (c+di) = ((ac + bd) + (bc − ad)i) / (c² + d²)`.
 /// Signals on division by exact zero (c² + d² == 0 in rational).
-pub extern "C" fn ncl_div_complex(
+pub extern "C-unwind" fn ncl_div_complex(
     mutator: *mut MutatorState,
     a_raw: u64,
     b_raw: u64,

@@ -99,10 +99,6 @@ fn ensure_main_thread_record() {
 struct ThreadEntry {
     #[allow(dead_code)]
     id: i64,
-    /// Set to None after `join` is taken. For threads not spawned
-    /// via `create-thread` (e.g. the main thread, the iGui thread)
-    /// this stays None forever.
-    handle: Mutex<Option<JoinHandle<()>>>,
     /// Cooperative termination request. Checked at safepoints.
     terminate_requested: AtomicBool,
     /// Cooperative suspend request. Checked at safepoints.
@@ -112,6 +108,14 @@ struct ThreadEntry {
     suspend_cv: Condvar,
     /// If true, print a line to stderr when this thread terminates.
     report_when_finished: AtomicBool,
+    /// Set to true by the spawn-thunk right before it returns. A
+    /// (join-thread tid) before this becomes true blocks; after,
+    /// it returns immediately.
+    finished: AtomicBool,
+    /// Condvar broadcast when `finished` flips, so `join-thread`
+    /// can wait without spinning.
+    finish_mu: Mutex<()>,
+    finish_cv: Condvar,
     #[allow(dead_code)]
     name: String,
 }
@@ -119,14 +123,25 @@ struct ThreadEntry {
 fn new_entry(id: i64, name: &str) -> Arc<ThreadEntry> {
     Arc::new(ThreadEntry {
         id,
-        handle: Mutex::new(None),
         terminate_requested: AtomicBool::new(false),
         suspend_requested: AtomicBool::new(false),
         suspend_mu: Mutex::new(()),
         suspend_cv: Condvar::new(),
         report_when_finished: AtomicBool::new(false),
+        finished: AtomicBool::new(false),
+        finish_mu: Mutex::new(()),
+        finish_cv: Condvar::new(),
         name: name.to_string(),
     })
+}
+
+/// JoinHandles live in a separate map from ThreadEntry so the entry
+/// can be reaped on thread exit while the handle stays available
+/// for a later `(join-thread tid)`. Removed by the call to
+/// `join_thread` itself.
+fn join_handles() -> &'static Mutex<HashMap<i64, JoinHandle<()>>> {
+    static H: OnceLock<Mutex<HashMap<i64, JoinHandle<()>>>> = OnceLock::new();
+    H.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 struct ThreadRegistry {
@@ -163,14 +178,38 @@ fn unregister(id: i64) {
 
 // ─── exit-thread sentinel ───────────────────────────────────────────────
 
-// (We do NOT unwind through JIT'd Lisp frames.) Rust panics on
-// Windows are implemented over SEH; our JIT (LLVM) doesn't yet
-// emit the unwind tables that would let a panic propagate cleanly
-// past a JIT'd frame, so an exit-thread / terminate-thread that
-// panicked from deep inside a Lisp call would take the whole
-// process down with E06D7363. v1 therefore keeps both calls
-// purely cooperative: they set a flag, and the target thread
-// observes it the next time it calls (thread-safepoint).
+// `exit-thread` is implemented via `panic_any` with an
+// ExitThreadPayload sentinel. SEH tables are registered for
+// every JIT'd Lisp function (see ncl-llvm/src/jit_mm.rs) so the
+// panic unwinds back through any depth of JIT frames to the
+// spawn thunk's `catch_unwind`. `terminate-thread` (from another
+// thread) is cooperative: it flags the target's ThreadEntry, and
+// the next `(thread-safepoint)` call panics from inside the
+// target thread.
+
+struct ExitThreadPayload {
+    #[allow(dead_code)]
+    condition_raw: u64,
+}
+
+/// Install a panic hook on first use that silences the default
+/// "thread '...' panicked at ...: Box<dyn Any>" stderr line when
+/// the payload is our ExitThreadPayload sentinel. The unwind path
+/// still proceeds normally; we just spare the user the spurious
+/// noise on a clean `(exit-thread)`. Other panics (real bugs)
+/// fall through to the default hook.
+fn install_quiet_panic_hook() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if info.payload().downcast_ref::<ExitThreadPayload>().is_some() {
+                return;
+            }
+            prev(info);
+        }));
+    });
+}
 
 // ─── create-thread ──────────────────────────────────────────────────────
 
@@ -195,6 +234,7 @@ pub fn create_thread(
     report_when_finished: bool,
 ) -> i64 {
     ensure_main_thread_record();
+    install_quiet_panic_hook();
     let coord = Arc::clone(caller.coord());
     let id = alloc_thread_id();
     let entry = new_entry(id, &format!("ncl-thread-{id}"));
@@ -216,9 +256,11 @@ pub fn create_thread(
             let mptr: *mut MutatorState = &mut *m;
 
             // The user-supplied closure is called via the standard
-            // Lisp ABI. catch_unwind is still cheap insurance even
-            // though v1 doesn't panic through JIT frames — if a
-            // Rust shim somewhere panics, we'd rather log it than
+            // Lisp ABI. catch_unwind is cheap insurance: today
+            // exit-thread/terminate-thread are cooperative (the
+            // worker returns normally when it observes the
+            // termination flag at a safepoint), but if a runtime
+            // helper somewhere does panic, we'd rather log it than
             // take the whole process down.
             let result = std::panic::catch_unwind(
                 std::panic::AssertUnwindSafe(|| unsafe {
@@ -231,32 +273,76 @@ pub fn create_thread(
             {
                 match &result {
                     Ok(_) => eprintln!("[threads] thread {id} finished normally"),
-                    Err(_) => eprintln!(
-                        "[threads] thread {id} died with an unhandled condition"
-                    ),
+                    Err(p) => {
+                        if p.downcast_ref::<ExitThreadPayload>().is_some() {
+                            eprintln!("[threads] thread {id} called exit-thread");
+                        } else {
+                            eprintln!(
+                                "[threads] thread {id} died with an unhandled condition"
+                            );
+                        }
+                    }
                 }
             }
             drop(m);
+
+            // Mark finished and wake any join-thread waiters BEFORE
+            // unregister, so a racing waiter that has its Arc to the
+            // entry observes the flag.
+            {
+                let _g = entry_for_thread.finish_mu.lock().unwrap();
+                entry_for_thread.finished.store(true, Ordering::Release);
+                entry_for_thread.finish_cv.notify_all();
+            }
             unregister(id);
         })
         .expect("std::thread::spawn failed");
 
-    *entry.handle.lock().unwrap() = Some(join);
+    join_handles().lock().unwrap().insert(id, join);
     id
 }
 
-// ─── exit-thread (cooperative) ──────────────────────────────────────────
+// ─── join-thread ────────────────────────────────────────────────────────
 
-/// Request that the current thread exit at its next safepoint.
-/// `exit-thread` in Corman is documented to never return — once
-/// JIT unwind tables land we'll honour that contract. In v1 it
-/// sets a flag and returns NIL; the calling Lisp code is expected
-/// to (loop) back to a safepoint check that observes the flag.
-pub fn exit_thread(_condition: Word) {
-    let tid = current_thread_id();
-    if let Some(entry) = get_entry(tid) {
-        entry.terminate_requested.store(true, Ordering::Release);
+/// Block until the thread with `id` has finished its function and
+/// the OS thread has been joined. Returns true on success; false if
+/// the id was not a thread spawned by create-thread, or if it had
+/// already been joined.
+///
+/// Idempotent only in the trivial sense: a second join on the same
+/// id sees no JoinHandle and returns false.
+pub fn join_thread(id: i64) -> bool {
+    // Wait for the finished flag, if the entry still exists. The
+    // entry might have been unregister'd already (if the worker
+    // finished and we got here just after), in which case the
+    // JoinHandle is still in join_handles and we proceed straight
+    // to .join().
+    if let Some(entry) = get_entry(id) {
+        let mut g = entry.finish_mu.lock().unwrap();
+        while !entry.finished.load(Ordering::Acquire) {
+            g = entry.finish_cv.wait(g).unwrap();
+        }
     }
+    let h_opt = join_handles().lock().unwrap().remove(&id);
+    match h_opt {
+        Some(h) => {
+            let _ = h.join();
+            true
+        }
+        None => false,
+    }
+}
+
+// ─── exit-thread (preemptive via SEH-registered unwind) ───────────────
+
+/// Unwind the current thread immediately. Panics with the
+/// ExitThreadPayload sentinel; the spawn thunk's `catch_unwind`
+/// catches it and the OS thread joins. Matches Roger's Corman
+/// contract that exit-thread never returns.
+pub fn exit_thread(condition: Word) -> ! {
+    std::panic::panic_any(ExitThreadPayload {
+        condition_raw: condition.raw(),
+    });
 }
 
 // ─── suspend / resume / terminate ───────────────────────────────────────
@@ -298,46 +384,399 @@ pub fn terminate_thread(id: i64) -> bool {
     }
 }
 
-/// Cooperative safepoint. ONE call covers both concerns a Lisp
-/// thread has to poll for at quiet moments:
+/// Safepoint. ONE call covers both concerns a Lisp thread has to
+/// poll for at quiet moments:
 ///
 ///   1. GC stop-the-world — `MutatorState::safepoint` parks if
 ///      another mutator is about to collect.
-///   2. THREADS-package suspend / terminate — read the per-thread
-///      registry entry's flags and either park (for suspend) or
-///      return TRUE (for terminate / exit-thread).
+///   2. THREADS suspend / terminate — read the per-thread registry
+///      entry's flags and either park (suspend) or unwind via
+///      `panic_any(ExitThreadPayload)` (terminate). The unwind is
+///      caught by the spawn thunk's `catch_unwind`; SEH tables
+///      registered at JIT-time (see ncl-llvm/src/jit_mm.rs) carry
+///      it cleanly through any depth of JIT frames.
 ///
 /// Tight Lisp loops that don't allocate (and therefore never hit
 /// the GC's TLAB-refill safepoint by accident) MUST call this
-/// periodically, or peers can't trigger a GC and the THREADS API's
-/// suspend/terminate become ineffective. Once the compiler emits
-/// safepoints automatically at loop back-edges this becomes a
-/// belt-and-braces hook.
-///
-/// Returns `true` if a termination has been requested for this
-/// thread (via `terminate-thread` or `exit-thread`). The caller's
-/// Lisp code should observe the return value and `(return)` from
-/// its own loop. We deliberately do NOT panic-unwind on terminate
-/// because v1's JIT doesn't emit Windows SEH unwind tables, so a
-/// panic through Lisp frames takes down the process. Cooperative
-/// only.
-pub fn thread_safepoint(m: &mut MutatorState) -> bool {
+/// periodically. Once the compiler emits safepoints automatically
+/// at loop back-edges this becomes a belt-and-braces hook.
+pub fn thread_safepoint(m: &mut MutatorState) -> Word {
     m.safepoint();
 
     let tid = CURRENT_THREAD_ID.with(|c| c.get());
     if tid == 0 {
-        return false;
+        return Word::NIL;
     }
-    let Some(entry) = get_entry(tid) else { return false };
+    let Some(entry) = get_entry(tid) else { return Word::NIL };
 
     if entry.suspend_requested.load(Ordering::Acquire) {
         let mut g = entry.suspend_mu.lock().unwrap();
         while entry.suspend_requested.load(Ordering::Acquire) {
             g = entry.suspend_cv.wait(g).unwrap();
+            if entry.terminate_requested.load(Ordering::Acquire) {
+                drop(g);
+                std::panic::panic_any(ExitThreadPayload {
+                    condition_raw: Word::NIL.raw(),
+                });
+            }
         }
     }
 
-    entry.terminate_requested.load(Ordering::Acquire)
+    if entry.terminate_requested.load(Ordering::Acquire) {
+        std::panic::panic_any(ExitThreadPayload {
+            condition_raw: Word::NIL.raw(),
+        });
+    }
+    Word::NIL
+}
+
+// ─── sleep ──────────────────────────────────────────────────────────────
+
+/// Sleep for `seconds` (floats accepted via the Lisp wrapper).
+/// While parked, the thread is unresponsive to GC-stop and to
+/// suspend/terminate — by design, since std::thread::sleep can't
+/// be cancelled. Use small slices and (thread-safepoint) in
+/// between if you need responsiveness.
+pub fn sleep_seconds(seconds: f64) {
+    if seconds <= 0.0 || !seconds.is_finite() {
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
+}
+
+// ─── Atomic counters ────────────────────────────────────────────────────
+//
+// Lock-free integer cells shared across threads. The canonical
+// use case is a global "how many work items have I processed"
+// counter that scales without contention.
+//
+// Stored as `Arc<AtomicI64>` keyed by integer handle.
+
+use std::sync::atomic::AtomicI64;
+
+struct AtomicRegistry {
+    next_id: i64,
+    cells: HashMap<i64, Arc<AtomicI64>>,
+}
+
+fn atomic_registry() -> &'static Mutex<AtomicRegistry> {
+    static R: OnceLock<Mutex<AtomicRegistry>> = OnceLock::new();
+    R.get_or_init(|| {
+        Mutex::new(AtomicRegistry { next_id: 1, cells: HashMap::new() })
+    })
+}
+
+fn atomic_get_cell(id: i64) -> Option<Arc<AtomicI64>> {
+    atomic_registry().lock().unwrap().cells.get(&id).cloned()
+}
+
+pub fn make_atomic_counter(init: i64) -> i64 {
+    let mut r = atomic_registry().lock().unwrap();
+    let id = r.next_id;
+    r.next_id += 1;
+    r.cells.insert(id, Arc::new(AtomicI64::new(init)));
+    id
+}
+
+pub fn release_atomic_counter(id: i64) -> bool {
+    atomic_registry().lock().unwrap().cells.remove(&id).is_some()
+}
+
+pub fn atomic_incf(id: i64, delta: i64) -> Option<i64> {
+    let cell = atomic_get_cell(id)?;
+    Some(cell.fetch_add(delta, Ordering::AcqRel) + delta)
+}
+
+pub fn atomic_get(id: i64) -> Option<i64> {
+    let cell = atomic_get_cell(id)?;
+    Some(cell.load(Ordering::Acquire))
+}
+
+pub fn atomic_set(id: i64, v: i64) -> bool {
+    match atomic_get_cell(id) {
+        Some(cell) => {
+            cell.store(v, Ordering::Release);
+            true
+        }
+        None => false,
+    }
+}
+
+pub fn atomic_cas(id: i64, expected: i64, new: i64) -> Option<i64> {
+    let cell = atomic_get_cell(id)?;
+    match cell.compare_exchange(expected, new, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(v) => Some(v),
+        Err(observed) => Some(observed),
+    }
+}
+
+// ─── Mailboxes (multi-producer multi-consumer queues) ───────────────────
+//
+// A mailbox is a bounded-or-unbounded queue of Word values.
+// (send mb v) pushes; (receive mb &optional timeout) pops, blocking
+// until something arrives (or timeout expires). Multiple senders
+// and multiple receivers are supported.
+//
+// HEAP-POINTER CAVEAT for v1: messages stored mid-flight are NOT
+// tracked as GC roots. Pass immediates (fixnum, T, NIL, char) or
+// interned symbols (which live in the never-moving static area)
+// freely. A cons/string/vector passed to send() may have its
+// payload moved by GC, leaving a stale pointer in the queue. Until
+// we add a GC root-source for mailboxes this is a documented
+// limitation. Most thread-pool patterns pass small commands /
+// fixnum work-ids anyway.
+
+struct Mailbox {
+    /// Words stored verbatim. Bounded by `cap` if Some.
+    queue: Mutex<std::collections::VecDeque<u64>>,
+    cap: Option<usize>,
+    not_empty: Condvar,
+    not_full: Condvar,
+}
+
+struct MailboxRegistry {
+    next_id: i64,
+    boxes: HashMap<i64, Arc<Mailbox>>,
+}
+
+fn mailbox_registry() -> &'static Mutex<MailboxRegistry> {
+    static R: OnceLock<Mutex<MailboxRegistry>> = OnceLock::new();
+    R.get_or_init(|| {
+        Mutex::new(MailboxRegistry { next_id: 1, boxes: HashMap::new() })
+    })
+}
+
+fn mailbox_get(id: i64) -> Option<Arc<Mailbox>> {
+    mailbox_registry().lock().unwrap().boxes.get(&id).cloned()
+}
+
+pub fn make_mailbox(capacity: Option<usize>) -> i64 {
+    let mut r = mailbox_registry().lock().unwrap();
+    let id = r.next_id;
+    r.next_id += 1;
+    r.boxes.insert(
+        id,
+        Arc::new(Mailbox {
+            queue: Mutex::new(std::collections::VecDeque::new()),
+            cap: capacity,
+            not_empty: Condvar::new(),
+            not_full: Condvar::new(),
+        }),
+    );
+    id
+}
+
+pub fn release_mailbox(id: i64) -> bool {
+    mailbox_registry().lock().unwrap().boxes.remove(&id).is_some()
+}
+
+/// Block until there is room and push the word.
+pub fn mailbox_send(id: i64, raw: u64) -> bool {
+    let mb = match mailbox_get(id) {
+        Some(mb) => mb,
+        None => return false,
+    };
+    let mut q = mb.queue.lock().unwrap();
+    while let Some(cap) = mb.cap {
+        if q.len() < cap {
+            break;
+        }
+        q = mb.not_full.wait(q).unwrap();
+    }
+    q.push_back(raw);
+    mb.not_empty.notify_one();
+    true
+}
+
+/// Block (up to timeout_ms; -1 = forever, 0 = non-blocking) and pop
+/// the next word. Returns Some(raw) on success, None on timeout or
+/// unknown id.
+pub fn mailbox_receive(id: i64, timeout_ms: i64) -> Option<u64> {
+    let mb = mailbox_get(id)?;
+    let mut q = mb.queue.lock().unwrap();
+    if timeout_ms < 0 {
+        while q.is_empty() {
+            q = mb.not_empty.wait(q).unwrap();
+        }
+    } else if timeout_ms == 0 {
+        if q.is_empty() {
+            return None;
+        }
+    } else {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(timeout_ms as u64);
+        while q.is_empty() {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let (g, wr) = mb.not_empty.wait_timeout(q, deadline - now).unwrap();
+            q = g;
+            if wr.timed_out() && q.is_empty() {
+                return None;
+            }
+        }
+    }
+    let v = q.pop_front()?;
+    mb.not_full.notify_one();
+    Some(v)
+}
+
+pub fn mailbox_len(id: i64) -> Option<usize> {
+    let mb = mailbox_get(id)?;
+    Some(mb.queue.lock().unwrap().len())
+}
+
+// ─── Condition variables ────────────────────────────────────────────────
+//
+// Thin wrapper around std::sync::Condvar paired with the
+// reentrant critical section. The CL idiom:
+//
+//     (with-synchronization *cs*
+//       (loop
+//         (when (predicate) (return))
+//         (cv-wait *cv* *cs*)))
+//
+// where `cv-wait` atomically releases the section, parks, and
+// re-acquires the section when signaled. Pairs with (cv-notify)
+// and (cv-broadcast) from another thread.
+
+struct CondvarEntry {
+    cv: Condvar,
+    /// Auxiliary lock for cv.wait — std::sync::Condvar requires a
+    /// MutexGuard. The user-visible critical section is what
+    /// protects the shared state; this lock is just the rendezvous
+    /// the Condvar needs internally.
+    aux: Mutex<()>,
+}
+
+struct CondvarRegistry {
+    next_id: i64,
+    vars: HashMap<i64, Arc<CondvarEntry>>,
+}
+
+fn condvar_registry() -> &'static Mutex<CondvarRegistry> {
+    static R: OnceLock<Mutex<CondvarRegistry>> = OnceLock::new();
+    R.get_or_init(|| {
+        Mutex::new(CondvarRegistry { next_id: 1, vars: HashMap::new() })
+    })
+}
+
+fn condvar_get(id: i64) -> Option<Arc<CondvarEntry>> {
+    condvar_registry().lock().unwrap().vars.get(&id).cloned()
+}
+
+pub fn make_condvar() -> i64 {
+    let mut r = condvar_registry().lock().unwrap();
+    let id = r.next_id;
+    r.next_id += 1;
+    r.vars.insert(
+        id,
+        Arc::new(CondvarEntry {
+            cv: Condvar::new(),
+            aux: Mutex::new(()),
+        }),
+    );
+    id
+}
+
+pub fn release_condvar(id: i64) -> bool {
+    condvar_registry().lock().unwrap().vars.remove(&id).is_some()
+}
+
+/// Wait on cv. Caller must have entered the named critical section
+/// `cs_id`; the section is temporarily released for the duration of
+/// the wait and re-acquired before returning. Returns false on
+/// unknown cv id, true on a normal wake; timeout semantics: -1 wait
+/// forever, 0 no-wait, positive milliseconds (true on wake, false
+/// on timeout).
+///
+/// LOST-WAKEUP AVOIDANCE: we acquire `entry.aux` BEFORE releasing
+/// the user critical section. condvar_notify also acquires/releases
+/// entry.aux around its notify_one, so a notifier that arrives
+/// between our CS release and our cv.wait must wait for us to call
+/// cv.wait (which atomically releases aux). Without this ordering,
+/// a notify in the gap is lost and we park forever.
+pub fn condvar_wait(cv_id: i64, cs_id: i64, timeout_ms: i64) -> bool {
+    let entry = match condvar_get(cv_id) {
+        Some(e) => e,
+        None => return false,
+    };
+    let cs_arc = match cs_registry().lock().unwrap().sections.get(&cs_id) {
+        Some(cs) => Arc::clone(cs),
+        None => return false,
+    };
+    let me = current_thread_id();
+
+    // Step 1: claim entry.aux. From this point, condvar_notify (which
+    // also acquires entry.aux) cannot fire-and-forget past us.
+    let aux_g = entry.aux.lock().unwrap();
+
+    // Step 2: verify ownership and fully release the user CS.
+    let saved_count = {
+        let mut s = cs_arc.state.lock().unwrap();
+        if s.owner != me {
+            return false;
+        }
+        let c = s.count;
+        s.owner = 0;
+        s.count = 0;
+        cs_arc.cv.notify_one();
+        c
+    };
+
+    // Step 3: park on entry.cv. cv.wait atomically releases aux and
+    // suspends; on wake it re-acquires aux. Any notify between
+    // step 1 and step 3 is now waiting for aux and will fire after
+    // we're parked.
+    let (final_aux, waked) = if timeout_ms < 0 {
+        let g2 = entry.cv.wait(aux_g).unwrap();
+        (g2, true)
+    } else if timeout_ms == 0 {
+        (aux_g, false)
+    } else {
+        let (g2, wr) = entry
+            .cv
+            .wait_timeout(aux_g, std::time::Duration::from_millis(timeout_ms as u64))
+            .unwrap();
+        (g2, !wr.timed_out())
+    };
+    drop(final_aux);
+
+    // Step 4: re-acquire the user CS at the same reentrance count.
+    {
+        let mut s = cs_arc.state.lock().unwrap();
+        while s.owner != 0 {
+            s = cs_arc.cv.wait(s).unwrap();
+        }
+        s.owner = me;
+        s.count = saved_count;
+    }
+    waked
+}
+
+pub fn condvar_notify(id: i64) -> bool {
+    match condvar_get(id) {
+        Some(entry) => {
+            // Lock+unlock entry.aux: this serialises us against a
+            // waiter mid-setup so the notify can't slip past.
+            let _g = entry.aux.lock().unwrap();
+            entry.cv.notify_one();
+            true
+        }
+        None => false,
+    }
+}
+
+pub fn condvar_broadcast(id: i64) -> bool {
+    match condvar_get(id) {
+        Some(entry) => {
+            let _g = entry.aux.lock().unwrap();
+            entry.cv.notify_all();
+            true
+        }
+        None => false,
+    }
 }
 
 // ─── Critical sections (reentrant) ──────────────────────────────────────
@@ -478,7 +917,21 @@ pub extern "C-unwind" fn exit_thread_shim(
         Word::NIL
     };
     exit_thread(cond);
-    Word::NIL.raw()
+}
+
+/// `(%test-panic)` — Diagnostic: panic_any from a Rust shim, then
+/// see if catch_unwind elsewhere catches it without crashing the
+/// JIT call chain. Used to isolate the SEH-unwind-through-JIT
+/// pathway from the threading layer. Don't call this in real code.
+pub extern "C-unwind" fn test_panic_shim(
+    _mutator: *mut MutatorState,
+    _env: u64,
+    _args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    std::panic::panic_any(ExitThreadPayload {
+        condition_raw: Word::NIL.raw(),
+    });
 }
 
 /// `(thread-handle thread-id)` — Corman's API returns a Win32
@@ -589,6 +1042,234 @@ pub extern "C-unwind" fn leave_critical_section_shim(
 /// requested for the current thread (caller should bail out of its
 /// loop), NIL otherwise. Always performs the GC + suspend poll
 /// regardless of return value.
+pub extern "C-unwind" fn join_thread_shim(
+    _mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    let tid = unsafe { arg_fixnum_or(args, 0, -1) };
+    if join_thread(tid) { Word::T.raw() } else { Word::NIL.raw() }
+}
+
+/// `(sleep seconds)` — accepts fixnum or float seconds.
+pub extern "C-unwind" fn sleep_shim(
+    _mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    let w = unsafe { arg(args, 0) };
+    let seconds = crate::float::to_f64(w).unwrap_or(0.0);
+    sleep_seconds(seconds);
+    Word::T.raw()
+}
+
+pub extern "C-unwind" fn make_atomic_counter_shim(
+    _mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    let init = if n_args >= 1 {
+        unsafe { arg_fixnum_or(args, 0, 0) }
+    } else {
+        0
+    };
+    Word::fixnum(make_atomic_counter(init)).raw()
+}
+
+pub extern "C-unwind" fn release_atomic_counter_shim(
+    _mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    let id = unsafe { arg_fixnum_or(args, 0, -1) };
+    if release_atomic_counter(id) { Word::T.raw() } else { Word::NIL.raw() }
+}
+
+pub extern "C-unwind" fn atomic_incf_shim(
+    _mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    let id = unsafe { arg_fixnum_or(args, 0, -1) };
+    let delta = if n_args >= 2 { unsafe { arg_fixnum_or(args, 1, 1) } } else { 1 };
+    match atomic_incf(id, delta) {
+        Some(v) => Word::fixnum(v).raw(),
+        None => Word::NIL.raw(),
+    }
+}
+
+pub extern "C-unwind" fn atomic_get_shim(
+    _mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    let id = unsafe { arg_fixnum_or(args, 0, -1) };
+    match atomic_get(id) {
+        Some(v) => Word::fixnum(v).raw(),
+        None => Word::NIL.raw(),
+    }
+}
+
+pub extern "C-unwind" fn atomic_set_shim(
+    _mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    let id = unsafe { arg_fixnum_or(args, 0, -1) };
+    let v = unsafe { arg_fixnum_or(args, 1, 0) };
+    if atomic_set(id, v) { Word::T.raw() } else { Word::NIL.raw() }
+}
+
+pub extern "C-unwind" fn atomic_cas_shim(
+    _mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    let id = unsafe { arg_fixnum_or(args, 0, -1) };
+    let expected = unsafe { arg_fixnum_or(args, 1, 0) };
+    let new = unsafe { arg_fixnum_or(args, 2, 0) };
+    match atomic_cas(id, expected, new) {
+        Some(observed) => Word::fixnum(observed).raw(),
+        None => Word::NIL.raw(),
+    }
+}
+
+pub extern "C-unwind" fn make_mailbox_shim(
+    _mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    let cap = if n_args >= 1 {
+        let w = unsafe { arg(args, 0) };
+        if w.raw() == Word::NIL.raw() {
+            None
+        } else {
+            w.as_fixnum().map(|n| n.max(0) as usize)
+        }
+    } else {
+        None
+    };
+    Word::fixnum(make_mailbox(cap)).raw()
+}
+
+pub extern "C-unwind" fn release_mailbox_shim(
+    _mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    let id = unsafe { arg_fixnum_or(args, 0, -1) };
+    if release_mailbox(id) { Word::T.raw() } else { Word::NIL.raw() }
+}
+
+pub extern "C-unwind" fn mailbox_send_shim(
+    _mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    let id = unsafe { arg_fixnum_or(args, 0, -1) };
+    let v = unsafe { arg(args, 1) }.raw();
+    if mailbox_send(id, v) { Word::T.raw() } else { Word::NIL.raw() }
+}
+
+/// `(%mailbox-receive id timeout-ms)`. timeout-ms: -1 wait forever,
+/// 0 non-blocking, positive milliseconds. Returns the value, or
+/// the immediate value `(values nil :timeout)` is represented here
+/// as just `NIL` — Lisp wrappers distinguish via `mailbox-len`.
+pub extern "C-unwind" fn mailbox_receive_shim(
+    _mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    let id = unsafe { arg_fixnum_or(args, 0, -1) };
+    let timeout_ms = unsafe { arg_fixnum_or(args, 1, -1) };
+    match mailbox_receive(id, timeout_ms) {
+        Some(v) => v,
+        None => Word::NIL.raw(),
+    }
+}
+
+pub extern "C-unwind" fn mailbox_len_shim(
+    _mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    let id = unsafe { arg_fixnum_or(args, 0, -1) };
+    match mailbox_len(id) {
+        Some(n) => Word::fixnum(n as i64).raw(),
+        None => Word::NIL.raw(),
+    }
+}
+
+pub extern "C-unwind" fn make_condvar_shim(
+    _mutator: *mut MutatorState,
+    _env: u64,
+    _args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    Word::fixnum(make_condvar()).raw()
+}
+
+pub extern "C-unwind" fn release_condvar_shim(
+    _mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    let id = unsafe { arg_fixnum_or(args, 0, -1) };
+    if release_condvar(id) { Word::T.raw() } else { Word::NIL.raw() }
+}
+
+pub extern "C-unwind" fn condvar_wait_shim(
+    _mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    let cv_id = unsafe { arg_fixnum_or(args, 0, -1) };
+    let cs_id = unsafe { arg_fixnum_or(args, 1, -1) };
+    let timeout_ms = unsafe { arg_fixnum_or(args, 2, -1) };
+    if condvar_wait(cv_id, cs_id, timeout_ms) { Word::T.raw() } else { Word::NIL.raw() }
+}
+
+pub extern "C-unwind" fn condvar_notify_shim(
+    _mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    let id = unsafe { arg_fixnum_or(args, 0, -1) };
+    if condvar_notify(id) { Word::T.raw() } else { Word::NIL.raw() }
+}
+
+pub extern "C-unwind" fn condvar_broadcast_shim(
+    _mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    let id = unsafe { arg_fixnum_or(args, 0, -1) };
+    if condvar_broadcast(id) { Word::T.raw() } else { Word::NIL.raw() }
+}
+
+/// `(thread-safepoint)` — runs the safepoint poll. Returns NIL on
+/// the normal path; never returns at all when a terminate-thread
+/// or exit-thread is in flight (unwinds via panic instead). Lisp
+/// callers can still use the historical pattern of
+/// `(loop (when (thread-safepoint) (return)) ...)` — it'll just
+/// never see T, which is harmless.
 pub extern "C-unwind" fn thread_safepoint_shim(
     mutator: *mut MutatorState,
     _env: u64,
@@ -596,7 +1277,7 @@ pub extern "C-unwind" fn thread_safepoint_shim(
     _n_args: u64,
 ) -> u64 {
     let m = unsafe { &mut *mutator };
-    if thread_safepoint(m) { Word::T.raw() } else { Word::NIL.raw() }
+    thread_safepoint(m).raw()
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────

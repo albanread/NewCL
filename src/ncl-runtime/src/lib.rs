@@ -77,10 +77,16 @@ pub use igui::lisp_shims::{
 pub use printer::{format_word, format_word_aesthetic};
 
 pub use threads::{
-    allocate_critical_section_shim, create_thread_shim,
+    allocate_critical_section_shim, atomic_cas_shim, atomic_get_shim,
+    atomic_incf_shim, atomic_set_shim, condvar_broadcast_shim, test_panic_shim,
+    condvar_notify_shim, condvar_wait_shim, create_thread_shim,
     current_process_id_shim, current_thread_id_shim,
     deallocate_critical_section_shim, enter_critical_section_shim,
-    exit_thread_shim, leave_critical_section_shim, resume_thread_shim,
+    exit_thread_shim, join_thread_shim, leave_critical_section_shim,
+    mailbox_len_shim, mailbox_receive_shim, mailbox_send_shim,
+    make_atomic_counter_shim, make_condvar_shim, make_mailbox_shim,
+    release_atomic_counter_shim, release_condvar_shim,
+    release_mailbox_shim, resume_thread_shim, sleep_shim,
     suspend_thread_shim, terminate_thread_shim, thread_handle_shim,
     thread_safepoint_shim,
 };

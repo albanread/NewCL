@@ -186,7 +186,7 @@ pub fn ratio_denominator(w: Word) -> Word {
 // register_runtime_helpers now points the slow paths here.
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_add_full(
+pub extern "C-unwind" fn ncl_add_full(
     mutator: *mut MutatorState,
     a_raw: u64,
     b_raw: u64,
@@ -216,7 +216,7 @@ pub extern "C" fn ncl_add_full(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_sub_full(
+pub extern "C-unwind" fn ncl_sub_full(
     mutator: *mut MutatorState,
     a_raw: u64,
     b_raw: u64,
@@ -246,7 +246,7 @@ pub extern "C" fn ncl_sub_full(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_mul_full(
+pub extern "C-unwind" fn ncl_mul_full(
     mutator: *mut MutatorState,
     a_raw: u64,
     b_raw: u64,
@@ -281,7 +281,7 @@ pub extern "C" fn ncl_mul_full(
 ///   integer / integer (inexact)  → ratio
 ///   ratio / anything             → ratio (or integer if simplified)
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_div_full(
+pub extern "C-unwind" fn ncl_div_full(
     mutator: *mut MutatorState,
     a_raw: u64,
     b_raw: u64,
@@ -313,7 +313,7 @@ pub extern "C" fn ncl_div_full(
 /// Cross-type comparison spanning the full numeric tower. Returns
 /// -1, 0, or +1 as i64.
 #[unsafe(no_mangle)]
-pub extern "C" fn ncl_cmp_full(a_raw: u64, b_raw: u64) -> i64 {
+pub extern "C-unwind" fn ncl_cmp_full(a_raw: u64, b_raw: u64) -> i64 {
     let a = Word::from_raw(a_raw);
     let b = Word::from_raw(b_raw);
     if crate::float::is_float(a) || crate::float::is_float(b) {

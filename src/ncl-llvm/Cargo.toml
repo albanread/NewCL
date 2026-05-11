@@ -7,6 +7,13 @@ edition = "2024"
 ncl-ir = { path = "../ncl-ir" }
 ncl-runtime = { path = "../ncl-runtime" }
 inkwell = { version = "=0.9.0", default-features = false, features = ["llvm22-1", "target-x86"] }
+# llvm-sys piggy-backs on inkwell's bundled LLVM. We use it for the
+# constructors inkwell doesn't expose: LLVMCreateMCJITCompilerForModule
+# (lets us pass a custom memory manager so we can register SEH unwind
+# tables on Windows) and LLVMAddGlobalMapping (lets us bind runtime
+# helper symbols on our own ExecutionEngineRef without going through
+# inkwell's wrapper, which would expect to Drop the engine itself).
+llvm-sys = { version = "=221.0.1", default-features = false, features = ["force-static"] }
 
 [lints]
 workspace = true

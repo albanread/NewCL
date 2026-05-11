@@ -502,6 +502,50 @@ fn install_native_functions(
                    ncl_runtime::leave_critical_section_shim, 1);
     install_native(coord, mutator, "THREAD-SAFEPOINT",
                    ncl_runtime::thread_safepoint_shim, 0);
+    install_native(coord, mutator, "%TEST-PANIC",
+                   ncl_runtime::test_panic_shim, 0);
+    install_native(coord, mutator, "JOIN-THREAD",
+                   ncl_runtime::join_thread_shim, 1);
+    install_native(coord, mutator, "SLEEP",
+                   ncl_runtime::sleep_shim, 1);
+
+    // Atomic counters (lock-free shared integers).
+    install_native(coord, mutator, "MAKE-ATOMIC-COUNTER",
+                   ncl_runtime::make_atomic_counter_shim, 1);
+    install_native(coord, mutator, "RELEASE-ATOMIC-COUNTER",
+                   ncl_runtime::release_atomic_counter_shim, 1);
+    install_native(coord, mutator, "ATOMIC-INCF",
+                   ncl_runtime::atomic_incf_shim, 2);
+    install_native(coord, mutator, "ATOMIC-GET",
+                   ncl_runtime::atomic_get_shim, 1);
+    install_native(coord, mutator, "ATOMIC-SET",
+                   ncl_runtime::atomic_set_shim, 2);
+    install_native(coord, mutator, "ATOMIC-CAS",
+                   ncl_runtime::atomic_cas_shim, 3);
+
+    // Mailboxes (bounded/unbounded mpmc queues of Word values).
+    install_native(coord, mutator, "MAKE-MAILBOX",
+                   ncl_runtime::make_mailbox_shim, 1);
+    install_native(coord, mutator, "RELEASE-MAILBOX",
+                   ncl_runtime::release_mailbox_shim, 1);
+    install_native(coord, mutator, "MAILBOX-SEND",
+                   ncl_runtime::mailbox_send_shim, 2);
+    install_native(coord, mutator, "%MAILBOX-RECEIVE",
+                   ncl_runtime::mailbox_receive_shim, 2);
+    install_native(coord, mutator, "MAILBOX-LEN",
+                   ncl_runtime::mailbox_len_shim, 1);
+
+    // Condition variables (paired with critical sections).
+    install_native(coord, mutator, "MAKE-CONDVAR",
+                   ncl_runtime::make_condvar_shim, 0);
+    install_native(coord, mutator, "RELEASE-CONDVAR",
+                   ncl_runtime::release_condvar_shim, 1);
+    install_native(coord, mutator, "%CONDVAR-WAIT",
+                   ncl_runtime::condvar_wait_shim, 3);
+    install_native(coord, mutator, "CONDVAR-NOTIFY",
+                   ncl_runtime::condvar_notify_shim, 1);
+    install_native(coord, mutator, "CONDVAR-BROADCAST",
+                   ncl_runtime::condvar_broadcast_shim, 1);
 
     // iGui (Windows only). Spawns the GUI thread and exposes the
     // window-management trio + event poll. Drawing primitives

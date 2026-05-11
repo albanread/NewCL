@@ -200,5 +200,122 @@
          (leave ,sec)
          ,result))))
 
+;; ── Extensions beyond Corman's THREADS API ─────────────────────────────
+;;
+;; The features below are NewCormanLisp additions that turn the
+;; basic API into something useful on a modern multi-core machine
+;; (20-thread laptops weren't a 2002 thing). All cross-platform —
+;; the underlying primitives are std::sync types.
+;;
+;;   (join-thread tid)        wait for a thread to finish
+;;   (sleep seconds)          park the current thread; fixnum or float
+;;
+;;   Atomic counters (lock-free integer cells, fixnum-valued):
+;;     (make-atomic-counter init)        -> handle
+;;     (release-atomic-counter h)
+;;     (atomic-incf h &optional delta)   default delta = 1
+;;     (atomic-decf h &optional delta)
+;;     (atomic-get h)
+;;     (atomic-set h v)
+;;     (atomic-cas h expected new)       -> observed value
+;;
+;;   Mailboxes (mpmc Word queues):
+;;     (make-mailbox &optional capacity)  capacity NIL = unbounded
+;;     (release-mailbox h)
+;;     (mailbox-send h v)
+;;     (mailbox-receive h &optional timeout-ms)  timeout-ms NIL = wait forever
+;;     (mailbox-try-receive h)            non-blocking variant
+;;     (mailbox-len h)
+;;     v1 CAVEAT: pass fixnums / T / NIL / chars / interned symbols
+;;     freely. Heap-pointer values (cons / vector / string) MAY be
+;;     stale after a GC between send and receive — they aren't yet
+;;     tracked as roots. Fix is on the GC-features TODO.
+;;
+;;   Condition variables (paired with critical sections):
+;;     (make-condvar)
+;;     (release-condvar h)
+;;     (condvar-wait cv cs &optional timeout-ms)
+;;     (condvar-notify cv)
+;;     (condvar-broadcast cv)
+
+(defun atomic-decf (h &optional (delta 1))
+  "Atomically subtract DELTA from H's value and return the new value."
+  (atomic-incf h (- 0 delta)))
+
+(defun mailbox-receive (h &optional timeout-ms)
+  "Pop the next value from mailbox H. If TIMEOUT-MS is NIL (the
+   default), block forever. If 0, return immediately. Positive
+   integer = milliseconds to wait. Returns the value, or NIL on
+   timeout. (Use (mailbox-len ...) before/after if you need to
+   distinguish a NIL-valued message from a timeout.)"
+  (%mailbox-receive h (cond ((null timeout-ms) -1)
+                            (t timeout-ms))))
+
+(defun mailbox-try-receive (h)
+  "Non-blocking receive. Returns the value or NIL if empty."
+  (%mailbox-receive h 0))
+
+(defun condvar-wait (cv cs &optional timeout-ms)
+  "Atomically release CS, wait on CV, re-acquire CS. Caller must
+   currently own CS. Returns T on a normal wake, NIL on timeout."
+  (%condvar-wait (cs cs) cv
+                 (cond ((null timeout-ms) -1)
+                       (t timeout-ms))))
+
+;; ── parallel-map: fan a function out across N worker threads ───────────
+;;
+;; The fundamental "I want to use my cores" primitive. Distributes
+;; ITEMS over a mailbox; N workers pull, apply FN, push results to
+;; a result mailbox; main thread gathers. Returns results in the
+;; original order.
+;;
+;; Restrictions inherited from the underlying primitives:
+;;   * ITEMS values are stored in a mailbox — pass fixnums or
+;;     interned symbols freely; heavy heap values not yet safe
+;;     across a concurrent GC.
+;;   * Each worker has its own MutatorState, so its FN can allocate
+;;     — but tight no-allocation loops should call (thread-safepoint).
+;;   * FN must return a value that's also mailbox-safe (fixnum etc.)
+;;
+;; Returned vector is the same length as ITEMS, with results in the
+;; order ITEMS were submitted.
+
+(defun parallel-map (fn items &key (workers 4))
+  "Apply FN to each element of ITEMS using WORKERS threads (default
+   4). Returns a list of (item-index . result) pairs — caller may
+   sort by car for original order. Workers stop when they receive
+   the :END token. Results are also collected via mailbox."
+  (let ((input (make-mailbox))
+        (output (make-mailbox))
+        (n-items 0)
+        (tids nil))
+    ;; Queue work items, each as (index . item).
+    (dolist (it items)
+      (mailbox-send input (cons n-items it))
+      (setq n-items (+ n-items 1)))
+    ;; Sentinels for the workers.
+    (dotimes (i workers) (mailbox-send input :end))
+    ;; Spin up workers. Each pulls until it sees :END.
+    (dotimes (i workers)
+      (push (create-thread
+             (let ((f fn) (in input) (out output))
+               (lambda ()
+                 (loop
+                   (let ((msg (mailbox-receive in)))
+                     (cond
+                       ((eq msg :end) (return nil))
+                       (t (mailbox-send out
+                            (cons (car msg)
+                                  (funcall f (cdr msg)))))))))))
+            tids))
+    ;; Gather results.
+    (let ((results nil))
+      (dotimes (i n-items)
+        (push (mailbox-receive output) results))
+      (dolist (the-tid tids) (join-thread the-tid))
+      (release-mailbox input)
+      (release-mailbox output)
+      results)))
+
 (provide 'threads)
 nil
