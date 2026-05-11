@@ -313,6 +313,15 @@ fn run_repl(session: &mut ncl_compiler::Session) -> ExitCode {
     let mut handle = stdin.lock();
 
     loop {
+        // Between prompts, drain any hot-reload pending queue. This
+        // is a Lisp-level call; if hot-reload was never enabled,
+        // (check-reloads) is a NIL-returning no-op. We swallow any
+        // Err so a broken reload doesn't take the REPL down — the
+        // Lisp handler-case inside check-reloads handles per-file
+        // errors; this is the safety net for the wrapper itself.
+        if buf.trim().is_empty() {
+            let _ = session.eval("(check-reloads)");
+        }
         let prompt = if buf.trim().is_empty() { "ncl> " } else { "...> " };
         print!("{prompt}");
         let _ = io::stdout().flush();

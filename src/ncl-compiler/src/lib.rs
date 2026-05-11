@@ -286,6 +286,11 @@ fn install_native_functions(
     // resolution and *modules* recording.
     install_native(coord, mutator, "%LOAD-FILE",
                    load_file_shim, 1);
+    // Hot-reload watcher (Tier "fun extension").
+    install_native(coord, mutator, "%WATCHER-START",
+                   ncl_runtime::hot_reload::watcher_start_shim, 1);
+    install_native(coord, mutator, "%WATCHER-PENDING",
+                   ncl_runtime::hot_reload::watcher_pending_shim, 0);
     // (compile name '(lambda (params) body)) — JIT a lambda form
     // at runtime and (optionally) install in name's function cell.
     // Closette uses this to install its discriminating functions.

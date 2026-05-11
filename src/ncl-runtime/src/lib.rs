@@ -16,6 +16,7 @@ pub mod complex;
 pub mod file_sys;
 pub mod float;
 pub mod format;
+pub mod hot_reload;
 pub mod ratio;
 pub mod gc_function;
 pub mod gc_string;

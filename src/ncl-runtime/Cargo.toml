@@ -21,6 +21,12 @@ num-complex = "0.4"
 # Shortest-round-trip float printing. Replaces Dragon4 / Grisu /
 # Steele-White with the simpler Ryū algorithm (Adams 2018).
 ryu = "1.0"
+# Filesystem watcher for hot reload. notify spawns its own thread
+# and posts events into a channel we drain on the Lisp side at
+# safe points (between REPL prompts). Default recommended-watcher
+# uses ReadDirectoryChangesW on Windows, inotify on Linux, FSEvents
+# on macOS.
+notify = "8"
 
 # Windows-only iGui dependency surface — Direct2D / Direct3D 11 /
 # DirectWrite plus the Win32 windowing layer. Versions tracked
