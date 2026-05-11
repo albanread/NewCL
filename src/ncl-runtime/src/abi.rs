@@ -1239,16 +1239,20 @@ pub extern "C-unwind" fn typep_shim(
         "KEYWORD" => is_keyword(obj),
         "FIXNUM" => obj.tag() == Tag::Fixnum,
         "BIGNUM" => crate::bignum::is_bignum(obj),
-        "INTEGER" | "RATIONAL" | "REAL" | "NUMBER" => {
-            crate::bignum::is_integer(obj)
-        }
+        "INTEGER" => crate::bignum::is_integer(obj),
+        "FLOAT" | "SHORT-FLOAT" | "SINGLE-FLOAT" | "DOUBLE-FLOAT" |
+        "LONG-FLOAT" => crate::float::is_float(obj),
+        "RATIONAL" => crate::bignum::is_integer(obj),
+        "REAL" | "NUMBER" => crate::float::is_real(obj),
         "STRING" | "SIMPLE-STRING" => obj.tag() == Tag::String,
         "CHARACTER" => obj.as_char().is_some(),
         "FUNCTION" => obj.tag() == Tag::Function,
         "VECTOR" | "SIMPLE-VECTOR" | "ARRAY" => {
-            // Bignums share Tag::Vector but aren't vectors at the
-            // language level.
-            obj.tag() == Tag::Vector && !crate::bignum::is_bignum(obj)
+            // Bignums and floats share Tag::Vector but aren't
+            // vectors at the language level.
+            obj.tag() == Tag::Vector
+                && !crate::bignum::is_bignum(obj)
+                && !crate::float::is_float(obj)
         }
         "SEQUENCE" => {
             obj.is_nil()

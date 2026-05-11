@@ -11,6 +11,9 @@ edition = "2024"
 num-bigint = "0.4"
 num-traits = "0.2"
 num-integer = "0.1"
+# Shortest-round-trip float printing. Replaces Dragon4 / Grisu /
+# Steele-White with the simpler Ryū algorithm (Adams 2018).
+ryu = "1.0"
 
 # Windows-only iGui dependency surface — Direct2D / Direct3D 11 /
 # DirectWrite plus the Win32 windowing layer. Versions tracked

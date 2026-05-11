@@ -119,6 +119,13 @@ pub enum HeapType {
     /// limb data — same shape as FfiBlock but with the bignum
     /// marker for printer / typep recognition.
     Bignum = 6,
+    /// IEEE 754 double-precision float. Layout under `float.rs`:
+    ///   cell 1: %FLOAT marker symbol
+    ///   cell 2: raw f64 bits (transmute, not a Word)
+    /// 2-cell payload (3 with header). GC scans the marker as a
+    /// Word; the f64 bits are opaque (probabilistic-correctness
+    /// is fine, same as bignum limbs).
+    Float = 7,
 }
 
 impl HeapType {
@@ -131,6 +138,7 @@ impl HeapType {
             4 => Some(HeapType::FfiBlock),
             5 => Some(HeapType::Other),
             6 => Some(HeapType::Bignum),
+            7 => Some(HeapType::Float),
             _ => None,
         }
     }

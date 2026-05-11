@@ -52,6 +52,16 @@ pub fn value_to_word(
                 ))
             ))?
         }
+        Value::Float(f) => {
+            ncl_runtime::float::alloc_float_in_static(
+                coord.static_area(), coord, *f,
+            )
+            .ok_or_else(|| EvalError::Compile(
+                crate::CompileError::NotImplemented(
+                    "static area exhausted while allocating float in macro input".into()
+                )
+            ))?
+        }
         Value::Char(c) => Word::char(*c),
         Value::Symbol(s) if &*s.name == "T" => Word::T,
         Value::Symbol(s) => crate::lower::intern_value_symbol(coord, s),
@@ -116,6 +126,21 @@ pub fn word_to_value(w: Word) -> Result<Value, EvalError> {
         Tag::String => {
             let s: String = gc_string::chars_of(w).collect();
             Value::String(Arc::new(s))
+        }
+        Tag::Vector => {
+            // Bignums and floats share Tag::Vector. Discriminate
+            // via header type and rebuild the corresponding Value
+            // variant so macroexpansion can carry them through.
+            if ncl_runtime::bignum::is_bignum(w) {
+                let s = ncl_runtime::bignum::bignum_to_decimal(w);
+                return Ok(Value::Bignum(Arc::new(s)));
+            }
+            if ncl_runtime::float::is_float(w) {
+                return Ok(Value::Float(ncl_runtime::float::float_value(w)));
+            }
+            return Err(EvalError::Compile(crate::CompileError::NotImplemented(
+                "word_to_value: vector that isn't a bignum or float".into(),
+            )));
         }
         other => {
             return Err(EvalError::Compile(crate::CompileError::NotImplemented(

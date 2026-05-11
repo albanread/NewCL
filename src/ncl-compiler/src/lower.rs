@@ -334,6 +334,17 @@ fn lower_in_mut(
             })?;
             Ok(Expr::Word(w.raw()))
         }
+        Value::Float(f) => {
+            let w = ncl_runtime::float::alloc_float_in_static(
+                coord.static_area(), coord, *f,
+            )
+            .ok_or_else(|| {
+                CompileError::NotImplemented(
+                    "static area exhausted while allocating float literal".into(),
+                )
+            })?;
+            Ok(Expr::Word(w.raw()))
+        }
         Value::Nil => Ok(Expr::Nil),
         Value::Char(c) => Ok(Expr::Word(ncl_runtime::Word::char(*c).raw())),
         Value::String(s) => {
@@ -414,6 +425,16 @@ fn build_quoted_word(
                 CompileError::NotImplemented(format!(
                     "static area exhausted while allocating quoted bignum {s}"
                 ))
+            })
+        }
+        Value::Float(f) => {
+            ncl_runtime::float::alloc_float_in_static(
+                coord.static_area(), coord, *f,
+            )
+            .ok_or_else(|| {
+                CompileError::NotImplemented(
+                    "static area exhausted while allocating quoted float".into(),
+                )
             })
         }
         Value::Nil => Ok(Word::NIL),
