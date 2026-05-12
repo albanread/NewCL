@@ -298,6 +298,15 @@ impl GcCoordinator {
         self.heap.lock().unwrap().young_used_bytes()
     }
 
+    /// Hand out the young start-bit bitmap to non-mutator threads
+    /// (e.g. the entropy stirrer). Reading the bitmap from outside
+    /// STW is safe because every op is relaxed-atomic and we never
+    /// require a consistent snapshot — the reader is using bits
+    /// as an entropy source, not as ground truth.
+    pub fn young_starts(&self) -> crate::heap::StartBits {
+        self.heap.lock().unwrap().young_starts_handle()
+    }
+
     pub fn old_used_bytes(&self) -> usize {
         self.heap.lock().unwrap().old_used_bytes()
     }

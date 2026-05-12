@@ -78,7 +78,7 @@ fn kw(coord: &GcCoordinator, name: &str) -> Word {
 /// The JoinHandle for the spawned thread is stashed; `(igui-wait)`
 /// blocks the calling thread on it.
 pub extern "C-unwind" fn igui_start_shim(
-    _mutator: *mut crate::mutator::MutatorState,
+    mutator: *mut crate::mutator::MutatorState,
     _env: u64,
     _args: *const u64,
     _n_args: u64,
@@ -89,6 +89,16 @@ pub extern "C-unwind" fn igui_start_shim(
         if guard.is_some() {
             return Word::T.raw();
         }
+    }
+
+    // Kick off the long-uptime entropy stirrer. It naps for an hour
+    // before its first stir, then hashes the young start-bit bitmap
+    // and XORs the result into the global PRNG state every hour
+    // after that. Confined to GUI mode so batch invocations never
+    // pay the (trivial) cost of a sleeping thread.
+    {
+        let m = unsafe { &*mutator };
+        crate::random::ensure_stirrer_started(m.coord().young_starts());
     }
 
     // window::run blocks for the lifetime of the message pump, so

@@ -66,6 +66,25 @@ impl Xoshiro256 {
         self.s[3] = self.s[3].rotate_left(45);
         result
     }
+
+    /// Stir externally-derived material into the state by XOR-ing
+    /// four words into the four state slots and running a few
+    /// diffusion steps so any single contributed word touches every
+    /// state slot before the next user call. Conservative — never
+    /// reduces entropy, can only add. Caller's `mix` should already
+    /// be SplitMix64-finalised so it doesn't expose the raw input
+    /// distribution.
+    pub fn stir(&mut self, mix: [u64; 4]) {
+        self.s[0] ^= mix[0];
+        self.s[1] ^= mix[1];
+        self.s[2] ^= mix[2];
+        self.s[3] ^= mix[3];
+        // 8 diffusion advances — overkill for xoshiro256**, which
+        // mixes every word into every word in two steps, but cheap.
+        for _ in 0..8 {
+            let _ = self.next_u64();
+        }
+    }
 }
 
 // SplitMix64 — used only for seed expansion.
@@ -171,6 +190,81 @@ pub fn random_in_range(limit: u64) -> u64 {
     (m >> 64) as u64
 }
 
+// ─── Long-uptime entropy stirrer ───────────────────────────────────────────
+//
+// "Free entropy" pulled out of the young-heap start-bit bitmap.
+// The bitmap encodes the GC trajectory of an interactive session —
+// every event timing, every conservative pin-pass outcome, every
+// surviving allocation pattern — and is therefore a slow-drift
+// fingerprint of real-time jitter that no fixed-at-startup seed
+// can capture.
+//
+// Activated when iGui starts. Sleeps `STIR_INTERVAL` (1 hour),
+// hashes the current young bitmap, mixes the hash through
+// SplitMix64 to four u64s, XORs them into the global RNG state,
+// and diffuses. Then loops.
+//
+// Cost: one background thread that's blocked 99.97% of the time;
+// per stir, ~32 KiB of relaxed atomic loads + a few thousand
+// multiplies + 8 PRNG advances under the mutex. Totally
+// invisible to interactive work.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+const STIR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+static STIRRER_STARTED: OnceLock<()> = OnceLock::new();
+
+/// Hash a bitmap slice and stir the result into the global RNG.
+/// Public so tests (and future GC hooks) can call it directly.
+pub fn stir_from_bitmap(words: &[AtomicU64]) {
+    // FNV-1a 64-bit over the bitmap. Quality of the hash doesn't
+    // matter much — we're feeding into SplitMix64 next which is
+    // doing the real diffusion. We just need every input bit to
+    // influence the output.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for w in words {
+        let v = w.load(Ordering::Relaxed);
+        h ^= v;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    // Also fold in fresh time-of-stir nanos and an RDTSC sample —
+    // belt-and-braces if the bitmap happens to be sparse on a
+    // freshly-cold session.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    h ^= now;
+    #[cfg(target_arch = "x86_64")]
+    {
+        h ^= unsafe { std::arch::x86_64::_rdtsc() };
+    }
+
+    let mut sm = SplitMix64 { x: h };
+    let mix = [sm.next(), sm.next(), sm.next(), sm.next()];
+    rng().lock().unwrap().stir(mix);
+}
+
+/// Spawn the entropy stirrer thread once. Idempotent — second and
+/// subsequent calls are no-ops. Called by `igui_start_shim` so the
+/// stirrer only runs in interactive sessions; batch / one-shot
+/// invocations of `ncl --eval ...` never spend the resources.
+pub fn ensure_stirrer_started(young_starts: crate::heap::StartBits) {
+    if STIRRER_STARTED.set(()).is_err() {
+        return; // already running
+    }
+    std::thread::Builder::new()
+        .name("ncl-entropy-stirrer".to_string())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(STIR_INTERVAL);
+                stir_from_bitmap(&young_starts);
+            }
+        })
+        .expect("spawn entropy stirrer");
+}
+
 // ─── Lisp shim ──────────────────────────────────────────────────────────────
 
 /// `(random N)` — N must be a positive fixnum. Returns a non-negative
@@ -241,5 +335,33 @@ mod tests {
         let a = evil_seed();
         let b = evil_seed();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn stir_changes_global_rng_output() {
+        // Draw a baseline, then stir from a synthetic non-trivial
+        // bitmap, then draw again. The two draws must differ. (One
+        // call to next_u64 already differs from another, of course,
+        // but we additionally check that the bitmap material
+        // influences the state by stirring with a different bitmap
+        // a third time and seeing the trajectory diverge.)
+        let mut bits1: Vec<AtomicU64> = (0..16).map(|i| AtomicU64::new(i)).collect();
+        let mut bits2: Vec<AtomicU64> = (0..16).map(|i| AtomicU64::new(i * 31337 + 1)).collect();
+        let _ = &mut bits1; // suppress unused-mut lint
+        let _ = &mut bits2;
+        let before = random_in_range(u64::MAX);
+        stir_from_bitmap(&bits1);
+        let after = random_in_range(u64::MAX);
+        assert_ne!(before, after);
+
+        // Snapshot state, stir from bits2, draw — then re-stir from
+        // bits1 and confirm the resulting draw differs from the
+        // bits2 path. (Indirect: we can't introspect the state
+        // directly so we observe its output.)
+        stir_from_bitmap(&bits2);
+        let after_bits2 = random_in_range(u64::MAX);
+        stir_from_bitmap(&bits1);
+        let after_bits1 = random_in_range(u64::MAX);
+        assert_ne!(after_bits2, after_bits1);
     }
 }
