@@ -1,6 +1,6 @@
 # NewCormanLisp Garbage Collector — Design
 
-*Status: agreed, pre-implementation. Last updated 2026-05-10.*
+*Status: implemented through start-bit bitmap. Last updated 2026-05-12.*
 
 ## What this is
 
@@ -233,6 +233,86 @@ Cons-cell allocation is the hot of the hot path. The compiler
 recognises the pattern and emits a specialised inline allocation
 that skips the header write (because cons cells have no header).
 TLAB-bump is identical for cons; the size is just 2 cells.
+
+## Young start-bit bitmap
+
+Alongside young's cell array, we keep a packed per-cell bitmap —
+2 bits per cell, 32 cells per `AtomicU64`, ~3.125% memory overhead.
+For cell index `c`, the pair lives at bit positions `(c % 32) * 2`
+and `(c % 32) * 2 + 1` within word `c / 32`. Encoding:
+
+```
+00 = not a start (the canonical "free / unused" state; abandoned
+     TLAB tails and post-GC dead zones are just runs of 00 pairs,
+     invisible to bitmap-driven walkers)
+01 = header-bearing object start (length lives in the cell at idx)
+11 = cons start (2 cells: car at idx, cdr at idx+1)
+10 = reserved (candidate uses: forwarded-source marker, pinned-
+     header fast-skip, opaque-payload "skip scan" hint — left
+     unused until a real use case bites; reach for this code
+     before adding another HeapType)
+```
+
+Every young allocation path sets the appropriate pair (single
+`fetch_or` with `Relaxed` ordering; header = `0b01 << offset`,
+cons = `0b11 << offset`). Walkers iterate set start-bits via the
+mask `0x5555...` and read the adjacent odd bit to classify each
+visit as cons-or-header.
+
+### Why we need it on young
+
+Young is a mixed-format heap: 2-cell headerless cons cells live
+right next to header-bearing objects. The structural GC walkers
+(`count_pinned`, `rewind_past_pinned`, `clear_pinned_bits`) need
+to know where each object begins so they can check the Pinned bit
+and advance by `1 + length_cells`. Without a bitmap, the only
+way to "guess" object starts is to decode each cell's low 5 bits
+as a HeapType — but a cons-car's value will coincidentally decode
+to a valid HeapType ~31% of the time, and bits 5..29 of that car
+become a fake length that sends the walker stampeding past `top`.
+This is exactly the bug we hit at frame 29 of the bouncing demo
+on 2026-05-11; the panic-on-suspect-walk diagnostic is preserved
+in `Semispace::dump_and_panic` for future walker bugs.
+
+### Why old does NOT need it
+
+A symmetric question with a satisfying answer: **old has no
+walker that needs to find object starts.**
+
+Three phases touch old. None of them care about object boundaries:
+
+1. **Minor GC, card-table scan over old.live.** Iterates *every
+   cell* in each dirty card, treats it as a candidate `Word`, and
+   calls `copy_into`. `copy_into` filters by tag-bits and by
+   "points into young", so false positives are impossible — a
+   non-pointer Word can't decode as a valid young pointer. It
+   doesn't matter whether cell `i` is a header, a car, a cdr, or
+   interior payload: it's all just "slots to inspect."
+
+2. **Full GC, queue-driven Cheney copy.** When an object is
+   copied into `dest`, `copy_into` pushes a `CopiedObject {
+   to_offset, size, is_cons }` onto a queue. `scan_to_completion`
+   drains the queue, iterating each object's payload using the
+   queue entry's `size` and `is_cons` — never reading the heap
+   structurally to recover those.
+
+3. **Pin scan.** Doesn't run on old at all. Pinning exists to
+   tolerate conservative stack scans — JIT'd frames hold tagged
+   words that might or might not be live pointers, and we pin
+   candidates rather than risk moving an object referenced by a
+   stale slot. *Old objects never move during minor GC*; they
+   only move during full GC, which has precise roots and no
+   conservative pass. So no pinning, no Pinned-bit walkers, no
+   need to know object starts.
+
+The architecture is symmetric — `Semispace` already has the
+bitmap field — we just don't populate or consult it on the old
+semispaces. If we ever add a phase that walks old structurally
+(a real **sweeper** for mark-sweep, an **in-place compactor**,
+**incremental marking** with per-header trace dispatch), the
+fix is to start populating the bitmap on old's alloc paths and
+extending the walker discipline. Until then, old gets to be the
+simpler space.
 
 ## Minor GC: copying with forwarding pointers
 
