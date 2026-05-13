@@ -428,6 +428,37 @@ fn install_native_functions(
                    ncl_runtime::float::ceiling_float_shim, 1);
     install_native(coord, mutator, "ROUND-FLOAT",
                    ncl_runtime::float::round_float_shim, 1);
+
+    // Character primitives — see `Lisp/Library/characters.lisp` for
+    // the variadic CHAR= / CHAR< / CHAR-EQUAL family that builds on
+    // top of these. Every shim takes one or two args; argument count
+    // checks happen inside the shim because some are variadic in
+    // the radix slot.
+    install_native(coord, mutator, "CHAR-CODE",
+                   ncl_runtime::chars::char_code_shim, 1);
+    install_native(coord, mutator, "CODE-CHAR",
+                   ncl_runtime::chars::code_char_shim, 1);
+    install_native(coord, mutator, "CHAR-UPCASE",
+                   ncl_runtime::chars::char_upcase_shim, 1);
+    install_native(coord, mutator, "CHAR-DOWNCASE",
+                   ncl_runtime::chars::char_downcase_shim, 1);
+    install_native(coord, mutator, "ALPHA-CHAR-P",
+                   ncl_runtime::chars::alpha_char_p_shim, 1);
+    install_native(coord, mutator, "ALPHANUMERICP",
+                   ncl_runtime::chars::alphanumericp_shim, 1);
+    install_native(coord, mutator, "UPPER-CASE-P",
+                   ncl_runtime::chars::upper_case_p_shim, 1);
+    install_native(coord, mutator, "LOWER-CASE-P",
+                   ncl_runtime::chars::lower_case_p_shim, 1);
+    install_native(coord, mutator, "BOTH-CASE-P",
+                   ncl_runtime::chars::both_case_p_shim, 1);
+    install_native(coord, mutator, "GRAPHIC-CHAR-P",
+                   ncl_runtime::chars::graphic_char_p_shim, 1);
+    install_native(coord, mutator, "DIGIT-CHAR-P",
+                   ncl_runtime::chars::digit_char_p_shim, 2);
+    install_native(coord, mutator, "DIGIT-CHAR",
+                   ncl_runtime::chars::digit_char_shim, 2);
+
     // Multi-value support — `(values ...)` itself is a special form
     // lowered in lower.rs; this is the primitive used by the
     // multiple-value-bind / multiple-value-list macros to read the
@@ -461,6 +492,10 @@ fn install_native_functions(
                    ncl_runtime::symbol_function_shim, 1);
     install_native(coord, mutator, "%SET-SYMBOL-FUNCTION",
                    ncl_runtime::set_symbol_function_shim, 2);
+    install_native(coord, mutator, "SYMBOL-NAME",
+                   ncl_runtime::symbol_name_shim, 1);
+    install_native(coord, mutator, "SYMBOL-PACKAGE",
+                   ncl_runtime::symbol_package_shim, 1);
     install_native(coord, mutator, "FMAKUNBOUND",
                    ncl_runtime::fmakunbound_shim, 1);
     install_native(coord, mutator, "FBOUNDP",

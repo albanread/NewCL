@@ -1677,6 +1677,70 @@ pub extern "C-unwind" fn symbol_function_shim(
     f.raw()
 }
 
+/// `(symbol-name sym)` — return the symbol's printable name as a
+/// fresh String. Interned symbol names live in the process-wide
+/// `sym_names` registry (the symbol's own name cell is left NIL
+/// at allocation time — see `MutatorState::intern`), so we look
+/// up by raw word and allocate a young-heap String to hand back.
+pub extern "C-unwind" fn symbol_name_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        return signal_condition_string(
+            mutator,
+            "symbol-name: expected 1 arg (symbol)",
+        );
+    }
+    let sym = Word::from_raw(unsafe { *args });
+    if sym.tag() != Tag::Symbol {
+        return signal_condition_string(
+            mutator,
+            &format!("symbol-name: argument must be a symbol, got {sym:?}"),
+        );
+    }
+    let m = unsafe { &mut *mutator };
+    match crate::sym_names::lookup(sym.raw()) {
+        Some(name) => {
+            crate::gc_string::alloc_string_in_young(m, name.as_ref()).raw()
+        }
+        None => {
+            // Uninterned / unknown symbol. Hand back an empty
+            // string rather than NIL so callers can pass the
+            // result to length/aref/char without an extra check.
+            crate::gc_string::alloc_string_in_young(m, "").raw()
+        }
+    }
+}
+
+/// `(symbol-package sym)` — return the symbol's home package
+/// (`COMMON-LISP`, `COMMON-LISP-USER`, `KEYWORD`, etc.) or NIL
+/// for an uninterned symbol. Most callers want this to filter
+/// out keywords or to print qualified names.
+pub extern "C-unwind" fn symbol_package_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        return signal_condition_string(
+            mutator,
+            "symbol-package: expected 1 arg (symbol)",
+        );
+    }
+    let sym = Word::from_raw(unsafe { *args });
+    if sym.tag() != Tag::Symbol {
+        return signal_condition_string(
+            mutator,
+            &format!("symbol-package: argument must be a symbol, got {sym:?}"),
+        );
+    }
+    crate::gc_symbol::package(sym).raw()
+}
+
 /// `(%set-symbol-function sym fn)` — install FN as the function
 /// bound to SYM. The setf-symbol-function lowering rewrites
 /// `(setf (symbol-function s) f)` into a call to this. Returns

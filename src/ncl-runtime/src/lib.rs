@@ -12,6 +12,7 @@
 
 pub mod abi;
 pub mod bignum;
+pub mod chars;
 pub mod complex;
 pub mod file_sys;
 pub mod float;
@@ -43,7 +44,7 @@ pub use abi::{
     fboundp_shim, file_exists_shim, file_length_shim, file_position_shim,
     fmakunbound_shim, format_shim,
     gensym_shim, handler_case_shim, intern_shim,
-    set_symbol_function_shim, symbol_function_shim,
+    set_symbol_function_shim, symbol_function_shim, symbol_name_shim, symbol_package_shim,
     loop_return_shim, make_array_shim, multiple_value_list_of_shim, mv_clear_shim,
     values_shim, values_list_shim,
     native_block_shim, native_loop_shim,
