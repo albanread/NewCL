@@ -2485,9 +2485,13 @@ mod end_to_end_tests {
     }
 
     #[test]
-    fn defparameter_returns_value() {
-        // Like setq, defparameter returns the assigned value.
-        assert_eq!(eval_str("(defparameter *x* 99)").unwrap(), "99");
+    fn defparameter_returns_symbol_name() {
+        // CL semantics: defparameter / defvar return the symbol
+        // being defined, NOT the assigned value. (setq returns the
+        // value; the two forms differ on this point.) The symbol's
+        // value cell is set as a side-effect.
+        assert_eq!(eval_str("(defparameter *x* 99)").unwrap(), "*X*");
+        assert_eq!(eval_str("(defparameter *x* 99) *x*").unwrap(), "99");
     }
 
     #[test]
@@ -4111,11 +4115,19 @@ mod end_to_end_tests {
     #[test]
     fn stdlib_member() {
         let mut s = Session::with_stdlib().unwrap();
+        // Fixnums are eql by value, so the default :test #'eql works.
         assert_eq!(s.eval("(member 3 '(1 2 3 4 5))").unwrap(), "(3 4 5)");
         assert_eq!(s.eval("(member 99 '(1 2 3))").unwrap(), "nil");
-        // member uses equal — finds string content match.
+        // Symbols interned in the same package are eq, hence eql.
         assert_eq!(
-            s.eval(r#"(member "b" '("a" "b" "c"))"#).unwrap(),
+            s.eval("(member 'b '(a b c))").unwrap(),
+            "(B C)",
+        );
+        // Strings are NOT eql by content (they are eql only by
+        // identity); the caller must opt into equal for content
+        // comparison. This matches ANSI CL — and Corman.
+        assert_eq!(
+            s.eval(r#"(member "b" '("a" "b" "c") :test #'equal)"#).unwrap(),
             r#"("b" "c")"#,
         );
     }

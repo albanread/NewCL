@@ -5,11 +5,14 @@
 //! decision is independent of readtable case (numbers are
 //! case-insensitive by spec).
 //!
-//! Phase 1c supports fixnums (i64) and floats (f64). Bignums and
-//! ratios land with the numeric tower. Demos that use `3/4` will
-//! currently parse it as a symbol named `3/4`; we'll catch this in
-//! the corpus run (1d) and decide whether to bring up ratios early
-//! or list it as a known limitation.
+//! Supported shapes:
+//!   * fixnums (i64) — `42`, `-7`
+//!   * bignums — integer-shaped literals that overflow i64; carried
+//!     as a decimal-string `Value::Bignum` and converted to a
+//!     heap-allocated bignum by the lowering pass.
+//!   * ratios — `[sign]digits/digits`; carried as a string pair
+//!     `Value::Ratio` and reduced by the lowering pass.
+//!   * floats (f64) — `3.14`, `1e3`, `1.5d-2`, `1.5s2`.
 
 use ncl_runtime::Value;
 
@@ -205,9 +208,40 @@ mod tests {
         assert!(try_parse_number("3foo").is_none());
         assert!(try_parse_number("1e").is_none());
         assert!(try_parse_number(".").is_none());
-        // Ratios — Phase 1c does NOT recognise these. They fall
-        // through and become symbols. See module docstring.
-        assert!(try_parse_number("3/4").is_none());
+        // Sign on the denominator is not a ratio (CL folds sign
+        // onto the numerator) — fall through to symbol.
+        assert!(try_parse_number("3/-4").is_none());
+        // Float-shaped numerator or denominator likewise.
+        assert!(try_parse_number("3.0/4").is_none());
+    }
+
+    #[test]
+    fn ratios_are_recognised() {
+        // `Value::Ratio(num, den)` carries both halves as their
+        // source decimal strings; the lowering pass reduces.
+        match try_parse_number("3/4") {
+            Some(Value::Ratio(n, d)) => {
+                assert_eq!(&*n, "3");
+                assert_eq!(&*d, "4");
+            }
+            other => panic!("3/4 should be Value::Ratio, got {other:?}"),
+        }
+        // Negative numerator.
+        match try_parse_number("-7/8") {
+            Some(Value::Ratio(n, d)) => {
+                assert_eq!(&*n, "-7");
+                assert_eq!(&*d, "8");
+            }
+            other => panic!("-7/8 should be Value::Ratio, got {other:?}"),
+        }
+        // Bignum-sized numerator survives the unreduced ratio path.
+        match try_parse_number("100000000000000000000/3") {
+            Some(Value::Ratio(n, d)) => {
+                assert_eq!(&*n, "100000000000000000000");
+                assert_eq!(&*d, "3");
+            }
+            other => panic!("big ratio should be Value::Ratio, got {other:?}"),
+        }
     }
 
     #[test]
