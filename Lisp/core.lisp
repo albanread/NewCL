@@ -481,6 +481,129 @@
            (t ,@body
               (setq ,var (+ ,var 1))))))))
 
+;; ── DO and DO* ────────────────────────────────────────────────────────
+;;
+;; Common Lisp's general iterative construct:
+;;
+;;   (do ((var init [step])...)
+;;       (end-test result-form...)
+;;     body...)
+;;
+;; Semantics in three parts:
+;;
+;;   1. Establish an implicit (block nil …) around the whole form.
+;;   2. Bind all VARs to their INIT forms simultaneously (let-style
+;;      for DO; let*-style for DO*).
+;;   3. Loop. Each pass: evaluate END-TEST; if true, evaluate
+;;      RESULT-FORMs and return the last one. Otherwise evaluate
+;;      BODY (treated as an implicit progn — we don't have tagbody
+;;      yet; go-tags inside the body aren't supported), then step
+;;      every bound variable that has a STEP form. For DO the steps
+;;      are evaluated in parallel (the classic "swap" idiom works);
+;;      for DO* sequentially.
+;;
+;; Bindings without a STEP form keep their value across iterations.
+;; A bare-symbol binding `(foo)` is treated as `(foo nil)`.
+;;
+;; (return val) inside BODY exits the do with VAL (it finds the
+;; implicit block-nil). Same for (return-from nil val).
+
+(defun %do-normalise-binding (b)
+  "Internal: turn each DO binding into (var init step-or-:no-step).
+   Accepts a bare symbol, (var), (var init), or (var init step)."
+  (cond
+    ((symbolp b) (list b nil :no-step))
+    ((null (cdr b)) (list (car b) nil :no-step))
+    ((null (cdr (cdr b))) (list (car b) (car (cdr b)) :no-step))
+    (t (list (car b) (car (cdr b)) (car (cdr (cdr b)))))))
+
+(defun %do-stepped-only (norm)
+  ;; Keep only the bindings that have a STEP form.
+  (cond
+    ((null norm) nil)
+    ((eq (car (cdr (cdr (car norm)))) :no-step)
+     (%do-stepped-only (cdr norm)))
+    (t (cons (car norm) (%do-stepped-only (cdr norm))))))
+
+(defun %do-let-bindings (norm)
+  ;; Build (let …) binding pairs (var init) from the normalised
+  ;; (var init step) triples. We can't use `(mapcar #'list vars
+  ;; inits)` because core's mapcar is unary; this recursive
+  ;; helper does the n-ary zip we need.
+  (cond
+    ((null norm) nil)
+    (t (cons (list (car (car norm)) (car (cdr (car norm))))
+             (%do-let-bindings (cdr norm))))))
+
+(defun %do-step-block-parallel (stepped)
+  "Build the parallel-step body: evaluate all step forms into
+   gensym temps, then assign each VAR from its temp."
+  (cond
+    ((null stepped) nil)
+    (t
+     (let ((bindings nil)
+           (assigns nil))
+       (dolist (s stepped)
+         (let ((var (car s))
+               (step (car (cdr (cdr s))))
+               (tmp (gensym "DO-NEW-")))
+           (push (list tmp step) bindings)
+           (push (list 'setq var tmp) assigns)))
+       (list `(let ,(reverse bindings) ,@(reverse assigns)))))))
+
+(defun %do-step-block-sequential (stepped)
+  "DO* step: assign each VAR from its STEP in order; later steps
+   see the updated earlier values."
+  (cond
+    ((null stepped) nil)
+    (t (let ((assigns nil))
+         (dolist (s stepped)
+           (let ((var (car s))
+                 (step (car (cdr (cdr s)))))
+             (push (list 'setq var step) assigns)))
+         (reverse assigns)))))
+
+(defmacro do (bindings end-clause &rest body)
+  "Common Lisp DO: parallel-init / parallel-step iteration."
+  (let* ((norm     (mapcar #'%do-normalise-binding bindings))
+         (stepped  (%do-stepped-only norm))
+         (end-test (car end-clause))
+         (results  (cdr end-clause)))
+    `(block nil
+       (let ,(%do-let-bindings norm)
+         (loop
+           ;; cond, not (when test (return …)) — NCL's RETURN is
+           ;; a flag-set, not a non-local exit; using `when` lets
+           ;; the body and step still run after a triggered
+           ;; return-from-loop, which is wrong (and crashes when
+           ;; the step touches now-NIL state).
+           (cond
+             (,end-test (return (progn ,@results)))
+             ;; Trailing nil makes the t-clause non-empty when
+             ;; the do has no body forms AND no step bindings
+             ;; (the (t …) clause must have at least one body
+             ;; form per NCL's current cond lowering).
+             (t ,@body
+                ,@(%do-step-block-parallel stepped)
+                nil)))))))
+
+(defmacro do* (bindings end-clause &rest body)
+  "Common Lisp DO*: sequential-init (let*-style) / sequential-step
+   iteration. The init / step forms of later bindings see the
+   updated values of earlier ones."
+  (let* ((norm     (mapcar #'%do-normalise-binding bindings))
+         (stepped  (%do-stepped-only norm))
+         (end-test (car end-clause))
+         (results  (cdr end-clause)))
+    `(block nil
+       (let* ,(%do-let-bindings norm)
+         (loop
+           (cond
+             (,end-test (return (progn ,@results)))
+             (t ,@body
+                ,@(%do-step-block-sequential stepped)
+                nil)))))))
+
 ;; -- Property lists ----------------------------------------------------------
 
 (defun getf (plist key)

@@ -130,6 +130,10 @@ impl Session {
         // calling convention. The only difference is where they're
         // installed — macros into the coordinator's macro registry,
         // defuns into the symbol's function cell.
+        //
+        // ANSI CL convention says the body is implicitly wrapped
+        // in (block NAME …); we don't do that yet. See the comment
+        // on `wrap_body_in_block` below for the blocker.
         let fn_word = self.compile_function(name, params, body_forms)?;
         self.coord.install_macro(Arc::from(name), fn_word);
         Ok(Word::NIL)
@@ -1239,6 +1243,18 @@ fn match_defun(
 /// Recognise `(progn body...)` so top-level progn can splice its
 /// body forms back into the top-level recogniser. Returns the
 /// body as a Vec of Values, or None if the form isn't a progn.
+// NOTE: Auto-block for defun bodies (so `(return-from NAME val)`
+// inside `(defun NAME …)` works without an explicit BLOCK) is
+// deferred. The natural implementation wraps the body in
+// `(block NAME body…)`, which macroexpands to
+// `(%native-block 'NAME (lambda () body…))`. That adds an extra
+// captured-env lambda between the defun's parameters and any
+// inner lambda the body contains — and three-level closure
+// capture currently miscompiles in the LLVM lowering (a separate
+// `(defun mk (x) (let ((h (lambda () (lambda (y) (+ x y))))) (funcall h)))`
+// segfaults on baseline). Once that's fixed, re-add the wrap in
+// handle_defun / handle_defmacro gated on `coord.macro_for("BLOCK")`.
+
 fn match_top_level_progn(v: &Value) -> Option<Vec<Value>> {
     let Value::Cons(c) = v else { return None };
     let Value::Symbol(head) = &c.car else { return None };
