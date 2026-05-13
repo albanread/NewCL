@@ -76,20 +76,18 @@
 
 ;; ── create-thread wrapper: handles :report-when-finished ────────────────
 ;;
-;; The native shim takes one mandatory argument (the function). The
-;; Lisp wrapper accepts Corman's keyword and forwards.
+;; The native shim takes (function, report?). The Lisp wrapper
+;; presents Corman's `&key (report-when-finished t)` shape and
+;; forwards the flag through to the registry entry, where the
+;; spawn thunk reads it to decide whether to emit a line to
+;; stderr on thread exit.
 
 (defun create-thread (func &key (report-when-finished t))
   "Spawn an OS thread running (funcall FUNC) with no arguments.
    Returns the new thread's integer id. If REPORT-WHEN-FINISHED
    is non-nil (the default), a line is printed to stderr when the
    thread terminates."
-  (declare (ignore report-when-finished))
-  ;; The runtime shim always reports today; the keyword is accepted
-  ;; for Corman API compatibility but currently a no-op. Honouring
-  ;; the flag is a small follow-up: pipe it into a second shim arg
-  ;; and store it on the registry entry.
-  (%create-thread func))
+  (%create-thread func report-when-finished))
 
 ;; ── thread-loop: cooperative termination helper ─────────────────────────
 ;;

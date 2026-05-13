@@ -484,8 +484,12 @@ fn install_native_functions(
     // class, etc.) on top of these primitives. We install the
     // primitives unconditionally so `(require 'threads)` works on
     // every platform; the underlying OS support is `std::thread`.
+    // Arity is 2 (function, report-when-finished?); the shim treats
+    // the second arg as optional and defaults to T when only one
+    // arg is supplied, so the Lisp wrapper in Library/threads.lisp
+    // can pass either shape.
     install_native(coord, mutator, "%CREATE-THREAD",
-                   ncl_runtime::create_thread_shim, 1);
+                   ncl_runtime::create_thread_shim, 2);
     install_native(coord, mutator, "EXIT-THREAD",
                    ncl_runtime::exit_thread_shim, 1);
     install_native(coord, mutator, "THREAD-HANDLE",
