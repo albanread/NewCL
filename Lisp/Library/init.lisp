@@ -27,6 +27,7 @@
 (require 'sequences)                     ; generic position/find/count/etc.
 (require 'trees)                         ; subst, sublis, tree-equal, copy-tree, revappend
 (require 'characters)                    ; char-code/upcase/case-p, char= family, name-char
+(require 'lists)                         ; mapl/maplist/mapcan/mapcon, pairlis/acons, tailp/ldiff
 (require 'events)                        ; iGui event-loop / with-events-from
 (require 'hot-reload)                    ; (start-hot-reload), (check-reloads)
 
