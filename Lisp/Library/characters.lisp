@@ -65,15 +65,12 @@
 
 (defun %pairwise-distinct-by (chars key)
   "Internal: T iff no two chars in CHARS map to the same value
-   under KEY. Walks the upper-triangular pair set recursively.
-   Written with `(not (= …))` rather than `/=` because the latter
-   has no function-cell binding in NCL today (would crash on
-   funcall)."
+   under KEY. Walks the upper-triangular pair set recursively."
   (cond
     ((null chars) t)
     ((null (cdr chars)) t)
     (t (let ((k (funcall key (car chars))))
-         (and (every (lambda (c) (not (= k (funcall key c)))) (cdr chars))
+         (and (every (lambda (c) (/= k (funcall key c))) (cdr chars))
               (%pairwise-distinct-by (cdr chars) key))))))
 
 (defun %upcase-code (c) (char-code (char-upcase c)))
@@ -92,24 +89,11 @@
   (%pairwise-distinct-by chars #'char-code))
 
 ;; ── Strict-ordering chain (codepoint) ──────────────────────────────────
-;;
-;; NCL's numeric comparison operators `<`, `>`, `<=`, `>=` are
-;; lowered as compiler special forms — they have no function-cell
-;; binding, so `#'<` fails at runtime ("undefined function: <").
-;; Until comparison shims are installed natively, we pass a
-;; one-line lambda wrapper. The %CMP-* helpers below give every
-;; chain function exactly the predicate it needs without funcalling
-;; an unbound symbol.
 
-(defun %cmp-lt (a b) (< a b))
-(defun %cmp-gt (a b) (> a b))
-(defun %cmp-le (a b) (<= a b))
-(defun %cmp-ge (a b) (>= a b))
-
-(defun char<  (&rest chars) (%chain-by #'%cmp-lt chars #'char-code))
-(defun char>  (&rest chars) (%chain-by #'%cmp-gt chars #'char-code))
-(defun char<= (&rest chars) (%chain-by #'%cmp-le chars #'char-code))
-(defun char>= (&rest chars) (%chain-by #'%cmp-ge chars #'char-code))
+(defun char<  (&rest chars) (%chain-by #'<  chars #'char-code))
+(defun char>  (&rest chars) (%chain-by #'>  chars #'char-code))
+(defun char<= (&rest chars) (%chain-by #'<= chars #'char-code))
+(defun char>= (&rest chars) (%chain-by #'>= chars #'char-code))
 
 ;; ── Case-insensitive variants ──────────────────────────────────────────
 ;;
@@ -119,10 +103,10 @@
 (defun char-equal     (&rest chars) (%all-equal-by chars #'%upcase-code))
 (defun char-not-equal (&rest chars) (%pairwise-distinct-by chars #'%upcase-code))
 
-(defun char-lessp        (&rest chars) (%chain-by #'%cmp-lt chars #'%upcase-code))
-(defun char-greaterp     (&rest chars) (%chain-by #'%cmp-gt chars #'%upcase-code))
-(defun char-not-greaterp (&rest chars) (%chain-by #'%cmp-le chars #'%upcase-code))
-(defun char-not-lessp    (&rest chars) (%chain-by #'%cmp-ge chars #'%upcase-code))
+(defun char-lessp        (&rest chars) (%chain-by #'<  chars #'%upcase-code))
+(defun char-greaterp     (&rest chars) (%chain-by #'>  chars #'%upcase-code))
+(defun char-not-greaterp (&rest chars) (%chain-by #'<= chars #'%upcase-code))
+(defun char-not-lessp    (&rest chars) (%chain-by #'>= chars #'%upcase-code))
 
 ;; ── Character names ────────────────────────────────────────────────────
 ;;

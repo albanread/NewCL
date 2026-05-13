@@ -37,13 +37,9 @@ fn maplist_walks_cdr_chains_and_collects() {
         "((A B C) (B C) (C))",
     );
     // The function sees the *tail*, not the head — counting cars
-    // from each tail gives a strictly decreasing series. (We wrap
-    // LENGTH in a lambda because #'length doesn't yet resolve —
-    // LENGTH is a compiler special form with no function-cell
-    // binding; a separate slice will install those natives.)
+    // from each tail gives a strictly decreasing series.
     assert_eq!(
-        s.eval("(maplist (lambda (tail) (length tail)) '(a b c d e))")
-            .unwrap(),
+        s.eval("(maplist #'length '(a b c d e))").unwrap(),
         "(5 4 3 2 1)",
     );
 }

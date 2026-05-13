@@ -496,6 +496,27 @@ fn install_native_functions(
                    ncl_runtime::symbol_name_shim, 1);
     install_native(coord, mutator, "SYMBOL-PACKAGE",
                    ncl_runtime::symbol_package_shim, 1);
+
+    // Numeric comparison + length: the compiler lowers `(< a b)`,
+    // `(length x)` etc. as special forms (fast path), but `#'<` /
+    // `#'length` need callable function-cell bindings too. These
+    // shims supply the funcall path; direct calls still take the
+    // special-form lowering. `/=` is the lone exception — it's
+    // not a special form, so the shim is the only path.
+    install_native(coord, mutator, "<",
+                   ncl_runtime::lt_shim, 2);
+    install_native(coord, mutator, ">",
+                   ncl_runtime::gt_shim, 2);
+    install_native(coord, mutator, "<=",
+                   ncl_runtime::le_shim, 2);
+    install_native(coord, mutator, ">=",
+                   ncl_runtime::ge_shim, 2);
+    install_native(coord, mutator, "=",
+                   ncl_runtime::num_eq_shim, 2);
+    install_native(coord, mutator, "/=",
+                   ncl_runtime::num_ne_shim, 2);
+    install_native(coord, mutator, "LENGTH",
+                   ncl_runtime::length_shim, 1);
     install_native(coord, mutator, "FMAKUNBOUND",
                    ncl_runtime::fmakunbound_shim, 1);
     install_native(coord, mutator, "FBOUNDP",

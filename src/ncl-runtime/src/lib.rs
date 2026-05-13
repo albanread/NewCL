@@ -45,6 +45,7 @@ pub use abi::{
     fmakunbound_shim, format_shim,
     gensym_shim, handler_case_shim, intern_shim,
     set_symbol_function_shim, symbol_function_shim, symbol_name_shim, symbol_package_shim,
+    length_shim, lt_shim, gt_shim, le_shim, ge_shim, num_eq_shim, num_ne_shim,
     loop_return_shim, make_array_shim, multiple_value_list_of_shim, mv_clear_shim,
     values_shim, values_list_shim,
     native_block_shim, native_loop_shim,

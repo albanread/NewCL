@@ -1203,6 +1203,156 @@ pub extern "C-unwind" fn eql_shim(
     }
 }
 
+// ─── Numeric comparison + length shims ──────────────────────────────────
+//
+// The compiler lowers `(< a b)`, `(>= a b)`, `(length x)` etc. as
+// special forms, so direct use is fast. But `#'<`, `#'length`,
+// `(funcall #'< 1 2)`, `(every #'< xs ys)` — every first-class
+// reference to one of these names — needs an actual function
+// object in the symbol's function cell. Without that, the load
+// of `<`'s function cell returns UNBOUND and the call fails with
+// `undefined function: <`.
+//
+// These shims fix that. Each is a one-line wrapper over the
+// matching primitive (`ncl_cmp_full` for the comparison family,
+// `ncl_length` for the polymorphic length). The arithmetic
+// behaviour is unchanged — direct-call lowering still emits
+// inline IR; only the funcall path now has a real callable.
+
+/// `(< a b)` — numeric less-than across the full numeric tower.
+pub extern "C-unwind" fn lt_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        return signal_condition_string(mutator, "<: expected 2 args");
+    }
+    let a = unsafe { *args };
+    let b = unsafe { *args.add(1) };
+    if crate::ratio::ncl_cmp_full(a, b) < 0 {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
+/// `(> a b)`.
+pub extern "C-unwind" fn gt_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        return signal_condition_string(mutator, ">: expected 2 args");
+    }
+    let a = unsafe { *args };
+    let b = unsafe { *args.add(1) };
+    if crate::ratio::ncl_cmp_full(a, b) > 0 {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
+/// `(<= a b)`.
+pub extern "C-unwind" fn le_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        return signal_condition_string(mutator, "<=: expected 2 args");
+    }
+    let a = unsafe { *args };
+    let b = unsafe { *args.add(1) };
+    if crate::ratio::ncl_cmp_full(a, b) <= 0 {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
+/// `(>= a b)`.
+pub extern "C-unwind" fn ge_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        return signal_condition_string(mutator, ">=: expected 2 args");
+    }
+    let a = unsafe { *args };
+    let b = unsafe { *args.add(1) };
+    if crate::ratio::ncl_cmp_full(a, b) >= 0 {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
+/// `(= a b)` — numeric equality (NOT object identity; `=` walks the
+/// numeric tower so `(= 1 1.0)` is T even though `(eql 1 1.0)` is NIL).
+pub extern "C-unwind" fn num_eq_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        return signal_condition_string(mutator, "=: expected 2 args");
+    }
+    let a = unsafe { *args };
+    let b = unsafe { *args.add(1) };
+    if crate::ratio::ncl_cmp_full(a, b) == 0 {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
+/// `(/= a b)` — numeric inequality. The inverse of `=`, not the
+/// inverse of `EQL`. (No equivalent compiler special form, so
+/// this is the *only* way `/=` works at all — direct calls land
+/// here too.)
+pub extern "C-unwind" fn num_ne_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        return signal_condition_string(mutator, "/=: expected 2 args");
+    }
+    let a = unsafe { *args };
+    let b = unsafe { *args.add(1) };
+    if crate::ratio::ncl_cmp_full(a, b) != 0 {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
+/// `(length x)` — polymorphic on tag: codepoint count for strings,
+/// element count for vectors, spine length for cons-list. The
+/// underlying `ncl_length` already implements this for the
+/// direct-call path; we expose it as a callable.
+pub extern "C-unwind" fn length_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        return signal_condition_string(mutator, "length: expected 1 arg");
+    }
+    ncl_length(unsafe { *args })
+}
+
 /// `(typep object type-spec)` — true if `object` belongs to the
 /// CL type named by `type-spec`. `type-spec` is a symbol; compound
 /// type specs like `(integer 0 100)` are not yet supported.
