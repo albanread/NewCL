@@ -56,36 +56,129 @@
       b
       (cons (car a) (append (cdr a) b))))
 
-;; -- mapcar, mapc, every, some -----------------------------------------------
+;; -- mapcar, mapc, every, some (variadic) ----------------------------------
+;;
+;; CL's mapping family walks N lists in parallel and stops at the
+;; shortest. Each step builds the argument vector by taking the CAR
+;; of every list, applies FN, then advances every list by one CDR.
+;;
+;; The N=1 case is hot — recursion stays as it was (no per-step
+;; cons-list of cars/cdrs). The N>1 case routes through a shared
+;; walker; the &rest tail it consumes is the only extra allocation.
+;;
+;; Early-exit predicates (every, some) short-circuit naturally: the
+;; recursive helper returns the moment its own cond fires, and the
+;; ACL stack unwinds without any further work.
+;;
+;; Two helpers do the parallel-walk plumbing: %cars-of gathers
+;; (car a) (car b) (car c) … and %cdrs-of gathers (cdr a) (cdr b)
+;; (cdr c) …. %any-null is the loop's end-test.
 
-(defun mapcar (fn lst)
-  (if (null lst)
-      nil
-      (cons (funcall fn (car lst))
-            (mapcar fn (cdr lst)))))
+(defun %any-null (lsts)
+  (cond
+    ((null lsts) nil)
+    ((null (car lsts)) t)
+    (t (%any-null (cdr lsts)))))
 
-(defun mapc (fn lst)
-  ;; Like mapcar but returns the original list and is called for
-  ;; effect.
-  (if (null lst)
-      lst
-      (progn (funcall fn (car lst))
-             (mapc fn (cdr lst))
-             lst)))
+(defun %cars-of (lsts)
+  (cond
+    ((null lsts) nil)
+    (t (cons (car (car lsts)) (%cars-of (cdr lsts))))))
 
-(defun every (pred lst)
-  ;; True iff pred is non-nil for every element.
+(defun %cdrs-of (lsts)
+  (cond
+    ((null lsts) nil)
+    (t (cons (cdr (car lsts)) (%cdrs-of (cdr lsts))))))
+
+;; ── mapcar ──────────────────────────────────────────────────────
+
+(defun %mapcar-1 (fn lst)
+  (cond
+    ((null lst) nil)
+    (t (cons (funcall fn (car lst))
+             (%mapcar-1 fn (cdr lst))))))
+
+(defun %mapcar-n (fn lsts)
+  (cond
+    ((%any-null lsts) nil)
+    (t (cons (apply fn (%cars-of lsts))
+             (%mapcar-n fn (%cdrs-of lsts))))))
+
+(defun mapcar (fn list &rest more-lists)
+  "Apply FN to successive elements of LIST and MORE-LISTS in
+   parallel, collecting the results. Stops at the shortest input.
+   FN receives one argument per list."
+  (cond
+    ((null more-lists) (%mapcar-1 fn list))
+    (t (%mapcar-n fn (cons list more-lists)))))
+
+;; ── mapc ────────────────────────────────────────────────────────
+
+(defun %mapc-1 (fn lst)
+  (cond
+    ((null lst) nil)
+    (t (funcall fn (car lst))
+       (%mapc-1 fn (cdr lst)))))
+
+(defun %mapc-n (fn lsts)
+  (cond
+    ((%any-null lsts) nil)
+    (t (apply fn (%cars-of lsts))
+       (%mapc-n fn (%cdrs-of lsts)))))
+
+(defun mapc (fn list &rest more-lists)
+  "Like MAPCAR but called for effect. Returns LIST (the first
+   input list) unchanged. FN is invoked for its side effects."
+  (cond
+    ((null more-lists) (%mapc-1 fn list))
+    (t (%mapc-n fn (cons list more-lists))))
+  list)
+
+;; ── every ──────────────────────────────────────────────────────
+
+(defun %every-1 (pred lst)
   (cond
     ((null lst) t)
-    ((funcall pred (car lst)) (every pred (cdr lst)))
+    ((funcall pred (car lst)) (%every-1 pred (cdr lst)))
     (t nil)))
 
-(defun some (pred lst)
-  ;; Returns the first non-nil value of pred over the list, or nil.
+(defun %every-n (pred lsts)
+  (cond
+    ((%any-null lsts) t)
+    ((apply pred (%cars-of lsts)) (%every-n pred (%cdrs-of lsts)))
+    (t nil)))
+
+(defun every (pred list &rest more-lists)
+  "T iff PRED returns non-NIL for every parallel tuple of elements
+   from LIST and MORE-LISTS. Stops at the shortest input. Early-
+   exits on the first NIL."
+  (cond
+    ((null more-lists) (%every-1 pred list))
+    (t (%every-n pred (cons list more-lists)))))
+
+;; ── some ───────────────────────────────────────────────────────
+
+(defun %some-1 (pred lst)
   (cond
     ((null lst) nil)
     (t (let ((v (funcall pred (car lst))))
-         (if v v (some pred (cdr lst)))))))
+         (cond (v v)
+               (t (%some-1 pred (cdr lst)))))) ))
+
+(defun %some-n (pred lsts)
+  (cond
+    ((%any-null lsts) nil)
+    (t (let ((v (apply pred (%cars-of lsts))))
+         (cond (v v)
+               (t (%some-n pred (%cdrs-of lsts)))))) ))
+
+(defun some (pred list &rest more-lists)
+  "Returns the first non-NIL value of PRED applied to parallel
+   tuples from LIST and MORE-LISTS, or NIL if all yielded NIL.
+   Stops at the shortest input or at the first hit."
+  (cond
+    ((null more-lists) (%some-1 pred list))
+    (t (%some-n pred (cons list more-lists)))))
 
 ;; -- member, position, find, assoc -------------------------------------------
 

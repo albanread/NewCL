@@ -8,13 +8,11 @@
 ;;;;   * Alist helpers — PAIRLIS, ACONS.
 ;;;;   * Tail-sharing helpers — TAILP, LDIFF.
 ;;;;
-;;;; Scope note: CL's mapping family is variadic over the input
-;;;; lists — (MAPCAR fn a b c) walks three lists in parallel. The
-;;;; Corman implementation expresses this with DO loops and
-;;;; RETURN-FROM blocks, neither of which NCL has yet. This module
-;;;; ports the unary (one input list) shapes only, which cover the
-;;;; overwhelming majority of real uses. Variadic versions land
-;;;; when DO / named-block support arrives.
+;;;; All four mapping operators are variadic over the input lists:
+;;;; (MAPLIST fn a b c) walks three lists in parallel and stops at
+;;;; the shortest, exactly like the CL spec. The single-list case
+;;;; takes a fast path (plain recursion); the multi-list case
+;;;; routes through %cars-of / %cdrs-of (core.lisp helpers).
 
 ;; ── Map family ─────────────────────────────────────────────────────────
 ;;
@@ -25,43 +23,96 @@
 ;;   nconc      MAPCAN              MAPCON
 ;;   discard    MAPC                MAPL
 ;;
-;; MAPCAR / MAPC live in core.lisp. We add the other four.
+;; MAPCAR / MAPC live in core.lisp; here we add the other four. All
+;; four are variadic over the input lists in the same parallel-walk
+;; shape MAPCAR uses.
 
-(defun mapl (fn lst)
-  "Apply FN successively to LST, (CDR LST), (CDDR LST), … until the
-   list is exhausted. Called for effect; returns LST unchanged."
-  (cond
-    ((null lst) lst)
-    (t (funcall fn lst)
-       (mapl fn (cdr lst))
-       lst)))
+;; ── mapl ────────────────────────────────────────────────────────
 
-(defun maplist (fn lst)
-  "Apply FN to LST, (CDR LST), (CDDR LST), … collecting each
-   result into a fresh list. Like MAPCAR but the function receives
-   the *tail* at each step, not the head element."
+(defun %mapl-1 (fn lst)
   (cond
     ((null lst) nil)
-    (t (cons (funcall fn lst)
-             (maplist fn (cdr lst))))))
+    (t (funcall fn lst)
+       (%mapl-1 fn (cdr lst)))))
 
-(defun mapcan (fn lst)
-  "Apply FN to each element of LST and NCONC the results together.
-   FN must return a list at every step; an empty return contributes
-   no elements."
+(defun %mapl-n (fn lsts)
+  (cond
+    ((%any-null lsts) nil)
+    (t (apply fn lsts)
+       (%mapl-n fn (%cdrs-of lsts)))))
+
+(defun mapl (fn list &rest more-lists)
+  "Apply FN successively to (LIST MORE…), then to (CDR LIST) …,
+   walking every list in parallel and stopping at the shortest.
+   FN receives one tail per list. Called for effect; returns
+   LIST unchanged."
+  (cond
+    ((null more-lists) (%mapl-1 fn list))
+    (t (%mapl-n fn (cons list more-lists))))
+  list)
+
+;; ── maplist ────────────────────────────────────────────────────
+
+(defun %maplist-1 (fn lst)
+  (cond
+    ((null lst) nil)
+    (t (cons (funcall fn lst) (%maplist-1 fn (cdr lst))))))
+
+(defun %maplist-n (fn lsts)
+  (cond
+    ((%any-null lsts) nil)
+    (t (cons (apply fn lsts) (%maplist-n fn (%cdrs-of lsts))))))
+
+(defun maplist (fn list &rest more-lists)
+  "Apply FN to (LIST MORE…), (CDR LIST) …, …, collecting each
+   result. Like MAPCAR but FN sees the tails at each step, not
+   the heads."
+  (cond
+    ((null more-lists) (%maplist-1 fn list))
+    (t (%maplist-n fn (cons list more-lists)))))
+
+;; ── mapcan ────────────────────────────────────────────────────
+
+(defun %mapcan-1 (fn lst)
   (cond
     ((null lst) nil)
     (t (let ((head (funcall fn (car lst))))
-         (nconc head (mapcan fn (cdr lst)))))))
+         (nconc head (%mapcan-1 fn (cdr lst)))))))
 
-(defun mapcon (fn lst)
-  "Apply FN to LST, (CDR LST), … and NCONC the results. Each FN
-   call receives a tail; each return is concatenated into the
-   final list."
+(defun %mapcan-n (fn lsts)
+  (cond
+    ((%any-null lsts) nil)
+    (t (let ((head (apply fn (%cars-of lsts))))
+         (nconc head (%mapcan-n fn (%cdrs-of lsts)))))))
+
+(defun mapcan (fn list &rest more-lists)
+  "Apply FN to parallel tuples of elements and NCONC the results
+   together. FN must return a list at every step; NIL contributes
+   no elements. The idiomatic 'filter and flatten' combinator."
+  (cond
+    ((null more-lists) (%mapcan-1 fn list))
+    (t (%mapcan-n fn (cons list more-lists)))))
+
+;; ── mapcon ────────────────────────────────────────────────────
+
+(defun %mapcon-1 (fn lst)
   (cond
     ((null lst) nil)
     (t (let ((head (funcall fn lst)))
-         (nconc head (mapcon fn (cdr lst)))))))
+         (nconc head (%mapcon-1 fn (cdr lst)))))))
+
+(defun %mapcon-n (fn lsts)
+  (cond
+    ((%any-null lsts) nil)
+    (t (let ((head (apply fn lsts)))
+         (nconc head (%mapcon-n fn (%cdrs-of lsts)))))))
+
+(defun mapcon (fn list &rest more-lists)
+  "Apply FN to the cdr-chains of LIST and MORE-LISTS in parallel
+   and NCONC the results. Each FN call receives a tail per list."
+  (cond
+    ((null more-lists) (%mapcon-1 fn list))
+    (t (%mapcon-n fn (cons list more-lists)))))
 
 ;; ── Alist helpers ──────────────────────────────────────────────────────
 

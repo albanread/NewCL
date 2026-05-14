@@ -555,6 +555,18 @@ fn install_native_functions(
                    ncl_runtime::num_ne_shim, 2);
     install_native(coord, mutator, "LENGTH",
                    ncl_runtime::length_shim, 1);
+
+    // Arithmetic — same story as the comparison family above. Direct
+    // (+ a b) takes the special-form fast path; #'+ / (funcall #'+ …)
+    // / (mapcar #'+ …) need the function-cell shim. The shims wrap
+    // ncl_add_full / ncl_sub_full / ncl_mul_full, which already
+    // handle the full numeric tower.
+    install_native(coord, mutator, "+",
+                   ncl_runtime::add_shim, 2);
+    install_native(coord, mutator, "-",
+                   ncl_runtime::sub_shim, 2);
+    install_native(coord, mutator, "*",
+                   ncl_runtime::mul_shim, 2);
     install_native(coord, mutator, "FMAKUNBOUND",
                    ncl_runtime::fmakunbound_shim, 1);
     install_native(coord, mutator, "FBOUNDP",

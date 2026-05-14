@@ -1353,6 +1353,90 @@ pub extern "C-unwind" fn length_shim(
     ncl_length(unsafe { *args })
 }
 
+// ─── Arithmetic shims (the funcall path) ────────────────────────────────
+//
+// `+`, `-`, `*` are compiler special forms — the direct-call path
+// generates inline IR through `Expr::add` / `Expr::sub` / `Expr::mul`
+// and only spills to `ncl_*_full` on overflow / non-fixnum operands.
+// But the symbols' function cells need real callables too, or
+// `#'+` / `(funcall #'+ …)` / `(mapcar #'+ …)` crash with
+// "undefined function: +".
+//
+// These are binary shims (CL's +/-/* are variadic but here we expose
+// the two-arg fold step — `(mapcar #'+ '(1 2) '(3 4))` calls the
+// shim with exactly two args at each step). The Lisp side already
+// has variadic wrappers via the special-form lowering for direct
+// calls; the funcall surface is the only thing that goes through
+// these shims today.
+
+/// `(+ &rest args)` — CL spec: variadic fold over the numeric
+/// tower, with `(+)` returning 0 (the additive identity). Each
+/// fold step calls `ncl_add_full`, which handles fixnum / bignum
+/// / ratio / float / complex transparently.
+pub extern "C-unwind" fn add_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    let mut acc = Word::fixnum(0).raw();
+    for i in 0..n_args {
+        let next = unsafe { *args.add(i as usize) };
+        acc = crate::ratio::ncl_add_full(mutator, acc, next);
+        if ABORT_PENDING.with(|p| p.get()) {
+            return acc;
+        }
+    }
+    acc
+}
+
+/// `(- a)` negates; `(- a b c …)` is `a - b - c - …`. `(- )` with no
+/// args is a CL spec error (and we follow suit).
+pub extern "C-unwind" fn sub_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args == 0 {
+        return signal_condition_string(mutator, "-: expected at least 1 arg");
+    }
+    let first = unsafe { *args };
+    if n_args == 1 {
+        // Unary negate: 0 - first.
+        let zero = Word::fixnum(0).raw();
+        return crate::ratio::ncl_sub_full(mutator, zero, first);
+    }
+    let mut acc = first;
+    for i in 1..n_args {
+        let next = unsafe { *args.add(i as usize) };
+        acc = crate::ratio::ncl_sub_full(mutator, acc, next);
+        if ABORT_PENDING.with(|p| p.get()) {
+            return acc;
+        }
+    }
+    acc
+}
+
+/// `(* &rest args)` — variadic fold; `(*)` returns 1 (the
+/// multiplicative identity).
+pub extern "C-unwind" fn mul_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    let mut acc = Word::fixnum(1).raw();
+    for i in 0..n_args {
+        let next = unsafe { *args.add(i as usize) };
+        acc = crate::ratio::ncl_mul_full(mutator, acc, next);
+        if ABORT_PENDING.with(|p| p.get()) {
+            return acc;
+        }
+    }
+    acc
+}
+
 /// `(typep object type-spec)` — true if `object` belongs to the
 /// CL type named by `type-spec`. `type-spec` is a symbol; compound
 /// type specs like `(integer 0 100)` are not yet supported.

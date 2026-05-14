@@ -165,3 +165,75 @@ fn ldiff_returns_prefix_before_eq_object() {
     // LDIFF of NIL → NIL.
     assert_eq!(s.eval("(ldiff nil 'q)").unwrap(), "nil");
 }
+
+// ── Variadic forms (walk N lists in parallel) ─────────────────────────
+
+#[test]
+fn maplist_variadic_walks_n_lists_in_parallel() {
+    let mut s = fresh_session_with_lists();
+    // FN receives one tail per list; we cons (car a) onto (car b)
+    // at each step to make the parallel walk visible.
+    assert_eq!(
+        s.eval(
+            "(maplist (lambda (a b) (cons (car a) (car b)))
+                      '(1 2 3) '(x y z))"
+        )
+        .unwrap(),
+        "((1 . X) (2 . Y) (3 . Z))",
+    );
+    // Mismatched lengths: stops at the shortest.
+    assert_eq!(
+        s.eval(
+            "(maplist (lambda (a b) (cons (car a) (car b)))
+                      '(1 2 3 4 5) '(x y))"
+        )
+        .unwrap(),
+        "((1 . X) (2 . Y))",
+    );
+}
+
+#[test]
+fn mapl_variadic_returns_first_list() {
+    let mut s = fresh_session_with_lists();
+    let prog = "
+        (defparameter *seen* nil)
+        (defparameter *r*
+          (mapl (lambda (a b) (push (cons (car a) (car b)) *seen*))
+                '(1 2 3) '(x y z)))
+        (list *r* (nreverse *seen*))
+    ";
+    // First return is LIST (the first input, unchanged); second
+    // shows the side-effect captured the parallel walk.
+    assert_eq!(
+        s.eval(prog).unwrap(),
+        "((1 2 3) ((1 . X) (2 . Y) (3 . Z)))",
+    );
+}
+
+#[test]
+fn mapcan_variadic_nconcs_per_tuple() {
+    let mut s = fresh_session_with_lists();
+    // Each FN call receives one element per list and returns a list;
+    // results are nconc'd.
+    assert_eq!(
+        s.eval(
+            "(mapcan (lambda (a b) (list a b))
+                     '(1 2 3) '(10 20 30))"
+        )
+        .unwrap(),
+        "(1 10 2 20 3 30)",
+    );
+}
+
+#[test]
+fn mapcon_variadic_nconcs_tail_results() {
+    let mut s = fresh_session_with_lists();
+    assert_eq!(
+        s.eval(
+            "(mapcon (lambda (a b) (list (car a) (car b)))
+                     '(1 2 3) '(x y z))"
+        )
+        .unwrap(),
+        "(1 X 2 Y 3 Z)",
+    );
+}
