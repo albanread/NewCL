@@ -131,10 +131,11 @@ impl Session {
         // installed — macros into the coordinator's macro registry,
         // defuns into the symbol's function cell.
         //
-        // ANSI CL convention says the body is implicitly wrapped
-        // in (block NAME …); we don't do that yet. See the comment
-        // on `wrap_body_in_block` below for the blocker.
-        let fn_word = self.compile_function(name, params, body_forms)?;
+        // Both share the implicit (block NAME …) wrap; see
+        // `handle_defun` for the rationale and the gating.
+        let body_wrapped = self.maybe_wrap_in_block(name, body_forms);
+        let fn_word =
+            self.compile_function(name, params, body_wrapped.as_deref().unwrap_or(body_forms))?;
         self.coord.install_macro(Arc::from(name), fn_word);
         Ok(Word::NIL)
     }
@@ -145,10 +146,43 @@ impl Session {
         params: &ParamSpec,
         body_forms: &[Value],
     ) -> Result<Word, EvalError> {
-        let fn_word = self.compile_function(name, params, body_forms)?;
+        // ANSI CL convention: the body of a DEFUN is implicitly
+        // wrapped in (block NAME …), so (return-from NAME val)
+        // anywhere inside works without an explicit BLOCK.
+        //
+        // Wrapping is gated on whether the BLOCK macro is
+        // installed yet — early-bootstrap defuns in core.lisp run
+        // before `(defmacro block …)` lands at line ~449. Those
+        // pre-BLOCK defuns don't need auto-block and wrapping
+        // prematurely would leave a literal (BLOCK …) form in
+        // the IR.
+        //
+        // Only DEFUN / DEFMACRO go through this wrap. `(compile
+        // NAME '(lambda …))` is intentionally left unwrapped —
+        // CLOS uses it to install discriminating functions and
+        // method bodies that already carry their own explicit
+        // (block GF-NAME …) wrap.
+        let body_wrapped = self.maybe_wrap_in_block(name, body_forms);
+        let fn_word =
+            self.compile_function(name, params, body_wrapped.as_deref().unwrap_or(body_forms))?;
         let sym_word = self.coord.intern(name);
         self.mutator.set_symbol_function(sym_word, fn_word);
         Ok(Word::NIL)
+    }
+
+    /// Returns a one-element Vec wrapping BODY_FORMS in `(BLOCK
+    /// <NAME> body…)` when the BLOCK macro is installed; otherwise
+    /// None, meaning "leave the body unchanged." Called from both
+    /// handle_defun and handle_defmacro.
+    fn maybe_wrap_in_block(
+        &self,
+        name: &str,
+        body_forms: &[Value],
+    ) -> Option<Vec<Value>> {
+        if body_forms.is_empty() || self.coord.macro_for("BLOCK").is_none() {
+            return None;
+        }
+        Some(vec![wrap_body_in_block(name, body_forms)])
     }
 
     /// Shared lowering+JIT path for `defun` and `defmacro`. Returns
@@ -1243,17 +1277,28 @@ fn match_defun(
 /// Recognise `(progn body...)` so top-level progn can splice its
 /// body forms back into the top-level recogniser. Returns the
 /// body as a Vec of Values, or None if the form isn't a progn.
-// NOTE: Auto-block for defun bodies (so `(return-from NAME val)`
-// inside `(defun NAME …)` works without an explicit BLOCK) is
-// deferred. The natural implementation wraps the body in
-// `(block NAME body…)`, which macroexpands to
-// `(%native-block 'NAME (lambda () body…))`. That adds an extra
-// captured-env lambda between the defun's parameters and any
-// inner lambda the body contains — and three-level closure
-// capture currently miscompiles in the LLVM lowering (a separate
-// `(defun mk (x) (let ((h (lambda () (lambda (y) (+ x y))))) (funcall h)))`
-// segfaults on baseline). Once that's fixed, re-add the wrap in
-// handle_defun / handle_defmacro gated on `coord.macro_for("BLOCK")`.
+/// Wrap a defun body in `(BLOCK <name> body…)` so that a
+/// `(return-from <name> val)` anywhere in the body finds its
+/// target. Per ANSI CL: every defun's body is implicitly a
+/// (block NAME …). The result is a single Value the caller passes
+/// as the new body — macroexpansion will turn the BLOCK form into
+/// the existing `(%native-block 'NAME (lambda () body…))` shape.
+///
+/// Both symbols (`BLOCK` and `<name>`) are interned in
+/// `COMMON-LISP`; the macroexpander matches by name string, so
+/// the package choice is for hygiene only.
+fn wrap_body_in_block(name: &str, body_forms: &[Value]) -> Value {
+    let cl = ncl_runtime::universe()
+        .find_package("COMMON-LISP")
+        .expect("CL bootstrapped");
+    let (block_sym, _) = cl.intern("BLOCK");
+    let (name_sym, _) = cl.intern(name);
+    let mut items: Vec<Value> = Vec::with_capacity(2 + body_forms.len());
+    items.push(Value::Symbol(block_sym));
+    items.push(Value::Symbol(name_sym));
+    items.extend(body_forms.iter().cloned());
+    Value::list(items)
+}
 
 fn match_top_level_progn(v: &Value) -> Option<Vec<Value>> {
     let Value::Cons(c) = v else { return None };
