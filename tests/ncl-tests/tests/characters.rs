@@ -206,23 +206,22 @@ fn char_name_and_name_char_round_trip_standard_names() {
     assert_eq!(s.eval(r"(char-name #\Newline)").unwrap(), "\"Newline\"");
     assert_eq!(s.eval(r"(char-name #\Tab)").unwrap(), "\"Tab\"");
     assert_eq!(s.eval(r"(char-name #\Return)").unwrap(), "\"Return\"");
-    // name-char round-trips back to the right codepoint. We
-    // check by char-code rather than by printed form because
-    // the current printer renders a space as `#\ ` rather than
-    // `#\Space` — printer name-table emission is a separate
-    // enhancement.
+    // name-char round-trips. The printer now emits the standard
+    // names for these well-known control characters, so the
+    // returned character round-trips through prin1 back to its
+    // named form.
     assert_eq!(
-        s.eval(r#"(char-code (name-char "Space"))"#).unwrap(),
-        "32",
+        s.eval(r#"(name-char "Space")"#).unwrap(),
+        "#\\Space",
     );
     assert_eq!(
-        s.eval(r#"(char-code (name-char "newline"))"#).unwrap(),
-        "10",
+        s.eval(r#"(name-char "newline")"#).unwrap(),
+        "#\\Newline",
     );
     // Capitalisation in the lookup is irrelevant.
     assert_eq!(
-        s.eval(r#"(char-code (name-char "TAB"))"#).unwrap(),
-        "9",
+        s.eval(r#"(name-char "TAB")"#).unwrap(),
+        "#\\Tab",
     );
     // Unknown name → NIL.
     assert_eq!(s.eval(r#"(name-char "no-such-name")"#).unwrap(), "nil");

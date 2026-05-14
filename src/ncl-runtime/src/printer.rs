@@ -48,8 +48,21 @@ fn write_word(out: &mut String, w: Word, readable: bool) {
             if let Some(c) = w.as_char() {
                 if readable {
                     out.push_str("#\\");
+                    // Use the standard name where one exists, so a
+                    // space prints as `#\Space` (not `#\ `) and a
+                    // newline as `#\Newline` (not a literal LF).
+                    // The reader recognises all of these names
+                    // case-insensitively — see
+                    // ncl-reader/src/lexer.rs::resolve_char_name —
+                    // so the printed form is reader-roundtrippable.
+                    if let Some(name) = standard_char_name(c) {
+                        out.push_str(name);
+                    } else {
+                        out.push(c);
+                    }
+                } else {
+                    out.push(c);
                 }
-                out.push(c);
             } else {
                 out.push_str(&format!("<imm {:#x}>", w.raw()));
             }
@@ -222,6 +235,28 @@ fn write_list(out: &mut String, head: Word, readable: bool) {
     }
 }
 
+/// Map a character to its standard reader-accepted name, or None
+/// if the character doesn't have one. The names here are the
+/// canonical CL spellings — the form a reader-roundtrip should
+/// produce — paralleling the case-insensitive lookup in
+/// `ncl-reader::lexer::resolve_char_name`. The alternative reader
+/// spellings (`SP`, `NL`, `LF`, `CR`, `FF`, `BS`, `DEL`, `NUL`,
+/// `ESC`) are accepted on input but never emitted.
+fn standard_char_name(c: char) -> Option<&'static str> {
+    match c {
+        ' '    => Some("Space"),
+        '\n'   => Some("Newline"),
+        '\t'   => Some("Tab"),
+        '\r'   => Some("Return"),
+        '\x0c' => Some("Page"),
+        '\x08' => Some("Backspace"),
+        '\x7f' => Some("Rubout"),
+        '\x00' => Some("Null"),
+        '\x1b' => Some("Escape"),
+        _      => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +280,40 @@ mod tests {
         assert_eq!(format_word(Word::fixnum(42)), "42");
         assert_eq!(format_word(Word::fixnum(-7)), "-7");
         assert_eq!(format_word(Word::char('a')), "#\\a");
+    }
+
+    #[test]
+    fn standard_char_names_print_with_their_canonical_form() {
+        // The nine named characters that round-trip with the reader.
+        assert_eq!(format_word(Word::char(' ')),     "#\\Space");
+        assert_eq!(format_word(Word::char('\n')),    "#\\Newline");
+        assert_eq!(format_word(Word::char('\t')),    "#\\Tab");
+        assert_eq!(format_word(Word::char('\r')),    "#\\Return");
+        assert_eq!(format_word(Word::char('\x0c')),  "#\\Page");
+        assert_eq!(format_word(Word::char('\x08')),  "#\\Backspace");
+        assert_eq!(format_word(Word::char('\x7f')),  "#\\Rubout");
+        assert_eq!(format_word(Word::char('\x00')),  "#\\Null");
+        assert_eq!(format_word(Word::char('\x1b')),  "#\\Escape");
+    }
+
+    #[test]
+    fn ordinary_characters_keep_raw_form() {
+        // Anything outside the named-table prints raw — letters,
+        // digits, punctuation, and arbitrary Unicode.
+        assert_eq!(format_word(Word::char('A')),     "#\\A");
+        assert_eq!(format_word(Word::char('5')),     "#\\5");
+        assert_eq!(format_word(Word::char('!')),     "#\\!");
+        // Cyrillic letter Г (U+0413) — alphabetic, not a control.
+        assert_eq!(format_word(Word::char('\u{0413}')), "#\\\u{0413}");
+    }
+
+    #[test]
+    fn aesthetic_form_emits_raw_character_regardless_of_name() {
+        // princ-style (~A): the raw glyph, no `#\` prefix and no
+        // named substitution. A space is just a space.
+        assert_eq!(format_word_aesthetic(Word::char(' ')),   " ");
+        assert_eq!(format_word_aesthetic(Word::char('\n')),  "\n");
+        assert_eq!(format_word_aesthetic(Word::char('A')),   "A");
     }
 
     #[test]
