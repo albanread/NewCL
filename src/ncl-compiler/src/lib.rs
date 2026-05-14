@@ -1352,9 +1352,46 @@ fn match_defun_like(
     }
     let name = match &args[0] {
         Value::Symbol(s) => s.name.to_string(),
+        // CL accepts `(setf NAME)` as a function name. We mangle
+        // it to `%SETF-NAME` so the existing generic-setf-fallback
+        // in lower.rs (which expands `(setf (NAME args…) val)`
+        // into `(%SETF-NAME val args…)`) finds the user's setter
+        // automatically. This is the standard pattern used by
+        // every CL implementation; ours just happens to mangle
+        // explicitly rather than carrying a separate function-name
+        // namespace.
+        Value::Cons(c) => {
+            let parts = list_to_vec_of_value(&Value::Cons(c.clone())).map_err(|e| {
+                EvalError::Compile(CompileError::ImproperList(e))
+            })?;
+            if parts.len() != 2 {
+                return Err(EvalError::Compile(CompileError::BadDefun(format!(
+                    "{} name must be SYMBOL or (SETF SYMBOL), got a list of length {}",
+                    head_name.to_lowercase(),
+                    parts.len(),
+                ))));
+            }
+            let (Value::Symbol(head_sym), Value::Symbol(tgt_sym)) =
+                (&parts[0], &parts[1])
+            else {
+                return Err(EvalError::Compile(CompileError::BadDefun(format!(
+                    "{} name list must contain symbols, got {:?}",
+                    head_name.to_lowercase(),
+                    parts,
+                ))));
+            };
+            if &*head_sym.name != "SETF" {
+                return Err(EvalError::Compile(CompileError::BadDefun(format!(
+                    "{} compound name must start with SETF, got ({} ...)",
+                    head_name.to_lowercase(),
+                    head_sym.name,
+                ))));
+            }
+            format!("%SETF-{}", tgt_sym.name)
+        }
         other => {
             return Err(EvalError::Compile(CompileError::BadDefun(format!(
-                "{} name must be a symbol, got {other:?}",
+                "{} name must be a symbol or (SETF SYMBOL), got {other:?}",
                 head_name.to_lowercase()
             ))));
         }
