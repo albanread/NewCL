@@ -534,6 +534,12 @@ fn install_native_functions(
                    ncl_runtime::symbol_name_shim, 1);
     install_native(coord, mutator, "SYMBOL-PACKAGE",
                    ncl_runtime::symbol_package_shim, 1);
+    install_native(coord, mutator, "BOUNDP",
+                   ncl_runtime::boundp_shim, 1);
+    install_native(coord, mutator, "SYMBOL-VALUE",
+                   ncl_runtime::symbol_value_shim, 1);
+    install_native(coord, mutator, "TYPE-OF",
+                   ncl_runtime::type_of_shim, 1);
 
     // Numeric comparison + length: the compiler lowers `(< a b)`,
     // `(length x)` etc. as special forms (fast path), but `#'<` /

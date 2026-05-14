@@ -29,6 +29,7 @@
 (require 'characters)                    ; char-code/upcase/case-p, char= family, name-char
 (require 'lists)                         ; mapl/maplist/mapcan/mapcon, pairlis/acons, tailp/ldiff
 (require 'places)                        ; (setf first/rest/cddr/...) + defsetf short form
+(require 'describe)                      ; (describe obj) — REPL inspection
 (require 'events)                        ; iGui event-loop / with-events-from
 (require 'hot-reload)                    ; (start-hot-reload), (check-reloads)
 

@@ -1975,6 +1975,130 @@ pub extern "C-unwind" fn symbol_package_shim(
     crate::gc_symbol::package(sym).raw()
 }
 
+/// `(boundp sym)` — T iff SYM's value cell holds something other
+/// than the UNBOUND sentinel. The companion to FBOUNDP.
+pub extern "C-unwind" fn boundp_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        return signal_condition_string(mutator, "boundp: expected 1 arg (symbol)");
+    }
+    let sym = Word::from_raw(unsafe { *args });
+    if sym.tag() != Tag::Symbol {
+        return signal_condition_string(
+            mutator,
+            &format!("boundp: argument must be a symbol, got {sym:?}"),
+        );
+    }
+    if crate::gc_symbol::value_acquire(sym).is_unbound() {
+        Word::NIL.raw()
+    } else {
+        Word::T.raw()
+    }
+}
+
+/// `(symbol-value sym)` — read the value cell. Signals if SYM is
+/// not currently BOUNDP.
+pub extern "C-unwind" fn symbol_value_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        return signal_condition_string(
+            mutator,
+            "symbol-value: expected 1 arg (symbol)",
+        );
+    }
+    let sym = Word::from_raw(unsafe { *args });
+    if sym.tag() != Tag::Symbol {
+        return signal_condition_string(
+            mutator,
+            &format!("symbol-value: argument must be a symbol, got {sym:?}"),
+        );
+    }
+    let v = crate::gc_symbol::value_acquire(sym);
+    if v.is_unbound() {
+        let name = crate::sym_names::lookup(sym.raw())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        return signal_condition_string(
+            mutator,
+            &format!("symbol-value: {name} is unbound"),
+        );
+    }
+    v.raw()
+}
+
+/// `(type-of x)` — a symbol naming the most specific type of X.
+/// CL spec says the result is implementation-defined for many
+/// cases; we return the obvious symbol that matches our TYPEP
+/// vocabulary so `(typep x (type-of x))` always holds.
+pub extern "C-unwind" fn type_of_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        return signal_condition_string(mutator, "type-of: expected 1 arg");
+    }
+    let w = Word::from_raw(unsafe { *args });
+    let m = unsafe { &mut *mutator };
+    let coord = m.coord();
+    let name = if w.is_nil() {
+        "NULL"
+    } else if w.is_t() {
+        // T is the boolean true; CL says (type-of t) is BOOLEAN.
+        "BOOLEAN"
+    } else {
+        match w.tag() {
+            Tag::Fixnum => "FIXNUM",
+            Tag::Cons => "CONS",
+            Tag::Symbol => {
+                // Keyword if its name starts with ':' (our intern
+                // convention prefixes keyword names that way).
+                match crate::sym_names::lookup(w.raw()) {
+                    Some(n) if n.starts_with(':') => "KEYWORD",
+                    _ => "SYMBOL",
+                }
+            }
+            Tag::String => "STRING",
+            Tag::Function => "FUNCTION",
+            Tag::Vector => {
+                // Distinguish numeric heap-types from ordinary
+                // simple-vectors via the HeapHeader.
+                let p = w.as_ptr::<u64>(Tag::Vector);
+                if let Some(p) = p {
+                    let hdr = crate::heap::HeapHeader::from_raw(unsafe { *p });
+                    match hdr.ty() {
+                        crate::heap::HeapType::Float => "FLOAT",
+                        crate::heap::HeapType::Bignum => "BIGNUM",
+                        crate::heap::HeapType::Ratio => "RATIO",
+                        crate::heap::HeapType::Complex => "COMPLEX",
+                        _ => "SIMPLE-VECTOR",
+                    }
+                } else {
+                    "SIMPLE-VECTOR"
+                }
+            }
+            Tag::Immediate => {
+                if w.as_char().is_some() {
+                    "CHARACTER"
+                } else {
+                    "T"
+                }
+            }
+            Tag::Forward => "T",
+        }
+    };
+    coord.intern(name).raw()
+}
+
 /// `(%set-symbol-function sym fn)` — install FN as the function
 /// bound to SYM. The setf-symbol-function lowering rewrites
 /// `(setf (symbol-function s) f)` into a call to this. Returns
