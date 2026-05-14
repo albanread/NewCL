@@ -550,12 +550,13 @@ fn lower_call_in_mut(
     match head_name.as_str() {
         "+" => fold_arithmetic(&head_name, args, env, coord, 0, Expr::add),
         "*" => fold_arithmetic(&head_name, args, env, coord, 1, Expr::mul),
-        // Integer division and remainder. CL's `truncate` and `rem`
-        // pair: rem's sign matches the dividend (LLVM srem
-        // semantics). `mod` (sign of divisor) is a user-Lisp
-        // wrapper — see Lisp/core.lisp.
-        "TRUNCATE" => binary_op(&head_name, args, env, coord, Expr::truncate),
-        "REM" => binary_op(&head_name, args, env, coord, Expr::rem),
+        // TRUNCATE and REM used to be special-form-intercepted and
+        // lowered to inline LLVM srem / sdiv. We demoted them to
+        // ordinary native calls (truncate_shim / rem_shim in
+        // ncl-runtime::bignum) so that Library/numbers.lisp can
+        // override them with polymorphic, multi-value-returning
+        // versions. The fast int-int path still happens — it just
+        // goes through one shim call instead of inline IR.
         "QUOTE" => {
             if args.len() != 1 {
                 return Err(CompileError::BadArity {
@@ -1848,6 +1849,14 @@ pub(crate) fn build_arglist_prologue(
 /// sub-expression's value as their own — Progn (last form), Let
 /// (body), If (both branches). Everything else is a leaf tail and
 /// gets the single-MV wrap.
+///
+/// Special case — `%NATIVE-BLOCK`: the `block` macro expands to
+/// `(%native-block 'NAME (lambda () body…))`. The lambda body is
+/// independently instrumented by lower_lambda, so `%native-block`
+/// already propagates whatever MV state the lambda exits with.
+/// Wrapping the call with EnsureSingleMv would collapse `(values q
+/// r)` returns to a single value. We skip the wrap for this
+/// particular call symbol.
 pub(crate) fn instrument_tail_for_mv(e: Expr) -> Expr {
     match e {
         Expr::Values(_) => e,
@@ -1871,6 +1880,14 @@ pub(crate) fn instrument_tail_for_mv(e: Expr) -> Expr {
         // EnsureSingleMv on top of EnsureSingleMv would be wasted
         // work; keep the inner one.
         Expr::EnsureSingleMv(_) => e,
+        // %native-block propagates MV from its lambda — skip the
+        // EnsureSingleMv wrap so multi-value returns flow through.
+        Expr::Call { sym_word, .. }
+            if ncl_runtime::sym_names::lookup(sym_word)
+                .as_deref() == Some("%NATIVE-BLOCK") =>
+        {
+            e
+        }
         // Everything else is a leaf tail. Wrap.
         other => Expr::ensure_single_mv(other),
     }

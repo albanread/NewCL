@@ -366,8 +366,15 @@ fn install_native_functions(
     install_native(coord, mutator, "TYPEP",
                    ncl_runtime::typep_shim, 2);
     // Bignum math (Tier 1.D.2): gcd / lcm / expt / abs / isqrt.
-    // Truncate / rem stay as special forms; these are stand-alone
-    // numeric primitives.
+    // TRUNCATE and REM used to be compile-time special forms
+    // lowered to inline LLVM srem; they're now ordinary native
+    // calls so Library/numbers.lisp can override them with
+    // polymorphic, multi-value-returning wrappers. The int-only
+    // fast path is preserved by these shims (fixnum + bignum).
+    install_native(coord, mutator, "TRUNCATE",
+                   ncl_runtime::bignum::truncate_shim, 2);
+    install_native(coord, mutator, "REM",
+                   ncl_runtime::bignum::rem_shim, 2);
     install_native(coord, mutator, "GCD",
                    ncl_runtime::bignum::gcd_shim, 2);
     install_native(coord, mutator, "LCM",

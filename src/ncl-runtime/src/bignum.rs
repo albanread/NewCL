@@ -411,6 +411,51 @@ pub extern "C-unwind" fn ncl_mod_promote(
 
 // ─── Lisp-callable math shims (registered via install_native) ────────────
 
+/// `(truncate a b)` — integer truncating division. Quotient rounds
+/// toward zero. Both operands must be integers (fixnum or bignum);
+/// non-int operands signal a condition. The polymorphic wrapper in
+/// `Lisp/Library/numbers.lisp` dispatches floats and ratios before
+/// this shim sees them.
+///
+/// Returns single value (the quotient). The Lisp wrapper computes
+/// the remainder via `(- a (* q b))` and packages both with `values`.
+pub extern "C-unwind" fn truncate_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        return crate::abi::signal_condition_string(
+            mutator, "truncate: expected 2 args",
+        );
+    }
+    let a = unsafe { *args };
+    let b = unsafe { *args.add(1) };
+    // ncl_truncate_promote already accepts fixnum + bignum and
+    // signals "division by zero" cleanly.
+    ncl_truncate_promote(mutator, a, b)
+}
+
+/// `(rem a b)` — integer remainder paired with TRUNCATE (sign of
+/// the dividend; LLVM srem semantics). Integer-only; the
+/// polymorphic dispatcher lives in `Lisp/Library/numbers.lisp`.
+pub extern "C-unwind" fn rem_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        return crate::abi::signal_condition_string(
+            mutator, "rem: expected 2 args",
+        );
+    }
+    let a = unsafe { *args };
+    let b = unsafe { *args.add(1) };
+    ncl_rem_promote(mutator, a, b)
+}
+
 /// `(gcd a b)` — non-negative greatest common divisor. Returns a
 /// fixnum or bignum.
 pub extern "C-unwind" fn gcd_shim(
