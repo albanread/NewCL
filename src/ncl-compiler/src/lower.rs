@@ -1681,35 +1681,97 @@ fn lower_lambda(
     // grandchild lambda that captures from a grandparent would
     // produce a parent Lambda IR with empty captures and a runtime
     // ClosureRef would read garbage.
+    //
+    // CRITICAL: this MUST walk the chain recursively. A 4-level
+    // nest `(defun mk (x) (lambda () (lambda () (lambda (y) (+ x
+    // y)))))` segfaults if we only copy one level. The innermost
+    // body's find_or_capture(x) walks up through clones —
+    // ParentOfInner → L1View1 → MView1 — adding captures at every
+    // level *of the clone chain it walked*. The innermost
+    // lambda's reconcile copies ParentOfInner's growth back into
+    // the directly-surrounding lambda. But L1View1's growth is
+    // held inside ParentOfInner.capture_parent, NOT inside the
+    // directly-surrounding lambda's own .capture_parent (which is
+    // an *independent* clone of L1, untouched by the inner walk).
+    // So the L1 level never learns it needs to capture x from mk,
+    // and L1 emits an empty captures list → its env is empty at
+    // runtime → the next-level lambda reads garbage from env[0]
+    // and segfaults.
+    //
+    // Fix: when reconciling, walk into parent_clone.capture_parent
+    // and outer_env.capture_parent in lockstep, copying new
+    // entries at every level. The "before" sizes for the deeper
+    // levels are simply each grandparent's current sizes —
+    // outer_env's grandparents weren't directly mutated during
+    // body lowering (only inner_env's clone-chain was), so their
+    // current sizes equal their pre-body sizes.
     if let Some(parent_clone) = inner_env.capture_parent.take() {
-        let new_caps: Vec<Expr> = parent_clone
-            .captures
-            .iter()
-            .skip(outer_captures_before)
-            .cloned()
-            .collect();
-        for c in new_caps {
-            outer_env.captures.push(c);
-        }
-        let new_bindings: Vec<(Arc<str>, Binding)> = parent_clone
-            .bindings
-            .iter()
-            .skip(outer_bindings_before)
-            .cloned()
-            .collect();
-        for b in new_bindings {
-            outer_env.bindings.push(b);
-        }
-        // closure_count tracks how many ClosureRef indices were
-        // handed out; if the parent clone grew its closure_count,
-        // outer_env must reflect that so the next capture in
-        // outer_env's scope picks the right next index.
-        if parent_clone.closure_count > outer_env.closure_count {
-            outer_env.closure_count = parent_clone.closure_count;
-        }
+        reconcile_chain(*parent_clone, outer_env, outer_captures_before, outer_bindings_before);
     }
 
     Ok(Expr::lambda(params.required.len() as u32, body_expr, captures))
+}
+
+/// Recursively reconcile a parent_clone chain back into its
+/// outer_env chain after a lambda body has been lowered.
+///
+/// The clone-chain holds any new captures and bindings that
+/// `find_or_capture` added while walking up looking for free
+/// variables. Each level of the chain corresponds to one
+/// enclosing lambda scope. We need every level's growth back in
+/// the matching level of the real chain so the *outermost*
+/// lambda that needed the variable ends up with the right
+/// Param(i) capture in its IR.
+///
+/// The `before` sizes are only known precisely for the first
+/// level (the direct caller passes them). For deeper levels we
+/// use outer_env's current sizes — outer_env's chain wasn't
+/// mutated during body lowering (only its clone was, inside
+/// inner_env.capture_parent), so its current state equals its
+/// pre-body state.
+fn reconcile_chain(
+    parent_clone: LocalEnv,
+    outer_env: &mut LocalEnv,
+    outer_captures_before: usize,
+    outer_bindings_before: usize,
+) {
+    // Copy this level.
+    let new_caps: Vec<Expr> = parent_clone
+        .captures
+        .iter()
+        .skip(outer_captures_before)
+        .cloned()
+        .collect();
+    for c in new_caps {
+        outer_env.captures.push(c);
+    }
+    let new_bindings: Vec<(Arc<str>, Binding)> = parent_clone
+        .bindings
+        .iter()
+        .skip(outer_bindings_before)
+        .cloned()
+        .collect();
+    for b in new_bindings {
+        outer_env.bindings.push(b);
+    }
+    if parent_clone.closure_count > outer_env.closure_count {
+        outer_env.closure_count = parent_clone.closure_count;
+    }
+
+    // Recurse into the next level if both sides have a parent.
+    // We can take parent_clone.capture_parent because we own
+    // parent_clone (passed by value), and we use outer_env's
+    // capture_parent by mutable reference so changes propagate
+    // back into the chain the caller still holds.
+    let pc_parent = parent_clone.capture_parent;
+    if let Some(pc_grand) = pc_parent {
+        if let Some(oe_grand_box) = outer_env.capture_parent.as_mut() {
+            let oe_grand: &mut LocalEnv = oe_grand_box;
+            let oe_caps_before = oe_grand.captures.len();
+            let oe_bind_before = oe_grand.bindings.len();
+            reconcile_chain(*pc_grand, oe_grand, oe_caps_before, oe_bind_before);
+        }
+    }
 }
 
 /// Build the entry-block let-bindings that materialise &optional,
