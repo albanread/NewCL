@@ -2430,13 +2430,31 @@ mod end_to_end_tests {
     }
 
     #[test]
-    fn setf_unknown_form_errors() {
-        // No (foo …) setf-expander wired in. Fails to compile.
-        let r = eval_str("(setf (foo x) 1)");
-        assert!(matches!(
-            r,
-            Err(EvalError::Compile(CompileError::NotImplemented(_))),
-        ));
+    fn setf_unknown_form_falls_back_to_setf_mangled_call() {
+        // (setf (FOO arg…) val) rewrites to a call to %SETF-FOO
+        // when no built-in setf-expander matches the head. This is
+        // the convention defstruct uses to auto-install slot
+        // setters: each slot accessor X compiles `(setf (X obj)
+        // val)` into `(%setf-X val obj)`, and the user (or the
+        // defstruct expansion) defines `%setf-X` as an ordinary
+        // function.
+        //
+        // The form compiles successfully — it's NOT a compile
+        // error. We verify that by catching the runtime condition
+        // (`%SETF-FOO` is unbound here) inside handler-case. If
+        // the form failed to compile, eval would return an Err
+        // and the handler-case would never run; if the runtime
+        // error escaped the handler-case, the process would
+        // abort.
+        let mut s = Session::with_stdlib().expect("session boots");
+        s.activate();
+        let result = s.eval(
+            "(handler-case
+               (let ((x 0))
+                 (setf (foo x) 1))
+               (error (c) (list :caught)))",
+        );
+        assert_eq!(result.unwrap(), "(:CAUGHT)");
     }
 
     // -- Mutable lexical bindings ------------------------------------------
