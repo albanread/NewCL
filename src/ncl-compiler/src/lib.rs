@@ -623,6 +623,18 @@ fn install_native_functions(
                    ncl_runtime::current_thread_id_shim, 0);
     install_native(coord, mutator, "CURRENT-PROCESS-ID",
                    ncl_runtime::current_process_id_shim, 0);
+    // Windows surface — Phase 1 of docs/WINDOWS_FFI.md.
+    // (windows-enabled-p), (ui-thread-id), (ui-thread-p) are always
+    // installed; they return NIL outside `--windows` mode. The
+    // conditional (when (windows-enabled-p) (require 'win32-threading))
+    // branch in init.lisp uses them to decide whether to pull in the
+    // UI-thread surface.
+    install_native(coord, mutator, "WINDOWS-ENABLED-P",
+                   ncl_runtime::windows_enabled_p_shim, 0);
+    install_native(coord, mutator, "UI-THREAD-ID",
+                   ncl_runtime::ui_thread_id_shim, 0);
+    install_native(coord, mutator, "UI-THREAD-P",
+                   ncl_runtime::ui_thread_p_shim, 0);
     install_native(coord, mutator, "ALLOCATE-CRITICAL-SECTION",
                    ncl_runtime::allocate_critical_section_shim, 0);
     install_native(coord, mutator, "DEALLOCATE-CRITICAL-SECTION",

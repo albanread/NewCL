@@ -35,6 +35,7 @@ pub mod symbol;
 pub mod threads;
 pub mod universe;
 pub mod value;
+pub mod win_surface;
 pub mod word;
 
 pub use abi::{
@@ -82,6 +83,10 @@ pub use igui::lisp_shims::{
 };
 pub use printer::{format_word, format_word_aesthetic};
 pub use random::random_shim;
+
+pub use win_surface::{
+    ui_thread_id_shim, ui_thread_p_shim, windows_enabled_p_shim,
+};
 
 pub use threads::{
     allocate_critical_section_shim, atomic_cas_shim, atomic_get_shim,

@@ -9,12 +9,16 @@ use std::sync::Mutex;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn usage() {
-    eprintln!("usage: ncl [--lean] [--repl | (--eval <src> | --load <file>)...] [--repl]");
+    eprintln!("usage: ncl [--lean] [--windows] [--repl | (--eval <src> | --load <file>)...] [--repl]");
     eprintln!("       ncl --version | --help");
     eprintln!("  --eval, -e <src>     evaluate a source string");
     eprintln!("  --load, -l <file>    read and evaluate the file");
     eprintln!("  --repl, -r           enter the interactive REPL (default if no flags given)");
     eprintln!("  --lean, -L           start with core only (no CLOS, no Library/init.lisp)");
+    eprintln!("  --windows, -W        enable the Windows surface: thread 0 runs a Win32");
+    eprintln!("                       message pump, Lisp runs on a worker thread, and");
+    eprintln!("                       (windows-enabled-p) is T. Without this flag the");
+    eprintln!("                       process is byte-for-byte unchanged from today.");
     eprintln!("  --version, -V        print version and exit");
     eprintln!("  --help, -h           print this message and exit");
     eprintln!("  multiple --eval / --load can be chained; --repl runs after them");
@@ -35,6 +39,66 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // --windows: thread 0 becomes the Win32 UI thread (message pump),
+    // Lisp eval moves to a worker thread. See docs/WINDOWS_FFI.md.
+    let want_windows = raw_args.iter().any(|a| a == "--windows" || a == "-W");
+
+    if want_windows {
+        run_with_windows_surface(raw_args)
+    } else {
+        run_without_windows_surface(raw_args)
+    }
+}
+
+/// Today's startup path. Lisp runs on thread 0; no message pump; no
+/// Windows surface. Pulled out of main() unchanged so we can compose
+/// it as either thread-0 work (no `--windows`) or worker work
+/// (`--windows`).
+fn run_without_windows_surface(raw_args: Vec<String>) -> ExitCode {
+    lisp_main(raw_args)
+}
+
+/// `--windows` path. Thread 0 registers itself as the UI thread,
+/// flips the `windows-enabled` flag, spawns the Lisp worker, then
+/// runs the Win32 message pump. When the worker finishes, it posts
+/// `WM_QUIT` to thread 0; the pump unblocks and we return the
+/// worker's exit code.
+fn run_with_windows_surface(raw_args: Vec<String>) -> ExitCode {
+    use std::sync::mpsc;
+
+    // Flip the flag BEFORE spawning the worker so init.lisp sees it.
+    ncl_runtime::win_surface::set_windows_enabled(true);
+    ncl_runtime::win_surface::register_ui_thread();
+
+    let (tx, rx) = mpsc::sync_channel::<ExitCode>(1);
+
+    let _worker = match std::thread::Builder::new()
+        .name("ncl-lisp-worker".into())
+        .spawn(move || {
+            let code = lisp_main(raw_args);
+            let _ = tx.send(code);
+            ncl_runtime::win_surface::post_quit_to_ui_thread();
+        }) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("ncl: cannot spawn worker thread: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // Thread 0 takes over the pump. Returns when the worker posts WM_QUIT.
+    ncl_runtime::win_surface::run_message_pump();
+
+    // Read back the worker's exit code (sent before the WM_QUIT post,
+    // so this never blocks).
+    rx.try_recv().unwrap_or(ExitCode::SUCCESS)
+}
+
+/// The Lisp side of startup — runs on thread 0 without `--windows`,
+/// on the worker thread with `--windows`. Builds the session, loads
+/// stdlib + Library/init.lisp, processes `--eval` / `--load` flags,
+/// optionally runs the REPL.
+fn lisp_main(raw_args: Vec<String>) -> ExitCode {
     // Bare `ncl` invocation drops into the REPL with the stdlib loaded.
     let want_repl = raw_args.is_empty()
         || raw_args.iter().any(|a| a == "--repl" || a == "-r");
@@ -138,6 +202,9 @@ fn main() -> ExitCode {
             }
             "--lean" | "-L" => {
                 // Handled at session-construction time above; accept here.
+            }
+            "--windows" | "-W" => {
+                // Handled in main() before session creation; accept here.
             }
             other => {
                 eprintln!("ncl: unknown argument '{other}'");
