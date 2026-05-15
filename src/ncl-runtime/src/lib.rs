@@ -36,6 +36,7 @@ pub mod threads;
 pub mod universe;
 pub mod value;
 pub mod win_buffer;
+pub mod win_callback;
 pub mod win_ffi;
 pub mod win_metadata;
 pub mod win_surface;

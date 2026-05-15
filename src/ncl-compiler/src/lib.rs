@@ -705,6 +705,13 @@ fn install_native_functions(
                    ncl_runtime::buffer_read_wstring_shim, 2);
     install_native(coord, mutator, "BUFFER-WRITE-WSTRING",
                    ncl_runtime::buffer_write_wstring_shim, 3);
+    // (%make-win32-callback CLOSURE ARITY) — Phase 6. Registers
+    // CLOSURE in the runtime's callback registry and JIT-emits a
+    // trampoline that Win32 can call directly. Returns the
+    // trampoline's machine-code address as a fixnum, ready to
+    // store in a WNDCLASSEXW.lpfnWndProc slot or similar.
+    install_native(coord, mutator, "%MAKE-WIN32-CALLBACK",
+                   ncl_llvm::make_win32_callback_shim, 2);
     install_native(coord, mutator, "ALLOCATE-CRITICAL-SECTION",
                    ncl_runtime::allocate_critical_section_shim, 0);
     install_native(coord, mutator, "DEALLOCATE-CRITICAL-SECTION",

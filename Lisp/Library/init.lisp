@@ -44,7 +44,8 @@
 (when (windows-enabled-p)
   (require 'win32-threading)            ; (on-ui-thread …), (post-to-ui-thread …)
   (require 'win32-buffer)               ; foreign buffers + defstruct-win32
-  (require 'win32))                     ; (win32 …), (defwin32 …)
+  (require 'win32)                      ; (win32 …), (defwin32 …)
+  (require 'win32-callback))            ; define-win32-callback for WNDPROC etc.
 
 ;;; Example user-side hook: load a personal utilities module if
 ;;; present. Uncomment and rename to taste.

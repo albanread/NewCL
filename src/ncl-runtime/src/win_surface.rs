@@ -327,6 +327,22 @@ thread_local! {
     static UI_MUTATOR_PTR: Cell<*mut MutatorState> = const { Cell::new(std::ptr::null_mut()) };
 }
 
+/// Public façade for `ensure_ui_mutator` — used by callers
+/// outside this module (Phase 6 callback dispatcher, etc.) that
+/// need the UI thread's mutator state from inside a Win32 callback.
+/// Panics with a clear message rather than returning Option so the
+/// failure mode is obvious in stack traces.
+pub fn ui_mutator_or_panic() -> *mut MutatorState {
+    #[cfg(windows)]
+    {
+        ensure_ui_mutator()
+    }
+    #[cfg(not(windows))]
+    {
+        panic!("ui_mutator_or_panic: Windows surface not available on this platform")
+    }
+}
+
 /// Get the UI thread's mutator state pointer, creating it on first
 /// use. Must be called FROM the UI thread (it calls
 /// `coord.register_mutator()` which introspects the calling thread's
