@@ -225,6 +225,15 @@
 
 ;; -- Type predicates and platform shims -------------------------------------
 
+;; NCL has no `keywordp`. Define it as "symbol whose printed name
+;; starts with `:`" — matches NCL's reader convention for keywords.
+(defun keywordp (x)
+  (and (symbolp x)
+       (not (null x))
+       (let ((n (symbol-name x)))
+         (and (> (length n) 0)
+              (char= (char n 0) #\:)))))
+
 (defun simple-atom-p (x) (and (atom x) (not (symbolp x))))
 (defun otherp (x) (not (or (consp x) (symbolp x))))
 (defun commonp (x) (declare (ignore x)) t)
@@ -835,7 +844,7 @@
                    (null (Qoffset xp ptr)))
           (setf (Qoffset xp ptr) (- (qright xp) ptr))
           (return-from end-block-find nil))))
-    (pop-prefix-stack xp)))
+    (pop-block-stack xp)))
 
 (defun pprint-indent+ (kind n xp)
   (enqueue xp :ind kind n))
@@ -1385,16 +1394,15 @@
 ;; non-local-exiting equivalents.
 
 (defun %xp-pblock-subst (form list-sym stream-sym)
-  (declare (ignore stream-sym))
   (cond ((atom form) form)
         ((and (eq (car form) 'pprint-pop) (null (cdr form)))
-         `(pprint-pop+ ,list-sym xp))
+         `(pprint-pop+ ,list-sym ,stream-sym))
         ((and (eq (car form) 'pprint-exit-if-list-exhausted) (null (cdr form)))
          `(when (null ,list-sym) (return-from logical-block nil)))
         ((member (car form) '(pprint-logical-block pprint-logical-block+))
          form)
-        (t (cons (%xp-pblock-subst (car form) list-sym nil)
-                 (%xp-pblock-subst (cdr form) list-sym nil)))))
+        (t (cons (%xp-pblock-subst (car form) list-sym stream-sym)
+                 (%xp-pblock-subst (cdr form) list-sym stream-sym)))))
 
 (defmacro pprint-logical-block (args &rest body)
   "(pprint-logical-block (stream list &key prefix per-line-prefix suffix) body)"
@@ -1438,9 +1446,8 @@
        (unless (check-block-abbreviation ,var ,args ,cc)
          (block logical-block
            (start-block ,var ,prefix ,per-line? ,suffix)
-           (unwind-protect
-                (progn ,@expanded)
-             (end-block ,var ,suffix)))))))
+           (progn ,@expanded)
+           (end-block ,var ,suffix))))))
 
 (defun pprint-newline (kind &optional (stream *standard-output*))
   (setq stream (decode-stream-arg stream))
@@ -2291,40 +2298,56 @@
                 (write-char++ #\space xp)
                 (pprint-newline+ :fill xp)))))))
 
+;; pprint-linear / pprint-fill / pprint-tabular bypass pprint-logical-block
+;; and inline the start/end-block dance. NCL has no unwind-protect, so an
+;; early exit from inside pprint-logical-block (via the macroexpanded
+;; return-from logical-block that pprint-pop+ emits on circular / length
+;; abbreviation) would skip the closing suffix. The explicit per-element
+;; loop here always reaches end-block on the normal-exit path.
+
+(defun %xp-pp-emit (xp lst colon? newline-kind tab-fn)
+  (let ((cursor lst))
+    (start-block xp (if colon? "(" "") nil (if colon? ")" ""))
+    (when (consp cursor)
+      (write+ (car cursor) xp)
+      (setq cursor (cdr cursor))
+      (block %xp-pp-loop
+        (loop
+          (when (null cursor) (return-from %xp-pp-loop nil))
+          (unless (consp cursor)
+            (write-string++ " . " xp 0 3)
+            (write+ cursor xp)
+            (return-from %xp-pp-loop nil))
+          (write-char++ #\space xp)
+          (when tab-fn (funcall tab-fn xp))
+          (pprint-newline+ newline-kind xp)
+          (write+ (car cursor) xp)
+          (setq cursor (cdr cursor)))))
+    (end-block xp (if colon? ")" ""))))
+
+(defun %xp-pp-dispatch (s lst colon? newline-kind tab-fn)
+  (let ((dest (decode-stream-arg s)))
+    (cond ((xp-structure-p-safe dest)
+           (%xp-pp-emit dest lst colon? newline-kind tab-fn))
+          (t (maybe-initiate-xp-printing
+              (lambda (xp) (%xp-pp-emit xp lst colon? newline-kind tab-fn))
+              dest))))
+  nil)
+
 (defun pprint-linear (s list &optional (colon? t) atsign?)
   (declare (ignore atsign?))
-  (pprint-logical-block (s list :prefix (if colon? "(" "")
-                                :suffix (if colon? ")" ""))
-    (pprint-exit-if-list-exhausted)
-    (block pl-loop
-      (loop (write+ (pprint-pop) s)
-            (pprint-exit-if-list-exhausted)
-            (write-char++ #\space s)
-            (pprint-newline+ :linear s)))))
+  (%xp-pp-dispatch s list colon? :linear nil))
 
 (defun pprint-fill (s list &optional (colon? t) atsign?)
   (declare (ignore atsign?))
-  (pprint-logical-block (s list :prefix (if colon? "(" "")
-                                :suffix (if colon? ")" ""))
-    (pprint-exit-if-list-exhausted)
-    (block pf-loop
-      (loop (write+ (pprint-pop) s)
-            (pprint-exit-if-list-exhausted)
-            (write-char++ #\space s)
-            (pprint-newline+ :fill s)))))
+  (%xp-pp-dispatch s list colon? :fill nil))
 
 (defun pprint-tabular (s list &optional (colon? t) atsign? (tabsize nil))
   (declare (ignore atsign?))
-  (when (null tabsize) (setq tabsize 16))
-  (pprint-logical-block (s list :prefix (if colon? "(" "")
-                                :suffix (if colon? ")" ""))
-    (pprint-exit-if-list-exhausted)
-    (block pt-loop
-      (loop (write+ (pprint-pop) s)
-            (pprint-exit-if-list-exhausted)
-            (write-char++ #\space s)
-            (pprint-tab+ :section-relative 0 tabsize s)
-            (pprint-newline+ :fill s)))))
+  (let ((ts (or tabsize 16)))
+    (%xp-pp-dispatch s list colon? :fill
+                     (lambda (xp)
+                       (pprint-tab+ :section-relative 0 ts xp)))))
 
 (defun fn-call (xp list)
   (funcall (formatter "~:<~W~^ ~:I~@_~@{~W~^ ~_~}~:>") xp list))
