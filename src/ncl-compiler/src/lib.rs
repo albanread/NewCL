@@ -635,6 +635,12 @@ fn install_native_functions(
                    ncl_runtime::ui_thread_id_shim, 0);
     install_native(coord, mutator, "UI-THREAD-P",
                    ncl_runtime::ui_thread_p_shim, 0);
+    // (%ui-execute closure) — marshal a 0-arg closure to the UI
+    // thread, block until it returns. The (on-ui-thread BODY) macro
+    // in Lisp/Library/win32-threading.lisp wraps BODY in (lambda ()
+    // …) and calls this. Errors if --windows wasn't passed.
+    install_native(coord, mutator, "%UI-EXECUTE",
+                   ncl_runtime::ui_execute_shim, 1);
     install_native(coord, mutator, "ALLOCATE-CRITICAL-SECTION",
                    ncl_runtime::allocate_critical_section_shim, 0);
     install_native(coord, mutator, "DEALLOCATE-CRITICAL-SECTION",

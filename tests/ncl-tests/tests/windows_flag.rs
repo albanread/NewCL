@@ -101,7 +101,7 @@ fn ui_thread_p_is_nil_on_worker_thread() {
 }
 
 #[test]
-fn windows_short_flag_W_works() {
+fn windows_short_flag_w_works() {
     // Accept -W as the short form of --windows, matching --version/-V.
     let (stdout, _stderr, code) = run_ncl(&[
         "--lean", "-W", "-e",
@@ -124,4 +124,85 @@ fn worker_eval_completes_and_returns() {
     assert_eq!(code, 0, "process should exit cleanly");
     // -e prints the last form's value:
     assert!(stdout.contains('6'), "expected '6' in stdout, got: {stdout:?}");
+}
+
+// ─── Phase 2: on-ui-thread closure marshalling ─────────────────────
+
+#[test]
+fn on_ui_thread_runs_closure_on_thread_zero() {
+    // (ui-thread-p) outside on-ui-thread is NIL (we're on the worker);
+    // inside on-ui-thread it's T (we're on thread 0). The macro
+    // therefore proves the marshalling actually crossed threads.
+    let (stdout, _stderr, code) = run_ncl(&[
+        "--windows", "-e",
+        "(format t \"~A ~A ~A\" (ui-thread-p) (on-ui-thread (ui-thread-p)) (ui-thread-p))",
+    ]);
+    assert_eq!(code, 0, "stderr: ");
+    assert!(stdout.contains("nil T nil") || stdout.contains("NIL T NIL"),
+            "expected 'nil T nil' pattern, got: {stdout:?}");
+}
+
+#[test]
+fn on_ui_thread_propagates_return_value() {
+    // The closure returns a value; on-ui-thread relays it to the
+    // worker. Confirms the out_result slot of ExecuteRequest is
+    // round-tripping correctly.
+    let (stdout, _stderr, code) = run_ncl(&[
+        "--windows", "-e",
+        "(format t \"~A\" (on-ui-thread (+ 100 200 300)))",
+    ]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("600"),
+            "expected 600 in stdout, got: {stdout:?}");
+}
+
+#[test]
+fn nested_on_ui_thread_short_circuits() {
+    // Inside on-ui-thread, (ui-thread-p) is T, so the macro's
+    // (if (ui-thread-p) (progn …) (%ui-execute …)) takes the
+    // progn branch — no extra SendMessage round-trip. Functionally
+    // this means three-deep nesting still returns the right value;
+    // performance-wise it's a single thread hop. We can't easily
+    // assert "no round-trip" but we can confirm correctness.
+    let (stdout, _stderr, code) = run_ncl(&[
+        "--windows", "-e",
+        "(format t \"~A\" (on-ui-thread (on-ui-thread (on-ui-thread 42))))",
+    ]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("42"),
+            "expected 42 in stdout, got: {stdout:?}");
+}
+
+#[test]
+fn on_ui_thread_without_windows_errors() {
+    // Without --windows, init.lisp doesn't auto-load win32-threading,
+    // so the macro is undefined. The user sees a clean compiler
+    // error rather than silently wrong behaviour.
+    let (_stdout, stderr, code) = run_ncl(&[
+        "-e", "(on-ui-thread (+ 1 2))",
+    ]);
+    assert_ne!(code, 0, "should fail when surface is off");
+    assert!(stderr.to_lowercase().contains("on-ui-thread")
+            || stderr.to_lowercase().contains("undefined"),
+            "expected error mentioning on-ui-thread, got: {stderr:?}");
+}
+
+#[test]
+fn ui_thread_id_inside_on_ui_thread_matches_outer() {
+    // (ui-thread-id) returns the same OS thread id whether read
+    // from the worker or from inside on-ui-thread. It's just a
+    // OnceLock lookup, not "what thread am I on right now" — so it
+    // must agree across threads.
+    let (stdout, _stderr, code) = run_ncl(&[
+        "--windows", "-e",
+        "(format t \"~A=~A\" (ui-thread-id) (on-ui-thread (ui-thread-id)))",
+    ]);
+    assert_eq!(code, 0);
+    let first_line = stdout.lines().next().unwrap_or("");
+    let parts: Vec<&str> = first_line.split('=').collect();
+    assert_eq!(parts.len(), 2, "expected exactly one '=', got: {first_line:?}");
+    let outer: i64 = parts[0].chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap();
+    let inner: i64 = parts[1].chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap();
+    assert_eq!(outer, inner, "thread id should match across threads");
+    assert!(outer > 0, "thread id should be positive");
 }

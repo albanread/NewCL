@@ -69,6 +69,9 @@ fn run_with_windows_surface(raw_args: Vec<String>) -> ExitCode {
     // Flip the flag BEFORE spawning the worker so init.lisp sees it.
     ncl_runtime::win_surface::set_windows_enabled(true);
     ncl_runtime::win_surface::register_ui_thread();
+    // Create the hidden HWND_MESSAGE dispatch window before the
+    // worker can possibly send the first WM_NCL_EXECUTE message.
+    ncl_runtime::win_surface::init_ui_dispatch();
 
     let (tx, rx) = mpsc::sync_channel::<ExitCode>(1);
 
@@ -124,6 +127,12 @@ fn lisp_main(raw_args: Vec<String>) -> ExitCode {
     // route into it from inside Lisp.
     let mut session = Box::new(session);
     session.activate();
+
+    // Publish the coordinator so thread 0 can register itself as a
+    // mutator on the same heap when WM_NCL_EXECUTE arrives. No-op
+    // when --windows is off (the OnceLock is set but no one reads
+    // it); harmless to do unconditionally.
+    ncl_runtime::win_surface::publish_coordinator(session.coord().clone());
 
     // ─── User library bootstrap ──────────────────────────────────────────
     //

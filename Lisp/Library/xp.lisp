@@ -57,6 +57,17 @@
 
 ;; -- Print control variables ------------------------------------------------
 
+;; *standard-output* — defaulted to T (the native format dest meaning
+;; "write to stdout"). XP's redefined format / print / princ / etc.
+;; reference this when called as e.g. (format t …) or with a missing
+;; stream arg; without a definition here those forms fail with
+;; "unbound variable" at runtime. NCL doesn't have stream objects for
+;; stdin/stdout — the native format's dest=T path handles output
+;; directly, so T-as-sentinel works correctly everywhere downstream.
+(defvar *standard-output* t)
+(defvar *error-output* t)
+(defvar *terminal-io* t)
+
 (defvar *print-escape* t)
 (defvar *print-base* 10)
 (defvar *print-radix* nil)

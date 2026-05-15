@@ -85,7 +85,7 @@ pub use printer::{format_word, format_word_aesthetic};
 pub use random::random_shim;
 
 pub use win_surface::{
-    ui_thread_id_shim, ui_thread_p_shim, windows_enabled_p_shim,
+    ui_execute_shim, ui_thread_id_shim, ui_thread_p_shim, windows_enabled_p_shim,
 };
 
 pub use threads::{
