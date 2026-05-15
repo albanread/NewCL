@@ -35,6 +35,8 @@ pub mod symbol;
 pub mod threads;
 pub mod universe;
 pub mod value;
+pub mod win_ffi;
+pub mod win_metadata;
 pub mod win_surface;
 pub mod word;
 
@@ -84,6 +86,7 @@ pub use igui::lisp_shims::{
 pub use printer::{format_word, format_word_aesthetic};
 pub use random::random_shim;
 
+pub use win_ffi::{ffi_call_shim, win32_call_shim, win32_lookup_shim};
 pub use win_surface::{
     ui_execute_shim, ui_thread_id_shim, ui_thread_p_shim, windows_enabled_p_shim,
 };

@@ -641,6 +641,21 @@ fn install_native_functions(
     // …) and calls this. Errors if --windows wasn't passed.
     install_native(coord, mutator, "%UI-EXECUTE",
                    ncl_runtime::ui_execute_shim, 1);
+    // (%ffi-call DLL FN ARG-TYPES RETURN-TYPE ARGS…) — the FFI
+    // kernel. Variadic (arity 0 = no compile-time arg-count check);
+    // the shim itself enforces "at least 4 fixed args plus one per
+    // arg-type". Phase 3 of docs/WINDOWS_FFI.md.
+    install_native(coord, mutator, "%FFI-CALL",
+                   ncl_runtime::ffi_call_shim, 0);
+    // (%win32-lookup NAME) -> plist or NIL. Used by (defwin32 …) at
+    // macroexpansion time to bake the signature into a defun. The
+    // metadata pack is loaded by the driver at --windows startup.
+    install_native(coord, mutator, "%WIN32-LOOKUP",
+                   ncl_runtime::win32_lookup_shim, 1);
+    // (%win32-call NAME &rest user-args). Used by (win32 NAME …)
+    // for one-shot dynamic dispatch (no Lisp-side defun generated).
+    install_native(coord, mutator, "%WIN32-CALL",
+                   ncl_runtime::win32_call_shim, 0);
     install_native(coord, mutator, "ALLOCATE-CRITICAL-SECTION",
                    ncl_runtime::allocate_critical_section_shim, 0);
     install_native(coord, mutator, "DEALLOCATE-CRITICAL-SECTION",

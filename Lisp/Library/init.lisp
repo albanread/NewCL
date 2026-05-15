@@ -42,7 +42,8 @@
 ;;; "unbound function" mystery. The conditional guards the Win32
 ;;; binding modules — those are deferred to per-namespace require.
 (when (windows-enabled-p)
-  (require 'win32-threading))           ; (on-ui-thread …), (post-to-ui-thread …)
+  (require 'win32-threading)            ; (on-ui-thread …), (post-to-ui-thread …)
+  (require 'win32))                     ; (win32 …), (defwin32 …)
 
 ;;; Example user-side hook: load a personal utilities module if
 ;;; present. Uncomment and rename to taste.

@@ -72,6 +72,15 @@ fn run_with_windows_surface(raw_args: Vec<String>) -> ExitCode {
     // Create the hidden HWND_MESSAGE dispatch window before the
     // worker can possibly send the first WM_NCL_EXECUTE message.
     ncl_runtime::win_surface::init_ui_dispatch();
+    // Load the Win32 metadata pack (Phase 4). Looks under
+    // <exe-dir>/../packs/windows_api.pack first (dev), then
+    // <exe-dir>/packs/windows_api.pack (install). Failure is
+    // non-fatal: %ffi-call still works directly; only (win32 …) /
+    // (defwin32 …) need the pack and they report a clean error
+    // when they can't find it.
+    if let Some(pack_path) = find_pack_path() {
+        ncl_runtime::win_metadata::try_load_pack(&pack_path);
+    }
 
     let (tx, rx) = mpsc::sync_channel::<ExitCode>(1);
 
@@ -232,6 +241,28 @@ fn lisp_main(raw_args: Vec<String>) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// Resolve the path to `packs/windows_api.pack` for the Windows
+/// surface metadata. Search order matches `find_library_dir`:
+///   1. NCL_PACK_DIR env override
+///   2. <exe_dir>/packs/windows_api.pack  (installed shape)
+///   3. <exe_dir>/../../packs/windows_api.pack  (dev build)
+fn find_pack_path() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("NCL_PACK_DIR") {
+        let cand = std::path::Path::new(&p).join("windows_api.pack");
+        if cand.is_file() { return Some(cand); }
+    }
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    let beside = exe_dir.join("packs").join("windows_api.pack");
+    if beside.is_file() { return Some(beside); }
+    let dev = exe_dir.ancestors().nth(2)
+        .map(|p| p.join("packs").join("windows_api.pack"));
+    if let Some(d) = dev {
+        if d.is_file() { return Some(d); }
+    }
+    None
 }
 
 /// Resolve the path to `Library/` next to the executable. Returns
