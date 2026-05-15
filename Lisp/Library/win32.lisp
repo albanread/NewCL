@@ -36,27 +36,17 @@
 
 ;;; -- Hot path: macro-time binding --
 
-(defun %defwin32-param-names (n)
-  "Generate N gensym-ish parameter symbols for a (defwin32 …)
-   expansion. Plain numbered names ARG0..ARGN-1 are enough: they
-   only show up in the generated defun's body and don't clash with
-   user-visible names."
-  (let ((acc nil) (i 0))
-    (loop
-      (when (>= i n) (return (nreverse acc)))
-      (push (intern (string-append-char
-                     (string-append-char "ARG" (code-char (+ 48 i)))
-                     #\space))   ; placeholder; replaced below
-            acc)
-      (setq i (+ i 1)))))
-
-;; A simpler implementation that doesn't try to pretty-name:
 (defun %defwin32-params (n)
+  "Generate N gensym'd parameter symbols for a (defwin32 …)
+   expansion. NCL's (return …) inside (when …) inside (loop …)
+   doesn't synchronously break, so we use an explicit block +
+   return-from."
   (let ((acc nil) (i 0))
-    (loop
-      (when (>= i n) (return (nreverse acc)))
-      (push (gensym "A") acc)
-      (setq i (+ i 1)))))
+    (block param-loop
+      (loop
+        (cond ((>= i n) (return-from param-loop (nreverse acc)))
+              (t (push (gensym "A") acc)
+                 (setq i (+ i 1))))))))
 
 (defmacro defwin32 (lisp-name win32-name)
   "Declare a Lisp binding for the Win32 function named WIN32-NAME,

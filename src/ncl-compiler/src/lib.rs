@@ -656,6 +656,55 @@ fn install_native_functions(
     // for one-shot dynamic dispatch (no Lisp-side defun generated).
     install_native(coord, mutator, "%WIN32-CALL",
                    ncl_runtime::win32_call_shim, 0);
+    // Foreign buffer primitives (Phase 5). The defstruct-win32
+    // macro (Lisp/Library/win32-buffer.lisp) layers offset/size
+    // discipline on top so user code doesn't hand-roll layouts.
+    install_native(coord, mutator, "MAKE-FOREIGN-BUFFER",
+                   ncl_runtime::make_foreign_buffer_shim, 1);
+    install_native(coord, mutator, "FREE-FOREIGN-BUFFER",
+                   ncl_runtime::free_foreign_buffer_shim, 2);
+    install_native(coord, mutator, "BUFFER-ZERO",
+                   ncl_runtime::buffer_zero_shim, 2);
+    install_native(coord, mutator, "BUFFER-REF-U8",
+                   ncl_runtime::buffer_ref_u8_shim, 2);
+    install_native(coord, mutator, "BUFFER-REF-I8",
+                   ncl_runtime::buffer_ref_i8_shim, 2);
+    install_native(coord, mutator, "BUFFER-REF-U16",
+                   ncl_runtime::buffer_ref_u16_shim, 2);
+    install_native(coord, mutator, "BUFFER-REF-I16",
+                   ncl_runtime::buffer_ref_i16_shim, 2);
+    install_native(coord, mutator, "BUFFER-REF-U32",
+                   ncl_runtime::buffer_ref_u32_shim, 2);
+    install_native(coord, mutator, "BUFFER-REF-I32",
+                   ncl_runtime::buffer_ref_i32_shim, 2);
+    install_native(coord, mutator, "BUFFER-REF-U64",
+                   ncl_runtime::buffer_ref_u64_shim, 2);
+    install_native(coord, mutator, "BUFFER-REF-I64",
+                   ncl_runtime::buffer_ref_i64_shim, 2);
+    install_native(coord, mutator, "BUFFER-REF-PTR",
+                   ncl_runtime::buffer_ref_ptr_shim, 2);
+    install_native(coord, mutator, "BUFFER-SET-U8",
+                   ncl_runtime::buffer_set_u8_shim, 3);
+    install_native(coord, mutator, "BUFFER-SET-I8",
+                   ncl_runtime::buffer_set_i8_shim, 3);
+    install_native(coord, mutator, "BUFFER-SET-U16",
+                   ncl_runtime::buffer_set_u16_shim, 3);
+    install_native(coord, mutator, "BUFFER-SET-I16",
+                   ncl_runtime::buffer_set_i16_shim, 3);
+    install_native(coord, mutator, "BUFFER-SET-U32",
+                   ncl_runtime::buffer_set_u32_shim, 3);
+    install_native(coord, mutator, "BUFFER-SET-I32",
+                   ncl_runtime::buffer_set_i32_shim, 3);
+    install_native(coord, mutator, "BUFFER-SET-U64",
+                   ncl_runtime::buffer_set_u64_shim, 3);
+    install_native(coord, mutator, "BUFFER-SET-I64",
+                   ncl_runtime::buffer_set_i64_shim, 3);
+    install_native(coord, mutator, "BUFFER-SET-PTR",
+                   ncl_runtime::buffer_set_ptr_shim, 3);
+    install_native(coord, mutator, "BUFFER-READ-WSTRING",
+                   ncl_runtime::buffer_read_wstring_shim, 2);
+    install_native(coord, mutator, "BUFFER-WRITE-WSTRING",
+                   ncl_runtime::buffer_write_wstring_shim, 3);
     install_native(coord, mutator, "ALLOCATE-CRITICAL-SECTION",
                    ncl_runtime::allocate_critical_section_shim, 0);
     install_native(coord, mutator, "DEALLOCATE-CRITICAL-SECTION",
