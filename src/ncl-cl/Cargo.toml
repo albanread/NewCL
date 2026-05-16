@@ -8,8 +8,16 @@ edition = "2024"
 # registers the small set of stdlib pieces that must be implemented
 # natively (e.g. some numeric primitives, condition machinery).
 
+[features]
+# Forward the GC backend choice to ncl-runtime so a single
+# workspace-level feature flag selects across every dependent
+# crate. See `ncl-runtime/src/gc.rs` for the underlying mechanism.
+default = ["gc-semispace"]
+gc-semispace = ["ncl-runtime/gc-semispace"]
+gc-page-heap = ["ncl-runtime/gc-page-heap"]
+
 [dependencies]
-ncl-runtime = { path = "../ncl-runtime" }
+ncl-runtime = { path = "../ncl-runtime", default-features = false }
 
 [lints]
 workspace = true

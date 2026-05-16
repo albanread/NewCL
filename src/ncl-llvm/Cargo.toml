@@ -3,9 +3,14 @@ name = "ncl-llvm"
 version = "0.0.0"
 edition = "2024"
 
+[features]
+default = ["gc-semispace"]
+gc-semispace = ["ncl-runtime/gc-semispace"]
+gc-page-heap = ["ncl-runtime/gc-page-heap"]
+
 [dependencies]
 ncl-ir = { path = "../ncl-ir" }
-ncl-runtime = { path = "../ncl-runtime" }
+ncl-runtime = { path = "../ncl-runtime", default-features = false }
 inkwell = { version = "=0.9.0", default-features = false, features = ["llvm22-1", "target-x86"] }
 # llvm-sys piggy-backs on inkwell's bundled LLVM. We use it for the
 # constructors inkwell doesn't expose: LLVMCreateMCJITCompilerForModule

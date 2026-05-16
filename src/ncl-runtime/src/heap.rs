@@ -773,59 +773,6 @@ impl Heap {
     }
 }
 
-// -- HeapBackend impl -------------------------------------------------------
-//
-// Phase 3 sub-phase 1 of `docs/GC_DESIGN.md`: route the GC coordinator
-// through a trait so a second heap implementation (the forthcoming
-// page-based heap) can slot in side-by-side via `GcConfig::backend`.
-// Each method here forwards to the existing inherent method — zero
-// semantic change, just a layer of indirection.
-
-impl crate::heap_backend::HeapBackend for Heap {
-    fn young_used_bytes(&self) -> usize { Heap::young_used_bytes(self) }
-    fn old_used_bytes(&self) -> usize { Heap::old_used_bytes(self) }
-    fn used_bytes(&self) -> usize { Heap::used_bytes(self) }
-    fn young_capacity_bytes(&self) -> usize { Heap::young_capacity_bytes(self) }
-    fn old_capacity_bytes(&self) -> usize { Heap::old_capacity_bytes(self) }
-    fn old_capacity_bytes_per_semi(&self) -> usize {
-        Heap::old_capacity_bytes_per_semi(self)
-    }
-
-    fn young_try_alloc_slab(&mut self, cells: usize) -> Option<std::ptr::NonNull<u64>> {
-        Heap::young_try_alloc_slab(self, cells)
-    }
-    fn young_base_ptr(&self) -> *const u64 { Heap::young_base_ptr(self) }
-    fn young_starts_handle(&self) -> StartBits { Heap::young_starts_handle(self) }
-
-    fn young_contains(&self, ptr: *const u8) -> bool { Heap::young_contains(self, ptr) }
-    fn old_contains(&self, ptr: *const u8) -> bool { Heap::old_contains(self, ptr) }
-
-    fn old_cards(&self) -> &Arc<CardTable> { Heap::old_cards(self) }
-    fn old_live_base_ptr(&self) -> *const u8 { Heap::old_live_base_ptr(self) }
-
-    fn collect_minor_with_static(
-        &mut self,
-        static_cards: &CardTable,
-        static_base: *mut u64,
-        static_cells: usize,
-        pin_stack_ranges: &[(usize, usize)],
-        visit_roots: &mut dyn FnMut(&mut RootScanner<'_, '_>),
-    ) {
-        Heap::collect_minor_with_static(
-            self,
-            static_cards,
-            static_base,
-            static_cells,
-            pin_stack_ranges,
-            visit_roots,
-        );
-    }
-
-    fn last_pin_summary(&self) -> (usize, usize) {
-        Heap::last_pin_summary(self)
-    }
-}
-
 // -- Cheney machinery, with two flavours ------------------------------------
 
 struct CopiedObject {

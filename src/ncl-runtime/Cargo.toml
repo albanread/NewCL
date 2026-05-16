@@ -3,6 +3,22 @@ name = "ncl-runtime"
 version = "0.0.0"
 edition = "2024"
 
+# GC backend selection. Mutually exclusive — pick at most one.
+# Default is `gc-semispace`, the production heap (`heap.rs`).
+# `gc-page-heap` selects the page-based GC under construction
+# (Phase 3 of `docs/GC_DESIGN.md`); it builds today but parts of
+# the integration are still landing — see sub-phase 11.
+#
+# Switch at build time:
+#   cargo build                                           # semispace (default)
+#   cargo build --no-default-features --features gc-page-heap
+#
+# Enabling both at once is a `compile_error!` in `gc.rs`.
+[features]
+default = ["gc-semispace"]
+gc-semispace = []
+gc-page-heap = []
+
 [dependencies]
 # Bignum kernel. We use it as the arithmetic engine but store
 # limb data in our GC heap (see bignum.rs) — no Box<BigInt>

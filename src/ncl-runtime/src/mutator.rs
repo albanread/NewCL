@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::heap::{CardTable, Heap};
-use crate::heap_backend::{HeapBackend, HeapBackendKind};
+use crate::gc;
 use crate::static_area::StaticArea;
 use crate::word::{Tag, Word};
 
@@ -93,13 +93,12 @@ pub struct GcCoordinator {
     /// The global heap. Acquiring this lock is required for TLAB
     /// refill and for running the actual GC.
     ///
-    /// Phase 3 sub-phase 1 of `docs/GC_DESIGN.md`: indirected
-    /// through `HeapBackend` so the page-based heap can slot in
-    /// alongside today's two-semispace generational copier without
-    /// a build-time fork. Allocation fast paths bypass this — they
-    /// cache the young-base pointer and start-bit bitmap at mutator
+    /// Concrete type is `gc::Heap`, selected at build time via the
+    /// `gc-semispace` (default) / `gc-page-heap` Cargo features (see
+    /// `gc.rs`). Allocation fast paths bypass this — they cache the
+    /// young-base pointer and start-bit bitmap at mutator
     /// registration, so per-alloc cost is unchanged.
-    heap: Mutex<Box<dyn HeapBackend>>,
+    heap: Mutex<gc::Heap>,
     /// "Park yourselves." Mutators poll this at safe points.
     stop_requested: AtomicBool,
     /// Set of registered mutators + how many are currently parked.
@@ -150,12 +149,6 @@ pub struct GcCoordinator {
     /// can publish updates without anyone else's lock. Exposed to
     /// Lisp via `(gc-stats)`.
     pub stats: GcStats,
-
-    /// Which backend was selected for this coordinator. Read at
-    /// `new` from `NCL_HEAP_BACKEND` (default Semispace) and never
-    /// changed afterward. Surfaces in `(gc-stats)` as
-    /// `:heap-backend` so the user can confirm what's running.
-    pub heap_backend_kind: HeapBackendKind,
 }
 
 /// Process-global GC counters. Reset never (cumulative over the
@@ -175,6 +168,20 @@ pub struct GcStats {
     pub objects_pinned_total: AtomicU64,
     pub peak_young_used_bytes: AtomicU64,
     pub pinned_residual_cells: AtomicU64,
+    // -- Per-cycle wall-clock timing (sub-phase 11b) ---------------------
+    //
+    // Wall-clock microseconds the most-recent minor GC spent stopped
+    // (from the moment all mutators parked to the moment the flag
+    // cleared). `*_total` accumulates across the run for throughput-
+    // style ratios; `*_max` is the worst single pause observed.
+    // All atomic so the GC trigger thread can publish without
+    // anyone else's lock.
+    pub last_minor_pause_us: AtomicU64,
+    pub max_minor_pause_us: AtomicU64,
+    pub total_minor_pause_us: AtomicU64,
+    pub last_full_pause_us: AtomicU64,
+    pub max_full_pause_us: AtomicU64,
+    pub total_full_pause_us: AtomicU64,
 }
 
 impl Default for GcStats {
@@ -186,6 +193,12 @@ impl Default for GcStats {
             objects_pinned_total: AtomicU64::new(0),
             peak_young_used_bytes: AtomicU64::new(0),
             pinned_residual_cells: AtomicU64::new(0),
+            last_minor_pause_us: AtomicU64::new(0),
+            max_minor_pause_us: AtomicU64::new(0),
+            total_minor_pause_us: AtomicU64::new(0),
+            last_full_pause_us: AtomicU64::new(0),
+            max_full_pause_us: AtomicU64::new(0),
+            total_full_pause_us: AtomicU64::new(0),
         }
     }
 }
@@ -196,25 +209,11 @@ struct ParkState {
 }
 
 impl GcCoordinator {
+    /// Construct a coordinator wrapping a fresh heap. The concrete
+    /// heap type is picked at build time via the `gc-semispace` /
+    /// `gc-page-heap` Cargo features — see `gc.rs`.
     pub fn new(config: GcConfig) -> Arc<GcCoordinator> {
-        // Pick heap backend from the env var. Default is Semispace
-        // (current production). `NCL_HEAP_BACKEND=page-heap` selects
-        // the page-based heap under construction (Phase 3 of
-        // `docs/GC_DESIGN.md`) — currently panics on construction
-        // because sub-phases 2-7 aren't built yet, but the dispatch
-        // wiring is in place so flipping a single line of source in
-        // sub-phase 11 makes it production-default.
-        Self::new_with_backend(config, HeapBackendKind::from_env())
-    }
-
-    /// Explicit-backend construction. The public `new` reads
-    /// `NCL_HEAP_BACKEND`; this lets tests and any code that wants
-    /// to pin a specific backend bypass the env var.
-    pub fn new_with_backend(
-        config: GcConfig,
-        backend: HeapBackendKind,
-    ) -> Arc<GcCoordinator> {
-        let heap = Heap::new(config.young_bytes, config.old_bytes);
+        let heap = gc::Heap::new(config.young_bytes, config.old_bytes);
         let cards = Arc::clone(heap.old_cards());
         let live_base = AtomicUsize::new(heap.old_live_base_ptr() as usize);
         let old_capacity = heap.old_capacity_bytes_per_semi();
@@ -237,28 +236,8 @@ impl GcCoordinator {
         } else {
             Arc::new(StaticArea::new(config.static_bytes))
         };
-        // Backend dispatch. Today both variants compile in (the
-        // page-heap is a panic-stub); after Phase 3 sub-phase 7
-        // lands, PageHeap returns a real `Box<dyn HeapBackend>`.
-        // The Heap is constructed unconditionally above so the
-        // coordinator's old-card / live-base caches stay valid
-        // even when we're routing to the page heap — those caches
-        // are dead weight under PageHeap (its card table is
-        // single-anchored), but keeping them avoids a wider
-        // refactor of GcCoordinator until sub-phase 11.
-        let heap_backend: Box<dyn HeapBackend> = match backend {
-            HeapBackendKind::Semispace => Box::new(heap),
-            HeapBackendKind::PageHeap => {
-                panic!(
-                    "ncl: NCL_HEAP_BACKEND=page-heap selected, but the page-based \
-                     heap is not yet implemented. Phase 3 sub-phases 2-7 of \
-                     docs/GC_DESIGN.md build it. Unset the env var (or set \
-                     NCL_HEAP_BACKEND=semispace) to use the production heap."
-                );
-            }
-        };
         Arc::new(GcCoordinator {
-            heap: Mutex::new(heap_backend),
+            heap: Mutex::new(heap),
             config,
             stop_requested: AtomicBool::new(false),
             park_state: Mutex::new(ParkState {
@@ -273,7 +252,6 @@ impl GcCoordinator {
             intern_table: Mutex::new(HashMap::new()),
             macros: Mutex::new(HashMap::new()),
             stats: GcStats::default(),
-            heap_backend_kind: backend,
         })
     }
 
@@ -731,14 +709,19 @@ impl MutatorState {
                 Err(now) => prev = now,
             }
         }
+        // Time the actual GC work — from "all mutators parked, heap
+        // lock acquired" to "collection complete, lock released."
+        // This is the STW pause as the application would observe it
+        // (mutators are parked the whole time).
+        let pause_start = std::time::Instant::now();
         {
             let mut heap = self.coord.heap.lock().unwrap();
-            // The trait method takes `&mut dyn FnMut(&mut
+            // The heap method takes `&mut dyn FnMut(&mut
             // RootScanner)`, not `impl FnMut`. We bind the closure
             // to a local first so Rust can infer its concrete
             // FnMut-implementing type, then coerce to the trait
             // object at the call site.
-            let mut visit = |scanner: &mut crate::heap::RootScanner<'_, '_>| {
+            let mut visit = |scanner: &mut crate::gc::RootScanner<'_, '_>| {
                 // My own roots first.
                 {
                     let mut my = my_handle.roots.lock().unwrap();
@@ -762,6 +745,7 @@ impl MutatorState {
                 &mut visit,
             );
         }
+        let pause_us = pause_start.elapsed().as_micros() as u64;
 
         // Stats: count this GC and compute promotion delta. The
         // pin counter / residual is published by the heap layer
@@ -788,6 +772,27 @@ impl MutatorState {
             .stats
             .pinned_residual_cells
             .store(pinned_cells as u64, Ordering::Relaxed);
+
+        // Publish the pause timing. `last_*` is just a store; the
+        // running `max_*` does a CAS-up retry; `total_*` is a
+        // straight fetch_add.
+        let stats = &self.coord.stats;
+        stats.last_minor_pause_us.store(pause_us, Ordering::Relaxed);
+        stats
+            .total_minor_pause_us
+            .fetch_add(pause_us, Ordering::Relaxed);
+        let mut prev_max = stats.max_minor_pause_us.load(Ordering::Relaxed);
+        while pause_us > prev_max {
+            match stats.max_minor_pause_us.compare_exchange(
+                prev_max,
+                pause_us,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(now) => prev_max = now,
+            }
+        }
 
         // My TLAB pointed into young, which is now empty (or
         // rewound past pinned survivors). Abandon it; the next
@@ -1080,7 +1085,7 @@ pub extern "C-unwind" fn gc_stats_shim(
     let s = &coord.stats;
     let static_area = coord.static_area();
 
-    let pairs: [(&str, i64); 13] = [
+    let pairs: [(&str, i64); 16] = [
         ("MINOR-GCS",             s.minor_gcs.load(Ordering::Relaxed) as i64),
         ("FULL-GCS",              s.full_gcs.load(Ordering::Relaxed) as i64),
         ("BYTES-PROMOTED-TOTAL",  s.bytes_promoted_total.load(Ordering::Relaxed) as i64),
@@ -1098,6 +1103,14 @@ pub extern "C-unwind" fn gc_stats_shim(
         // this is the page-aligned commit frontier; for Box-backed
         // it equals STATIC-CAP.
         ("STATIC-COMMITTED",      static_area.committed_bytes() as i64),
+        // Per-cycle wall-clock pause times in microseconds.
+        // LAST-MINOR-PAUSE-US is the most recent cycle; MAX is the
+        // worst observed; TOTAL is the cumulative pause time over
+        // the run (so MINOR-GCS / TOTAL-MINOR-PAUSE-US gives mean
+        // throughput-relative work per cycle).
+        ("LAST-MINOR-PAUSE-US",   s.last_minor_pause_us.load(Ordering::Relaxed) as i64),
+        ("MAX-MINOR-PAUSE-US",    s.max_minor_pause_us.load(Ordering::Relaxed) as i64),
+        ("TOTAL-MINOR-PAUSE-US",  s.total_minor_pause_us.load(Ordering::Relaxed) as i64),
     ];
 
     // Build the plist `(:key1 v1 :key2 v2 ... )` from the end.
@@ -1109,11 +1122,12 @@ pub extern "C-unwind" fn gc_stats_shim(
         result = m.alloc_cons(kw, result);
     }
     // Prepend `:heap-backend <symbol>` so the user can tell which
-    // implementation they're running on. Value is a plain symbol
-    // (`semispace` or `page-heap`) — not a keyword, so the symbol's
-    // print name matches its `name()` exactly.
+    // implementation they're running on. The build-time-selected
+    // backend name comes from `gc::ACTIVE_BACKEND_NAME`. Value is
+    // a plain symbol (`SEMISPACE` or `PAGE-HEAP`) — not a keyword,
+    // so the symbol's print name matches the constant.
     {
-        let backend_sym = coord.intern(&coord.heap_backend_kind.name().to_uppercase());
+        let backend_sym = coord.intern(&gc::ACTIVE_BACKEND_NAME.to_uppercase());
         let kw = coord.intern(":HEAP-BACKEND");
         result = m.alloc_cons(backend_sym, result);
         result = m.alloc_cons(kw, result);
@@ -1198,8 +1212,7 @@ mod tests {
             m.alloc_cons(Word::fixnum(99), Word::fixnum(99));
         }
 
-        // The rooted cons should still be alive. After GCs,
-        // it's been moved to old.
+        // The rooted cons should still be alive after GC.
         let root = m.root_at(idx);
         assert!(root.is_cons());
         let p = root.as_ptr::<u64>(Tag::Cons).unwrap();
@@ -1207,8 +1220,11 @@ mod tests {
             assert_eq!(Word::from_raw(*p).as_fixnum(), Some(42));
             assert!(Word::from_raw(*p.add(1)).is_nil());
         }
-        // Root pointer now points into old (it's been promoted).
-        assert!(coord.old_used_bytes() >= 16);
+        // Heap holds the cons somewhere (semispace: promoted to old;
+        // page-heap: stays in G0 until threshold cycles fire). The
+        // size assertion is backend-agnostic — `used_bytes` aggregates
+        // across all generations.
+        assert!(coord.used_bytes() >= 16);
     }
 
     #[test]
@@ -1372,20 +1388,33 @@ mod tests {
         let coord = GcCoordinator::new(small_config());
         let m = coord.register_mutator();
 
-        // Stack address is far from the old heap.
+        // Stack address is far from any heap. Both backends route
+        // mark_card via a range check against the heap base; an
+        // address outside the reservation marks no card.
         let stack_var: u64 = 0;
         m.mark_card(&stack_var as *const u64 as *const u8);
-
-        // No card was marked.
         assert_eq!(coord.cards.dirty_count(), 0);
 
-        // A young-heap address should also be a no-op (cards only
-        // cover old).
-        drop(m); // m is borrowed, drop before next op
-        let mut m = coord.register_mutator();
-        let young_cons = m.alloc_cons(Word::fixnum(1), Word::NIL);
-        m.mark_card(young_cons.as_ptr::<u8>(Tag::Cons).unwrap());
-        assert_eq!(coord.cards.dirty_count(), 0);
+        // Under SEMISPACE: a young-heap address also marks no card
+        // (the card table covers ONLY the old semispace; young is
+        // scanned in its entirety on minor GC, so cross-young
+        // stores don't need barrier tracking).
+        //
+        // Under PAGE-HEAP: the card table covers the WHOLE
+        // reservation, including G0 pages. A store into a G0
+        // (young) cell DOES mark a card. The card scan filters by
+        // page generation, so G0 cards do no harm — they just
+        // produce one filtered-out card lookup per cycle. This is
+        // expected behavior, so the assertion below is
+        // semispace-only.
+        #[cfg(feature = "gc-semispace")]
+        {
+            drop(m); // m is borrowed, drop before next op
+            let mut m = coord.register_mutator();
+            let young_cons = m.alloc_cons(Word::fixnum(1), Word::NIL);
+            m.mark_card(young_cons.as_ptr::<u8>(Tag::Cons).unwrap());
+            assert_eq!(coord.cards.dirty_count(), 0);
+        }
     }
 
     #[test]

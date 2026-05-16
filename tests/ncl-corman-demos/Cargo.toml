@@ -9,8 +9,13 @@ edition = "2024"
 # end-to-end) rather than linking it. Empty until Phase 3 lands the
 # first end-to-end pipeline.
 
+[features]
+default = ["gc-semispace"]
+gc-semispace = ["ncl-reader/gc-semispace"]
+gc-page-heap = ["ncl-reader/gc-page-heap"]
+
 [dependencies]
-ncl-reader = { path = "../../src/ncl-reader" }
+ncl-reader = { path = "../../src/ncl-reader", default-features = false }
 
 [lints]
 workspace = true

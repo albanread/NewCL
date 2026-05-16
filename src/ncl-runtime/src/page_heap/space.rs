@@ -56,6 +56,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use crate::heap_common::CardTable;
+
 use super::alloc::{AllocRegion, PageStartBits};
 use super::page_desc::{Generation, PageDesc, PageKind};
 
@@ -159,6 +161,32 @@ pub struct PageHeap {
     /// `pub(super)` so sibling modules (`pin`, future `evacuate`)
     /// can mutate without going through accessors.
     pub(super) pinned_cells: std::collections::HashSet<usize>,
+    /// Minor cycles since the last G0 → G1 promotion. Incremented
+    /// by `collect_minor`; reset to 0 on the cycle that promotes.
+    /// Sub-phase 8 of `docs/GC_DESIGN.md`.
+    pub(super) minors_since_g0_promote: u32,
+    /// G0-promotion events since the last G1 → Tenured promotion.
+    /// Ticks only on cycles that already promoted G0; reset on the
+    /// cycle that cascades into G1 promotion.
+    pub(super) g0_promotes_since_g1_promote: u32,
+    /// Soft card-marking table covering the WHOLE reservation
+    /// (page-heap doesn't split into young/old address ranges the
+    /// way the semispace does). One byte per `CARD_SIZE_BYTES`
+    /// = 512 bytes; ~2 MB for the 1 GB default reservation.
+    ///
+    /// Sub-phase 9: mutator-side stores into older-than-G0 objects
+    /// mark cards via `GcCoordinator::mark_card`. Minor GC scans
+    /// dirty cards in G1/Tenured pages for cross-gen pointers into
+    /// G0. The field exists from sub-phase 11a so the coordinator
+    /// can wire its barrier through here; full minor-GC integration
+    /// follows in sub-phase 11b.
+    pub(super) cards: Arc<CardTable>,
+    /// Most recent pin-scan result (n_objects, n_cells), surfaced
+    /// to `(gc-stats)` via `last_pin_summary`. Updated by every
+    /// `pin_pointers_in_ranges`; sub-phase 11b populates the
+    /// `n_cells` field too (currently always 0 — `PinScanResult`
+    /// hasn't computed object sizes yet).
+    pub(super) last_pin_summary: (usize, usize),
 }
 
 enum Backing {
@@ -209,15 +237,36 @@ impl Drop for Backing {
 }
 
 impl PageHeap {
-    /// Reserve `reserved_bytes` of address space rounded up to a
-    /// whole number of pages (64 KB each). On Windows uses
-    /// `VirtualAlloc(MEM_RESERVE, PAGE_NOACCESS)`; pages must be
-    /// individually committed via `commit_page` before use. On
-    /// non-Windows allocates a `Box<[u8]>` of the same size with
-    /// all pages permanently "committed" (the kernel decommit
-    /// semantics aren't faithfully reproduced — proper mmap-based
-    /// support is future work).
-    pub fn new(reserved_bytes: usize) -> Self {
+    /// Coordinator-facing constructor. Mirrors `Heap::new(young_bytes,
+    /// old_bytes)` so `GcCoordinator::new` can use the same signature
+    /// for either backend under build-time feature selection.
+    ///
+    /// For the page heap, both byte counts feed into a single
+    /// reservation: total = `young_bytes + old_bytes`, rounded up to
+    /// a whole number of 64 KB pages, with a **4-page minimum**
+    /// (256 KB). The 4-page floor matters because:
+    /// - Within-gen evacuation (`G0 → G0` on a non-threshold minor)
+    ///   needs at least one Free page to copy survivors into, AND
+    ///   the original page still in G0 at the time the BFS runs.
+    /// - Cascading promotion wants a Free page for the destination
+    ///   cohort plus working slack for the BFS.
+    /// - The sub-phase 7 mid-evacuation OOM panic is avoided on
+    ///   typical test configs that pass 32 KB / 32 KB sizes.
+    pub fn new(young_bytes: usize, old_bytes: usize) -> Self {
+        const MIN_BYTES: usize = 4 * PAGE_SIZE_BYTES;
+        let bytes = (young_bytes + old_bytes).max(MIN_BYTES);
+        Self::with_reservation(bytes)
+    }
+
+    /// Internal / test constructor: reserve `reserved_bytes` of
+    /// address space rounded up to a whole number of pages
+    /// (64 KB each). On Windows uses `VirtualAlloc(MEM_RESERVE,
+    /// PAGE_NOACCESS)`; pages must be individually committed via
+    /// `commit_page` before use. On non-Windows allocates a
+    /// `Box<[u8]>` of the same size with all pages permanently
+    /// "committed" (the kernel decommit semantics aren't faithfully
+    /// reproduced — proper mmap-based support is future work).
+    pub fn with_reservation(reserved_bytes: usize) -> Self {
         let n_pages = reserved_bytes.div_ceil(PAGE_SIZE_BYTES);
         let total_bytes = n_pages * PAGE_SIZE_BYTES;
         let n_bitmap_words = n_pages.div_ceil(64);
@@ -257,6 +306,10 @@ impl PageHeap {
         let mark_bits: Box<[u64]> = vec![0u64; n_mark_words].into_boxed_slice();
         // Pinned-cells set starts empty — no scan run yet.
         let pinned_cells = std::collections::HashSet::new();
+        // Card table covering the whole reservation. Same 512-byte
+        // card granularity as the semispace heap so the IR-level
+        // barrier shape is identical.
+        let cards = Arc::new(CardTable::new(total_bytes));
 
         #[cfg(windows)]
         {
@@ -285,6 +338,10 @@ impl PageHeap {
                 start_bits,
                 mark_bits,
                 pinned_cells,
+                minors_since_g0_promote: 0,
+                g0_promotes_since_g1_promote: 0,
+                cards,
+                last_pin_summary: (0, 0),
             }
         }
         #[cfg(not(windows))]
@@ -310,6 +367,10 @@ impl PageHeap {
                 start_bits,
                 mark_bits,
                 pinned_cells,
+                minors_since_g0_promote: 0,
+                g0_promotes_since_g1_promote: 0,
+                cards,
+                last_pin_summary: (0, 0),
             }
         }
     }
@@ -695,7 +756,7 @@ mod tests {
     fn small_heap() -> PageHeap {
         // 1 MB = 16 pages. Plenty to exercise page indexing without
         // wasting VAD space across thousands of test runs.
-        PageHeap::new(1024 * 1024)
+        PageHeap::with_reservation(1024 * 1024)
     }
 
     #[test]

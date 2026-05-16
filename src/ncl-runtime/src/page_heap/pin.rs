@@ -228,7 +228,7 @@ mod tests {
 
     fn small_heap() -> PageHeap {
         // 4 pages = 256 KB. Plenty for several thousand cons cells.
-        PageHeap::new(4 * 64 * 1024)
+        PageHeap::with_reservation(4 * 64 * 1024)
     }
 
     /// Build a stack-like array of u64 values containing the given

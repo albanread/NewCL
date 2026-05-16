@@ -7,14 +7,36 @@ edition = "2024"
 name = "ncl"
 path = "src/main.rs"
 
+[features]
+# Forwarded from every dependent crate that pulls in ncl-runtime.
+# Picking `gc-page-heap` here flips the entire workspace's
+# transitively-linked GC backend in one shot.
+default = ["gc-semispace"]
+gc-semispace = [
+    "ncl-runtime/gc-semispace",
+    "ncl-cl/gc-semispace",
+    "ncl-compiler/gc-semispace",
+    "ncl-llvm/gc-semispace",
+    "ncl-loader/gc-semispace",
+    "ncl-reader/gc-semispace",
+]
+gc-page-heap = [
+    "ncl-runtime/gc-page-heap",
+    "ncl-cl/gc-page-heap",
+    "ncl-compiler/gc-page-heap",
+    "ncl-llvm/gc-page-heap",
+    "ncl-loader/gc-page-heap",
+    "ncl-reader/gc-page-heap",
+]
+
 [dependencies]
-ncl-cl = { path = "../ncl-cl" }
-ncl-compiler = { path = "../ncl-compiler" }
+ncl-cl = { path = "../ncl-cl", default-features = false }
+ncl-compiler = { path = "../ncl-compiler", default-features = false }
 ncl-ir = { path = "../ncl-ir" }
-ncl-llvm = { path = "../ncl-llvm" }
-ncl-loader = { path = "../ncl-loader" }
-ncl-reader = { path = "../ncl-reader" }
-ncl-runtime = { path = "../ncl-runtime" }
+ncl-llvm = { path = "../ncl-llvm", default-features = false }
+ncl-loader = { path = "../ncl-loader", default-features = false }
+ncl-reader = { path = "../ncl-reader", default-features = false }
+ncl-runtime = { path = "../ncl-runtime", default-features = false }
 
 [lints]
 workspace = true

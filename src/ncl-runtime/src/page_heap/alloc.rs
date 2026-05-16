@@ -193,6 +193,25 @@ impl PageHeap {
         for w in first_word..first_word + WORDS_PER_PAGE {
             bits[w].store(0, Ordering::Relaxed);
         }
+        // Bug #4 (sub-phase 11d): zero the page's CELLS too. The
+        // start-bit clear above hides old objects from the GC's
+        // structural walkers, but the mutator-side alloc helpers
+        // don't fully initialise payloads — `alloc_typed_vector`
+        // writes only the header; `alloc_string_buffer` says
+        // "payload is uninitialised" in its rustdoc. A page
+        // recycled after GC contains forwarding-marker leftovers
+        // and prior live data; reading those as Words from a
+        // partially-initialised object's payload returns garbage
+        // that propagates through the JIT'd code. Fresh
+        // VirtualAlloc'd pages get zero-init for free; recycled
+        // pages must be zeroed here.
+        unsafe {
+            std::ptr::write_bytes(
+                self.page_ptr(idx),
+                0,
+                super::space::PAGE_SIZE_BYTES,
+            );
+        }
         Some(idx)
     }
 
@@ -328,7 +347,7 @@ mod tests {
     fn small_heap() -> PageHeap {
         // 8 pages = 512 KB. Enough to exercise multi-page allocation
         // (one page = 8192 cells = 4096 cons cells).
-        PageHeap::new(8 * 64 * 1024)
+        PageHeap::with_reservation(8 * 64 * 1024)
     }
 
     #[test]
@@ -419,7 +438,7 @@ mod tests {
         // 100k cons × 16 bytes = 1.6 MB. At 32 KB of conses per
         // page (4096 conses), needs 25 pages. Use a 32-page heap
         // = 2 MB so there's headroom.
-        let mut h = PageHeap::new(32 * 64 * 1024);
+        let mut h = PageHeap::with_reservation(32 * 64 * 1024);
         // Stash a few pointers to verify content round-trips
         // after the cells are written.
         let mut samples: Vec<*mut u64> = Vec::with_capacity(10);

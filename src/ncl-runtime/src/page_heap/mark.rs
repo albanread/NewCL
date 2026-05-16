@@ -139,24 +139,32 @@ impl PageHeap {
 
     /// Scan the payload cells of a marked object and recurse on
     /// any heap-pointer children. `cell_idx` is the object's
-    /// first cell (header for Boxed, car for Cons). The object's
-    /// size is determined by the page kind and (for Boxed) the
-    /// HeapHeader.
+    /// first cell (header for boxed, car for cons).
+    ///
+    /// **Object-kind dispatch**: for `PageKind::Cons` pages, every
+    /// cell is a 2-cell cons pair (a small optimization for pages
+    /// produced by `try_alloc_cons_in` — fixed stride, no start-
+    /// bit lookup). For `PageKind::Boxed` pages, the per-cell
+    /// **start-bit pattern** decides: `11` → cons (2 cells), `01`
+    /// → header-bearing (`1 + length_cells()`). Mutator TLABs
+    /// land on Boxed pages and intermix cons + boxed allocations,
+    /// so the start-bit check is the source of truth there.
     fn scan_marked_object(
         &mut self,
         cell_idx: usize,
         target: Generation,
         queue: &mut Vec<usize>,
     ) {
-        // Determine size by inspecting the page kind.
         let page_idx = cell_idx / PAGE_SIZE_CELLS;
         let kind = self.desc(page_idx).kind;
-        let size_cells = match kind {
-            PageKind::Cons => 2,
+        let is_cons = match kind {
+            PageKind::Cons => true,
             PageKind::Boxed => {
-                let header_word = self.read_cell(cell_idx);
-                let h = HeapHeader::from_raw(header_word);
-                1 + h.length_cells() as usize
+                // Dispatch by start-bit pattern. Mutator TLABs
+                // intermix conses and boxed objects on the same
+                // page; `11` is the cons-start pair, `01` is the
+                // boxed-header start.
+                is_cons_start_at(self.start_bits_slice(), cell_idx)
             }
             PageKind::Large => {
                 // Sub-phase 7 will define large-object marking
@@ -177,19 +185,21 @@ impl PageHeap {
                 return;
             }
         };
+        let size_cells = if is_cons {
+            2
+        } else {
+            let header_word = self.read_cell(cell_idx);
+            let h = HeapHeader::from_raw(header_word);
+            1 + h.length_cells() as usize
+        };
         // Walk payload. For Cons, both cells are Words. For Boxed,
         // cells 1..size_cells are payload; cell 0 is the header
         // and we skip it. SOME boxed objects have non-Word cells
         // in their payload (Function::code_ptr, Bignum limbs,
         // Float bits) but the conservative scanner treats them
         // as candidate Words and harmlessly rejects non-pointer
-        // bit patterns. Sub-phase 7 can specialise per-HeapType
-        // if profiling demands precision.
-        let payload_start = if matches!(kind, PageKind::Cons) {
-            cell_idx
-        } else {
-            cell_idx + 1
-        };
+        // bit patterns.
+        let payload_start = if is_cons { cell_idx } else { cell_idx + 1 };
         let payload_end = cell_idx + size_cells;
         for c in payload_start..payload_end {
             let w = Word::from_raw(self.read_cell(c));
@@ -238,7 +248,7 @@ mod tests {
     fn small_heap() -> PageHeap {
         // 4 pages = 256 KB. Plenty for 1000 cons cells (250 per
         // page).
-        PageHeap::new(4 * 64 * 1024)
+        PageHeap::with_reservation(4 * 64 * 1024)
     }
 
     /// Allocate `n` cons cells, chained `next.cdr = prev`. Returns

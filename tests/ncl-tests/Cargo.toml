@@ -3,11 +3,26 @@ name = "ncl-tests"
 version = "0.0.0"
 edition = "2024"
 
+[features]
+default = ["gc-semispace"]
+gc-semispace = [
+    "ncl-runtime/gc-semispace",
+    "ncl-compiler/gc-semispace",
+    "ncl-loader/gc-semispace",
+    "ncl-reader/gc-semispace",
+]
+gc-page-heap = [
+    "ncl-runtime/gc-page-heap",
+    "ncl-compiler/gc-page-heap",
+    "ncl-loader/gc-page-heap",
+    "ncl-reader/gc-page-heap",
+]
+
 [dependencies]
-ncl-compiler = { path = "../../src/ncl-compiler" }
-ncl-loader = { path = "../../src/ncl-loader" }
-ncl-reader = { path = "../../src/ncl-reader" }
-ncl-runtime = { path = "../../src/ncl-runtime" }
+ncl-compiler = { path = "../../src/ncl-compiler", default-features = false }
+ncl-loader = { path = "../../src/ncl-loader", default-features = false }
+ncl-reader = { path = "../../src/ncl-reader", default-features = false }
+ncl-runtime = { path = "../../src/ncl-runtime", default-features = false }
 
 [lints]
 workspace = true

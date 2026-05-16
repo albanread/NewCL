@@ -3,11 +3,24 @@ name = "ncl-compiler"
 version = "0.0.0"
 edition = "2024"
 
+[features]
+default = ["gc-semispace"]
+gc-semispace = [
+    "ncl-runtime/gc-semispace",
+    "ncl-reader/gc-semispace",
+    "ncl-llvm/gc-semispace",
+]
+gc-page-heap = [
+    "ncl-runtime/gc-page-heap",
+    "ncl-reader/gc-page-heap",
+    "ncl-llvm/gc-page-heap",
+]
+
 [dependencies]
 ncl-ir = { path = "../ncl-ir" }
-ncl-reader = { path = "../ncl-reader" }
-ncl-runtime = { path = "../ncl-runtime" }
-ncl-llvm = { path = "../ncl-llvm" }
+ncl-reader = { path = "../ncl-reader", default-features = false }
+ncl-runtime = { path = "../ncl-runtime", default-features = false }
+ncl-llvm = { path = "../ncl-llvm", default-features = false }
 
 [lints]
 workspace = true
