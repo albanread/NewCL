@@ -218,6 +218,15 @@ decide.
    pass framework, a configuration system), the default answer is no
    until the simpler version has demonstrably failed.
 
+   **Carve-out: the GC.** Modern generational, multi-threaded,
+   precisely-rooted collectors are inherently complex, and that
+   complexity buys real correctness and throughput. The simplicity rule
+   does NOT veto GC machinery: TLABs, card barriers, conservative pin
+   sets, two-level pin indices, per-page descriptors, age cohorts, mark
+   bitmaps, statepoint integration. `docs/GC_DESIGN.md` is the spec
+   for the GC; that document's complexity is intentional. Apply the
+   simplicity rule to the rest of the system.
+
 2. **The thread boundary is the OS boundary.** The Lisp runtime runs on
    its own thread, started by the UI thread. That boundary is the only
    place OS-specific code is allowed to live. The UI thread owns the
