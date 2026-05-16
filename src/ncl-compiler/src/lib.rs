@@ -119,6 +119,72 @@ impl Session {
         ncl_llvm::jit_eval(&expr, mutator_ptr).map_err(EvalError::Jit)
     }
 
+    /// Dry-run check of a single Value: do parse + macroexpand + lower
+    /// but skip JIT execution for forms that aren't definitions. This
+    /// is the kernel of the driver's `--check` flag — it surfaces
+    /// reader, macroexpand, and compile-time errors WITHOUT running
+    /// the file's "main" side-effects (FFI calls, network I/O, window
+    /// creation, etc.).
+    ///
+    /// Definition forms (`defun`, `defmacro`, top-level `progn` of
+    /// definitions, `defparameter`/`defvar`/`defconstant`, the
+    /// installer side of `require`/`provide`/`load`/`in-package`)
+    /// are FULL-evaluated, because later forms' macroexpansion and
+    /// lowering need them to be in place (a macro defined on line 10
+    /// has to be available when line 20 is checked).
+    ///
+    /// Everything else is macroexpanded, then lowered, then thrown
+    /// away — never JIT-evaluated. Returns `Ok(())` if the form
+    /// passes; any reader / macroexpand / lower error propagates.
+    pub fn check_value(&mut self, v: &Value) -> Result<(), EvalError> {
+        // Same eager defmacro/defun recognition as eval_value — the
+        // body is compiled (which is what catches errors), and the
+        // resulting Function is installed so later forms can refer
+        // to it during their own macroexpand pass.
+        if let Some((name, params, body_forms)) = match_defmacro(v)? {
+            self.handle_defmacro(&name, &params, &body_forms)?;
+            return Ok(());
+        }
+        if let Some((name, params, body_forms)) = match_defun(v)? {
+            self.handle_defun(&name, &params, &body_forms)?;
+            return Ok(());
+        }
+        // Macroexpand so we can decide what kind of form this is
+        // AFTER macros run. defstruct-win32, define-win32-callback,
+        // require-with-side-effects, etc. all surface as something
+        // different post-expansion.
+        let expanded = macroexpand_all(v, &self.coord, &mut self.mutator)?;
+        if let Some(body_forms) = match_top_level_progn(&expanded) {
+            for form in body_forms {
+                self.check_value(&form)?;
+            }
+            return Ok(());
+        }
+        // Recognise definition-flavoured forms and full-eval them so
+        // their effect is visible to later check_value calls.
+        if is_definition_like(&expanded) {
+            self.eval_value(&expanded)?;
+            return Ok(());
+        }
+        // Pure check: lower the form (which exercises macroexpand
+        // and the lowering pass), then discard the resulting Expr
+        // without handing it to the JIT.
+        let _expr = lower(&expanded, &self.coord).map_err(EvalError::Compile)?;
+        Ok(())
+    }
+
+    /// Dry-run check of a source string: parse it into top-level
+    /// forms, then run `check_value` on each. Errors propagate.
+    /// On success, returns the number of forms checked.
+    pub fn check(&mut self, src: &str) -> Result<usize, EvalError> {
+        let values = ncl_reader::read_all(src)
+            .map_err(|e| EvalError::Read(format!("{:?}", e.kind)))?;
+        for v in &values {
+            self.check_value(v)?;
+        }
+        Ok(values.len())
+    }
+
     fn handle_defmacro(
         &mut self,
         name: &str,
@@ -388,12 +454,13 @@ fn install_native_functions(
     // Bit operations (Tier 1.D.3).
     install_native(coord, mutator, "ASH",
                    ncl_runtime::bignum::ash_shim, 2);
+    // n-ary in CL: identity 0 for logior/logxor, -1 for logand.
     install_native(coord, mutator, "LOGAND",
-                   ncl_runtime::bignum::logand_shim, 2);
+                   ncl_runtime::bignum::logand_shim, 0);
     install_native(coord, mutator, "LOGIOR",
-                   ncl_runtime::bignum::logior_shim, 2);
+                   ncl_runtime::bignum::logior_shim, 0);
     install_native(coord, mutator, "LOGXOR",
-                   ncl_runtime::bignum::logxor_shim, 2);
+                   ncl_runtime::bignum::logxor_shim, 0);
     install_native(coord, mutator, "LOGNOT",
                    ncl_runtime::bignum::lognot_shim, 1);
     install_native(coord, mutator, "INTEGER-LENGTH",
@@ -1421,6 +1488,34 @@ fn match_top_level_progn(v: &Value) -> Option<Vec<Value>> {
         return None;
     }
     list_to_vec_of_value(&c.cdr).ok()
+}
+
+/// Heuristic for the `--check` flag: is `v` a top-level form whose
+/// side-effect matters for later forms in the same file?
+///
+/// Examples that return true: `defparameter`, `defvar`, `defconstant`,
+/// `setq` of a global (people use it as a poor person's defparameter),
+/// `require` / `provide` / `load` / `in-package` (module bookkeeping).
+///
+/// `defun` / `defmacro` are recognised separately by the caller —
+/// they go through the explicit handle_* path so the function body
+/// is compiled at top level. progn is also handled separately
+/// (recursive splice).
+fn is_definition_like(v: &Value) -> bool {
+    let Value::Cons(c) = v else { return false };
+    let Value::Symbol(head) = &c.car else { return false };
+    matches!(
+        &*head.name,
+        "DEFPARAMETER"
+            | "DEFVAR"
+            | "DEFCONSTANT"
+            | "SETQ"
+            | "SETF"
+            | "REQUIRE"
+            | "PROVIDE"
+            | "LOAD"
+            | "IN-PACKAGE"
+    )
 }
 
 /// Recognise `(defmacro name (params...) body...)`. Same shape as

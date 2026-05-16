@@ -703,27 +703,34 @@ fn bit_op_2(
     name: &str,
     op: impl Fn(BigInt, BigInt) -> BigInt,
 ) -> u64 {
-    if n_args != 2 {
-        return crate::abi::signal_condition_string(
-            mutator, &format!("{name}: expected 2 args"),
-        );
-    }
+    // CL semantics: (logand)/(logior)/(logxor) accept any arity.
+    // (logior) → 0, (logior x) → x, (logior a b c ...) → fold.
+    // The identity differs per op:
+    //   logand: -1 (all bits set), logior: 0, logxor: 0.
+    let identity: BigInt = match name {
+        "logand" => -BigInt::from(1),
+        _ => BigInt::from(0),
+    };
     let m = unsafe { &mut *mutator };
-    let a = Word::from_raw(unsafe { *args });
-    let b = Word::from_raw(unsafe { *args.add(1) });
-    let na = match integer_to_bigint(a) {
+    if n_args == 0 {
+        return bigint_to_word(m, &identity).raw();
+    }
+    let mut acc = match integer_to_bigint(Word::from_raw(unsafe { *args })) {
         Some(n) => n,
         None => return crate::abi::signal_condition_string(
-            mutator, &format!("{name}: first arg is not an integer"),
+            mutator, &format!("{name}: arg 0 is not an integer"),
         ),
     };
-    let nb = match integer_to_bigint(b) {
-        Some(n) => n,
-        None => return crate::abi::signal_condition_string(
-            mutator, &format!("{name}: second arg is not an integer"),
-        ),
-    };
-    bigint_to_word(m, &op(na, nb)).raw()
+    for i in 1..n_args {
+        let next = match integer_to_bigint(Word::from_raw(unsafe { *args.add(i as usize) })) {
+            Some(n) => n,
+            None => return crate::abi::signal_condition_string(
+                mutator, &format!("{name}: arg {i} is not an integer"),
+            ),
+        };
+        acc = op(acc, next);
+    }
+    bigint_to_word(m, &acc).raw()
 }
 
 /// `(lognot n)` — bitwise complement (-n - 1 in two's complement).

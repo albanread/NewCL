@@ -40,6 +40,13 @@ pub const FUNCTION_PAYLOAD_CELLS: u32 = 4;
 /// Allocate a fresh Function in the static area. The code_ptr is a
 /// raw machine-code address; the JIT keeps the underlying engine
 /// alive so this pointer stays valid for the process lifetime.
+///
+/// All Function records live here for now (defun'd functions,
+/// native shims, anonymous lambdas, Win32 callback trampolines).
+/// A young-heap allocation path was tried in an earlier branch
+/// and is documented in `docs/GC_DESIGN.md` — it requires GC-layer
+/// fixes (Phase 3 in that doc: page-based heap with age-threshold
+/// tenuring) before it's safe to use for lambdas.
 pub fn alloc_function_in_static(
     static_area: &StaticArea,
     code_ptr: usize,

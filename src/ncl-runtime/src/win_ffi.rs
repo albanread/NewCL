@@ -312,6 +312,16 @@ fn marshal_in(w: Word, tag: TypeTag, carrier: &mut ArgCarrier) -> u64 {
         | TypeTag::Handle
         | TypeTag::Ptr => marshal_integer(w, tag),
         TypeTag::Wstr => {
+            // Three legal inputs:
+            //   NIL      → null pointer
+            //   string   → marshal into a UTF-16 buffer, pass pointer
+            //   integer  → treat as already-prepared pointer (the
+            //              caller did make-foreign-buffer +
+            //              buffer-write-wstring) OR a class atom.
+            //              Many Win32 APIs (CreateWindowExW,
+            //              FindResourceW, LoadStringW…) accept either
+            //              a pointer or an integer atom in an LPCWSTR
+            //              parameter — MAKEINTRESOURCE-style usage.
             if w.is_nil() {
                 0
             } else if w.tag() == Tag::String {
@@ -321,11 +331,18 @@ fn marshal_in(w: Word, tag: TypeTag, carrier: &mut ArgCarrier) -> u64 {
                 let ptr = buf.as_ptr() as u64;
                 carrier._wstrs.push(buf);
                 ptr
+            } else if let Some(n) = w.as_fixnum() {
+                n as u64
+            } else if crate::bignum::is_bignum(w) {
+                marshal_integer(w, TypeTag::U64)
             } else {
-                panic!("%ffi-call :wstr arg: expected a string or NIL, got {w:?}");
+                panic!(
+                    "%ffi-call :wstr arg: expected string, integer, or NIL; got {w:?}"
+                );
             }
         }
         TypeTag::Cstr => {
+            // Same three-way input as :wstr (NIL / string / pointer).
             if w.is_nil() {
                 0
             } else if w.tag() == Tag::String {
@@ -338,8 +355,14 @@ fn marshal_in(w: Word, tag: TypeTag, carrier: &mut ArgCarrier) -> u64 {
                 let ptr = buf.as_ptr() as u64;
                 carrier._cstrs.push(buf);
                 ptr
+            } else if let Some(n) = w.as_fixnum() {
+                n as u64
+            } else if crate::bignum::is_bignum(w) {
+                marshal_integer(w, TypeTag::U64)
             } else {
-                panic!("%ffi-call :cstr arg: expected a string or NIL, got {w:?}");
+                panic!(
+                    "%ffi-call :cstr arg: expected string, integer, or NIL; got {w:?}"
+                );
             }
         }
     }
@@ -674,7 +697,22 @@ pub extern "C-unwind" fn win32_call_shim(
             let tag = TypeTag::from_byte(tag_byte)
                 .unwrap_or_else(|| panic!("%win32-call: bad tag byte {tag_byte} for {name:?}"));
             let w = read(1 + i as u64);
-            marshalled.push(marshal_in(w, tag, &mut carrier));
+            // Attach call context so panics from marshal_in identify
+            // which API and which positional arg failed — crucial
+            // when debugging FFI marshalling (otherwise the user gets
+            // a bare "expected fixnum" with no way to find which
+            // (win32 …) call upstream is at fault).
+            let marshalled_one = std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| marshal_in(w, tag, &mut carrier)),
+            ).unwrap_or_else(|payload| {
+                let msg = payload.downcast_ref::<String>().cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                panic!(
+                    "%win32-call: marshalling arg {i} ({tag:?}) of {name:?} failed: {msg}"
+                );
+            });
+            marshalled.push(marshalled_one);
         }
         let raw = unsafe { call_dispatch(proc, &marshalled) };
         drop(carrier);

@@ -9,19 +9,32 @@ use std::sync::Mutex;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn usage() {
-    eprintln!("usage: ncl [--lean] [--windows] [--repl | (--eval <src> | --load <file>)...] [--repl]");
+    eprintln!("usage: ncl [--lean] [--windows] [--repl | (--eval <src> | --load <file> | --check <file>)...] [--repl]");
     eprintln!("       ncl --version | --help");
-    eprintln!("  --eval, -e <src>     evaluate a source string");
-    eprintln!("  --load, -l <file>    read and evaluate the file");
-    eprintln!("  --repl, -r           enter the interactive REPL (default if no flags given)");
-    eprintln!("  --lean, -L           start with core only (no CLOS, no Library/init.lisp)");
+    eprintln!("  --eval,  -e <src>    evaluate a source string");
+    eprintln!("  --load,  -l <file>   read and evaluate the file");
+    eprintln!("  --check, -c <file>   dry-run: parse + macroexpand + lower each top-level form,");
+    eprintln!("                       executing only definitions (defun, defmacro, defparameter,");
+    eprintln!("                       defconstant, require, …). Non-definition forms get lowered");
+    eprintln!("                       through the JIT pipeline but never run, so the file's main");
+    eprintln!("                       side-effects (FFI calls, network I/O, window creation) are");
+    eprintln!("                       suppressed. Surfaces reader, macroexpand, and compile errors.");
+    eprintln!("  --repl,  -r          enter the interactive REPL (default if no flags given)");
+    eprintln!("  --lean,  -L          start with core only (no CLOS, no Library/init.lisp)");
     eprintln!("  --windows, -W        enable the Windows surface: thread 0 runs a Win32");
     eprintln!("                       message pump, Lisp runs on a worker thread, and");
     eprintln!("                       (windows-enabled-p) is T. Without this flag the");
     eprintln!("                       process is byte-for-byte unchanged from today.");
     eprintln!("  --version, -V        print version and exit");
-    eprintln!("  --help, -h           print this message and exit");
-    eprintln!("  multiple --eval / --load can be chained; --repl runs after them");
+    eprintln!("  --help,    -h        print this message and exit");
+    eprintln!("  multiple --eval / --load / --check can be chained; --repl runs after them");
+    eprintln!();
+    eprintln!("Environment variables:");
+    eprintln!("  NCL_HEAP_BACKEND     pick the GC implementation:");
+    eprintln!("                         semispace  (default, production)");
+    eprintln!("                         page-heap  (under construction — see docs/GC_DESIGN.md)");
+    eprintln!("  NCL_LIBRARY          override the Library/ directory location");
+    eprintln!("  NCL_PACK_DIR         override the packs/ directory (Win32 metadata pack)");
 }
 
 fn main() -> ExitCode {
@@ -209,6 +222,34 @@ fn lisp_main(raw_args: Vec<String>) -> ExitCode {
                 };
                 match session.eval(&src) {
                     Ok(s) => last_output = Some(s),
+                    Err(e) => {
+                        eprintln!("ncl: {path}: {e}");
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+            "--check" | "-c" => {
+                // Dry-run: parse + macroexpand + lower each form,
+                // executing only definitions. Non-definition forms
+                // pass through the JIT pipeline (so syntax / macro /
+                // lowering errors surface) but never run.
+                let Some(path) = args.next() else {
+                    eprintln!("ncl: {flag} requires a file path");
+                    usage();
+                    return ExitCode::from(2);
+                };
+                let src = match fs::read_to_string(&path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("ncl: cannot read {path}: {e}");
+                        return ExitCode::from(1);
+                    }
+                };
+                match session.check(&src) {
+                    Ok(n) => {
+                        println!("[CHECK] {path}: OK ({n} forms)");
+                        last_output = None;
+                    }
                     Err(e) => {
                         eprintln!("ncl: {path}: {e}");
                         return ExitCode::from(1);

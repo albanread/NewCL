@@ -448,6 +448,23 @@ impl Semispace {
                 Tag::Symbol | Tag::Vector | Tag::Function | Tag::String
             ) {
                 let target = (raw & crate::word::PAYLOAD_MASK) as usize;
+                // Self-stack-pointer exclusion (SBCL gencgc.c:3248
+                // trick). On rare OS layouts the stack range and the
+                // young-heap range can overlap (e.g. some Linux mmap
+                // arenas grow downward through the address space);
+                // when that happens, a frame pointer or saved RBP on
+                // the stack — value points back into the same stack
+                // we're scanning — would otherwise pass the heap-range
+                // check below and pin a spurious "object." Skip any
+                // candidate whose target falls within the very range
+                // we're conservatively scanning. On Windows the stack
+                // and heap are in disjoint VMAs and this is a no-op,
+                // but the check is cheap and the bug it prevents is
+                // expensive (silent corruption of the young heap).
+                if target >= range_lo && target < range_hi {
+                    p = unsafe { p.add(1) };
+                    continue;
+                }
                 if target >= base && target < end_addr {
                     let target_cell_idx = (target - base) / 8;
                     // Only pin if this cell is actually the start of
@@ -934,6 +951,59 @@ impl Heap {
         // old-live-after-swap.
         self.old.swap_and_reset_scratch();
         self.young.reset();
+    }
+}
+
+// -- HeapBackend impl -------------------------------------------------------
+//
+// Phase 3 sub-phase 1 of `docs/GC_DESIGN.md`: route the GC coordinator
+// through a trait so a second heap implementation (the forthcoming
+// page-based heap) can slot in side-by-side via `GcConfig::backend`.
+// Each method here forwards to the existing inherent method — zero
+// semantic change, just a layer of indirection.
+
+impl crate::heap_backend::HeapBackend for Heap {
+    fn young_used_bytes(&self) -> usize { Heap::young_used_bytes(self) }
+    fn old_used_bytes(&self) -> usize { Heap::old_used_bytes(self) }
+    fn used_bytes(&self) -> usize { Heap::used_bytes(self) }
+    fn young_capacity_bytes(&self) -> usize { Heap::young_capacity_bytes(self) }
+    fn old_capacity_bytes(&self) -> usize { Heap::old_capacity_bytes(self) }
+    fn old_capacity_bytes_per_semi(&self) -> usize {
+        Heap::old_capacity_bytes_per_semi(self)
+    }
+
+    fn young_try_alloc_slab(&mut self, cells: usize) -> Option<std::ptr::NonNull<u64>> {
+        Heap::young_try_alloc_slab(self, cells)
+    }
+    fn young_base_ptr(&self) -> *const u64 { Heap::young_base_ptr(self) }
+    fn young_starts_handle(&self) -> StartBits { Heap::young_starts_handle(self) }
+
+    fn young_contains(&self, ptr: *const u8) -> bool { Heap::young_contains(self, ptr) }
+    fn old_contains(&self, ptr: *const u8) -> bool { Heap::old_contains(self, ptr) }
+
+    fn old_cards(&self) -> &Arc<CardTable> { Heap::old_cards(self) }
+    fn old_live_base_ptr(&self) -> *const u8 { Heap::old_live_base_ptr(self) }
+
+    fn collect_minor_with_static(
+        &mut self,
+        static_cards: &CardTable,
+        static_base: *mut u64,
+        static_cells: usize,
+        pin_stack_ranges: &[(usize, usize)],
+        visit_roots: &mut dyn FnMut(&mut RootScanner<'_, '_>),
+    ) {
+        Heap::collect_minor_with_static(
+            self,
+            static_cards,
+            static_base,
+            static_cells,
+            pin_stack_ranges,
+            visit_roots,
+        );
+    }
+
+    fn last_pin_summary(&self) -> (usize, usize) {
+        Heap::last_pin_summary(self)
     }
 }
 

@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::heap::{CardTable, Heap};
+use crate::heap_backend::{HeapBackend, HeapBackendKind};
 use crate::static_area::StaticArea;
 use crate::word::{Tag, Word};
 
@@ -36,17 +37,47 @@ use crate::word::{Tag, Word};
 pub struct GcConfig {
     pub young_bytes: usize,
     pub old_bytes: usize,
+    /// Static area RESERVATION size. On Windows, when this is large
+    /// (>= `ELASTIC_STATIC_THRESHOLD_BYTES`), the area is backed by
+    /// `VirtualAlloc(MEM_RESERVE)` — pages only charge against the
+    /// working set as the bump pointer crosses them. So a 256 MB
+    /// reservation in a session that uses 20 MB of static costs
+    /// 20 MB of RAM, not 256 MB.
+    ///
+    /// Small static_bytes (tests, embedded configs) get a
+    /// Box-backed allocation with full commit up front, matching
+    /// pre-Phase-2 semantics.
+    ///
+    /// On non-Windows the elastic path falls back to Box-backed
+    /// regardless of size (proper `mmap(MAP_NORESERVE)` support is
+    /// future work; Windows is the primary platform).
+    ///
+    /// Used to be a 16 MB hard cap with frequent "static exhausted"
+    /// panics. Phase 2 of `docs/GC_DESIGN.md` lifted that on
+    /// Windows; the production default is now 256 MB reserved with
+    /// ~10-20 MB resident for typical workloads.
     pub static_bytes: usize,
     /// Cells per TLAB. Each cell is 8 bytes.
     pub tlab_cells: usize,
 }
+
+/// Above this static_bytes threshold, GcCoordinator picks the
+/// elastic VirtualAlloc-backed StaticArea. Below it, the Box-backed
+/// new() — keeps the existing tests, which use sub-megabyte static
+/// areas to exercise the "exhausted" path, behaving identically.
+pub const ELASTIC_STATIC_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
 
 impl Default for GcConfig {
     fn default() -> Self {
         GcConfig {
             young_bytes: 16 * 1024 * 1024,
             old_bytes: 64 * 1024 * 1024,
-            static_bytes: 16 * 1024 * 1024,
+            // 256 MB reservation. With the Windows elastic backing
+            // in `StaticArea::new_elastic`, only as many pages as
+            // the session touches are paid for. The cap is generous
+            // enough that a long session loading several big images
+            // won't hit it.
+            static_bytes: 256 * 1024 * 1024,
             tlab_cells: 65536, // 512 KB
         }
     }
@@ -61,7 +92,14 @@ pub struct GcCoordinator {
     config: GcConfig,
     /// The global heap. Acquiring this lock is required for TLAB
     /// refill and for running the actual GC.
-    heap: Mutex<Heap>,
+    ///
+    /// Phase 3 sub-phase 1 of `docs/GC_DESIGN.md`: indirected
+    /// through `HeapBackend` so the page-based heap can slot in
+    /// alongside today's two-semispace generational copier without
+    /// a build-time fork. Allocation fast paths bypass this — they
+    /// cache the young-base pointer and start-bit bitmap at mutator
+    /// registration, so per-alloc cost is unchanged.
+    heap: Mutex<Box<dyn HeapBackend>>,
     /// "Park yourselves." Mutators poll this at safe points.
     stop_requested: AtomicBool,
     /// Set of registered mutators + how many are currently parked.
@@ -112,6 +150,12 @@ pub struct GcCoordinator {
     /// can publish updates without anyone else's lock. Exposed to
     /// Lisp via `(gc-stats)`.
     pub stats: GcStats,
+
+    /// Which backend was selected for this coordinator. Read at
+    /// `new` from `NCL_HEAP_BACKEND` (default Semispace) and never
+    /// changed afterward. Surfaces in `(gc-stats)` as
+    /// `:heap-backend` so the user can confirm what's running.
+    pub heap_backend_kind: HeapBackendKind,
 }
 
 /// Process-global GC counters. Reset never (cumulative over the
@@ -122,6 +166,11 @@ pub struct GcCoordinator {
 /// converges on the high-water mark the workload demanded.
 pub struct GcStats {
     pub minor_gcs: AtomicU64,
+    /// Full GC cycles run (`collect_full`, young + old → fresh old).
+    /// Bumped from `trigger_full_gc`, which the auto-trigger
+    /// escalates to when old is past `FULL_GC_OLD_THRESHOLD`. Phase 1
+    /// addition; surfaces via `(gc-stats)` as `:full-gcs`.
+    pub full_gcs: AtomicU64,
     pub bytes_promoted_total: AtomicU64,
     pub objects_pinned_total: AtomicU64,
     pub peak_young_used_bytes: AtomicU64,
@@ -132,6 +181,7 @@ impl Default for GcStats {
     fn default() -> Self {
         GcStats {
             minor_gcs: AtomicU64::new(0),
+            full_gcs: AtomicU64::new(0),
             bytes_promoted_total: AtomicU64::new(0),
             objects_pinned_total: AtomicU64::new(0),
             peak_young_used_bytes: AtomicU64::new(0),
@@ -147,13 +197,68 @@ struct ParkState {
 
 impl GcCoordinator {
     pub fn new(config: GcConfig) -> Arc<GcCoordinator> {
+        // Pick heap backend from the env var. Default is Semispace
+        // (current production). `NCL_HEAP_BACKEND=page-heap` selects
+        // the page-based heap under construction (Phase 3 of
+        // `docs/GC_DESIGN.md`) — currently panics on construction
+        // because sub-phases 2-7 aren't built yet, but the dispatch
+        // wiring is in place so flipping a single line of source in
+        // sub-phase 11 makes it production-default.
+        Self::new_with_backend(config, HeapBackendKind::from_env())
+    }
+
+    /// Explicit-backend construction. The public `new` reads
+    /// `NCL_HEAP_BACKEND`; this lets tests and any code that wants
+    /// to pin a specific backend bypass the env var.
+    pub fn new_with_backend(
+        config: GcConfig,
+        backend: HeapBackendKind,
+    ) -> Arc<GcCoordinator> {
         let heap = Heap::new(config.young_bytes, config.old_bytes);
         let cards = Arc::clone(heap.old_cards());
         let live_base = AtomicUsize::new(heap.old_live_base_ptr() as usize);
         let old_capacity = heap.old_capacity_bytes_per_semi();
-        let static_area = Arc::new(StaticArea::new(config.static_bytes));
+        // Pick the static-area backing by size. Production
+        // (≥ ELASTIC_STATIC_THRESHOLD_BYTES = 16 MB) gets the
+        // VirtualAlloc-backed path on Windows so the reservation is
+        // cheap. Test configs and small embedded uses stay with the
+        // Box-backed fully-committed path — they want predictable
+        // exhaustion semantics for unit tests like
+        // `static_returns_none_when_exhausted`. The threshold + 1/4
+        // initial-commit policy isolates the size choice from the
+        // backing choice.
+        let static_area = if config.static_bytes >= ELASTIC_STATIC_THRESHOLD_BYTES {
+            // 1/4 of the reservation committed up front. For 256 MB
+            // that's 64 MB — covers a full-stdlib + Win32 + a
+            // demo's worth of static work without needing further
+            // commit-grow round-trips for cold startup.
+            let initial = config.static_bytes / 4;
+            Arc::new(StaticArea::new_elastic(config.static_bytes, initial))
+        } else {
+            Arc::new(StaticArea::new(config.static_bytes))
+        };
+        // Backend dispatch. Today both variants compile in (the
+        // page-heap is a panic-stub); after Phase 3 sub-phase 7
+        // lands, PageHeap returns a real `Box<dyn HeapBackend>`.
+        // The Heap is constructed unconditionally above so the
+        // coordinator's old-card / live-base caches stay valid
+        // even when we're routing to the page heap — those caches
+        // are dead weight under PageHeap (its card table is
+        // single-anchored), but keeping them avoids a wider
+        // refactor of GcCoordinator until sub-phase 11.
+        let heap_backend: Box<dyn HeapBackend> = match backend {
+            HeapBackendKind::Semispace => Box::new(heap),
+            HeapBackendKind::PageHeap => {
+                panic!(
+                    "ncl: NCL_HEAP_BACKEND=page-heap selected, but the page-based \
+                     heap is not yet implemented. Phase 3 sub-phases 2-7 of \
+                     docs/GC_DESIGN.md build it. Unset the env var (or set \
+                     NCL_HEAP_BACKEND=semispace) to use the production heap."
+                );
+            }
+        };
         Arc::new(GcCoordinator {
-            heap: Mutex::new(heap),
+            heap: Mutex::new(heap_backend),
             config,
             stop_requested: AtomicBool::new(false),
             park_state: Mutex::new(ParkState {
@@ -168,6 +273,7 @@ impl GcCoordinator {
             intern_table: Mutex::new(HashMap::new()),
             macros: Mutex::new(HashMap::new()),
             stats: GcStats::default(),
+            heap_backend_kind: backend,
         })
     }
 
@@ -531,7 +637,23 @@ impl MutatorState {
     /// trigger — others see `stop_requested` and park instead. The
     /// trigger waits for all OTHER mutators to park, then runs the
     /// GC, then clears the flag and wakes everyone.
+    ///
+    /// Auto-full-GC was attempted in Phase 1 of `docs/GC_DESIGN.md`
+    /// and reverted: `collect_full` only follows explicit roots; it
+    /// has no conservative-stack-pin pass, so any JIT-stack-only
+    /// rooted Word would be lost across a full cycle, corrupting
+    /// downstream computation. A proper `collect_full_with_static`
+    /// (mirror of `collect_minor_with_static`) lands in Phase 3 of
+    /// the design (page-based heap), at which point auto-escalation
+    /// becomes safe to re-enable.
     fn trigger_minor_gc(&mut self) {
+        self.do_minor_gc();
+    }
+
+    /// The standard minor-GC implementation. Extracted from
+    /// `trigger_minor_gc` so a future auto-full-GC escalation path
+    /// can share the "did we already park everyone" decision point.
+    fn do_minor_gc(&mut self) {
         // We are the trigger. Set the flag; this prevents new
         // mutators from entering allocation slow paths or running
         // through safe points without parking.
@@ -608,27 +730,33 @@ impl MutatorState {
         }
         {
             let mut heap = self.coord.heap.lock().unwrap();
+            // The trait method takes `&mut dyn FnMut(&mut
+            // RootScanner)`, not `impl FnMut`. We bind the closure
+            // to a local first so Rust can infer its concrete
+            // FnMut-implementing type, then coerce to the trait
+            // object at the call site.
+            let mut visit = |scanner: &mut crate::heap::RootScanner<'_, '_>| {
+                // My own roots first.
+                {
+                    let mut my = my_handle.roots.lock().unwrap();
+                    for r in my.iter_mut() {
+                        scanner.visit(r);
+                    }
+                }
+                // Other mutators' roots.
+                for h in &other_handles {
+                    let mut other = h.roots.lock().unwrap();
+                    for r in other.iter_mut() {
+                        scanner.visit(r);
+                    }
+                }
+            };
             heap.collect_minor_with_static(
                 &static_cards,
                 static_base,
                 static_cells,
                 &pin_ranges,
-                |scanner| {
-                    // My own roots first.
-                    {
-                        let mut my = my_handle.roots.lock().unwrap();
-                        for r in my.iter_mut() {
-                            scanner.visit(r);
-                        }
-                    }
-                    // Other mutators' roots.
-                    for h in &other_handles {
-                        let mut other = h.roots.lock().unwrap();
-                        for r in other.iter_mut() {
-                            scanner.visit(r);
-                        }
-                    }
-                },
+                &mut visit,
             );
         }
 
@@ -929,6 +1057,13 @@ fn current_thread_stack_range() -> (usize, usize) {
 ///   :peak-young-bytes       highest young usage observed at any
 ///                           GC trigger point
 ///   :young-used / :young-cap / :old-used / :old-cap   current
+///   :static-used / :static-cap                        current
+///                           bump-pointer usage of the static
+///                           area (JIT code, interned symbols
+///                           and strings, every Function record,
+///                           every closure literal). This area
+///                           is never freed; growth here is
+///                           monotonic for the process lifetime.
 ///
 /// Values are fixnums (cells/bytes/counts).
 pub extern "C-unwind" fn gc_stats_shim(
@@ -940,9 +1075,11 @@ pub extern "C-unwind" fn gc_stats_shim(
     let m = unsafe { &mut *mutator };
     let coord = Arc::clone(m.coord());
     let s = &coord.stats;
+    let static_area = coord.static_area();
 
-    let pairs: [(&str, i64); 9] = [
+    let pairs: [(&str, i64); 13] = [
         ("MINOR-GCS",             s.minor_gcs.load(Ordering::Relaxed) as i64),
+        ("FULL-GCS",              s.full_gcs.load(Ordering::Relaxed) as i64),
         ("BYTES-PROMOTED-TOTAL",  s.bytes_promoted_total.load(Ordering::Relaxed) as i64),
         ("OBJECTS-PINNED-TOTAL",  s.objects_pinned_total.load(Ordering::Relaxed) as i64),
         ("PINNED-RESIDUAL-CELLS", s.pinned_residual_cells.load(Ordering::Relaxed) as i64),
@@ -951,6 +1088,13 @@ pub extern "C-unwind" fn gc_stats_shim(
         ("YOUNG-CAP",             coord.config.young_bytes as i64),
         ("OLD-USED",              coord.old_used_bytes() as i64),
         ("OLD-CAP",               coord.config.old_bytes as i64),
+        ("STATIC-USED",           static_area.used_bytes() as i64),
+        ("STATIC-CAP",            static_area.capacity_bytes() as i64),
+        // STATIC-COMMITTED: bytes currently backed by physical pages
+        // or page-file. For the elastic VirtualAlloc-backed area
+        // this is the page-aligned commit frontier; for Box-backed
+        // it equals STATIC-CAP.
+        ("STATIC-COMMITTED",      static_area.committed_bytes() as i64),
     ];
 
     // Build the plist `(:key1 v1 :key2 v2 ... )` from the end.
@@ -959,6 +1103,16 @@ pub extern "C-unwind" fn gc_stats_shim(
         let kw = coord.intern(&format!(":{name}"));
         let v = Word::fixnum(*value);
         result = m.alloc_cons(v, result);
+        result = m.alloc_cons(kw, result);
+    }
+    // Prepend `:heap-backend <symbol>` so the user can tell which
+    // implementation they're running on. Value is a plain symbol
+    // (`semispace` or `page-heap`) — not a keyword, so the symbol's
+    // print name matches its `name()` exactly.
+    {
+        let backend_sym = coord.intern(&coord.heap_backend_kind.name().to_uppercase());
+        let kw = coord.intern(":HEAP-BACKEND");
+        result = m.alloc_cons(backend_sym, result);
         result = m.alloc_cons(kw, result);
     }
     result.raw()

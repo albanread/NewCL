@@ -454,6 +454,15 @@
     ((null rest) `(defparameter ,name nil))
     (t `(defparameter ,name ,(car rest)))))
 
+(defmacro defconstant (name value &rest rest)
+  "Declare NAME as a constant with VALUE. CL semantics say a
+   defconstant'd symbol must not be reassigned; NCL doesn't yet
+   enforce that, so this is documentation-only and aliases to
+   defparameter. The optional docstring argument is accepted and
+   discarded for source-compat with portable libraries."
+  (declare (ignore rest))
+  `(defparameter ,name ,value))
+
 (defmacro push (value place)
   "Prepend VALUE to the list stored at PLACE. PLACE is evaluated
    twice — fine for symbol or simple-accessor places (which is

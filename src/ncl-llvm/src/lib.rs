@@ -2139,12 +2139,31 @@ pub fn jit_compile_win32_trampoline(slot: u64, arity: u32) -> Result<usize, Stri
         .build_alloca(alloca_ty, "args")
         .map_err(|e| format!("build_alloca: {e}"))?;
 
-    // Store each parameter into the buffer.
+    // Box each parameter into a Fixnum-tagged Word and store into
+    // the buffer.
+    //
+    // Win32 hands us raw u64 args (HWND, MSG, WPARAM, LPARAM, …) —
+    // bare pointers and integers, not Lisp Words. NCL's calling
+    // convention (ncl_funcall) expects each arg slot to already be
+    // a Word. If we skipped the boxing, a raw HWND pointer whose
+    // low 3 bits happen to be 0b100 would be interpreted as a
+    // Function-tagged Word and crash any subsequent (= msg WM_…)
+    // test, since arithmetic shims reject non-fixnum inputs.
+    //
+    // Fixnum encoding is `value << 3` (Tag::Fixnum = 0b000, no OR
+    // needed). For x64 user-space pointers (≤ 48 bits) this shift
+    // is lossless. For the rare 64-bit WPARAM/LPARAM caller, the
+    // top 3 bits get truncated; the Lisp side can always read it
+    // back as i64 by `(ash w -0)`-style decoding when that matters.
+    let three = i64_t.const_int(3, false);
     for i in 0..arity {
         let param = function
             .get_nth_param(i)
             .expect("trampoline param")
             .into_int_value();
+        let boxed = builder
+            .build_left_shift(param, three, &format!("box{i}"))
+            .map_err(|e| format!("build_left_shift: {e}"))?;
         let gep = unsafe {
             builder.build_in_bounds_gep(
                 alloca_ty,
@@ -2155,7 +2174,7 @@ pub fn jit_compile_win32_trampoline(slot: u64, arity: u32) -> Result<usize, Stri
         }
         .map_err(|e| format!("build_in_bounds_gep: {e}"))?;
         builder
-            .build_store(gep, param)
+            .build_store(gep, boxed)
             .map_err(|e| format!("build_store: {e}"))?;
     }
 
@@ -2171,8 +2190,18 @@ pub fn jit_compile_win32_trampoline(slot: u64, arity: u32) -> Result<usize, Stri
         .map_err(|e| format!("build_call dispatch: {e}"))?;
     let result = call.try_as_basic_value().unwrap_basic().into_int_value();
 
+    // Unbox the Lisp Word result back into a raw i64 for Windows.
+    // The closure returns a Word (e.g. a fixnum 0 from
+    // PostQuitMessage's WndProc). We arithmetic-shift-right by 3 to
+    // recover the underlying integer. Non-fixnum returns (Cons,
+    // Function) would yield garbage — by convention Win32-callable
+    // closures must return a fixnum (LRESULT-shaped).
+    let unboxed = builder
+        .build_right_shift(result, three, true, "unbox")
+        .map_err(|e| format!("build_right_shift: {e}"))?;
+
     builder
-        .build_return(Some(&result))
+        .build_return(Some(&unboxed))
         .map_err(|e| format!("build_return: {e}"))?;
 
     // Optional IR dump (NCL_DUMP_IR=1) for debugging — same hook

@@ -316,6 +316,18 @@ pub extern "C-unwind" fn ncl_funcall(
 /// captured values. JIT'd `(lambda …)` evaluates each capture
 /// expression in outer scope, packs the values into a stack
 /// buffer, and calls here to materialise the function value.
+///
+/// Static-area placement: the Function record is permanent for the
+/// process lifetime (or until retirement-with-quiescent-epoch lands,
+/// which it hasn't). Moving these to the young heap was tried in
+/// an earlier branch and is documented in `docs/GC_DESIGN.md` —
+/// the issue was conservative-stack-pinning + promote-on-first-
+/// survival turning every macroexpand-time transient into a tenured
+/// object, spiralling into OOM. The fix lives at the GC layer
+/// (Phase 1 of GC_DESIGN.md: tighten pinner, age-threshold
+/// promotion), not at the allocator layer. Once the GC handles
+/// transient closures gracefully, this can revisit the young-heap
+/// path.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn ncl_make_closure(
     mutator: *mut crate::mutator::MutatorState,

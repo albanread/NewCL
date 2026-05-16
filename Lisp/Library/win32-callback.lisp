@@ -68,6 +68,10 @@
    underlying closure Word is stable for the process lifetime and
    safe to embed in Win32 data structures.
 
+   Expansion uses a top-level (progn (defparameter …) (defun …))
+   because NCL only allows defun at top level — wrapping the defun
+   in a (let …) would be rejected by the lowerer.
+
    Example:
      (define-win32-callback hello-wnd-proc (hwnd msg wparam lparam)
        (cond ((= msg WM_DESTROY) (win32 \"PostQuitMessage\" 0) 0)
@@ -75,13 +79,16 @@
 
      ;; Call (hello-wnd-proc) once at startup; cache the result."
   (let ((closure-sym (gensym "CB-CLOSURE"))
-        (cached-sym  (gensym "CB-CACHED")))
-    `(let ((,cached-sym nil))
+        (cached-var  (intern (string-concat "%CB-CACHED-"
+                                            (symbol-name name)))))
+    `(progn
+       (defparameter ,cached-var nil)
        (defun ,name ()
-         (or ,cached-sym
+         (or ,cached-var
              (let ((,closure-sym (lambda ,params ,@body)))
-               (setq ,cached-sym
-                     (%make-win32-callback ,closure-sym ,(length params)))
-               ,cached-sym))))))
+               (setq ,cached-var
+                     (%make-win32-callback ,closure-sym
+                                           ,(length params)))
+               ,cached-var))))))
 
 nil
