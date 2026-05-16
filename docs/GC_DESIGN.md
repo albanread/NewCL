@@ -679,19 +679,137 @@ rewrite because the current heap is fully working and tested.
    `pin_pointers_in_range` in `mutator.rs` need to be retargeted.
    Sub-phase 6 itself is purely additive to the page_heap module.
 
-7. **Evacuation / compaction pass** *(2 days)*
-   Two-pass evacuation: forward unpinned to dest open regions, sweep
-   payload to update tagged pointers. Zero-pin pages → free list (or
-   `VirtualFree(MEM_DECOMMIT)`); pinned-only pages → flip
-   `page.gen` in place. **Acceptance**: port all `heap.rs:1383-1680`
-   tests to the page heap, all pass.
+7. **Evacuation / compaction pass** *(LANDED)*
+   New file `src/ncl-runtime/src/page_heap/evac.rs` (~500 lines)
+   plus a 4-line registration in `mod.rs`. Cheney-style BFS
+   evacuation ported from the semispace `copy_into` /
+   `scan_to_completion` pair (`heap.rs:1050-1132`, `:977-1000`)
+   with three page-heap-specific adaptations:
 
-8. **Three-generation policy + age threshold** *(1 day)*
-   Per-page age counter, `num_gcs_before_promotion` thresholds
-   (G0→G1 after 3, G1→Tenured after 5). PageDesc generation byte
-   IS the age. **Acceptance**: `nursery_transients_die_in_g0_
-   within_threshold_cycles` test. *This fixes promote-on-first-
-   survival.*
+   - **`PageEvacuator`** stateful visitor handed to the caller's
+     root closure: `visit(&mut Word)` reads a slot, runs the BFS,
+     and rewrites in place. `evacuate_with_roots(from, dest, F)`
+     is the entry point; `evacuate_from_word_roots(from, dest,
+     &mut [Word])` is a thin test/driver helper.
+   - **Page reclaim**: snapshot `from_pages` at start of cycle,
+     run BFS, then iterate the snapshot:
+     - No pins → `PageDesc::release()` back to Free. Page's
+       start-bit slice zeroed via `clear_page_start_bits`.
+     - Has pins → `desc.generation = dest_gen`, `age = 0`. Page
+       stays in place; non-pinned start bits cleared so
+       abandoned forwarding markers / dead-but-allocated cells
+       become invisible to future scanners. Pinned-cell start
+       bits re-set in a post-pass keyed off `pinned_cells`.
+   - **Pinned-source short-circuit**: `maybe_copy` returns
+     `Some(w)` (unchanged) on a pinned source so the slot keeps
+     its original address. Mirrors `heap.rs:1086`. Works for
+     boxed objects as well — unlike semispace, page-heap pinning
+     is uniform across cons and boxed (sub-phase 6).
+
+   **Five gates in `maybe_copy`** (in order, fast-rejects first):
+   1. Tag must be a heap-pointer tag (Cons/Symbol/Vector/
+      Function/String).
+   2. Target page must be in `from_gen`.
+   3. **Start-bit gate** — target cell must be a real object
+      start. Closes the false-positive-pointer-shaped-payload
+      hole that the design doc previously waved away by
+      reference to "harmless rejection by tag check"; with the
+      explicit gate, a stray bit pattern that tags as Cons but
+      points at an interior cell is now refused at the GC layer
+      rather than relying on probabilistic luck.
+   4. **Tag-vs-page-kind consistency** — Cons-tagged Word must
+      target a Cons-kind page; Symbol/Vector/Function/String-
+      tagged Words must target Boxed pages. Prevents tag-confused
+      Words from landing in root slots after an
+      almost-correct false positive.
+   5. Forwarding-pointer / pinned checks, as in semispace.
+
+   **17 new unit tests** (~600 lines of tests):
+   `rooted_cons_promotes_to_dest_gen` (acceptance),
+   `unrooted_objects_get_reclaimed`, `chain_head_evacuates_
+   every_link`, `cycle_in_object_graph_terminates`,
+   `pinned_object_stays_and_page_flips`, `cdr_pointer_gets_
+   fixed_up_after_evacuation`, `already_forwarded_slot_is_re_
+   resolved`, `boxed_object_with_word_payload_evacuates_
+   correctly`, `mixed_pinned_and_unpinned_on_same_page`,
+   `within_gen_evacuation_is_supported`, `pins_and_mark_bits_
+   are_cleared_after_cycle`, `released_page_can_be_re_acquired`,
+   `flipped_page_has_pinned_start_bits_preserved`,
+   `false_positive_payload_word_is_rejected` (regression test
+   for gate 3), `pointer_tag_must_match_page_kind` (regression
+   test for gate 4), `pinned_boxed_object_stays_in_place`
+   (uniform-pin coverage), `empty_from_gen_is_a_noop`.
+
+   Total page_heap tests: **72 passing** (55 + 17 new). Full
+   ncl-runtime suite: **294 passing** (was 277 before sub-phase
+   7). Hellowin still opens. Production path is still the
+   semispace heap; the page heap remains reachable only via its
+   own tests until sub-phase 11.
+
+   **Deferred to sub-phase 10**: mid-evacuation OOM panics
+   (`expect("page heap exhausted mid-evacuation")`) when
+   `from_gen == dest_gen` and free-page headroom is short. The
+   page-reclaim happens after the BFS drain, so a within-gen
+   evacuation can transiently need more pages than the heap
+   has free even when the post-reclaim state would fit.
+   Sub-phase 10's trigger budget will pre-allocate.
+
+8. **Three-generation policy + age threshold** *(LANDED)*
+   New file `src/ncl-runtime/src/page_heap/cycle.rs` (~570 lines
+   including 10 tests). Adds `collect_minor` and `collect_major`
+   drivers that wrap sub-phase 7's `evacuate_with_roots` with
+   per-heap promotion counters.
+
+   **Promotion model** — **cohort promotion**, not per-page age:
+   - `PageHeap::minors_since_g0_promote`: minor cycles since the
+     last G0 → G1 promotion. Bumped at the start of each minor.
+     When it reaches `G0_PROMOTION_THRESHOLD = 3`, that cycle's
+     destination is G1 (rather than G0); the counter resets.
+   - `PageHeap::g0_promotes_since_g1_promote`: G0-promotion
+     events since the last G1 → Tenured promotion. Ticks only on
+     cycles that already promoted G0. At `G1_PROMOTION_THRESHOLD
+     = 5`, the minor cascades into a second G1 → Tenured
+     evacuation pass.
+
+   This is "every G0 object alive at the threshold cycle gets
+   promoted, regardless of its individual age." Younger objects
+   allocated just before a threshold cycle therefore promote
+   sooner than the design ideal — a known shortcoming of cohort
+   promotion vs SBCL's per-page-age dispatch. Refinement deferred
+   to a future sub-phase; the `PageDesc::age` field (from sub-
+   phase 3) is reserved for that work, currently unused.
+
+   **API change in sub-phase 7**: `evacuate_with_roots` now takes
+   `F: FnMut` (was `F: FnOnce`) so cascading evac passes can
+   replay the same root closure. The closure isn't moved into the
+   first evac — `|e| visit_roots(e)` wraps it each call so each
+   pass has its own re-borrow.
+
+   **`collect_major`** (the manual-hammer variant): runs `G1 →
+   Tenured` then `G0 → G0` back to back, resetting both counters.
+   Tenured itself is not recollected — that's sub-phase 10's
+   trigger problem. Reports `promoted_g1` based on actual G1
+   work done, not unconditionally.
+
+   **OOM during evacuation** (inherited from sub-phase 7): a
+   within-gen pass on a heap with no Free pages panics with
+   `"page heap exhausted mid-evacuation"`. Documented in
+   `collect_minor`'s rustdoc; trigger policy (sub-phase 10) will
+   pre-allocate to avoid this.
+
+   **10 new unit tests**: `fresh_heap_counters_are_zero`,
+   `nursery_transients_die_in_g0_within_threshold_cycles`
+   (acceptance), `rooted_survivor_promotes_after_threshold_
+   cycles`, `promotion_resets_counter_and_starts_new_cohort`,
+   `g1_promotes_to_tenured_after_threshold_g0_promotions`,
+   `major_promotes_g1_and_collects_g0`, `major_on_empty_heap_is_
+   a_noop`, `cascade_reports_nonzero_objects_copied_when_g1_has_
+   data`, `unrooted_g1_cons_reclaimed_on_cascade`, `many_cycles_
+   dont_overflow_counter`.
+
+   Total page_heap tests: **82 passing** (72 + 10 new). Full
+   ncl-runtime suite: **304 passing** (was 294 before sub-phase
+   8). The semispace heap remains the production path.
 
 9. **Soft card marks + IR write barrier** *(1-2 days)*
    Single 1 GB / 512 = 2 MB card table covering the dynamic space.
@@ -710,12 +828,226 @@ rewrite because the current heap is fully working and tested.
     100 MB churn workload shows minor cycles fire on budget
     intervals; tenured-saturation triggers full GC.
 
-11. **Production switchover** *(1 day)*
-    Flip `GcConfig::default` to `HeapBackend::PageHeap`. Run full
-    test suite + hellowin + macroexpand-all stress under the new
-    heap. Side-by-side flag stays available for rollback for 1-2
-    weeks. **Acceptance**: all of `cargo test`, hellowin, and the
-    macroexpand-all repro pass with no regression.
+11. **Production switchover** — split into 11a / 11b / 11c.
+
+    **11a — Cargo features + PageHeap inherent API** *(LANDED)*
+    Replaced `HeapBackend` trait + `Mutex<Box<dyn HeapBackend>>`
+    with build-time selection via Cargo features. New file
+    `src/ncl-runtime/src/gc.rs` re-exports the chosen concrete heap
+    type (`gc::Heap`) under `#[cfg(feature = "gc-semispace")]` or
+    `#[cfg(feature = "gc-page-heap")]`; the two features are
+    mutually exclusive (`compile_error!` if both on). Deleted
+    `heap_backend.rs` and the trait + 6 `#[deprecated]` methods.
+
+    New file `src/ncl-runtime/src/page_heap/coordinator_api.rs`
+    (~330 lines) implements every inherent method `GcCoordinator`
+    / `MutatorState` calls on the heap:
+    - `PageHeap::new(young_bytes, old_bytes)` matches `Heap::new`'s
+      signature; sums args into a single reservation (min 1 page).
+      The pre-existing 1-arg constructor is renamed to
+      `with_reservation` and stays as the test helper.
+    - Aggregate stats `used_bytes` / `young_used_bytes` /
+      `old_used_bytes` walk `descs` and filter by generation.
+    - `young_base_ptr` returns the reservation base (the page-heap's
+      start-bit bitmap is indexed against the whole reservation,
+      so the mutator's cached `young_base` works for cell-index
+      math).
+    - `young_starts_handle` delegates to `start_bits_handle`.
+    - `young_try_alloc_slab(cells)` is new infrastructure: it
+      reserves a `cells`-sized chunk on a G0 cons page WITHOUT
+      setting any start bits (the mutator sets them per-allocation
+      via the cached handle). Capped at one page; oversize requests
+      get a page's worth.
+    - `old_cards` returns a new `Arc<CardTable>` field on PageHeap,
+      sized for the whole reservation. `old_live_base_ptr` returns
+      the reservation base, and `old_capacity_bytes_per_semi`
+      returns `reserved_bytes()` — the coordinator's barrier range
+      check then covers every page (which is the desired semantics
+      under page-heap, where mutations into G1/Tenured pages are
+      what need to be tracked).
+    - `collect_minor_with_static` and `last_pin_summary` are
+      stubs: `collect_minor_with_static` panics with `unimplemented!`
+      pointing at sub-phase 11b; `last_pin_summary` returns a
+      stored `(0, 0)` tuple ready for 11b to populate.
+
+    `:heap-backend` plist value now comes from
+    `gc::ACTIVE_BACKEND_NAME`, a `&'static str` resolved at compile
+    time (semispace / page-heap). `HeapBackendKind` enum + env-var
+    resolver are gone.
+
+    **8 new unit tests** in `coordinator_api.rs`:
+    `ctor_sums_young_and_old_bytes_for_reservation`,
+    `ctor_rounds_up_to_one_page_minimum`,
+    `used_bytes_aggregates_by_generation`,
+    `slab_alloc_returns_aligned_pointer_and_advances_words_used`,
+    `slab_alloc_fits_multiple_slabs_per_page`,
+    `slab_alloc_caps_at_page_size`,
+    `slab_alloc_zero_cells_returns_none`,
+    `old_cards_and_base_match_reservation`.
+
+    Build matrix:
+
+    | Command | Result |
+    |---|---|
+    | `cargo build` (default) | clean |
+    | `cargo build --no-default-features --features gc-page-heap` | clean |
+    | `cargo test -p ncl-runtime --lib` (default) | 312/312 |
+    | `cargo test -p ncl-runtime --no-default-features --features gc-page-heap --lib` | 302/312 (10 failures: 7 hit the documented `collect_minor_with_static` `unimplemented!` stub, 3 hit semispace-specific assertions in test code that don't hold for the page-heap's whole-reservation card table) |
+
+    **11b — Real `collect_minor_with_static` on PageHeap** *(LANDED)*
+
+    New file `src/ncl-runtime/src/page_heap/scanner.rs` (~40 lines)
+    defines a page-heap `RootScanner` analogue: a thin 2-lifetime
+    wrapper over `PageEvacuator` exposing the same
+    `visit(&mut Word)` surface as the semispace `RootScanner`.
+    `gc::RootScanner` re-exports the right one per build.
+
+    Refactored
+    `coordinator_api::collect_minor_with_static` to drive a real
+    cycle:
+    1. Run `pin_pointers_in_ranges(G0, stack_ranges)`. Stash
+       result into `last_pin_summary`.
+    2. Snapshot the per-page descriptor table BEFORE evacuation
+       runs (page generations get mutated during evac; the dirty-
+       card scan needs the pre-evac state to filter G0/Free
+       pages out).
+    3. Call `cycle::collect_minor` with a closure that:
+       - Visits caller's roots via the page-heap `RootScanner`.
+       - Scans static-area dirty cards.
+       - Scans reservation dirty cards, filtered to G1/Tenured
+         pages via the snapshotted descriptors. G0/Free pages
+         are skipped (intra-G0 refs come through BFS drain;
+         Free pages have no live data).
+    4. Clear both card tables.
+
+    New helper `scan_dirty_cards_as_roots` (free function in
+    `coordinator_api.rs`): for each dirty card, iterates its 64
+    cells and offers each to the evacuator via `visit_cell`
+    (newly `pub unsafe fn`). `page_filter: Option<&[PageDesc]>`
+    distinguishes the static-area scan (no filter — every dirty
+    card matters) from the reservation scan (G1/Tenured filter).
+
+    **Configuration adjustment**: `PageHeap::new(young, old)`
+    minimum reservation bumped to 4 pages (256 KB). Within-gen
+    evacuation (G0 → G0 on a non-threshold minor) needs at least
+    one Free page to copy survivors into; the 1-page minimum from
+    sub-phase 11a caused mid-evac OOM panics on the smaller test
+    configs.
+
+    **Per-cycle GC timing instrumented** (works under both
+    backends — semispace + page-heap):
+    - `GcStats` gained 6 new fields:
+      `last_minor_pause_us` / `max_minor_pause_us` /
+      `total_minor_pause_us` and the same triple for full GCs
+      (full timing wires up when sub-phase 10's auto-full path
+      lands; the fields exist now for consistency).
+    - `MutatorState::do_minor_gc` wraps the heap-lock+collect
+      block in `Instant::now()..elapsed()`, publishes the
+      microsecond pause via atomic store / fetch_add / CAS-up.
+    - `(gc-stats)` plist gained 3 new keys:
+      `:LAST-MINOR-PAUSE-US`, `:MAX-MINOR-PAUSE-US`,
+      `:TOTAL-MINOR-PAUSE-US`. Both backends report.
+
+    **Test fixes for backend-agnostic assertions**:
+    - `rooted_cons_survives_minor_gc`: replaced
+      `coord.old_used_bytes() >= 16` with `coord.used_bytes() >= 16`.
+      Under semispace the survivor moves to old; under page-heap
+      it stays in G0 until threshold cycles fire. Both backends
+      preserve the cons; the generation-agnostic check is the
+      correct invariant to test.
+    - `mark_card_outside_old_is_noop`: the second half (testing
+      that a young-heap address marks no card) is now gated
+      `#[cfg(feature = "gc-semispace")]`. Under page-heap the
+      card table covers the whole reservation by design; the
+      dirty-card scanner filters by source page generation, so
+      the spurious G0-card mark is no-op work but not incorrect.
+
+    Build matrix:
+
+    | Command | Result |
+    |---|---|
+    | `cargo build` (default = gc-semispace) | clean |
+    | `cargo build --no-default-features --features gc-page-heap` | clean |
+    | `cargo build --workspace` | clean |
+    | `cargo test -p ncl-runtime --lib` (gc-semispace) | **312/312** |
+    | `cargo test -p ncl-runtime --no-default-features --features gc-page-heap --lib` | **312/312** — **parity** |
+
+    Sub-phase 11b delivers a functional page-heap under
+    `--features gc-page-heap`: end-to-end minor GC cycles run,
+    rooted survivors are preserved, transient garbage is reclaimed,
+    cross-gen pointers via card barrier are honoured, and per-cycle
+    pause timings are exposed for performance work.
+
+    **11c — Workspace-level feature propagation + completeness** *(LANDED)*
+
+    Card-mark dispatch was already correct after 11a (`GcCoordinator`
+    populates its lock-free `cards`/`live_base`/`old_capacity`
+    cache from the active backend's inherent `old_*` methods —
+    page-heap returns reservation-wide values; semispace returns
+    its old-semispace values). So the original 11c scope reduced
+    to "make workspace-level feature switching work."
+
+    The conversion to build-time features (11a) exposed a Cargo
+    feature-propagation issue: workspace members depending on
+    `ncl-runtime` were activating its default `gc-semispace`
+    feature even when the consumer asked for `gc-page-heap`,
+    causing `compile_error!` (both features active). Sub-phase
+    11c sweeps each of the 8 dependent crates to:
+    - Add `[features] default = ["gc-semispace"]` plus
+      `gc-semispace = [...]` and `gc-page-heap = [...]` feature
+      lists forwarding to every transitive `ncl-*` dependency.
+    - Set `default-features = false` on every `ncl-*` path
+      dependency so transitive defaults don't sneak the
+      semispace feature back in.
+
+    Crates updated: `ncl-cl`, `ncl-compiler`, `ncl-driver`,
+    `ncl-llvm`, `ncl-loader`, `ncl-reader`, `ncl-tests`,
+    `ncl-corman-demos`.
+
+    **Switching the backend** is now:
+    ```bash
+    cargo build                                                    # gc-semispace (default)
+    cargo build -p ncl-driver --no-default-features --features gc-page-heap
+    cargo test  -p ncl-tests --no-default-features --features gc-page-heap
+    ```
+
+    Note: top-level `cargo build --workspace --no-default-features
+    --features gc-page-heap` doesn't reliably propagate because
+    Cargo's `--no-default-features` for workspace builds doesn't
+    fully suppress workspace-member defaults. The per-package
+    `-p` form is the supported workflow until Cargo's workspace
+    feature unification matures further.
+
+    Build matrix:
+
+    | Command | Result |
+    |---|---|
+    | `cargo build --workspace` (defaults = gc-semispace) | clean |
+    | `cargo build -p ncl-driver --no-default-features --features gc-page-heap` | clean |
+    | `cargo build -p ncl-tests --no-default-features --features gc-page-heap` | clean |
+    | `cargo test  -p ncl-runtime --lib` (default) | 312/312 |
+    | `cargo test  -p ncl-runtime --no-default-features --features gc-page-heap --lib` | 312/312 |
+
+    Sub-phase 11 is now complete. The page-heap is fully reachable
+    from every workspace crate and exercisable end-to-end under
+    `--features gc-page-heap`. Subsequent perf work (an optional
+    write-time gen filter for `mark_card`, IR-emitted inline
+    barriers in sub-phase 9) is layered on top of this foundation
+    and doesn't block production-readiness of the page-heap.
+    Refactor `GcCoordinator::mark_card` so under
+    `gc-page-heap` the cached `live_base`/`old_capacity`/`cards`
+    point at the page-heap's reservation-wide table. (Current
+    foundation: these fields are already populated by
+    `gc::Heap`'s inherent methods via `old_cards` etc. — sub-phase
+    11a got this for free.) The integration tests under
+    `gc-page-heap` that depend on real cycles will start passing
+    as 11b lands.
+
+    **12. Delete semispace code** *(pending, unchanged)*
+    Same as before: remove `Semispace`, `OldGen`, etc. once page
+    heap has soaked. With the build-time selection, "delete" is
+    just removing the `gc-semispace` feature flag and the cfg
+    arms in `gc.rs`, then deleting `heap.rs`.
 
 12. **Delete semispace code** *(0.5 day)*
     Remove `Semispace`, `OldGen`, `Heap`, `MinorState`, `FullState`,

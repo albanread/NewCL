@@ -1,98 +1,99 @@
-# NCL PROGRAMMER'S MANUAL
+# NCL User Guide
 
-*A Guide for the User of the NCL System.*
-*In the manner of the LISP 1.5 Programmer's Manual.*
+*A Lisp for working hackers, by way of Corman, McCarthy, and a JIT
+that thinks it's an interpreter.*
 
 ---
 
 ## FOREWORD
 
-NewCL is a dialect of LISP intended for use on the modern
-sixty-four-bit electronic digital computer. 
+NCL — NewCormanLisp — is a Common Lisp. It compiles every form
+through LLVM, runs on a precise generational GC, talks fluently to
+Win32, and answers a `>` prompt within a few hundred milliseconds of
+the icon being clicked. Its language is the Corman Lisp dialect of
+ANSI Common Lisp; its implementation is a from-scratch Rust core.
+The compatibility lives at the source level. Recompile from source
+and your old `.lisp` files run.
 
-The notation is that of Common LISP as set forth by the American National Standards Institute;
-the implementation traces its lineage through the Corman LISP system
-of Roger Corman (1996–2015). Roger created a LISP I could actually afford and
-that didnt need a mainframe.
+If you know SBCL, CCL, Clozure, or Allegro, nothing in here will
+surprise you for long. If you came up on Corman and miss it, the
+demos still run. If LISP for you means McCarthy 1960, you'll find
+everything from `(car (cdr ...))` up to `defmethod :around` waiting
+for you, and the same `(quote foo)` trick still works.
 
-It is the author's hope that the practitioner familiar with any one of the LISPs 
-INTERLISP, MACLISP, ZetaLisp, SBCL — shall find himself entirely at home, and that one new
-to the language shall find here a small set of ideas of considerable
-power.
-
-The reader is presumed to have access to the compiler, `ncl`. To
-begin a session he writes, at the command prompt of his operating
-system,
+You start a session by typing
 
 ```
     ncl
 ```
 
-whereupon the system replies with its prompt, conventionally written
-as `>` in what follows. To leave the system he writes `(quit)` or
-strikes the end-of-file character of his terminal.
+at the command prompt of your operating system. The system answers
+with `ncl>`. You leave by typing `(quit)`, `(exit)`, or by striking
+end-of-file (Ctrl+D on Unix, Ctrl+Z+Enter on Windows). Everything
+else is detail.
 
-The author has organised this manual in seven Sections, an Appendix
-of evaluable forms, and a glossary of the system's principal
-functions. Each Section may be read independently of the others; the
-practitioner is, however, advised to read Sections 1 and 2 first.
+This manual has eight sections, three appendices, and a glossary's
+worth of functions in Appendix I. Section 1 and 2 are the floor;
+everything else assumes them. Beyond that you can read in any
+order — Section 6 (CLOS) and Section 7 (conditions, I/O, FFI,
+graphics) are written to stand alone.
 
 ---
 
-## SECTION 1 — The Elementary Functions
+## SECTION 1 — Atoms, Lists, and the Five Primitives
 
-### 1.1 Atomic Symbols and Their Evaluation
+### 1.1 Atoms
 
-The atomic symbols of LISP are written as one would write a name in
-English: a sequence of letters, digits, and a few permitted
-punctuation marks. Examples are
+An *atom* is a symbol, a number, a string, or a character. Symbols
+are written as plain words:
 
 ```
     FOO          X1          NIL          *PRINT-CASE*
 ```
 
-By convention the reader of NCL folds every unquoted
-letter to upper case before interning; thus `foo`, `Foo`, and `FOO`
-denote the same symbol. This convention may be altered through the
-readtable, but the practitioner is advised to leave it alone.
+The reader folds unquoted letters to upper case before interning, so
+`foo`, `Foo`, and `FOO` denote the same symbol. You can change the
+readtable to keep case, but: don't. The whole standard library
+expects upper-case interned names and you will spend an afternoon
+debugging if you fight it.
 
-A *number* is also an atom. NCL recognises:
+NCL recognises numbers in the full Common Lisp menagerie:
 
 ```
-    42                  a decimal integer
-   -17                  a negative integer
-    3.14                a floating-point number
-    1.5e3               a number in scientific notation
-    #b1011              a binary integer (=11)
-    #o755               an octal integer (=493)
-    #x1A                a hexadecimal integer (=26)
-    #36rZZ              a number in radix 36 (=1295)
-    3/4                 a rational number
-    100000000000000000000  a "bignum" (arbitrarily large)
+    42                  fixnum (signed 61-bit on x86-64)
+   -17                  ditto, negative
+    100000000000000000000  bignum (arbitrary precision; integer math
+                          promotes through fixnum → bignum on overflow,
+                          transparently)
+    3/4                 ratio (exact rational; reduces automatically)
+    3.14                double float
+    1.5e3               float in scientific notation
+    #b1011              binary integer = 11
+    #o755               octal integer = 493
+    #x1A                hexadecimal integer = 26
+    #36rZZ              radix-36 integer = 1295
+    #c(1 2)             complex number, real 1 imag 2
 ```
 
-A *string* is a sequence of characters between quotation marks,
-`"like so"`. A *character* is written `#\a`, `#\Space`, `#\Newline`.
+A *string* is `"like so"`; a *character* is `#\a`, `#\Space`,
+`#\Newline`. Backslash inside a string escapes the next character;
+the recognised escapes are `\"` and `\\`.
 
-To evaluate an atom the system performs the following:
+Atoms evaluate as follows:
 
-> *If the atom is a number, a string, a character, or the symbol
-> `NIL` or `T`, the atom evaluates to itself. If it is a keyword
-> (an atom whose name begins with the colon, as `:FOO`), it
-> evaluates to itself. Otherwise the atom is taken as the name of
-> a variable, and the value of that variable is returned.*
+> Numbers, strings, and characters evaluate to themselves. So do `T`
+> and `NIL`. Keywords (symbols whose name begins with `:`) evaluate
+> to themselves. Everything else is a variable name; the value of
+> the variable is returned.
 
-The two pre-defined variables `T` and `NIL` represent truth and
-falsity respectively; they also represent the empty list and the
-"non-list," as we shall see. They are sacred symbols of the system;
-they cannot be re-assigned.
+`T` and `NIL` are sacred. They cannot be reassigned. `NIL` is both
+boolean falsity and the empty list — those are the same object.
+Every other value is true.
 
-### 1.2 S-Expressions: The Form of All Things
+### 1.2 Lists and S-Expressions
 
-Every program written in LISP, and every datum upon which a LISP
-program operates, is an *S-expression*. An S-expression is either
-an atom or a *list*. A list is written as a sequence of
-S-expressions enclosed in parentheses:
+Every datum in Lisp is an S-expression. Every program in Lisp is an
+S-expression. This is the whole trick.
 
 ```
     (A B C)
@@ -102,36 +103,38 @@ S-expressions enclosed in parentheses:
 ```
 
 To evaluate a non-empty list `(F A1 A2 ... AN)`, the system
-first evaluates each of the arguments `A1, ..., AN` in turn, then
-applies the function named by `F` to the resulting values. Hence
-`(* 3 4)` evaluates to 12, `(+ (- 5 3) (* 2 7))` evaluates to 16,
-and so on.
-
-Some forms — the *special forms* — alter this rule. We shall meet
-them in due course.
-
-### 1.3 The Five Elementary Functions
-
-Following McCarthy, every operation upon S-expressions is built up
-from a very small number of primitives. NCL implements
-these as follows:
+evaluates each `Ai` in turn, then applies the function named by `F`
+to the resulting values:
 
 ```
-    (car   X)         the first element of the list X
-    (cdr   X)         the list X with its first element removed
-    (cons  X Y)       prepend X to the list Y
-    (atom  X)         T if X is an atom; NIL if X is a cons
+    > (* 3 4)
+    12
+    > (+ (- 5 3) (* 2 7))
+    16
+```
+
+A handful of forms — the *special forms* — break this rule and look
+at their arguments unevaluated. You'll meet them as we go.
+
+### 1.3 The Five Primitives
+
+Following McCarthy, you can build every list operation out of five
+primitives. NCL provides them:
+
+```
+    (car   X)         the first element of list X
+    (cdr   X)         X with its first element removed
+    (cons  X Y)       prepend X to list Y
+    (atom  X)         T if X is an atom; NIL if a cons
     (eq    X Y)       T if X and Y are the same object; NIL otherwise
 ```
 
-The names `car` and `cdr` are historical, dating from the IBM 704
-register-pair instruction the original implementation used. They
-are pronounced "car" and "could-er." The combinations `caar`,
-`cadr`, `cddr`, `caddr`, ... up to four levels are pre-defined;
-they expand in the obvious manner — `cadr` is `(car (cdr ...))`,
-and so on.
-
-The following session illustrates:
+`car` and `cdr` are pronounced "car" and "could-er", because in 1958
+the IBM 704 had instructions named `CAR` and `CDR` that took the
+address part and decrement part of a register pair. We've kept the
+names for the same reason Latin lives on in anatomy. The
+compositions `caar`, `cadr`, `cddr`, `caddr`, ..., up to four levels
+deep, are predefined and expand as you'd expect.
 
 ```
     > (car '(A B C))
@@ -148,15 +151,14 @@ The following session illustrates:
     T
 ```
 
-The single quote, `'X`, is read as `(quote X)` and prevents the
-evaluator from looking at the form inside. Without it, `(car (A B
-C))` would attempt to call a function named `A`.
+The leading `'X` is `(quote X)` — a special form that hands its
+argument back unevaluated. Without it, `(car (A B C))` would try to
+call a function named `A`.
 
 ### 1.4 The Conditional
 
-The fundamental conditional of LISP 1.5 is the function `COND`;
-ncl also provides `IF`, `WHEN`, and `UNLESS`. The general
-shape of `COND` is
+`COND` is the conditional McCarthy gave us; NCL also provides `IF`,
+`WHEN`, `UNLESS`, `CASE`, and `TYPECASE`. The shape of `COND`:
 
 ```
     (COND (P1 E1)
@@ -166,8 +168,8 @@ shape of `COND` is
 ```
 
 The predicates `P1, P2, ...` are evaluated in turn until one yields
-a non-`NIL` value; the corresponding `E` is then evaluated and its
-value returned. Thus
+a non-`NIL` value; the corresponding `Ei` is then evaluated and its
+value returned.
 
 ```
     > (cond ((= 1 2)  'no)
@@ -176,96 +178,89 @@ value returned. Thus
     YES
 ```
 
-The `IF` form is simpler: `(IF P E1 E2)` returns the value of `E1`
-when `P` is true, of `E2` otherwise. When the false branch is
-omitted, `NIL` is returned. The forms `(WHEN P E ...)` and
-`(UNLESS P E ...)` evaluate any number of body forms when the
-predicate is, respectively, true and false; they return the value
-of the last body form, or `NIL`.
+`IF` is the binary form: `(IF P THEN ELSE)`. The `ELSE` branch may
+be omitted, in which case the false case returns `NIL`. `WHEN` and
+`UNLESS` allow multiple body forms and return the last one's value.
+
+If you find your `COND` tower wanting more visual structure, do
+`(require 'ifstar)` and use Foderaro's `if*`:
+
+```
+    (if* (eq op :add) then
+           (incf counter)
+           (push val results)
+         elseif (eq op :reset) then
+           (setq counter 0)
+           (setq results nil)
+         else
+           (error "unknown op ~A" op))
+```
 
 ---
 
-## SECTION 2 — Definition of Functions
+## SECTION 2 — Functions
 
-### 2.1 The DEFUN Form
-
-A function is defined by the special form `DEFUN`:
+### 2.1 DEFUN
 
 ```
     (DEFUN name (parameter-list) body...)
 ```
 
-The name must be an atom. The parameter-list is a (possibly empty)
-list of atoms naming the formal arguments. The body is one or more
-S-expressions, the value of the last being the value of the function.
-
-Hence the factorial:
+Every form in the body is evaluated; the last one's value is the
+function's value. Recursion is the natural style; the compiler
+optimises tail calls, so a properly written tail-recursive function
+doesn't grow the stack.
 
 ```
     (DEFUN FACT (N)
       (IF (= N 0)
           1
           (* N (FACT (- N 1)))))
-```
 
-and the length of a list:
-
-```
     (DEFUN LEN (L)
       (IF (NULL L)
           0
           (+ 1 (LEN (CDR L)))))
 ```
 
-Recursive definitions, as in the foregoing, are entirely natural.
-The system is compiled (not interpreted); `DEFUN` compiles its body
-to machine instructions at the moment of definition.
+NCL is a JIT-first system: `DEFUN` compiles the body to LLVM IR and
+then to machine instructions *at the moment of definition*, even at
+the REPL. There is no interpreter. The form `(disassemble 'fact)`
+prints the machine code, and yes, you can read it.
 
-### 2.2 LAMBDA — Functions without Names
+### 2.2 LAMBDA
 
-A function may be written without being given a name, by means of
-the LAMBDA form:
+Functions without names are written with `LAMBDA`:
 
 ```
     (LAMBDA (X) (* X X))
 ```
 
-denotes the squaring function. To apply a lambda to arguments, use
-`FUNCALL`:
+Apply one with `FUNCALL`, or quote it with `#'` (which reads as
+`(FUNCTION ...)`):
 
 ```
     > (FUNCALL (LAMBDA (X) (* X X)) 7)
     49
-```
-
-A more concise form is provided by the function-quote, written
-`#'NAME` (it reads as `(FUNCTION NAME)`). Thus
-
-```
     > (FUNCALL #'CAR '(A B C))
     A
     > (MAPCAR #'(LAMBDA (X) (* X X)) '(1 2 3 4))
     (1 4 9 16)
 ```
 
-Function values are first-class. They may be passed as arguments,
-stored in variables, and returned from other functions.
+Functions are first-class values: pass them, store them, return them.
 
-### 2.3 Argument-Lists with Optionals, Rest, and Keywords
+### 2.3 Lambda Lists: Optionals, Rest, and Keywords
 
-The lambda-list has the same shape as that of full Common LISP.
-After the required parameters the practitioner may write
+The lambda list has the full CL shape:
 
 ```
-    &OPTIONAL          followed by names whose absence is replaced by NIL
-    &REST              followed by one name to receive the remaining args
-                       as a list
-    &KEY               followed by names whose values are taken from
-                       keyword-marked arguments
+    &OPTIONAL          names whose absence is NIL (or a default)
+    &REST              one name; bound to the remaining args as a list
+    &KEY               keyword-marked arguments, matched by name
 ```
 
-A default value may be given in the form `(NAME DEFAULT)`. For
-example:
+A default value is given as `(NAME DEFAULT)`:
 
 ```
     (DEFUN GREET (NAME &OPTIONAL (GREETING "Hello"))
@@ -275,11 +270,7 @@ example:
     "Hello, world!"
     > (GREET "world" "Greetings")
     "Greetings, world!"
-```
 
-The `&KEY` parameters are matched by keyword, not position:
-
-```
     (DEFUN MEMBER* (ITEM LST &KEY (TEST #'EQL))
       (COND
         ((NULL LST) NIL)
@@ -290,249 +281,241 @@ The `&KEY` parameters are matched by keyword, not position:
     (3 4)
 ```
 
-### 2.4 LET, LET*, and Local Bindings
+### 2.4 Local Bindings
 
-Temporary bindings are introduced by `LET`:
+`LET` is parallel binding; `LET*` is sequential.
 
 ```
-    (LET ((A 1) (B 2))
+    (LET ((A 1) (B 2))             A and B both bound; no order
       (+ A B))
-```
 
-The variables of a `LET` are bound in parallel. To introduce them
-sequentially — so that each may refer to the preceding — use
-`LET*`:
-
-```
-    (LET* ((A 5)
+    (LET* ((A 5)                   each binding sees the previous
            (B (+ A 1)))
-      (* A B))                      ⇒ 30
+      (* A B))                     ⇒ 30
 ```
 
-For local functions the form is `FLET` (parallel) or `LABELS`
-(sequential and mutually recursive). The shape is the same as
-`LET` save that each binding is a function definition:
+Local functions get `FLET` (parallel) or `LABELS` (sequential and
+mutually recursive):
 
 ```
-    (LABELS ((EVEN? (N) (IF (= N 0) T (ODD?  (- N 1))))
+    (LABELS ((EVEN? (N) (IF (= N 0) T   (ODD?  (- N 1))))
              (ODD?  (N) (IF (= N 0) NIL (EVEN? (- N 1)))))
-      (EVEN? 10))
+      (EVEN? 10))                  ⇒ T
 ```
 
-### 2.5 Sequential Evaluation, Assignment
+### 2.5 PROGN, SETQ, SETF
 
-`PROGN` evaluates a sequence of forms and returns the value of the
-last. Most special forms with a "body" — `LET`, `WHEN`, `DEFUN`,
-and so on — perform an implicit `PROGN`.
+`PROGN` evaluates its body in order and returns the last value.
+Most body-bearing forms (`DEFUN`, `LET`, `WHEN`, `UNLESS`, …) are
+implicit `PROGN`s.
 
-Assignment to a variable is by `SETQ`:
-
-```
-    (SETQ X 10)                     X is now 10
-```
-
-A more general assignment, capable of modifying any *place* in a
-structure, is `SETF`:
+`SETQ` assigns to a variable. `SETF` assigns to a *place* — any
+location accessible by an inverted-function syntax:
 
 ```
-    (SETF (CAR X) 'NEW)             modify the car of X
-    (SETF (CDR X) '(2 3))           modify the cdr of X
+    (SETQ X 10)
+    (SETF (CAR X) 'NEW)             modify the car of cons X
+    (SETF (CDR X) '(2 3))
     (SETF (AREF V 0) 'FIRST)        modify element 0 of vector V
     (SETF (GETHASH 'K H) "value")   modify a hash-table entry
+    (SETF (SYMBOL-FUNCTION 'F) #'G) replace F's function definition
 ```
 
-Top-level variables are introduced by `DEFPARAMETER` (always
-assigned) or `DEFVAR` (assigned only if previously unbound).
+`DEFPARAMETER` introduces a top-level variable, always assigned;
+`DEFVAR` introduces one, assigned only if previously unbound;
+`DEFCONSTANT` is the immutable form.
 
 ### 2.6 Iteration
 
-The two principal iterative forms are `DOTIMES`, for counted loops,
-and `DOLIST`, for traversal:
+For straightforward counted and traversal loops:
 
 ```
-    (DOTIMES (I 5)
-      (FORMAT T "~D " I))           prints  0 1 2 3 4
-
-    (DOLIST (X '(A B C))
-      (PRINT X))                    prints  A B C
+    (DOTIMES (I 5) (FORMAT T "~D " I))     prints  0 1 2 3 4
+    (DOLIST (X '(A B C)) (PRINT X))        prints  A B C
 ```
 
-A more general loop is supplied as `LOOP`, with `RETURN` to exit:
+The full extended `LOOP` macro is loaded by `(require 'loop)` (and
+already loaded by `init.lisp` in the default setup):
 
 ```
-    (LET ((I 0))
-      (LOOP
-        (WHEN (= I 5) (RETURN I))
-        (SETQ I (1+ I))))           ⇒ 5
+    (LOOP FOR I FROM 1 TO 10
+          WHEN (ODDP I) COLLECT I)        ⇒ (1 3 5 7 9)
+
+    (LOOP FOR X IN '(A B C D E)
+          AS I FROM 0
+          DO (FORMAT T "~D: ~A~%" I X))
+
+    (LOOP FOR LINE = (READ-LINE STREAM NIL NIL)
+          WHILE LINE
+          COLLECT LINE)
 ```
 
-Recursion remains the more natural form for many programs. The
-practitioner is encouraged to use whichever leads to the clearer
-program; the compiler optimises tail calls, so a tail-recursive
-function does not consume stack indefinitely.
+The plain unannotated `(LOOP body ...)` is also available — it
+repeats body until `(RETURN value)` fires.
+
+When recursion is clearer, use it. The compiler handles tail
+calls; a tail-recursive `LEN` does not blow the stack.
 
 ---
 
-## SECTION 3 — The S-Expression as Data
+## SECTION 3 — Data Is Code
 
-We have noted that every program is an S-expression. The converse
-is also true: every S-expression can be operated upon as data, by
-the same functions that operate upon any other list.
+Every program is an S-expression. The converse is the punchline:
+every S-expression can be operated on as data, by the same `CAR`,
+`CDR`, and `CONS` that operate on every other list. This is what
+makes macros worth writing.
 
-### 3.1 QUOTE and the Self-Evaluating Atoms
+### 3.1 QUOTE
 
-The reader-macro `'X` is shorthand for `(QUOTE X)`. The form
-`(QUOTE X)` returns `X` unevaluated. Without the quote, `(CAR (A B
-C))` would try to call a function named `A`; with it, `(CAR '(A B
-C))` yields `A`.
+`'X` is shorthand for `(QUOTE X)`, which returns its argument
+unevaluated. Numbers, strings, characters, and keywords don't need
+the quote — they evaluate to themselves anyway.
 
-A keyword (`:FOO`) is its own value, as are numbers, strings, and
-characters. They do not need to be quoted.
+### 3.2 Backquote, Comma, Splice
 
-### 3.2 Backquote, Comma, and Splice
-
-For building list-shaped output it is convenient to write a list
-*almost* literally, but with selected positions filled in by the
-values of expressions. This is the *backquote*, `` ` ``:
+For building list-shaped output that's *almost* literal, use the
+backquote `` ` ``:
 
 ```
     (LET ((X 10))
-      `(THE VALUE IS ,X))           ⇒ (THE VALUE IS 10)
-```
+      `(THE VALUE IS ,X))                ⇒ (THE VALUE IS 10)
 
-Inside a `` ` `` form, a `,EXPR` substitutes the value of `EXPR`,
-and `,@EXPR` splices a list-valued expression in:
-
-```
     (LET ((MIDDLE '(B C D)))
-      `(A ,@MIDDLE E))              ⇒ (A B C D E)
+      `(A ,@MIDDLE E))                   ⇒ (A B C D E)
 ```
 
-The backquote is the principal tool for writing macros.
+`,EXPR` substitutes the value; `,@EXPR` splices a list. This is the
+machine you build macros on. Get familiar with it.
 
-### 3.3 Cons-Cells, Lists, and Dotted Pairs
+### 3.3 Cons-Cells and Dotted Pairs
 
-A list is built from cons-cells; each cell has a *car* and a *cdr*.
-The list `(A B C)` is, in cons notation,
+A list is a chain of cons-cells, each with a `car` and a `cdr`. The
+list `(A B C)` is, expanded:
 
 ```
-    (cons 'A (cons 'B (cons 'C nil)))
+    (CONS 'A (CONS 'B (CONS 'C NIL)))
 ```
 
-A cons whose cdr is not a list is a *dotted pair*, written `(A . B)`.
-A list whose last cdr is non-`NIL` is *improper*; most list
-functions do not expect them.
+A cons whose cdr is not a list is a *dotted pair*, written
+`(A . B)`. A list whose last cdr is non-`NIL` is *improper*; most
+list functions do not expect them, and the few that do (`MAPL`,
+`LDIFF`) say so.
 
-The list reader also accepts the `#(...)` notation for *vectors*,
-which are fixed-length one-dimensional arrays:
+### 3.4 Vectors, Strings, Hash Tables
+
+Strings are vectors of characters. Vectors are one-dimensional
+arrays:
 
 ```
     > #(10 20 30)
     #(10 20 30)
     > (AREF #(10 20 30) 1)
     20
+    > (LENGTH "hello")
+    5
+    > (CHAR "hello" 1)
+    #\e
 ```
 
-### 3.4 Strings and Characters
+Hash tables are made with `MAKE-HASH-TABLE`; access by `GETHASH`,
+mutation by `(SETF (GETHASH ...) ...)`, iteration by `MAPHASH`.
 
-A string is a sequence of characters. The reader recognises the
-following escapes inside strings:
+### 3.5 FORMAT
 
-```
-    \"      a literal quote
-    \\      a literal backslash
-```
-
-The functions `LENGTH`, `CHAR`, `AREF`, and `STRING=` operate on
-strings as they do on vectors. `(FORMAT NIL ...)` builds a string
-without writing to any stream:
+`FORMAT` is the printf you've always wanted. The first argument
+chooses the destination:
 
 ```
-    > (FORMAT NIL "~A + ~A = ~A" 2 3 (+ 2 3))
-    "2 + 3 = 5"
+    (FORMAT T   ...)    write to standard output
+    (FORMAT NIL ...)    return the formatted string
+    (FORMAT s   ...)    write to stream s
 ```
 
-The format directives most commonly used are
+The directives you'll use 80% of the time:
 
 ```
-    ~A      print, as for *PRINT-ESCAPE* NIL (human)
-    ~S      print, as for *PRINT-ESCAPE* T   (re-readable)
+    ~A      print, no escapes — humans
+    ~S      print, with escapes — re-readable
     ~D      decimal integer
     ~X      hexadecimal
+    ~B      binary
+    ~F      fixed-point float
+    ~E      scientific float
+    ~R      english cardinal (~R: "one hundred twenty-three")
     ~%      newline
-    ~~      literal tilde
+    ~&      newline if not already at column 0
+    ~~      a literal tilde
+    ~{ ~}   loop over a list — body uses ~A, ~D, etc.
 ```
+
+Loading `(require 'xp)` adds Waters' XP pretty-printer machinery
+(`pprint`, `pprint-logical-block`, conditional newlines, fill mode).
 
 ---
 
-## SECTION 4 — Symbols and Packages
+## SECTION 4 — Symbols, Cells, and Packages
 
 ### 4.1 The Symbol
 
-A *symbol* is an atom carrying four cells:
+A symbol is an atom carrying four cells:
 
 ```
-    NAME            the printable name, a string
-    PACKAGE         the home package (q.v.)
-    VALUE CELL      the symbol's variable binding, accessed by SYMBOL-VALUE
-    FUNCTION CELL   the symbol's function binding, accessed by SYMBOL-FUNCTION
+    NAME            its printable name (a string)
+    PACKAGE         its home package
+    VALUE CELL      its variable binding   — SYMBOL-VALUE
+    FUNCTION CELL   its function binding   — SYMBOL-FUNCTION
 ```
 
-Ncl is, as Common LISP is, a "Lisp-2": variable bindings
-and function bindings live in two distinct namespaces. The variable
-`X` and the function `X` may coexist; references through a function
-position consult the function cell, references through a variable
-position consult the value cell. To pass the function value of `X`
-as data, write `#'X`.
+NCL, like all of Common Lisp, is a "Lisp-2": variable and function
+bindings live in distinct cells. The variable `X` and the function
+`X` are independent. Function-position references consult the
+function cell; variable-position references consult the value cell.
+To pass a function value as data, you wrap it in `#'`.
 
-### 4.2 Defining a Function Atomically
+### 4.2 DEFUN Is One Atomic Pointer Store
 
-`DEFUN` performs one atomic write to the named symbol's
-function cell. Calls to that symbol from compiled code load the
-cell and indirect through it. Redefining a function is therefore
-*one pointer store*; every live call site sees the new definition
-on its next invocation.
+This is the trick that makes interactive development real.
+`(DEFUN FOO ...)` compiles a fresh function object and *atomically
+stores it* into `FOO`'s function cell. Compiled calls to `FOO` load
+the cell and indirect through it. Redefining `FOO` is one pointer
+store; every live call site picks up the new definition on its next
+invocation.
 
-This makes interactive development direct: edit, hit `DEFUN`, call
-the function. No images to save, no library to relink. The old
-machine-code body remains in the live image until no reference can
-reach it, at which time the garbage collector reclaims it.
+No images to save. No library to relink. The old machine code stays
+in the static heap until no closure can still reach it, then the GC
+reclaims it. This is the SBCL/CCL shape, and it is why a Lisper at
+a REPL feels like they're conjuring functions out of the air. Edit,
+hit DEFUN, call. That is the whole loop.
 
 ### 4.3 Packages
 
-A *package* is a namespace for symbols. Three packages are
-established at start-up:
+A package is a namespace for symbols. Three are created at startup:
 
 ```
-    COMMON-LISP             the language; abbreviated CL
-    COMMON-LISP-USER        the default user package; abbreviated CL-USER
-    KEYWORD                 the package of self-evaluating symbols
+    COMMON-LISP             the language          — nickname CL
+    COMMON-LISP-USER        the default workspace — nickname CL-USER
+    KEYWORD                 the home of :KEYWORDS
 ```
 
-A symbol in another package may be named with a colon-qualifier:
+A symbol from another package is named with a colon-qualifier:
 
 ```
-    COMMON-LISP:CAR          the external symbol CAR of CL
-    CCL::QUIT                the internal symbol QUIT of the CCL package
+    COMMON-LISP:CAR          external symbol CAR of CL
+    CCL::QUIT                internal symbol QUIT of CCL
 ```
 
-The single colon refers to an *external* symbol (one explicitly
-made visible by `EXPORT`); the double colon refers to any symbol
-in the package.
-
-The current package — that which the reader interns into when no
-qualifier is given — is named by the special variable `*PACKAGE*`.
-A session begins in `COMMON-LISP-USER`.
+Single colon ⇒ external (exported); double colon ⇒ any symbol in
+the package. The current package — what the reader interns into
+when no prefix is given — is the value of `*PACKAGE*`. A fresh
+session starts in `COMMON-LISP-USER`.
 
 ---
 
 ## SECTION 5 — Macros
 
-A *macro* is a function from program-text to program-text.
-NCL expands macros at compile-time; the resulting
-S-expression is what the compiler actually sees.
-
-A macro is defined by `DEFMACRO`:
+A macro is a function from program text to program text. NCL
+expands macros at compile time. The expansion is what the compiler
+actually sees.
 
 ```
     (DEFMACRO WHILE (TEST &REST BODY)
@@ -541,31 +524,24 @@ A macro is defined by `DEFMACRO`:
          ,@BODY))
 ```
 
-Thereafter the programmer may write `(WHILE (> N 0) (PRINT N)
-(SETQ N (1- N)))`, and the compiler will see
+Now `(WHILE (> N 0) (PRINT N) (SETQ N (1- N)))` expands at compile
+time to a `LOOP` with the obvious shape. The body of `DEFMACRO`
+runs against unevaluated arguments and returns the replacement
+S-expression. If the user wrote `(WHILE ...)`, the compiler never
+sees that — it sees the `LOOP`.
 
-```
-    (LOOP
-      (UNLESS (> N 0) (RETURN))
-      (PRINT N)
-      (SETQ N (1- N)))
-```
+A useful starter set lives in `core.lisp` and the Library — `WHEN`,
+`UNLESS`, `LET`, `LET*`, `COND`, `DOLIST`, `DOTIMES`, `LOOP`,
+`CASE`, `TYPECASE`, `HANDLER-CASE`, `RESTART-CASE`,
+`WITH-OPEN-FILE`, `WITH-OUTPUT-TO-STRING`, `MULTIPLE-VALUE-BIND`,
+`WITH-SYNCHRONIZATION`. Read the source. The standard library is
+written in NCL itself, and it's an excellent way to see what good
+macros look like in this dialect.
 
-The body of a `DEFMACRO` runs at compile time; its arguments are
-the *unevaluated* sub-expressions of the call. The value returned
-is the replacement S-expression.
+### 5.1 GENSYM
 
-A handful of the most useful macros (`WHEN`, `UNLESS`, `LET`,
-`LET*`, `COND`, `DOLIST`, `DOTIMES`, `LOOP`, `WHILE`, `CASE`,
-`HANDLER-CASE`, `WITH-OPEN-FILE`, `WITH-OUTPUT-TO-STRING`,
-`MULTIPLE-VALUE-BIND`) are pre-defined in the user-Lisp portion of
-the standard library. Their source is in `Lisp/core.lisp` and is
-intended to be read.
-
-### 5.1 Gensym
-
-When a macro introduces a name, that name must not collide with one
-the user has bound. The function `GENSYM` returns a fresh symbol
+When a macro introduces a local name, that name must not collide
+with one the user has bound. `GENSYM` returns a fresh symbol
 distinct from every interned one:
 
 ```
@@ -575,19 +551,34 @@ distinct from every interned one:
            (IF ,G (PROGN ,@BODY) NIL))))
 ```
 
-The local `G` will be a name such as `#:G273` that the user cannot
-have written by accident.
+The local will be a name like `#:G273` that no user wrote. This is
+the hygiene story; NCL does not have implicit hygiene like Scheme,
+so you GENSYM by hand. It is one line; live with it.
+
+### 5.2 Trace and Time
+
+When debugging a macro you wrote, two utilities will save you:
+
+```
+    (REQUIRE 'TRACE)
+    (TRACE FOO BAR)        wraps FOO and BAR; prints entry, exit, depth
+    (UNTRACE FOO)
+
+    (REQUIRE 'TIME)
+    (TIME (FOO 30))        prints real seconds, GC stats; returns the value
+```
+
+`(MACROEXPAND-1 '(WHILE ...))` shows what your macro produced.
+`(MACROEXPAND ...)` keeps expanding until no macros remain.
 
 ---
 
-## SECTION 6 — Objects
+## SECTION 6 — CLOS
 
-NCL implements the Common LISP Object System (CLOS) in
-the manner of Closette — the metaobject-protocol implementation
-described by Kiczales, des Rivières and Bobrow. 
-The version here is based on the Corman Lisp version.
-The four central operators are `DEFCLASS`, `MAKE-INSTANCE`, `DEFGENERIC`, and
-`DEFMETHOD`.
+NCL's object system is CLOS, implemented in the manner of Closette
+(Kiczales / des Rivières / Bobrow's *The Art of the Metaobject
+Protocol*), seeded from Corman Lisp's port. The four operators you
+need are `DEFCLASS`, `MAKE-INSTANCE`, `DEFGENERIC`, and `DEFMETHOD`.
 
 ### 6.1 Classes and Instances
 
@@ -598,11 +589,7 @@ The four central operators are `DEFCLASS`, `MAKE-INSTANCE`, `DEFGENERIC`, and
 
     (DEFCLASS DOG (ANIMAL)
       ((SOUND :INITFORM "Woof")))
-```
 
-A class is constructed with `MAKE-INSTANCE`:
-
-```
     > (DEFPARAMETER REX (MAKE-INSTANCE 'DOG :NAME "Rex"))
     REX
     > (NAME REX)
@@ -611,15 +598,13 @@ A class is constructed with `MAKE-INSTANCE`:
     "Woof"
 ```
 
-The slot options `:INITARG`, `:INITFORM`, `:READER`, `:WRITER`, and
-`:ACCESSOR` have the meanings the practitioner expects from any CL
-implementation.
+Slot options `:INITARG`, `:INITFORM`, `:READER`, `:WRITER`,
+`:ACCESSOR`, `:ALLOCATION`, `:TYPE`, `:DOCUMENTATION` mean what they
+do everywhere else.
 
 ### 6.2 Generic Functions and Methods
 
-A *generic function* is a function whose behaviour depends upon
-the classes of its arguments. It is declared with `DEFGENERIC`,
-and individual *methods* are added with `DEFMETHOD`:
+A generic function dispatches on the classes of its arguments.
 
 ```
     (DEFGENERIC SPEAK (A))
@@ -634,81 +619,163 @@ and individual *methods* are added with `DEFMETHOD`:
     "[bark] Rex says Woof"
 ```
 
-The call `(CALL-NEXT-METHOD)` invokes the next most-specific method
-in the class-precedence list — here, the `ANIMAL` method.
-
-Method qualifiers `:BEFORE`, `:AFTER`, and `:AROUND` produce side
-effects before, after, and surrounding the primary method:
+`CALL-NEXT-METHOD` invokes the next most-specific method on the
+class precedence list. Method qualifiers `:BEFORE`, `:AFTER`, and
+`:AROUND` give you the standard method combination's full power:
 
 ```
     (DEFMETHOD SPEAK :BEFORE ((A ANIMAL))
       (FORMAT T "*pause*~%"))
 ```
 
-`EQL`-specializers may be used to specialise upon a particular
-value:
+`EQL`-specializers dispatch on a particular value:
 
 ```
     (DEFMETHOD GREET ((LANG (EQL :FRENCH)))
       "Bonjour")
 ```
 
-Multiple inheritance is supported; class precedence follows the
-standard linearisation. The functions `FIND-CLASS`, `CLASS-OF`,
-`CLASS-PRECEDENCE-LIST`, `SUBCLASSP`, and `CLOS-TYPEP` are
-available for introspection.
+Multiple inheritance works; class precedence follows the standard
+C3 linearisation. Introspection: `FIND-CLASS`, `CLASS-OF`,
+`CLASS-PRECEDENCE-LIST`, `SUBCLASSP`, `CLOS-TYPEP`,
+`COMPUTE-APPLICABLE-METHODS`.
+
+Method redefinition lands the same way function redefinition does:
+the generic function's dispatch table swaps in the new method body
+atomically, the per-class effective-method cache is flushed, and
+the next call sees the new version. The demo `clos-tour.lisp` walks
+the whole story end to end.
 
 ---
 
-## SECTION 7 — Conditions, I/O, and the World
+## SECTION 7 — The Outside World
 
-### 7.1 Conditions and Their Handling
+### 7.1 Conditions and Restarts
 
-An exceptional circumstance is signalled by the function `ERROR`,
-which raises a condition. The form `HANDLER-CASE` is the principal
-way to catch and recover:
+An exceptional circumstance is signalled by `ERROR`, which raises a
+condition. The first-pass machinery is `HANDLER-CASE`:
 
 ```
     (HANDLER-CASE
         (/ X Y)
-      (DIVISION-BY-ZERO ()
-        :INFINITE)
-      (ERROR (C)
-        (FORMAT NIL "unhandled: ~A" C)))
+      (DIVISION-BY-ZERO () :INFINITE)
+      (ERROR (C) (FORMAT NIL "unhandled: ~A" C)))
 ```
 
-The first matching clause is run; its value becomes the value of
-the `HANDLER-CASE`. A clause of `(ERROR (C) ...)` catches every
-condition and binds `C` to it.
+The first clause whose class matches the condition wins; its value
+becomes the value of the `HANDLER-CASE`. `(ERROR (C) ...)` catches
+everything and binds `C` to the condition.
 
-Condition types are themselves classes (see Section 6); the
-practitioner defines new ones with `DEFINE-CONDITION` from the
-`Library/conditions.lisp` module, which is loaded automatically
-unless `--lean` has been requested.
-
-### 7.2 Reading and Writing
+The full Common Lisp condition system — non-unwinding handlers and
+restarts — lives in the `conditions` module (loaded by default):
 
 ```
-    (PRINT X)                       writes X, with escapes, plus a newline
-    (PRINC X)                       writes X without escapes
-    (FORMAT T  ...)                 writes formatted text to standard out
-    (FORMAT NIL ...)                returns the formatted text as a string
+    (DEFINE-CONDITION my-trouble (error)
+      ((thing :initarg :thing :reader trouble-thing)))
+
+    (HANDLER-BIND ((my-trouble
+                    (LAMBDA (C)
+                      (FORMAT T "saw ~A~%" (trouble-thing C))
+                      (INVOKE-RESTART 'CONTINUE))))
+      (RESTART-CASE
+          (ERROR 'my-trouble :thing 42)
+        (CONTINUE () :recovered)))
+    ⇒ :RECOVERED
+```
+
+`HANDLER-CASE` unwinds; `HANDLER-BIND` does not — it lets the
+handler decide whether to transfer control via a restart or to
+decline and let the condition propagate. This is the distinguishing
+feature of the Lisp condition system: the *handler* and the *unwind
+target* are different decisions.
+
+Standard restart names — `ABORT`, `CONTINUE`, `USE-VALUE`,
+`STORE-VALUE`, `MUFFLE-WARNING` — are recognised by the helpers.
+
+The REPL itself is wrapped in a top-level handler-case; signalled
+errors print and return you to the prompt instead of taking down
+the session. As a belt-and-braces measure, the REPL also installs a
+setjmp/longjmp shield around each form, so Rust-level panics
+(usually from undefined-function or wrong-arity slip-ups in your
+code) recover cleanly back to a fresh `ncl>`.
+
+### 7.2 Input and Output
+
+```
+    (PRINT X)               write X with escapes, then a newline
+    (PRINC X)               write X without escapes
+    (FORMAT T   ...)        formatted, to *standard-output*
+    (FORMAT NIL ...)        formatted, returned as a string
 
     (WITH-OPEN-FILE (S "foo.txt" :DIRECTION :INPUT)
-      (READ-LINE S))                returns the first line of foo.txt
+      (READ-LINE S))                first line of foo.txt
 ```
 
-File-system primitives `OPEN-INPUT-FILE`, `OPEN-OUTPUT-FILE`,
-`READ-LINE`, `READ-CHAR-FROM`, `WRITE-STRING-TO`, `FILE-POSITION`,
-`FILE-LENGTH`, `FILE-EXISTS`, and `DELETE-FILE` lie underneath; the
-practitioner is encouraged to use `WITH-OPEN-FILE` and `FORMAT`
-in the first instance.
+The streams module gives you `WITH-OUTPUT-TO-STRING`,
+`MAKE-STRING-INPUT-STREAM`, and friends. Under the hood the file
+primitives are `OPEN-INPUT-FILE`, `OPEN-OUTPUT-FILE`,
+`OPEN-APPEND-FILE`, `CLOSE-STREAM`, `READ-LINE`, `READ-CHAR-FROM`,
+`WRITE-STRING-TO`, `FILE-POSITION`, `FILE-LENGTH`, `FILE-EXISTS`,
+`DELETE-FILE` — but prefer the `WITH-OPEN-FILE` macro in production
+code. It closes the file on any non-local exit.
 
-### 7.3 The Graphical Display
+### 7.3 Hot Reload
 
-NCL ships with a graphical substrate — *iGui* — derived
-from its sister project. To draw upon the screen, open a child
-window, batch a sequence of drawing calls, and submit them:
+The most under-appreciated feature of a Lisp is that your editor
+and your running image can stay synchronised. NCL ships a
+filesystem-watch hot-reload module:
+
+```
+    > (REQUIRE 'HOT-RELOAD)        already loaded by init.lisp
+    > (START-HOT-RELOAD)
+    ;;; hot-reload: watching .../Lisp/Library
+    T
+```
+
+Now edit a `.lisp` file in the watched directory, hit save, and the
+next REPL prompt picks the file up and `(LOAD)`s it. Because
+`DEFUN` is one atomic pointer store (Section 4.2), live closures
+that named the old version finish on it; the next call lands on the
+new code. `(CHECK-RELOADS)` runs the drain by hand from inside a
+long computation.
+
+A bad save — half a paren, a typo — is caught by a parse pre-check;
+the file is skipped, the previous definitions stay in place,
+nothing in the running session is touched. Re-save and the watcher
+retries.
+
+### 7.4 Threads
+
+NCL's threads are OS threads with a precise, generational, multi-
+mutator GC behind them. The native primitive surface is small;
+Corman's threads package is layered on top:
+
+```
+    (REQUIRE 'THREADS)
+    (DEFPARAMETER *CS* (MAKE-INSTANCE 'CRITICAL-SECTION))
+    (DEFPARAMETER *COUNT* 0)
+
+    (DEFUN BUMP ()
+      (DOTIMES (I 1000)
+        (WITH-SYNCHRONIZATION (CS *CS*)
+          (SETQ *COUNT* (+ *COUNT* 1)))))
+
+    (LET ((A (CREATE-THREAD #'BUMP))
+          (B (CREATE-THREAD #'BUMP)))
+      (DECLARE (IGNORE A B))
+      ...)
+```
+
+GCs are cooperative stop-the-world: each thread polls a safe-point
+flag and parks voluntarily; the collector runs only after every
+mutator is parked. In tight CPU loops, drop the occasional
+`(THREAD-SAFEPOINT)` so cooperative-suspend works promptly.
+
+### 7.5 Graphics (iGui)
+
+NCL has a graphical substrate called *iGui*, sitting on Direct2D /
+DirectWrite / DXGI on Windows. To draw, open a child window, batch
+a sequence of calls, and submit them:
 
 ```
     (DEFUN HELLO ()
@@ -716,67 +783,150 @@ window, batch a sequence of drawing calls, and submit them:
       (LET ((ID (OPEN-CHILD "hello")))
         (WITH-BATCH ID
           (CLEAR +SLATE+)
-          (FILL-RECT 60 80 100 60 +RED+)
-          (DRAW-TEXT 76 142 "red"   13 +WHITE+)
+          (FILL-RECT 60  80 100 60 +RED+)
+          (DRAW-TEXT  76 142 "red"   13 +WHITE+)
           (FILL-RECT 200 80 100 60 +GREEN+)
           (DRAW-TEXT 212 142 "green" 13 +WHITE+))))
 ```
 
-The pre-defined colours `+BLACK+`, `+WHITE+`, `+RED+`, `+GREEN+`,
-`+BLUE+`, `+YELLOW+`, `+SLATE+`, and `+PANEL+` are convenient;
-`(RGB R G B)` and `(RGBA R G B A)` build packed colour values.
-Events from the window system are obtained from `NEXT-EVENT` as a
-property list with keys `:KIND`, `:CHILD-ID`, `:WIDTH`, `:HEIGHT`,
-`:X`, `:Y`, and so on.
+Predefined colours: `+BLACK+ +WHITE+ +RED+ +GREEN+ +BLUE+ +YELLOW+
++SLATE+ +PANEL+`. Build packed colours with `(RGB R G B)` or
+`(RGBA R G B A)`. Events come from `NEXT-EVENT` as a property list
+with keys `:KIND`, `:CHILD-ID`, `:WIDTH`, `:HEIGHT`, `:X`, `:Y`,
+`:CHAR`, `:KEY`, and so on. A typed event-loop helper is in the
+`events` module: `(WITH-EVENTS-FROM child-id (event ...) body)`.
 
-A working tour of the graphics surface, the CLOS port, and the
-event loop is in `Lisp/demos/`.
+The demos in `Lisp/demos/` are the tour:
 
-### 7.4 The Foreign Function Interface
+```
+    hello-igui.lisp     a rectangle, some text
+    shapes.lisp         the primitive shape vocabulary
+    text-styles.lisp    fonts, sizes, weights, layout boxes
+    draw-square.lisp    the absolute minimum
+    buttons.lisp        click handling
+    click-counter.lisp  click handling with state
+    paint-and-log.lisp  multi-child windows, side-channel logging
+    bouncing.lisp       animation loop on a timer
+    clos-tour.lisp      CLOS dispatch driving the renderer
+    heap-monitor.lisp   live GC stats on a child window
+    gui-repl.lisp       an in-process editor + REPL, in NCL itself
+```
 
-Common LISP programs may call out to native code through the
-`#! ... !#` reader macro, which captures a header plist and a C
-body verbatim:
+### 7.6 Foreign Functions and Windows API
+
+CL programs may call out to native code. The Corman FFI surface is
+preserved: the `#! ... !#` reader macro captures a C-style header
+and body verbatim, parsed at load time to install a callable Lisp
+shim:
 
 ```
     #!(:library "user32" :pascal "WINAPI")
     int MessageBoxA(void* hwnd, char* text, char* caption, unsigned type);
     !#
+
+    (MESSAGE-BOX-A NIL "Hi from NCL" "NCL" 0)
 ```
 
-The Corman LISP demos use this surface heavily. The
-NCL implementation honours their convention; the FFI
-machinery is, however, separate from the language and is reserved
-for the user. NCL's own standard library is implemented
-in Rust and does not pass through the FFI.
+`DEFUN-DLL` is the same machinery under another name; the Corman
+demos use both interchangeably.
+
+For Win32 specifically, NCL also ships a pre-built metadata pack
+(`packs/windows_api.pack`) holding signatures for the entire Win32
+API — every type, every function, every parameter — derived from
+Microsoft's official `Windows.Win32.winmd`. With that loaded
+(automatic when you start with `--windows`), you can call any
+function by name, no FFI declaration:
+
+```
+    (WIN32 KERNEL32 GetCurrentProcessId)              ⇒ 12340
+    (WIN32 USER32   MessageBoxW NULL "hi" "NCL" 0)
+```
+
+For a function you call often, `DEFWIN32` mints a named wrapper:
+
+```
+    (DEFWIN32 USER32 MessageBoxW)
+    (MessageBoxW NULL "hi" "NCL" 0)
+```
+
+`SetLastError`/`GetLastError` plumbing is automatic on the ~13K
+functions Microsoft has annotated for it. Calling-convention,
+ANSI/Unicode pairing, and out-parameters are all picked up from the
+metadata. See `docs/WINDOWS_FFI.md` for the full story.
+
+NCL's *own* standard library does **not** go through the FFI: file
+I/O, strings, time, threads, hash tables, and so on are backed by
+Rust's `std`. The FFI sits beside the language for user code to
+reach; the language itself stays portable.
 
 ---
 
 ## SECTION 8 — The Driver
 
-The command-line driver is `ncl`. Its principal options are
+The command-line driver is `ncl`. Its principal options:
 
 ```
-    ncl                       enter the REPL with the full stdlib loaded
-    ncl --eval "(...)"        evaluate one form, print the result, exit
-    ncl --load file.lisp      read and evaluate every form in the file
-    ncl --eval ... --eval ... evaluate forms in order
-    ncl --eval ... --repl     evaluate forms, then enter the REPL
-    ncl --lean                load only the bare compiler — no CLOS,
-                              no Library/init.lisp
-    ncl --version             print the version and exit
-    ncl --help                print the usage summary
+    ncl                        REPL with the full stdlib loaded
+    ncl --repl                 same; explicit
+    ncl -e "(...)"             evaluate one form, print, exit
+    ncl --eval "(...)"         same; long form
+    ncl -l file.lisp           load and evaluate every form in the file
+    ncl --load file.lisp       same
+    ncl -c file.lisp           dry-run: parse + macroexpand + lower
+    ncl --check file.lisp      every top-level form, but execute only
+                               definitions (defun, defmacro, defparameter,
+                               defconstant, require). Non-definition
+                               forms pass through the JIT pipeline (so
+                               syntax / macro / lowering errors surface)
+                               but never run. Use it as a fast lint.
+    ncl --lean                 load only the bare compiler — no CLOS,
+                               no Library/init.lisp. Useful for sandboxes
+                               and minimal scripts.
+    ncl --windows              enable the Windows surface: thread 0 runs
+                               the Win32 message pump on a worker thread,
+                               (windows-enabled-p) returns T, the Win32
+                               metadata pack is loaded, and the win32-*
+                               modules are auto-required.
+    ncl --eval ... --load ... --repl
+                               multiple --eval / --load / --check chain;
+                               --repl drops you into the prompt after.
+    ncl --version
+    ncl --help
 ```
 
-The driver looks for a `Library/` directory beside its executable
-(or as named by the environment variable `NCL_LIBRARY`) and, if
-found, prepends it to `*LOAD-PATH*` and loads `Library/init.lisp`
-if present. The contents of `Library/` are an excellent place to
-keep one's own utility modules; each may be loaded once per
-session via `(REQUIRE 'NAME)`.
+Short forms exist for the common flags: `-e -l -c -r -L -W -V -h`.
 
-The interactive REPL prints results in the customary CL style.
-Multiple values are printed one per line:
+### 8.1 Environment Variables
+
+```
+    NCL_HEAP_BACKEND    pick the GC implementation:
+                          semispace   (default — production)
+                          page-heap   (under construction; see docs/GC_DESIGN.md)
+    NCL_LIBRARY         override the Library/ directory location
+    NCL_PACK_DIR        override the packs/ directory (Win32 metadata pack)
+```
+
+### 8.2 Library Bootstrap
+
+The driver looks for `Library/` next to its executable (or
+`NCL_LIBRARY` if you set it). If found, it prepends the directory
+to `*LOAD-PATH*` and runs `Library/init.lisp` if present. The
+shipping `init.lisp` `(require)`s the standard layer: `streams`,
+`conditions`, `loop`, `sequences`, `trees`, `characters`, `lists`,
+`places`, `numbers`, `xp`, `describe`, `events`, `hot-reload`, and
+— when `--windows` is on — the win32-* modules.
+
+Drop your own `.lisp` files into `Library/` and add `(require
+'name)` to `init.lisp` to load them every session. Each module is
+loaded exactly once per session; `REQUIRE` consults `*MODULES*`.
+
+### 8.3 The REPL
+
+Prompt is `ncl>`. Continued lines get `...>` until the input is a
+complete S-expression. Hit `(exit)`, `(quit)`, Ctrl+D, or Ctrl+Z to
+leave.
+
+Multiple values print one per line:
 
 ```
     > (VALUES 1 2 3)
@@ -788,117 +938,161 @@ Multiple values are printed one per line:
     2
 ```
 
-Striking control-D (Unix) or control-Z (Windows) ends the session,
-as does `(QUIT)`.
+Hot reload (Section 7.3) runs between prompts once you've called
+`(START-HOT-RELOAD)`. Each user input is wrapped in a top-level
+handler-case so errors print and the prompt comes back instead of
+taking the process down.
+
+### 8.4 The Cache
+
+NCL JIT-compiles your image on every launch. To keep that quick,
+the loader maintains a non-canonical artifact cache keyed by
+`(source hash, compiler version, codegen flags)`. On launch, the
+loader stats your source files and reuses cached artifacts where
+the key matches. Anything stale is recompiled.
+
+The cache is **never canonical**. Delete it whenever you want; it
+will rebuild. It never round-trips through git. Source files are
+the only persistence in this system — the image is what the running
+process *is*.
 
 ---
 
 ## APPENDIX I — Selected Standard Functions
 
-The following are available in every session unless `--lean` is
-requested. The list is not exhaustive; see `Lisp/core.lisp` for
-the full set, which is itself a readable example of the language.
+The list is not exhaustive; `Lisp/core.lisp` and the modules under
+`Lisp/Library/` are themselves readable examples of the language.
 
 ### Arithmetic and Numbers
 
 ```
     +  -  *  /  1+  1-                    arithmetic, variadic
-    TRUNCATE  REM  MOD                    integer division
+    TRUNCATE  REM  MOD                    integer division (3 forms)
     FLOOR  CEILING  ROUND                 division with rounding rule
     ABS  SIGNUM  MIN  MAX
     EXPT  SQRT  ISQRT  GCD  LCM
     ZEROP  PLUSP  MINUSP  ODDP  EVENP
-    =  <  >  <=  >=                       numeric comparison
+    =  <  >  <=  >=                       numeric comparison, variadic
     SIN  COS  TAN  ASIN  ACOS  ATAN
     SINH  COSH  TANH  EXP  LOG
-    NUMERATOR  DENOMINATOR  RATIONAL
-    ASH  LOGAND  LOGIOR  LOGXOR  LOGNOT
-    INTEGER-LENGTH  LOGBITP
+    NUMERATOR  DENOMINATOR  RATIONAL  RATIONALIZE
+    REALPART  IMAGPART  CONJUGATE  PHASE
+    ASH  LOGAND  LOGIOR  LOGXOR  LOGNOT  LOGEQV
+    INTEGER-LENGTH  LOGBITP  LOGCOUNT
+    RANDOM  MAKE-RANDOM-STATE
 ```
+
+Bignum promotion is transparent on `+`, `-`, `*`, `EXPT`, `ASH`,
+and friends — overflow a fixnum and you get a bignum without
+asking.
 
 ### Cons and List
 
 ```
     CAR  CDR  CONS  LIST  LIST*           construction
     NULL  CONSP  ATOM  LISTP              predicates
-    FIRST  SECOND  THIRD  ... FOURTH
+    FIRST .. FOURTH                       positional accessors
     CAAR  CADR  CDAR  CDDR  CADDR ...     classical compositions
     NTH  NTHCDR  LAST  BUTLAST
-    APPEND  REVERSE  NREVERSE  NCONC
-    COPY-LIST  LIST-LENGTH  LENGTH
-    MAPCAR  MAPC  EVERY  SOME
-    MEMBER  FIND  POSITION  ASSOC
-    FIND-IF  REMOVE-IF  REMOVE-IF-NOT  REMOVE
-    SORT  REMOVE-DUPLICATES
-    SET-DIFFERENCE  INTERSECTION  UNION
-    SUBSEQ
-    PUSH  POP                             (macros: cons / pop the place)
+    APPEND  REVERSE  NREVERSE  NCONC  REVAPPEND
+    COPY-LIST  COPY-TREE  LIST-LENGTH  LENGTH
+    MAPCAR  MAPC  MAPL  MAPLIST  MAPCAN  MAPCON
+    EVERY  SOME  NOTEVERY  NOTANY
+    MEMBER  MEMBER-IF  FIND  FIND-IF  POSITION  POSITION-IF
+    ASSOC  ASSOC-IF  RASSOC  PAIRLIS  ACONS
+    REMOVE  REMOVE-IF  REMOVE-IF-NOT  REMOVE-DUPLICATES
+    SORT  STABLE-SORT  MERGE
+    SET-DIFFERENCE  INTERSECTION  UNION  ADJOIN
+    SUBSEQ  TAILP  LDIFF  TREE-EQUAL  SUBST  SUBLIS
+    PUSH  POP  PUSHNEW                    place macros
 ```
 
 ### Equality and Type
 
 ```
     EQ                                    identity
-    EQL                                   eq, plus value-eq for numbers/chars
+    EQL                                   eq + value-eq for numbers/chars
     EQUAL                                 structural equality
-    TYPEP                                 (TYPEP X 'TYPE)
+    EQUALP                                EQUAL + case/numeric coercion
+    TYPEP   TYPE-OF
     SYMBOLP STRINGP VECTORP LISTP CONSP
-    NUMBERP INTEGERP FIXNUMP BIGNUMP
-    CHARACTERP FUNCTIONP
+    NUMBERP INTEGERP FIXNUMP BIGNUMP RATIONALP FLOATP COMPLEXP
+    CHARACTERP FUNCTIONP HASH-TABLE-P
 ```
 
 ### Strings, Vectors, Hash-Tables
 
 ```
-    LENGTH  CHAR  STRING-CHAR  STRING=    strings
-    AREF  SVREF  MAKE-ARRAY  VECTOR       vectors
-    MAKE-HASH-TABLE  GETHASH  REMHASH     hash tables
-    CLRHASH  HASH-TABLE-COUNT  MAPHASH
+    LENGTH  CHAR  STRING=  STRING<  STRING>           strings
+    STRING-UPCASE  STRING-DOWNCASE  STRING-CAPITALIZE
+    AREF  SVREF  MAKE-ARRAY  VECTOR  COPY-SEQ          vectors
+    MAKE-HASH-TABLE  GETHASH  REMHASH  CLRHASH         hash tables
+    HASH-TABLE-COUNT  HASH-TABLE-SIZE  MAPHASH
 ```
 
 ### Symbols and Functions
 
 ```
-    INTERN  MAKE-SYMBOL  GENSYM
+    INTERN  MAKE-SYMBOL  GENSYM  COPY-SYMBOL
     SYMBOL-FUNCTION  FBOUNDP  FMAKUNBOUND
+    SYMBOL-VALUE  BOUNDP  MAKUNBOUND
+    SYMBOL-NAME  SYMBOL-PACKAGE
     FDEFINITION  COMPLEMENT
-    FUNCALL  APPLY
+    FUNCALL  APPLY  MULTIPLE-VALUE-CALL
 ```
 
 ### Control and Sequencing
 
 ```
-    IF  WHEN  UNLESS  COND  CASE  TYPECASE
+    IF  WHEN  UNLESS  COND  CASE  TYPECASE  IF*
     AND  OR  NOT
     PROGN  PROG1  PROG2
-    LET  LET*  FLET  LABELS
+    LET  LET*  FLET  LABELS  SYMBOL-MACROLET
     BLOCK  RETURN-FROM  RETURN
-    LOOP  DOTIMES  DOLIST
-    VALUES  MULTIPLE-VALUE-BIND  MULTIPLE-VALUE-LIST
-    HANDLER-CASE  ERROR
+    LOOP  DOTIMES  DOLIST  DO  DO*  WHILE
+    VALUES  MULTIPLE-VALUE-BIND  MULTIPLE-VALUE-LIST  NTH-VALUE
+    HANDLER-CASE  HANDLER-BIND  RESTART-CASE  RESTART-BIND
+    INVOKE-RESTART  FIND-RESTART  COMPUTE-RESTARTS
+    ERROR  WARN  SIGNAL  CERROR  DEFINE-CONDITION
+    UNWIND-PROTECT
 ```
 
 ### Macros, Definition, Top-Level
 
 ```
-    DEFUN  DEFMACRO  LAMBDA
-    DEFPARAMETER  DEFVAR
-    DEFCLASS  DEFGENERIC  DEFMETHOD
-    MAKE-INSTANCE  SLOT-VALUE  SLOT-BOUNDP
-    FIND-CLASS  CLASS-OF  CLASS-PRECEDENCE-LIST
+    DEFUN  DEFMACRO  LAMBDA  MACROLET
+    DEFPARAMETER  DEFVAR  DEFCONSTANT
+    DEFCLASS  DEFGENERIC  DEFMETHOD  DEFINE-METHOD-COMBINATION
+    MAKE-INSTANCE  SLOT-VALUE  SLOT-BOUNDP  SLOT-MAKUNBOUND
+    FIND-CLASS  CLASS-OF  CLASS-PRECEDENCE-LIST  CLOS-TYPEP
     CALL-NEXT-METHOD  NEXT-METHOD-P
-    DEFSTRUCT
-    QUOTE  FUNCTION  SETQ  SETF
+    DEFSTRUCT  DEFPACKAGE  IN-PACKAGE  EXPORT  USE-PACKAGE
+    QUOTE  FUNCTION  SETQ  SETF  DEFSETF  PSETF
+    DECLARE  THE
+    MACROEXPAND  MACROEXPAND-1
 ```
 
 ### Input, Output, Files
 
 ```
-    PRINT  PRINC  TERPRI  FORMAT
+    READ  READ-FROM-STRING  PRINT  PRINC  TERPRI  WRITE
+    FORMAT  PPRINT
     OPEN-INPUT-FILE  OPEN-OUTPUT-FILE  OPEN-APPEND-FILE
     CLOSE-STREAM  READ-LINE  READ-CHAR-FROM  WRITE-STRING-TO
     FILE-POSITION  FILE-LENGTH  FILE-EXISTS  DELETE-FILE
-    WITH-OPEN-FILE
+    WITH-OPEN-FILE  WITH-OUTPUT-TO-STRING
+    MAKE-STRING-INPUT-STREAM  MAKE-STRING-OUTPUT-STREAM
+```
+
+### Threads
+
+```
+    CREATE-THREAD  CURRENT-THREAD-ID  THREAD-HANDLE
+    SUSPEND-THREAD  RESUME-THREAD  TERMINATE-THREAD
+    THREAD-SAFEPOINT  EXIT-THREAD
+    ALLOCATE-CRITICAL-SECTION  DEALLOCATE-CRITICAL-SECTION
+    ENTER-CRITICAL-SECTION  LEAVE-CRITICAL-SECTION
+    WITH-SYNCHRONIZATION
 ```
 
 ### Graphics (iGui)
@@ -908,19 +1102,43 @@ the full set, which is itself a readable example of the language.
     WITH-BATCH   CLEAR        FILL-RECT      STROKE-RECT
     FILL-OVAL    STROKE-OVAL  FILL-CIRCLE    STROKE-CIRCLE
     DRAW-LINE    DRAW-TEXT    DRAW-TEXT-STYLED  DRAW-ARC
-    MEASURE-TEXT  NEXT-EVENT  RGB  RGBA
+    MEASURE-TEXT  NEXT-EVENT  WITH-EVENTS-FROM
+    RGB  RGBA
     +BLACK+ +WHITE+ +RED+ +GREEN+ +BLUE+ +YELLOW+ +SLATE+ +PANEL+
     LOG-FORMAT   LOG-WRITE
+```
+
+### Windows FFI
+
+```
+    WIN32        DEFWIN32              dynamic + named entries
+    DEFUN-DLL                          Corman-style FFI declaration
+    WINDOWS-ENABLED-P                  is the surface live?
+    ON-UI-THREAD   POST-TO-UI-THREAD   marshal work to the message pump
+    DEFSTRUCT-WIN32                    struct layouts with packing
+    DEFINE-WIN32-CALLBACK              expose a Lisp fn to native code
+```
+
+### Developer Conveniences
+
+```
+    TRACE   UNTRACE                    function-call tracing
+    TIME    BENCH                      timing macros
+    DESCRIBE                           interactive inspection
+    MEMOIZE-FUNCTION   UNMEMOIZE-FUNCTION   automatic memoization
+    LAZY-CONS   LAZY-CDR   LAZY-TAKE   SICP-style streams
+    DISASSEMBLE                        show the JIT'd machine code
+    GC                                 force a collection
+    GC-STATS  ROOM                     heap statistics
 ```
 
 ---
 
 ## APPENDIX II — A Worked Example
 
-The following defines a tiny *symbolic differentiator* in the
-manner of McCarthy's original LISP examples. It accepts an
-algebraic expression and a variable, and returns the symbolic
-derivative.
+A symbolic differentiator, in the spirit of McCarthy's original
+LISP examples. Reads an algebraic expression and a variable;
+returns the symbolic derivative.
 
 ```
 (DEFUN DERIV (E X)
@@ -940,8 +1158,6 @@ derivative.
     (T (ERROR "DERIV: don't know how to differentiate ~S" E))))
 ```
 
-A session with the differentiator:
-
 ```
     > (DERIV 'X 'X)
     1
@@ -953,37 +1169,58 @@ A session with the differentiator:
     (* 3 (* (EXPT X 2) 1))
 ```
 
-A second pass, a *simplifier* (left as an exercise to the reader),
-would render these as `1`, `1`, `(* 2 X)`, and `(* 3 (EXPT X 2))`.
-The author hopes the practitioner will discover for himself that
-LISP is the language in which problems of this sort are most
-naturally expressed.
+A simplifier — left as an exercise — turns these into `1`, `1`,
+`(* 2 X)`, and `(* 3 (EXPT X 2))`. This is the kind of program LISP
+was made for, and it's the kind of program that is still hard to
+write fluently in anything else. Try it in Python.
 
 ---
 
-## APPENDIX III — Notes on the Implementation
+## APPENDIX III — What's Under the Hood
 
-NCL is implemented in the Rust language. The compiler is
-built on top of LLVM and emits machine code for the host
-architecture; every form, including those typed at the REPL, is
-compiled before it is executed.
+You don't need any of this to use NCL. The author records it
+because the curious always ask.
 
-The garbage collector is precise, generational (young / old, plus
-a pinned static area for compiled code), and stop-the-world. Each
-mutator thread allocates from a thread-local buffer and polls a
-flag at safe-points. Pointer tags occupy three bits; fixnums have
-the tag `000`, conses the tag `001`, forwarding pointers the tag
-`111`.
+**Compiler.** Reader → small typed IR → LLVM IR → machine code, JIT
+first. Every form, including the one you just typed at the prompt,
+is compiled. There is no interpreter. The compiler is written in
+Rust, hosted on LLVM, and emits for the host architecture.
+`disassemble` will show you what it produced.
 
-The image is not persistent. A session is constructed from source
-on every launch; an artifact cache, keyed by source hash, may be
-re-used or deleted at will without loss of correctness. Source
-files are the only persistence; the image is what the running
-process *is*.
+**GC.** Precise, generational, stop-the-world. Two GC-managed
+generations (young semispace + old two-semispace) plus a pinned
+static area for compiled code and the loaded image. Each mutator
+thread allocates from a thread-local buffer (TLAB) so the fast path
+takes no locks; each polls a safe-point flag and parks
+cooperatively. Pointer tags occupy three bits in a 64-bit word —
+fixnums tag `000`, conses tag `001`, forwarding pointers tag `111`.
+Roots come from LLVM `gc.statepoint`-emitted stack maps.
 
-These details should not concern the practitioner during ordinary
-use. The author records them only that the curious may know what
-is going on beneath the surface.
+**Image.** Not persistent. A session is constructed from source on
+every launch; the artifact cache keyed by `(source hash, compiler
+version, codegen flags)` may be reused or deleted without loss of
+correctness. Source files are the only persistence. The image is
+what the running process *is*.
+
+**Bignums.** Sign-magnitude, base-2³², stored as inline 8-byte
+header + variable-length limb tail in the static heap. Overflow
+promotion from fixnum is automatic at `+`, `-`, `*`, `EXPT`. The
+algorithms are textbook (schoolbook multiply, Knuth-D divide); a
+Karatsuba/Toom-3 ladder lives behind a tuning threshold.
+
+**Threads and the Windows surface.** When you start with `--windows`,
+thread 0 is the Win32 message pump; the Lisp evaluator runs on a
+worker thread; cross-thread Win32 calls marshal back to thread 0 via
+a private `WM_NCL_EXECUTE` message. Without `--windows`, Lisp runs
+on thread 0 like every other CLI program. The whole UI/runtime
+split lives behind a thin shim; the rest of `ncl-runtime` has no
+platform awareness.
+
+The simplicity rule applies to the rest of the system. The GC is
+intentionally complex — modern generational, multi-threaded,
+precisely-rooted collectors *are* complex, and that complexity buys
+real throughput and correctness. Everything else is meant to fit in
+a long evening's reading.
 
 ---
 
@@ -992,5 +1229,4 @@ you will have when you finally get it. That experience will make
 you a better programmer for the rest of your days, even if you
 never actually use LISP itself a lot."*  — Eric S. Raymond
 
-*The author would have it that the practitioner does, in fact, use
-LISP itself a lot.*
+*The author would prefer you used LISP itself a lot.*
