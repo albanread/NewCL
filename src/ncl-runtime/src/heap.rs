@@ -20,199 +20,16 @@
 
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::word::{Tag, Word};
 
-// -- Card table --------------------------------------------------------------
-//
-// Software card-marking for the old-heap write barrier. One byte per
-// CARD_SIZE_BYTES of old-heap storage. Mutator threads write to it
-// lock-free via atomic byte stores; the GC reads it during minor
-// collections to scan only the regions known to (possibly) hold
-// young pointers.
-//
-// False positives are fine — `copy_into` filters non-pointers and
-// pointers that aren't into young. False negatives (an unmarked
-// card that contains a young pointer) are NOT fine; the discipline
-// is that every old-heap store must mark.
-
-pub const CARD_SIZE_BYTES: usize = 512;
-pub const CARD_SIZE_CELLS: usize = CARD_SIZE_BYTES / 8;
-
-pub struct CardTable {
-    bytes: Box<[AtomicU8]>,
-}
-
-impl CardTable {
-    pub fn new(coverage_bytes: usize) -> CardTable {
-        let n_cards = coverage_bytes.div_ceil(CARD_SIZE_BYTES);
-        let v: Vec<AtomicU8> = (0..n_cards).map(|_| AtomicU8::new(0)).collect();
-        CardTable { bytes: v.into_boxed_slice() }
-    }
-
-    pub fn n_cards(&self) -> usize { self.bytes.len() }
-
-    /// Mark the card containing the given byte offset (relative to
-    /// the start of the covered region). Lock-free, single byte store.
-    pub fn mark_offset(&self, byte_offset: usize) {
-        let card = byte_offset / CARD_SIZE_BYTES;
-        if let Some(b) = self.bytes.get(card) {
-            b.store(1, Ordering::Relaxed);
-        }
-    }
-
-    pub fn is_dirty(&self, card: usize) -> bool {
-        self.bytes.get(card).is_some_and(|b| b.load(Ordering::Relaxed) != 0)
-    }
-
-    pub fn clear(&self, card: usize) {
-        if let Some(b) = self.bytes.get(card) {
-            b.store(0, Ordering::Relaxed);
-        }
-    }
-
-    pub fn clear_all(&self) {
-        for b in self.bytes.iter() {
-            b.store(0, Ordering::Relaxed);
-        }
-    }
-
-    /// Count dirty cards. Useful for tests and for diagnostics.
-    pub fn dirty_count(&self) -> usize {
-        self.bytes.iter().filter(|b| b.load(Ordering::Relaxed) != 0).count()
-    }
-}
-
-// -- HeapHeader --------------------------------------------------------------
-
-const TYPE_SHIFT: u32 = 0;
-const TYPE_BITS: u32 = 5;
-const TYPE_MASK: u64 = (1 << TYPE_BITS) - 1;
-
-const LEN_SHIFT: u32 = TYPE_SHIFT + TYPE_BITS;
-const LEN_BITS: u32 = 24;
-const LEN_MASK: u64 = (1 << LEN_BITS) - 1;
-
-const GC_SHIFT: u32 = LEN_SHIFT + LEN_BITS;
-const GC_BITS: u32 = 8;
-const GC_MASK: u64 = (1 << GC_BITS) - 1;
-
-pub const MAX_OBJECT_CELLS: u32 = (1 << LEN_BITS) - 1;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u8)]
-pub enum HeapType {
-    Symbol = 0,
-    Vector = 1,
-    Function = 2,
-    String = 3,
-    FfiBlock = 4,
-    Other = 5,
-    /// Arbitrary-precision integer. Layout under `bignum.rs`:
-    ///   cell 1: %BIGNUM marker symbol
-    ///   cell 2: sign (fixnum +1 or -1)
-    ///   cell 3: n_limbs (fixnum)
-    ///   cell 4: reserved (cached fixnum-equivalent / hash)
-    ///   cell 5..5+n_limbs: raw u64 limbs, little-endian
-    /// GC scans cells 0..=4 (header + boxed values), skips the
-    /// limb data — same shape as FfiBlock but with the bignum
-    /// marker for printer / typep recognition.
-    Bignum = 6,
-    /// IEEE 754 double-precision float. Layout under `float.rs`:
-    ///   cell 1: %FLOAT marker symbol
-    ///   cell 2: raw f64 bits (transmute, not a Word)
-    /// 2-cell payload (3 with header). GC scans the marker as a
-    /// Word; the f64 bits are opaque (probabilistic-correctness
-    /// is fine, same as bignum limbs).
-    Float = 7,
-    /// Exact rational. Layout under `ratio.rs`:
-    ///   cell 1: %RATIO marker symbol
-    ///   cell 2: numerator (Word — fixnum or bignum)
-    ///   cell 3: denominator (Word — fixnum or bignum, always > 1
-    ///           because we simplify and demote on construction)
-    /// 3-cell payload (4 with header). Both num and den ARE Words,
-    /// so the GC scan path treats them as live pointers naturally.
-    Ratio = 8,
-    /// Complex number. Layout under `complex.rs`:
-    ///   cell 1: %COMPLEX marker symbol
-    ///   cell 2: real part (Word — any real-number subtype)
-    ///   cell 3: imaginary part (Word — any real-number subtype,
-    ///           guaranteed non-zero after canonicalisation —
-    ///           imag-zero would demote to the real part)
-    /// 3-cell payload, identical shape to Ratio.
-    Complex = 9,
-}
-
-impl HeapType {
-    pub fn from_bits(bits: u8) -> Option<HeapType> {
-        match bits {
-            0 => Some(HeapType::Symbol),
-            1 => Some(HeapType::Vector),
-            2 => Some(HeapType::Function),
-            3 => Some(HeapType::String),
-            4 => Some(HeapType::FfiBlock),
-            5 => Some(HeapType::Other),
-            6 => Some(HeapType::Bignum),
-            7 => Some(HeapType::Float),
-            8 => Some(HeapType::Ratio),
-            9 => Some(HeapType::Complex),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-#[repr(transparent)]
-pub struct HeapHeader(u64);
-
-impl HeapHeader {
-    pub fn new(ty: HeapType, length_cells: u32) -> HeapHeader {
-        debug_assert!(length_cells <= MAX_OBJECT_CELLS);
-        let bits = ((ty as u64) << TYPE_SHIFT)
-            | (((length_cells as u64) & LEN_MASK) << LEN_SHIFT);
-        HeapHeader(bits)
-    }
-    pub fn raw(self) -> u64 { self.0 }
-    pub fn from_raw(bits: u64) -> HeapHeader { HeapHeader(bits) }
-    pub fn ty(self) -> HeapType {
-        HeapType::from_bits(((self.0 >> TYPE_SHIFT) & TYPE_MASK) as u8)
-            .expect("invalid header type")
-    }
-    pub fn length_cells(self) -> u32 {
-        ((self.0 >> LEN_SHIFT) & LEN_MASK) as u32
-    }
-    pub fn gc_bits(self) -> u8 {
-        ((self.0 >> GC_SHIFT) & GC_MASK) as u8
-    }
-    pub fn set_gc_bit(&mut self, bit: GcBit) {
-        self.0 |= (bit as u64) << GC_SHIFT;
-    }
-    pub fn clear_gc_bit(&mut self, bit: GcBit) {
-        self.0 &= !((bit as u64) << GC_SHIFT);
-    }
-    pub fn has_gc_bit(self, bit: GcBit) -> bool {
-        (self.0 >> GC_SHIFT) & (bit as u64) != 0
-    }
-}
-
-impl std::fmt::Debug for HeapHeader {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HeapHeader")
-            .field("ty", &self.ty())
-            .field("length_cells", &self.length_cells())
-            .field("gc_bits", &format_args!("{:#010b}", self.gc_bits()))
-            .finish()
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u8)]
-pub enum GcBit {
-    Mark = 0b0000_0001,
-    Tenured = 0b0000_0010,
-    Pinned = 0b0000_0100,
-}
+// Sub-phase 6.5: shared types extracted to `heap_common`. Re-export
+// so the rest of the runtime keeps compiling against
+// `use crate::heap::{HeapHeader, ...};` paths. Sub-phase 12 will
+// delete this module's semispace-specific contents but
+// heap_common.rs and these reexports will live on.
+pub use crate::heap_common::*;
 
 // -- Semispace ---------------------------------------------------------------
 
@@ -504,9 +321,11 @@ impl Semispace {
         header_cell: u64,
         len: usize,
     ) -> ! {
-        let ty_bits = ((header_cell >> TYPE_SHIFT) & TYPE_MASK) as u8;
+        let ty_bits = ((header_cell >> crate::heap_common::TYPE_SHIFT)
+            & crate::heap_common::TYPE_MASK) as u8;
         let ty = HeapType::from_bits(ty_bits);
-        let gc_bits = ((header_cell >> GC_SHIFT) & GC_MASK) as u8;
+        let gc_bits = ((header_cell >> crate::heap_common::GC_SHIFT)
+            & crate::heap_common::GC_MASK) as u8;
         let mut ctx = String::new();
         let lo = idx.saturating_sub(4);
         let hi = (idx + 5).min(self.top);

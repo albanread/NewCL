@@ -178,6 +178,21 @@ impl PageHeap {
         self.commit_page(idx).ok()?;
         // Assign generation / kind via desc_mut.
         *self.desc_mut(idx) = PageDesc::fresh(generation, kind);
+        // Bug #1 from the code review (docs/GC_DESIGN.md sub-phase
+        // 6.5): a previously-freed page may still carry stale
+        // start bits in the global bitmap from its prior tenant.
+        // After evacuation lands in sub-phase 7, recycled pages
+        // become routine; without this zero pass a conservative
+        // pointer landing on a stale `01`/`11` bit pattern would
+        // pass the start-bit gate and a) be incorrectly pinned, or
+        // b) be followed by the marker. Zero the page's 256-word
+        // slice of the start-bit table here.
+        const WORDS_PER_PAGE: usize = PAGE_SIZE_CELLS / CELLS_PER_STARTS_WORD;
+        let first_word = idx * WORDS_PER_PAGE;
+        let bits = self.start_bits_slice();
+        for w in first_word..first_word + WORDS_PER_PAGE {
+            bits[w].store(0, Ordering::Relaxed);
+        }
         Some(idx)
     }
 
@@ -507,5 +522,50 @@ mod tests {
             h.try_alloc_cons_in(Generation::G0).unwrap();
         }
         assert_eq!(h.desc(page).words_used, 20, "10 conses = 20 cells");
+    }
+
+    #[test]
+    fn recycle_page_clears_start_bits() {
+        // Regression test for bug #1 from the code review: after a
+        // page is freed and re-acquired, the global start_bits
+        // bitmap must NOT carry the prior tenant's `11`/`01`
+        // patterns. Before the fix, evacuation would have shipped
+        // pages back to the Free pool with stale bits set; the
+        // conservative pinner would then accept bogus pointers
+        // that happened to land on them.
+        let mut h = small_heap();
+        let p = h.try_alloc_cons_in(Generation::G0).unwrap();
+        let base = h.base_ptr() as usize;
+        let cell_idx = (p.as_ptr() as usize - base) / 8;
+        let page_idx = cell_idx / PAGE_SIZE_CELLS;
+        assert!(
+            is_start_at(h.start_bits_slice(), cell_idx),
+            "fresh cons must have its start bit set"
+        );
+        // Manually release the page (simulates sub-phase 7 freeing
+        // an evacuated page back to the Free pool).
+        h.desc_mut(page_idx).release();
+        // Reset the corresponding alloc region so the next acquire
+        // doesn't try to re-use the now-Free page through the
+        // cached current_page pointer.
+        {
+            let r = h.alloc_region_mut(Generation::G0, PageKind::Cons);
+            *r = AllocRegion::empty(Generation::G0, PageKind::Cons);
+        }
+        // Re-acquire (should be the same page since it's the first
+        // free one in our tiny 8-page heap).
+        let new_idx = h
+            .acquire_free_page(Generation::G0, PageKind::Cons)
+            .expect("re-acquire");
+        assert_eq!(new_idx, page_idx, "should recycle the just-freed page");
+        // EVERY cell of the page must now have a clear start bit —
+        // the stale `11` from the previous tenant is gone.
+        let first_cell = page_idx * PAGE_SIZE_CELLS;
+        for c in first_cell..first_cell + PAGE_SIZE_CELLS {
+            assert!(
+                !is_start_at(h.start_bits_slice(), c),
+                "cell {c} still has a stale start bit after recycle"
+            );
+        }
     }
 }

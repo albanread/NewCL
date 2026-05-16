@@ -400,6 +400,7 @@ impl GcCoordinator {
         self.heap.lock().unwrap().used_bytes()
     }
 
+    #[allow(deprecated)]
     pub fn young_used_bytes(&self) -> usize {
         self.heap.lock().unwrap().young_used_bytes()
     }
@@ -413,6 +414,7 @@ impl GcCoordinator {
         self.heap.lock().unwrap().young_starts_handle()
     }
 
+    #[allow(deprecated)]
     pub fn old_used_bytes(&self) -> usize {
         self.heap.lock().unwrap().old_used_bytes()
     }
@@ -653,6 +655,7 @@ impl MutatorState {
     /// The standard minor-GC implementation. Extracted from
     /// `trigger_minor_gc` so a future auto-full-GC escalation path
     /// can share the "did we already park everyone" decision point.
+    #[allow(deprecated)] // calls young_used_bytes (deprecated; sub-phase 12)
     fn do_minor_gc(&mut self) {
         // We are the trigger. Set the flag; this prevents new
         // mutators from entering allocation slow paths or running

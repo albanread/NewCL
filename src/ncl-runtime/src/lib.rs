@@ -24,6 +24,7 @@ pub mod gc_string;
 pub mod gc_symbol;
 pub mod heap;
 pub mod heap_backend;
+pub mod heap_common;
 pub mod page_heap;
 #[cfg(windows)]
 pub mod igui;

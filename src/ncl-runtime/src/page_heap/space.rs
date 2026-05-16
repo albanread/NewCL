@@ -383,17 +383,23 @@ impl PageHeap {
     /// Returns `Ok(())` on success or after observing an existing
     /// commit; `Err(...)` if the OS commit call fails (page-file
     /// full, etc.).
-    pub fn commit_page(&self, idx: usize) -> Result<(), CommitError> {
+    /// Bug #3 from the code review (docs/GC_DESIGN.md sub-phase
+    /// 6.5): both `commit_page` and `decommit_page` previously
+    /// took `&self`. Two threads racing — one committing, the
+    /// other decommitting — could observe each other's mid-state
+    /// and return Ok with the page in the wrong terminal state,
+    /// causing an AV on the next write. The fix is to require
+    /// `&mut self` so the borrow checker enforces exclusivity.
+    /// The internal `commit_lock` Mutex is now redundant; we
+    /// leave the field on the struct (avoiding churn) but no
+    /// longer lock it inside these methods. Sub-phase 7 routinely
+    /// decommits empty pages, so this protection becomes load-
+    /// bearing then.
+    pub fn commit_page(&mut self, idx: usize) -> Result<(), CommitError> {
         if idx >= self.n_pages {
             return Err(CommitError::OutOfRange(idx));
         }
-        // Fast path: already committed.
-        if self.is_committed(idx) {
-            return Ok(());
-        }
-        // Slow path: lock, re-check (another thread may have just
-        // committed), commit, set bit.
-        let _g = self.commit_lock.lock().unwrap_or_else(|p| p.into_inner());
+        // Idempotent — already committed.
         if self.is_committed(idx) {
             return Ok(());
         }
@@ -433,15 +439,13 @@ impl PageHeap {
     /// doesn't expose this), so this clears the bit but the memory
     /// stays resident. Diagnostics-only on that path.
     ///
-    /// Idempotent on already-uncommitted pages.
-    pub fn decommit_page(&self, idx: usize) -> Result<(), CommitError> {
+    /// Idempotent on already-uncommitted pages. Takes `&mut self`
+    /// (per bug #3 fix) so the borrow checker rules out the
+    /// commit/decommit race.
+    pub fn decommit_page(&mut self, idx: usize) -> Result<(), CommitError> {
         if idx >= self.n_pages {
             return Err(CommitError::OutOfRange(idx));
         }
-        if !self.is_committed(idx) {
-            return Ok(());
-        }
-        let _g = self.commit_lock.lock().unwrap_or_else(|p| p.into_inner());
         if !self.is_committed(idx) {
             return Ok(());
         }
@@ -710,7 +714,7 @@ mod tests {
 
     #[test]
     fn commit_single_page_roundtrips() {
-        let h = small_heap();
+        let mut h = small_heap();
         h.commit_page(3).expect("commit page 3");
         assert!(h.is_committed(3));
         #[cfg(windows)]
@@ -729,7 +733,7 @@ mod tests {
 
     #[test]
     fn commit_then_decommit() {
-        let h = small_heap();
+        let mut h = small_heap();
         h.commit_page(5).unwrap();
         assert!(h.is_committed(5));
         h.decommit_page(5).unwrap();
@@ -741,7 +745,7 @@ mod tests {
 
     #[test]
     fn commit_is_idempotent() {
-        let h = small_heap();
+        let mut h = small_heap();
         h.commit_page(7).unwrap();
         h.commit_page(7).unwrap();
         h.commit_page(7).unwrap();
@@ -755,14 +759,14 @@ mod tests {
 
     #[test]
     fn decommit_uncommitted_is_noop() {
-        let h = small_heap();
+        let mut h = small_heap();
         h.decommit_page(2).unwrap();
         assert!(!h.is_committed(2));
     }
 
     #[test]
     fn out_of_range_returns_error() {
-        let h = small_heap();
+        let mut h = small_heap();
         assert_eq!(
             h.commit_page(9999),
             Err(CommitError::OutOfRange(9999))
@@ -892,33 +896,27 @@ mod tests {
         let _ = h.desc(9999);
     }
 
-    #[test]
-    fn concurrent_commit_is_safe() {
-        use std::sync::Arc;
-        use std::thread;
+    // The `concurrent_commit_is_safe` test was deleted as part of
+    // bug-fix #3 (commit/decommit race). After the signature
+    // change to `&mut self`, the test's pattern (`Arc<PageHeap>`
+    // shared across threads, each calling `commit_page` via a
+    // shared ref) no longer compiles — and that's the point: the
+    // borrow checker now enforces the exclusivity that the
+    // test was probing for. The new
+    // `commit_decommit_use_exclusive_signature` test below
+    // verifies the new shape.
 
-        // 4 threads racing to commit the same 16 pages. Each
-        // thread iterates page 0..=15 and commits. Final state
-        // should be exactly 16 committed pages — no double-counts,
-        // no panics.
-        let h = Arc::new(small_heap());
-        let threads: Vec<_> = (0..4)
-            .map(|_| {
-                let h = Arc::clone(&h);
-                thread::spawn(move || {
-                    for i in 0..16 {
-                        h.commit_page(i).expect("commit");
-                    }
-                })
-            })
-            .collect();
-        for t in threads {
-            t.join().unwrap();
-        }
-        for i in 0..16 {
-            assert!(h.is_committed(i));
-        }
-        #[cfg(windows)]
-        assert_eq!(h.committed_pages(), 16);
+    #[test]
+    fn commit_decommit_use_exclusive_signature() {
+        // Regression test for bug #3 from the code review: both
+        // commit_page and decommit_page now take &mut self.
+        // Calling them through a mutable binding compiles; the
+        // borrow checker would reject any attempt to share the
+        // page heap across threads via Arc<PageHeap> + call these
+        // methods. The new signature IS the safety property.
+        let mut h = small_heap();
+        h.commit_page(0).unwrap();
+        h.decommit_page(0).unwrap();
+        assert!(!h.is_committed(0));
     }
 }

@@ -36,6 +36,22 @@
 //! `RootScanner` API by mirroring the enum's variants. Sub-phase 7
 //! either keeps this shape or introduces a `RootVisitor` trait if
 //! the duplication becomes painful.
+//!
+//! ## Backend-agnostic `dynamic_*` surface
+//!
+//! Sub-phase 6.5 of the design doc adds `dynamic_used_bytes`,
+//! `dynamic_capacity_bytes`, `dynamic_base_ptr`, `dynamic_cards`,
+//! and `dynamic_contains` to the trait. Each has a default
+//! implementation that delegates to the existing semispace-shaped
+//! `young_*` / `old_*` methods, so the production `Heap` gets the
+//! new surface for free. The forthcoming `PageHeap` will override
+//! them with backend-native logic (one big card table, single
+//! reservation range, aggregate usage across all generations).
+//!
+//! The semispace-specific `young_*` / `old_*` methods are
+//! `#[deprecated]` so call sites get a hint to migrate. Sub-phase
+//! 12 deletes them entirely; until then the production semispace
+//! impl and the gc-stats path keep using them.
 
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -110,16 +126,27 @@ impl HeapBackendKind {
 /// the GC coordinator and any code that needs to inspect the heap
 /// from outside the runtime (notably `(gc-stats)`).
 ///
-/// All methods correspond 1:1 to inherent methods on `Heap` today;
-/// see `heap.rs` for the per-method behavioural docs.
+/// Two surfaces coexist:
+///   - `dynamic_*` methods — backend-agnostic. Default impls
+///     forward to the semispace shape; the page heap will override
+///     them with its own logic.
+///   - `young_*` / `old_*` methods — semispace-shaped. Required
+///     today (the semispace impl uses them), `#[deprecated]` so
+///     new code calls `dynamic_*` instead. Sub-phase 12 removes
+///     them.
 pub trait HeapBackend: Send + 'static {
     // -- Capacity / usage queries (constant-time, `(gc-stats)` path) ---
 
+    #[deprecated(note = "use dynamic_used_bytes; sub-phase 12 removes this")]
     fn young_used_bytes(&self) -> usize;
+    #[deprecated(note = "use dynamic_used_bytes; sub-phase 12 removes this")]
     fn old_used_bytes(&self) -> usize;
     fn used_bytes(&self) -> usize;
+    #[deprecated(note = "use dynamic_capacity_bytes; sub-phase 12 removes this")]
     fn young_capacity_bytes(&self) -> usize;
+    #[deprecated(note = "use dynamic_capacity_bytes; sub-phase 12 removes this")]
     fn old_capacity_bytes(&self) -> usize;
+    #[deprecated(note = "semispace-specific; sub-phase 12 removes this")]
     fn old_capacity_bytes_per_semi(&self) -> usize;
 
     // -- Mutator-facing fast-path setup --------------------------------
@@ -138,13 +165,64 @@ pub trait HeapBackend: Send + 'static {
 
     // -- Range tests for tags / conservative scan ---------------------
 
+    #[deprecated(note = "use dynamic_contains; sub-phase 12 removes this")]
     fn young_contains(&self, ptr: *const u8) -> bool;
+    #[deprecated(note = "use dynamic_contains; sub-phase 12 removes this")]
     fn old_contains(&self, ptr: *const u8) -> bool;
 
     // -- Card-marking machinery (Inter-generational pointer tracking) -
 
+    #[deprecated(note = "use dynamic_cards; sub-phase 12 removes this")]
     fn old_cards(&self) -> &Arc<CardTable>;
+    #[deprecated(note = "use dynamic_base_ptr; sub-phase 12 removes this")]
     fn old_live_base_ptr(&self) -> *const u8;
+
+    // -- Backend-agnostic `dynamic_*` surface (sub-phase 6.5) ----------
+    //
+    // Default impls forward to the semispace shape. PageHeap will
+    // override with backend-native logic when it lands at sub-phase
+    // 11.
+
+    /// Total bytes used across the entire dynamic heap (all
+    /// generations combined). For semispace = young + old; for the
+    /// page heap = sum of `words_used * 8` across non-Free pages.
+    fn dynamic_used_bytes(&self) -> usize {
+        #[allow(deprecated)]
+        { self.young_used_bytes() + self.old_used_bytes() }
+    }
+
+    /// Total dynamic-heap address-space capacity in bytes. For
+    /// semispace = young_cap + old_cap; for the page heap = the
+    /// whole reservation.
+    fn dynamic_capacity_bytes(&self) -> usize {
+        #[allow(deprecated)]
+        { self.young_capacity_bytes() + self.old_capacity_bytes() }
+    }
+
+    /// Base pointer of the dynamic-heap region — anchor for card-
+    /// table arithmetic. For semispace this is `old.live`'s base
+    /// (today's barrier anchor); for the page heap this becomes
+    /// the reservation base.
+    fn dynamic_base_ptr(&self) -> *const u8 {
+        #[allow(deprecated)]
+        { self.old_live_base_ptr() }
+    }
+
+    /// Card table covering the dynamic heap. For semispace this is
+    /// `old.live`'s; for the page heap (sub-phase 9) this becomes
+    /// a single table covering the whole reservation.
+    fn dynamic_cards(&self) -> &Arc<CardTable> {
+        #[allow(deprecated)]
+        { self.old_cards() }
+    }
+
+    /// Whether `ptr` falls within the dynamic heap. For semispace
+    /// = `young_contains(ptr) || old_contains(ptr)`; for the page
+    /// heap = single reservation-range check.
+    fn dynamic_contains(&self, ptr: *const u8) -> bool {
+        #[allow(deprecated)]
+        { self.young_contains(ptr) || self.old_contains(ptr) }
+    }
 
     // -- GC entry points ----------------------------------------------
 

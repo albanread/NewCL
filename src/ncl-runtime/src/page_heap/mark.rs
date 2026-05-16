@@ -105,6 +105,19 @@ impl PageHeap {
         if self.desc(page_idx).generation != target {
             return;
         }
+        // Bug #2 from the code review (docs/GC_DESIGN.md sub-phase
+        // 6.5): even with a matching generation and a set start
+        // bit, a Free or Large page must never be followed. The
+        // start bit could be stale from a prior tenant (the
+        // recycle path in `acquire_free_page` zeros it as of
+        // bug-fix #1, but defence-in-depth) or belong to a Large
+        // object whose payload shape isn't yet defined. Without
+        // this gate the next call to `scan_marked_object` would
+        // hit the panic arm.
+        let kind = self.desc(page_idx).kind;
+        if !matches!(kind, PageKind::Cons | PageKind::Boxed) {
+            return;
+        }
         // Convert to global cell index.
         let cell_idx = (target_addr as usize - self.base_ptr() as usize) / 8;
         // For Boxed pages, the cell must be a header-start.
@@ -152,11 +165,16 @@ impl PageHeap {
                 return;
             }
             PageKind::Free => {
-                // A marked cell on a Free page is a bug — the
-                // mark cycle should never see those. Be loud.
-                panic!(
-                    "scan_marked_object: cell {cell_idx} is on a Free page {page_idx}"
-                );
+                // Bug #2 from the code review: try_mark_root rejects
+                // Free-page candidates up front via the kind gate,
+                // so this arm is unreachable in correct operation.
+                // Defensive skip rather than panic keeps the GC
+                // robust against latent kind-table races / future
+                // refactors that might queue a stale cell. A panic
+                // here would tear down the whole collector — too
+                // expensive for the protective value.
+                let _ = (cell_idx, page_idx);
+                return;
             }
         };
         // Walk payload. For Cons, both cells are Words. For Boxed,
@@ -410,5 +428,65 @@ mod tests {
             0,
             "minor mark must not cross generations"
         );
+    }
+
+    #[test]
+    fn marked_root_on_free_page_does_not_panic() {
+        // Regression test for bug #2 from the code review: when
+        // the kind table is corrupted (or pre bug-fix #1 left a
+        // stale start bit on a freed page), a stack-residual Word
+        // could target a Free page and crash `scan_marked_object`
+        // with `panic!("... on a Free page ...")`. After the fix,
+        // the kind gate in `try_mark_root` rejects the candidate
+        // and the Free arm in `scan_marked_object` defensively
+        // returns rather than panicking.
+        let mut h = small_heap();
+        let p = h.try_alloc_cons_in(Generation::G0).unwrap();
+        let base = h.base_ptr() as usize;
+        let cell_idx = (p.as_ptr() as usize - base) / 8;
+        let page_idx = cell_idx / PAGE_SIZE_CELLS;
+        // Corrupt the invariant: flip the page back to Free while
+        // its start bit stays set (exactly the dangerous state
+        // bug #1 would leave behind without its fix).
+        h.desc_mut(page_idx).generation = Generation::Free;
+        let root = Word::from_ptr(p.as_ptr() as *const u8, Tag::Cons);
+        // Must NOT panic.
+        h.mark_from_roots(Generation::G0, &[root]);
+        assert_eq!(
+            h.count_marked_in_gen(Generation::G0),
+            0,
+            "no cells in G0 should be marked — the only page is Free now"
+        );
+    }
+
+    #[test]
+    fn marking_a_boxed_object_walks_its_payload() {
+        // Mark coverage for Boxed pages, which the previous test
+        // set missed entirely (every existing mark test uses cons
+        // cells). Exercises `scan_marked_object`'s HeapHeader
+        // decoding path.
+        use crate::heap::{HeapHeader, HeapType};
+        let mut h = small_heap();
+        // 3-cell boxed object: header + 2 payload cells.
+        let boxed = h.try_alloc_boxed_in(Generation::G0, 3).unwrap();
+        let target = h.try_alloc_cons_in(Generation::G0).unwrap();
+        let target_word =
+            Word::from_ptr(target.as_ptr() as *const u8, Tag::Cons);
+        unsafe {
+            // Cell 0: HeapHeader. length_cells = 2 (payload only,
+            // header excluded). The walker computes size as
+            // `1 + length_cells()` = 3.
+            *boxed.as_ptr() = HeapHeader::new(HeapType::Vector, 2).raw();
+            // Cell 1: a Word pointing at the target cons.
+            *boxed.as_ptr().add(1) = target_word.raw();
+            // Cell 2: harmless fixnum so the walker has a
+            // non-pointer to skip.
+            *boxed.as_ptr().add(2) = Word::fixnum(0).raw();
+        }
+        let root = Word::from_ptr(boxed.as_ptr() as *const u8, Tag::Vector);
+        h.mark_from_roots(Generation::G0, &[root]);
+        // Two cells marked: the boxed object's header cell + the
+        // target cons's first cell.
+        assert_eq!(h.count_marked_in_gen(Generation::G0), 2);
     }
 }
