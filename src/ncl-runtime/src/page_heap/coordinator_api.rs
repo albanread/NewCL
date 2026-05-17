@@ -523,15 +523,18 @@ fn clear_cards_unless_intergen(
     cells: usize,
 ) {
     use crate::word::{Tag, Word};
-    for card_idx in 0..cards.n_cards() {
+    // Bound the iteration to cards that actually cover the `cells`
+    // region — for the static area, `cells = used_cells` is much
+    // smaller than the full card-table size, and iterating over
+    // the out-of-range tail did one atomic `is_dirty` load per card
+    // for no purpose. For the reservation card table this is a
+    // no-op (cells already equals the full reservation).
+    let card_idx_max = cells.div_ceil(CARD_SIZE_CELLS).min(cards.n_cards());
+    for card_idx in 0..card_idx_max {
         if !cards.is_dirty(card_idx) {
             continue;
         }
         let card_start = card_idx * CARD_SIZE_CELLS;
-        if card_start >= cells {
-            cards.clear(card_idx);
-            continue;
-        }
         let card_end = (card_start + CARD_SIZE_CELLS).min(cells);
         let mut has_heap_pointer = false;
         for c in card_start..card_end {
@@ -574,14 +577,18 @@ fn scan_dirty_cards_as_roots(
     page_filter: Option<&[PageDesc]>,
 ) {
     use super::page_desc::Generation;
-    for card_idx in 0..cards.n_cards() {
+    // Bound at the top: cards past `cells.div_ceil(CARD_SIZE_CELLS)`
+    // cover no real cells. The previous loop ran 0..n_cards() and
+    // only `break`d when it hit a *dirty* card past `cells` — clean
+    // cards past the boundary still cost an atomic load each. For
+    // the static-area scan (cells = used_cells << capacity) that's
+    // millions of wasted loads.
+    let card_idx_max = cells.div_ceil(CARD_SIZE_CELLS).min(cards.n_cards());
+    for card_idx in 0..card_idx_max {
         if !cards.is_dirty(card_idx) {
             continue;
         }
         let card_start = card_idx * CARD_SIZE_CELLS;
-        if card_start >= cells {
-            break;
-        }
         let card_end = (card_start + CARD_SIZE_CELLS).min(cells);
 
         // If a page filter was supplied, gate by the page's
@@ -621,14 +628,13 @@ fn scan_dirty_cards_as_marks(
     page_filter: Option<&[PageDesc]>,
 ) {
     use super::page_desc::Generation;
-    for card_idx in 0..cards.n_cards() {
+    // See comment in scan_dirty_cards_as_roots — same bound rationale.
+    let card_idx_max = cells.div_ceil(CARD_SIZE_CELLS).min(cards.n_cards());
+    for card_idx in 0..card_idx_max {
         if !cards.is_dirty(card_idx) {
             continue;
         }
         let card_start = card_idx * CARD_SIZE_CELLS;
-        if card_start >= cells {
-            break;
-        }
         let card_end = (card_start + CARD_SIZE_CELLS).min(cells);
 
         if let Some(descs) = page_filter {
