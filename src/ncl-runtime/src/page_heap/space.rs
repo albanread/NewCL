@@ -161,6 +161,20 @@ pub struct PageHeap {
     /// `pub(super)` so sibling modules (`pin`, future `evacuate`)
     /// can mutate without going through accessors.
     pub(super) pinned_cells: std::collections::HashSet<usize>,
+    /// Per-page count of marked live object starts for the current
+    /// recycling-enabled evacuation cycle. Zeroed when inactive.
+    pub(super) recycle_live_counts: Vec<u16>,
+    /// Generation whose per-page live counts are currently valid.
+    /// `None` disables mid-evacuation page recycling.
+    pub(super) recycle_live_counts_target: Option<Generation>,
+    /// Most recent mark pass's total live start count in cells.
+    pub(super) last_mark_live_cells: usize,
+    /// Most recent mark pass's count of pages with at least one
+    /// marked live start.
+    pub(super) last_mark_live_pages: usize,
+    /// Number of zero-live, unpinned pages reclaimed before the
+    /// most recent evacuation started.
+    pub(super) last_zero_live_pages_released: usize,
     /// Minor cycles since the last G0 → G1 promotion. Incremented
     /// by `collect_minor`; reset to 0 on the cycle that promotes.
     /// Sub-phase 8 of `docs/GC_DESIGN.md`.
@@ -187,6 +201,16 @@ pub struct PageHeap {
     /// `n_cells` field too (currently always 0 — `PinScanResult`
     /// hasn't computed object sizes yet).
     pub(super) last_pin_summary: (usize, usize),
+    /// Soft cap on the number of G0 pages before the allocator
+    /// refuses to open a fresh G0 page and forces a minor cycle.
+    /// Set from `young_bytes` in `PageHeap::new`; defaults to
+    /// `n_pages` (effectively unlimited) in `with_reservation`.
+    ///
+    /// This is the page-heap analogue of the semispace "young is
+    /// full" trigger. Without it, the page-heap freely promotes
+    /// G0 pages out of the shared reservation and `MINOR-GCS`
+    /// can stay zero indefinitely.
+    pub(super) young_page_cap: usize,
 }
 
 enum Backing {
@@ -255,7 +279,15 @@ impl PageHeap {
     pub fn new(young_bytes: usize, old_bytes: usize) -> Self {
         const MIN_BYTES: usize = 4 * PAGE_SIZE_BYTES;
         let bytes = (young_bytes + old_bytes).max(MIN_BYTES);
-        Self::with_reservation(bytes)
+        let mut heap = Self::with_reservation(bytes);
+        // Make `young_bytes` a real soft cap: the allocator stops
+        // opening fresh G0 pages once G0 reaches this many pages,
+        // forcing a minor cycle. Floor at 2 so a within-gen
+        // evacuation can copy survivors into at least one page
+        // while the other still holds the from-data.
+        let cap_pages = (young_bytes / PAGE_SIZE_BYTES).max(2);
+        heap.young_page_cap = cap_pages.min(heap.n_pages);
+        heap
     }
 
     /// Internal / test constructor: reserve `reserved_bytes` of
@@ -306,6 +338,7 @@ impl PageHeap {
         let mark_bits: Box<[u64]> = vec![0u64; n_mark_words].into_boxed_slice();
         // Pinned-cells set starts empty — no scan run yet.
         let pinned_cells = std::collections::HashSet::new();
+        let recycle_live_counts = vec![0u16; n_pages];
         // Card table covering the whole reservation. Same 512-byte
         // card granularity as the semispace heap so the IR-level
         // barrier shape is identical.
@@ -338,10 +371,16 @@ impl PageHeap {
                 start_bits,
                 mark_bits,
                 pinned_cells,
+                recycle_live_counts,
+                recycle_live_counts_target: None,
+                last_mark_live_cells: 0,
+                last_mark_live_pages: 0,
+                last_zero_live_pages_released: 0,
                 minors_since_g0_promote: 0,
                 g0_promotes_since_g1_promote: 0,
                 cards,
                 last_pin_summary: (0, 0),
+                young_page_cap: n_pages,
             }
         }
         #[cfg(not(windows))]
@@ -367,10 +406,16 @@ impl PageHeap {
                 start_bits,
                 mark_bits,
                 pinned_cells,
+                recycle_live_counts,
+                recycle_live_counts_target: None,
+                last_mark_live_cells: 0,
+                last_mark_live_pages: 0,
+                last_zero_live_pages_released: 0,
                 minors_since_g0_promote: 0,
                 g0_promotes_since_g1_promote: 0,
                 cards,
                 last_pin_summary: (0, 0),
+                young_page_cap: n_pages,
             }
         }
     }

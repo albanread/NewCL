@@ -56,6 +56,14 @@ impl Session {
 
     pub fn coord(&self) -> &Arc<GcCoordinator> { &self.coord }
 
+    /// Force a minor GC cycle. Used by integration tests and
+    /// diagnostic tooling to drive the collector deterministically
+    /// so a follow-up `(gc-stats)` reading is non-zero even on
+    /// workloads that wouldn't naturally fill the nursery.
+    pub fn force_gc(&mut self) {
+        self.mutator.collect_minor();
+    }
+
     /// Register this Session as the active one for the current
     /// thread, so `(eval-string ...)` from Lisp can route into it.
     /// Call this once after the Session is in its final memory
@@ -237,15 +245,36 @@ impl Session {
     }
 
     /// Returns a one-element Vec wrapping BODY_FORMS in `(BLOCK
-    /// <NAME> body…)` when the BLOCK macro is installed; otherwise
-    /// None, meaning "leave the body unchanged." Called from both
-    /// handle_defun and handle_defmacro.
+    /// <NAME> body…)` when the BLOCK macro is installed AND the
+    /// body actually uses `(return-from <NAME> …)` somewhere;
+    /// otherwise None, meaning "leave the body unchanged."
+    ///
+    /// Skipping the wrap is a major performance win: the BLOCK
+    /// macro expands to `(%native-block 'NAME (lambda () body…))`,
+    /// which allocates an env Vector + a Function on every call
+    /// to the defun. For tight recursive functions like
+    /// `demos/life.lisp`'s `member-cell` that don't use
+    /// `return-from`, those allocations are pure overhead and
+    /// drive the GC into a per-call cycle.
+    ///
+    /// The walk is syntactic over the unexpanded body. It misses
+    /// the case where a macro introduces `(return-from <NAME> …)`
+    /// at expansion time; that's rare in practice and the
+    /// trade-off is loud: such a macro will signal an
+    /// unmatched-block error at runtime, which is the same
+    /// failure mode as forgetting `(block …)` by hand. The
+    /// conservative variant remains available via the `BLOCK`
+    /// macro itself if a user writes `(block <NAME> body)`
+    /// explicitly.
     fn maybe_wrap_in_block(
         &self,
         name: &str,
         body_forms: &[Value],
     ) -> Option<Vec<Value>> {
         if body_forms.is_empty() || self.coord.macro_for("BLOCK").is_none() {
+            return None;
+        }
+        if !body_uses_return_from_name(body_forms, name) {
             return None;
         }
         Some(vec![wrap_body_in_block(name, body_forms)])
@@ -307,7 +336,7 @@ impl Session {
         let body_expr = lower::instrument_tail_for_mv(body_expr);
 
         let arity = params.required.len() as u32;
-        let code_ptr = ncl_llvm::jit_compile_function(arity, &body_expr)
+        let code_ptr = ncl_llvm::jit_compile_function(name, arity, &body_expr)
             .map_err(EvalError::Jit)?;
         let sym_word = self.coord.intern(name);
         gc_function::alloc_function_in_static(
@@ -793,6 +822,8 @@ fn install_native_functions(
                    ncl_runtime::test_panic_shim, 0);
     install_native(coord, mutator, "GC-STATS",
                    ncl_runtime::gc_stats_shim, 0);
+    install_native(coord, mutator, "GC",
+                   ncl_runtime::gc_force_shim, 0);
     install_native(coord, mutator, "JOIN-THREAD",
                    ncl_runtime::join_thread_shim, 1);
     install_native(coord, mutator, "SLEEP",
@@ -1468,6 +1499,38 @@ fn match_defun(
 /// Both symbols (`BLOCK` and `<name>`) are interned in
 /// `COMMON-LISP`; the macroexpander matches by name string, so
 /// the package choice is for hygiene only.
+/// Syntactic walk: is `(return-from <target_name> …)` anywhere in
+/// `body_forms`?
+///
+/// Matches by symbol name (case-insensitive — Common Lisp interns
+/// uppercased by default). Walks every Cons recursively. Used by
+/// `maybe_wrap_in_block` to decide whether a defun body actually
+/// needs the BLOCK wrap.
+fn body_uses_return_from_name(body_forms: &[Value], target_name: &str) -> bool {
+    body_forms
+        .iter()
+        .any(|f| value_uses_return_from_name(f, target_name))
+}
+
+fn value_uses_return_from_name(v: &Value, target_name: &str) -> bool {
+    let Value::Cons(c) = v else {
+        return false;
+    };
+    if let Value::Symbol(head) = &c.car {
+        if head.name.eq_ignore_ascii_case("return-from") {
+            if let Value::Cons(rest) = &c.cdr {
+                if let Value::Symbol(target) = &rest.car {
+                    if target.name.eq_ignore_ascii_case(target_name) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    value_uses_return_from_name(&c.car, target_name)
+        || value_uses_return_from_name(&c.cdr, target_name)
+}
+
 fn wrap_body_in_block(name: &str, body_forms: &[Value]) -> Value {
     let cl = ncl_runtime::universe()
         .find_package("COMMON-LISP")

@@ -12,6 +12,7 @@
 
 pub mod abi;
 pub mod bignum;
+pub mod brk;
 pub mod chars;
 pub mod complex;
 pub mod file_sys;
@@ -63,7 +64,7 @@ pub use abi::{
     ncl_abort_pending, ncl_alloc_cons, ncl_apply, ncl_aref_generic, ncl_aset_generic,
     ncl_build_rest_list, ncl_call, ncl_car, ncl_cdr, ncl_equal, ncl_funcall,
     ncl_length, ncl_load_function, ncl_load_value, ncl_lookup_keyword,
-    ncl_make_closure, ncl_set_car,
+    ncl_make_closure, ncl_pop_root, ncl_push_root, ncl_set_car,
     ncl_set_cdr, ncl_set_mv_many, ncl_set_mv_single, ncl_store_value,
     ncl_string_char, ncl_string_eq, ncl_string_set,
     vector_shim, word_hash_shim,
@@ -123,7 +124,7 @@ pub use heap::{
     CardTable, GcBit, Heap, HeapHeader, HeapType, CARD_SIZE_BYTES, CARD_SIZE_CELLS,
     MAX_OBJECT_CELLS,
 };
-pub use mutator::{gc_stats_shim, GcConfig, GcCoordinator, GcStats, MutatorHandle, MutatorState};
+pub use mutator::{gc_force_shim, gc_stats_shim, GcConfig, GcCoordinator, GcStats, MutatorHandle, MutatorState};
 pub use stack_map::{LiveSlot, ParkedFrame, StackMap, StackMapEntry, walk_parked_frame};
 pub use static_area::StaticArea;
 pub use symbol::{Package, Symbol, Visibility};

@@ -35,9 +35,19 @@ fn usage() {
     eprintln!("                         page-heap  (under construction — see docs/GC_DESIGN.md)");
     eprintln!("  NCL_LIBRARY          override the Library/ directory location");
     eprintln!("  NCL_PACK_DIR         override the packs/ directory (Win32 metadata pack)");
+    eprintln!("  NCL_YOUNG_MB         young-heap reservation in MB (default 256)");
+    eprintln!("  NCL_OLD_MB           old-heap reservation in MB (default 2048)");
+    eprintln!("  NCL_STATIC_MB        static-area reservation in MB (default 1024,");
+    eprintln!("                       elastic on Windows — only committed as used)");
+    eprintln!("  NCL_TLAB_KB          per-mutator TLAB size in KB (default 2048)");
+    eprintln!("                       smaller values force GC pressure for testing");
 }
 
 fn main() -> ExitCode {
+    // Install the Windows last-resort SEH filter before anything that
+    // could fault. On non-Windows this is a no-op. Idempotent.
+    ncl_runtime::brk::install_crash_handler();
+
     let raw_args: Vec<String> = env::args().skip(1).collect();
 
     // Early-exit flags. Scan ALL of argv so position doesn't matter —

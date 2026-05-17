@@ -50,6 +50,7 @@
 //!   that bitmap — Cheney BFS discovers liveness as it goes.
 
 use std::ptr;
+use std::sync::OnceLock;
 
 use crate::heap::HeapHeader;
 use crate::word::{Tag, Word, PAYLOAD_MASK};
@@ -84,84 +85,285 @@ pub struct EvacResult {
     pub pages_flipped: usize,
 }
 
-/// One queue entry: an object that has just been copied into
-/// `dest_gen`. The BFS will visit its payload to find children
-/// that also need to be evacuated.
-#[derive(Clone, Copy, Debug)]
-struct CopiedObject {
-    /// Global cell index of this object's first cell in the
-    /// DESTINATION page.
-    to_cell_idx: usize,
-    /// Total cells (header + payload for boxed; 2 for cons).
-    size: usize,
-    /// True for cons cells (both cells are Words). False for boxed
-    /// (cell 0 is HeapHeader, cells 1..size are payload Words).
-    is_cons: bool,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GcStallReason {
+    MidEvacOOM,
 }
 
-/// Stateful evacuator handed to the caller's root-walking closure.
-/// `visit(&mut Word)` is the only method the caller needs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GcStallError {
+    pub reason: GcStallReason,
+    pub from_gen: Generation,
+    pub dest_gen: Generation,
+    pub attempted_cells: usize,
+    pub attempted_kind: PageKind,
+    pub free_pages: usize,
+    pub g0_pages: usize,
+    pub g1_pages: usize,
+    pub tenured_pages: usize,
+    pub pinned_pages: usize,
+    pub pin_set_size: usize,
+    pub objects_copied_before_failure: usize,
+    pub cells_copied_before_failure: usize,
+    pub reserve_pages: usize,
+    pub mark_live_bytes: usize,
+    pub mark_live_pages: usize,
+    pub zero_live_pages_released: usize,
+    pub pages_recycled_mid_evac: usize,
+}
+
+impl GcStallError {
+    fn mid_evac_oom(
+        heap: &PageHeap,
+        from_gen: Generation,
+        dest_gen: Generation,
+        attempted_cells: usize,
+        attempted_kind: PageKind,
+        objects_copied_before_failure: usize,
+        cells_copied_before_failure: usize,
+        pages_recycled_mid_evac: usize,
+    ) -> Self {
+        Self {
+            reason: GcStallReason::MidEvacOOM,
+            from_gen,
+            dest_gen,
+            attempted_cells,
+            attempted_kind,
+            free_pages: heap.count_pages_in_gen(Generation::Free),
+            g0_pages: heap.count_pages_in_gen(Generation::G0),
+            g1_pages: heap.count_pages_in_gen(Generation::G1),
+            tenured_pages: heap.count_pages_in_gen(Generation::Tenured),
+            pinned_pages: heap.descs().iter().filter(|d| d.has_pins()).count(),
+            pin_set_size: heap.pinned_count(),
+            objects_copied_before_failure,
+            cells_copied_before_failure,
+            reserve_pages: heap.gc_free_page_reserve_for_mutator_slab(),
+            mark_live_bytes: heap.last_mark_live_bytes(),
+            mark_live_pages: heap.last_mark_live_pages(),
+            zero_live_pages_released: heap.last_zero_live_pages_released(),
+            pages_recycled_mid_evac,
+        }
+    }
+
+    pub fn render_with_runtime_context(
+        &self,
+        trigger: &str,
+        static_used_bytes: usize,
+        static_committed_bytes: usize,
+    ) -> String {
+        format!(
+            "gc-stall: reason={:?} trigger={trigger} from={:?} dest={:?} attempted-kind={:?} attempted-cells={} pages(free/g0/g1/tenured)={}/{}/{}/{} pinned-pages={} pin-set={} reserve-pages={} copied(objects/cells)={}/{} mark(live-bytes/live-pages/zero-live-pages-released)={}/{}/{} recycled-mid-evac={} static(used/committed)={}/{}",
+            self.reason,
+            self.from_gen,
+            self.dest_gen,
+            self.attempted_kind,
+            self.attempted_cells,
+            self.free_pages,
+            self.g0_pages,
+            self.g1_pages,
+            self.tenured_pages,
+            self.pinned_pages,
+            self.pin_set_size,
+            self.reserve_pages,
+            self.objects_copied_before_failure,
+            self.cells_copied_before_failure,
+            self.mark_live_bytes,
+            self.mark_live_pages,
+            self.zero_live_pages_released,
+            self.pages_recycled_mid_evac,
+            static_used_bytes,
+            static_committed_bytes,
+        )
+    }
+}
+
+pub fn install_quiet_gc_stall_panic_hook() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if info.payload().downcast_ref::<GcStallError>().is_some() {
+                return;
+            }
+            prev(info);
+        }));
+    });
+}
+
+/// Mode flag controlling how [`PageEvacuator::visit`] interprets a
+/// slot during the chunked two-phase mark-evacuate-rewrite cycle.
+/// See [`PageHeap::evacuate_with_roots`] for the driver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EvacMode {
+    /// Internal mark pass (test path only): visit sets the mark
+    /// bit at the target's start cell and queues for recursive
+    /// payload traversal. Mirrors `page_heap::mark::PageMarker`.
+    Mark,
+    /// Phase 2 rewrite (every chunk): visit reads the source cell
+    /// at the target address; if it holds a `Word::forward`,
+    /// rewrite the slot to point at the new location.
+    Rewrite,
+}
+
+/// Scanner handed to the caller's root-walking closure. The mode
+/// flag determines what `visit` does, but the call shape stays
+/// `evac.visit(slot)` either way — so neither the mutator-side
+/// closures nor the in-heap card scan need to know which phase
+/// they're feeding.
 pub struct PageEvacuator<'a> {
     heap: &'a mut PageHeap,
     from_gen: Generation,
     dest_gen: Generation,
-    queue: Vec<CopiedObject>,
-    /// Tally fields — published into `EvacResult` at end of cycle.
-    objects_copied: usize,
-    cells_copied: usize,
+    mode: EvacMode,
+    /// Cells queued for recursive payload mark traversal in `Mark`
+    /// mode. Empty in `Rewrite` mode.
+    mark_queue: Vec<usize>,
 }
 
 impl<'a> PageEvacuator<'a> {
-    /// Visit a root slot. Reads the current Word, decides whether
-    /// it needs to be copied / forwarded / left alone, and updates
-    /// the slot in place.
-    ///
-    /// Caller pattern (single-threaded under STW):
-    ///
-    /// ```ignore
-    /// heap.evacuate_with_roots(Gen::G0, Gen::G1, |evac| {
-    ///     for root_slot in mutator_roots.iter_mut() {
-    ///         evac.visit(root_slot);
-    ///     }
-    /// });
-    /// ```
+    /// Visit a root slot. Behavior depends on the mode: `Mark`
+    /// marks the reachable target's start cell and queues for
+    /// recursive payload mark; `Rewrite` consults the source cell
+    /// at the target address and rewrites the slot if a forwarding
+    /// marker is present.
     pub fn visit(&mut self, slot: &mut Word) {
-        let w = *slot;
-        if let Some(new) = self.maybe_copy(w) {
-            *slot = new;
+        match self.mode {
+            EvacMode::Mark => self.mark_visit_slot(slot),
+            EvacMode::Rewrite => {
+                if let Some(new) = self.maybe_rewrite(*slot) {
+                    *slot = new;
+                }
+            }
         }
     }
 
-    /// Same as `visit`, but for a raw cell address. Used by the
-    /// BFS drain to update payload Words in place at the
-    /// destination, and by the dirty-card scanner in
+    /// Same as [`Self::visit`], but for a raw cell address. Used
+    /// by the dirty-card scanner in
     /// `coordinator_api::collect_minor_with_static` to scan
     /// external regions (the static area, older-generation pages)
     /// for cross-gen pointers into `from_gen`.
     ///
     /// SAFETY: caller asserts `cell_ptr` is a valid `*mut u64`
     /// inside the page heap's reservation OR an externally-supplied
-    /// region (e.g., the static area) and points at an 8-byte
-    /// aligned cell. The cell content is read as a `Word`; if it
-    /// tags as a heap pointer into `from_gen`, evacuation runs and
-    /// the cell is rewritten.
+    /// region and points at an 8-byte-aligned cell. The cell content
+    /// is read as a `Word`. In `Mark` mode the slot is not written;
+    /// in `Rewrite` mode the cell is updated in place if it holds a
+    /// pointer whose source has a forwarding marker.
     pub unsafe fn visit_cell(&mut self, cell_ptr: *mut u64) {
         let raw = unsafe { *cell_ptr };
         let w = Word::from_raw(raw);
-        if let Some(new) = self.maybe_copy(w) {
-            unsafe { *cell_ptr = new.raw() };
+        match self.mode {
+            EvacMode::Mark => {
+                let mut tmp = w;
+                self.mark_visit_slot(&mut tmp);
+                // Mark never writes through to the slot.
+            }
+            EvacMode::Rewrite => {
+                if let Some(new) = self.maybe_rewrite(w) {
+                    unsafe { *cell_ptr = new.raw() };
+                }
+            }
         }
     }
 
-    /// Core decision: return the post-evacuation Word for `w`, or
-    /// `None` if the slot doesn't need rewriting (immediate, or
-    /// pointer outside `from_gen`, etc.).
-    fn maybe_copy(&mut self, w: Word) -> Option<Word> {
+    /// `Mark`-mode body. Mirrors `mark::PageHeap::try_mark_root`:
+    /// same gates (tag, page lookup, generation, kind, start-bit,
+    /// tag-vs-start consistency), same effect (sets a mark bit at
+    /// the target's start and queues for payload scan).
+    fn mark_visit_slot(&mut self, slot: &mut Word) {
+        let w = *slot;
         let tag = w.tag();
-        // Fast reject non-heap-pointer tags. Forward is rejected
-        // here because a Forward Word in a root slot would mean
-        // the GC was re-entered against an already-forwarded slot,
-        // which shouldn't happen under STW. Defensive None.
+        if !matches!(
+            tag,
+            Tag::Cons | Tag::Symbol | Tag::Vector | Tag::Function | Tag::String
+        ) {
+            return;
+        }
+        let target_addr = (w.raw() & PAYLOAD_MASK) as *const u8;
+        let page_idx = match self.heap.page_of(target_addr) {
+            Some(p) => p,
+            None => return,
+        };
+        if self.heap.desc(page_idx).generation != self.from_gen {
+            return;
+        }
+        let kind = self.heap.desc(page_idx).kind;
+        if !matches!(kind, PageKind::Cons | PageKind::Boxed) {
+            return;
+        }
+        let cell_idx =
+            (target_addr as usize - self.heap.base_ptr() as usize) / 8;
+        if !is_start_at(self.heap.start_bits_slice(), cell_idx) {
+            return;
+        }
+        let is_cons_start = super::alloc::is_cons_start_at(
+            self.heap.start_bits_slice(),
+            cell_idx,
+        );
+        match tag {
+            Tag::Cons if is_cons_start => {}
+            Tag::Symbol | Tag::Vector | Tag::Function | Tag::String
+                if !is_cons_start => {}
+            _ => return,
+        }
+        if self.heap.mark_cell(cell_idx) {
+            // Already marked — don't re-queue.
+            return;
+        }
+        self.mark_queue.push(cell_idx);
+    }
+
+    /// Drain the mark queue, walking each marked object's payload
+    /// and recursively marking heap-pointer children.
+    fn mark_drain(&mut self) {
+        while let Some(cell_idx) = self.mark_queue.pop() {
+            self.mark_scan_object(cell_idx);
+        }
+    }
+
+    /// Walk the payload cells of a marked object and call
+    /// `mark_visit_slot` on each. Same dispatch as
+    /// `mark::PageHeap::scan_marked_object`.
+    fn mark_scan_object(&mut self, cell_idx: usize) {
+        let page_idx = cell_idx / PAGE_SIZE_CELLS;
+        let kind = self.heap.desc(page_idx).kind;
+        let is_cons = match kind {
+            PageKind::Cons => true,
+            PageKind::Boxed => super::alloc::is_cons_start_at(
+                self.heap.start_bits_slice(),
+                cell_idx,
+            ),
+            _ => return,
+        };
+        let size = if is_cons {
+            2
+        } else {
+            let header_word = self.read_cell(cell_idx);
+            let h = HeapHeader::from_raw(header_word);
+            1 + h.length_cells() as usize
+        };
+        let payload_start = if is_cons { cell_idx } else { cell_idx + 1 };
+        let payload_end = cell_idx + size;
+        for c in payload_start..payload_end {
+            let w = Word::from_raw(self.read_cell(c));
+            let mut tmp = w;
+            self.mark_visit_slot(&mut tmp);
+        }
+    }
+
+    /// `Rewrite`-mode body. Returns the post-copy Word for a slot
+    /// whose target has a forwarding marker; otherwise `None`
+    /// (slot left untouched).
+    ///
+    /// Does NOT gate on `page.gen == from_gen`: a page that was a
+    /// from_gen source can have been flipped to `dest_gen` already
+    /// (for pinned pages, end of an earlier chunk's Phase 3), with
+    /// forward markers still sitting in its non-pinned cells. Words
+    /// elsewhere pointing at those source cells must still follow
+    /// the forward. `is_real_forward_target` validates the encoded
+    /// target lives in the reservation, which is the safety net.
+    fn maybe_rewrite(&self, w: Word) -> Option<Word> {
+        let tag = w.tag();
         if !matches!(
             tag,
             Tag::Cons | Tag::Symbol | Tag::Vector | Tag::Function | Tag::String
@@ -169,171 +371,23 @@ impl<'a> PageEvacuator<'a> {
             return None;
         }
         let target_addr = (w.raw() & PAYLOAD_MASK) as usize;
-        // Look up the source page.
         let page_idx = self.heap.page_of(target_addr as *const u8)?;
-        // Source must be in from_gen.
-        if self.heap.desc(page_idx).generation != self.from_gen {
+        if self.heap.desc(page_idx).generation == Generation::Free {
             return None;
         }
-        let from_cell_idx = (target_addr - self.heap.base_ptr() as usize) / 8;
-
-        // Start-bit gate: the target cell must be a real object
-        // start. Without this, a non-pointer payload word that
-        // coincidentally tags as a heap pointer and lands in
-        // `from_gen` would be followed as if it were a real
-        // reference, corrupting heap state (false copy + spurious
-        // forwarding marker + tag-confusion at the destination).
-        // The pin and mark passes apply the same gate; doing it
-        // here closes the same hole for evacuation.
-        if !is_start_at(self.heap.start_bits_slice(), from_cell_idx) {
-            return None;
-        }
-
-        // Tag-vs-start-bit consistency. A Cons-tagged Word must
-        // point at a cons-start cell (pair `11`); Symbol/Vector/
-        // Function/String-tagged Words must point at a boxed-
-        // header start (pair `01`). Mutator TLABs intermix conses
-        // and header-bearing objects on the same `PageKind::Boxed`
-        // page, so we can't dispatch on page.kind alone — the
-        // start-bit pattern is the source of truth.
-        let kind = self.heap.desc(page_idx).kind;
-        if matches!(kind, PageKind::Free | PageKind::Large) {
-            return None;
-        }
-        let is_cons_start = super::alloc::is_cons_start_at(
-            self.heap.start_bits_slice(),
-            from_cell_idx,
-        );
-        match tag {
-            Tag::Cons if is_cons_start => {}
-            Tag::Symbol | Tag::Vector | Tag::Function | Tag::String
-                if !is_cons_start => {}
-            // Tag/start-bit mismatch — bogus pointer or tag-confused
-            // root. Refuse.
-            _ => return None,
-        }
-
-        // Is the source already forwarded? If yes, just re-tag and
-        // return the forward target.
-        let src_header_raw = self.read_cell(from_cell_idx);
-        if Word::from_raw(src_header_raw).is_forward() {
-            let new_ptr = Word::from_raw(src_header_raw)
-                .forward_target()
-                .expect("forward target");
-            return Some(Word::from_ptr(new_ptr as *const u8, tag));
-        }
-
-        // Pinned? Don't move it — keep the slot pointing at the
-        // original address. The pinned object's page stays alive
-        // (and flips to dest_gen at end of cycle) and the cell
-        // there is still valid.
-        if self.heap.is_pinned_cell(from_cell_idx) {
-            return Some(w);
-        }
-
-        // Real copy. Determine size from the start-bit pattern,
-        // not the page kind — mutator TLABs intermix conses and
-        // boxed objects on the same Boxed page.
-        let (size, is_cons) = if is_cons_start {
-            (2, true)
-        } else {
-            let h = HeapHeader::from_raw(src_header_raw);
-            (1 + h.length_cells() as usize, false)
-        };
-
-        // Allocate at destination. The allocator may need to acquire
-        // a fresh page from the free list; if that fails the heap
-        // is full and we have no recourse but to leave the slot
-        // alone. Sub-phase 10 will pre-allocate evacuation budget;
-        // for sub-phase 7 we panic — running out of room mid-evac is
-        // a programming bug in the test sizing, not a recoverable
-        // production state.
-        let dest_ptr = if is_cons {
-            self.heap
-                .try_alloc_cons_in(self.dest_gen)
-                .expect("page heap exhausted mid-evacuation")
-        } else {
-            self.heap
-                .try_alloc_boxed_in(self.dest_gen, size)
-                .expect("page heap exhausted mid-evacuation")
-        };
-        // Bytewise copy of the cells. Source and destination
-        // reservations are disjoint pages, so a plain
-        // copy_nonoverlapping is safe even though it's the same
-        // arena.
-        let src_ptr =
-            unsafe { (self.heap.base_ptr() as *mut u64).add(from_cell_idx) };
-        unsafe {
-            ptr::copy_nonoverlapping(src_ptr, dest_ptr.as_ptr(), size);
-        }
-
-        // Compute the destination's global cell index. Used for
-        // the BFS queue and (indirectly) for any future caller
-        // querying "where is this now?".
-        let dest_cell_idx = (dest_ptr.as_ptr() as usize
-            - self.heap.base_ptr() as usize)
-            / 8;
-
-        // Write the forwarding pointer at the SOURCE. This both
-        // (a) lets later visits to the same object short-circuit
-        // through the forward check, and (b) tells future passes
-        // (e.g., card scanning) that this cell is no longer a
-        // live object header.
-        unsafe {
-            *src_ptr =
-                Word::forward(dest_ptr.as_ptr() as *const ()).raw();
-        }
-
-        // Push BFS entry. The drain loop will walk this object's
-        // payload at the destination.
-        self.queue.push(CopiedObject {
-            to_cell_idx: dest_cell_idx,
-            size,
-            is_cons,
-        });
-        self.objects_copied += 1;
-        self.cells_copied += size;
-        Some(Word::from_ptr(dest_ptr.as_ptr() as *const u8, tag))
+        let cell_idx = (target_addr - self.heap.base_ptr() as usize) / 8;
+        let src_raw = self.read_cell(cell_idx);
+        is_real_forward_target_at(self.heap, cell_idx, src_raw).map(|new_addr| {
+            Word::from_ptr(new_addr as *const u8, tag)
+        })
     }
 
-    /// Drain the work queue. Each entry describes one freshly-
-    /// copied object at the DESTINATION; we walk its payload
-    /// cells and run `maybe_copy` on each as a candidate Word,
-    /// updating in place at the destination.
-    fn drain(&mut self) {
-        // Index-based loop because new entries get pushed during
-        // iteration; we don't want to invalidate iterators.
-        let mut idx = 0;
-        while idx < self.queue.len() {
-            let obj = self.queue[idx];
-            // For cons: both cells are Words.
-            // For boxed: cells 1..size are payload Words. Cell 0
-            //   is the header, untouched (only the gc-bits + type
-            //   + length-cells field; not a pointer).
-            let (payload_start, n_words) = if obj.is_cons {
-                (obj.to_cell_idx, 2)
-            } else {
-                (obj.to_cell_idx + 1, obj.size - 1)
-            };
-            for i in 0..n_words {
-                let cell_idx = payload_start + i;
-                let cell_ptr = unsafe {
-                    (self.heap.base_ptr() as *mut u64).add(cell_idx)
-                };
-                unsafe { self.visit_cell(cell_ptr) };
-            }
-            idx += 1;
-        }
-    }
-
-    /// Read a raw u64 from a global cell index. Used by
-    /// `maybe_copy` to inspect a source header. Bounds-checked in
+    /// Read a raw u64 from a global cell index. Bounds-checked in
     /// debug.
     fn read_cell(&self, cell_idx: usize) -> u64 {
         debug_assert!(cell_idx < self.heap.total_cells());
-        let p = unsafe {
-            (self.heap.base_ptr() as *const u64).add(cell_idx)
-        };
+        let p =
+            unsafe { (self.heap.base_ptr() as *const u64).add(cell_idx) };
         unsafe { *p }
     }
 }
@@ -341,34 +395,52 @@ impl<'a> PageEvacuator<'a> {
 impl PageHeap {
     /// Evacuate every reachable object in `from_gen` into pages
     /// belonging to `dest_gen`. Pass `from_gen == dest_gen` for an
-    /// in-place mark-evacuate cycle; pass `dest_gen = from_gen.
-    /// promoted()` to promote.
+    /// in-place mark-evacuate cycle; pass `dest_gen =
+    /// from_gen.promoted()` to promote.
     ///
-    /// `visit_roots` is the caller's chance to feed in mutator
-    /// roots / static roots / dirty-card roots. For each root
-    /// slot, call `evac.visit(&mut slot)`; the slot will be
-    /// rewritten in place if the target moved.
+    /// ## Algorithm — block-incremental two-phase mark-evacuate-rewrite
     ///
-    /// Returns an `EvacResult` summarising what happened, suitable
-    /// for `(gc-stats)`.
+    /// 1. (Optional) **Internal mark pass**. If the caller hasn't
+    ///    run `mark_minor_with_static` first, drive a mark pass via
+    ///    `visit_roots` in `Mark` mode. Production path skips this
+    ///    (the coordinator runs mark first); test path uses it.
+    /// 2. **Pre-chunk release**. Snapshot `from_pages` and release
+    ///    every zero-mark unpinned page straight to Free, growing
+    ///    the dest budget for the first chunk.
+    /// 3. **Chunked loop**, iterating until every `from_page` is
+    ///    processed. Each chunk's size is bounded by current Free
+    ///    so Phase 1 can't run out of destination pages:
+    ///    - **Phase 1 (Copy)**: iterate marked starts on the
+    ///      chunk's source pages; copy each to `dest_gen` and
+    ///      write `Word::forward` at the source cell. Pinned cells
+    ///      are skipped (their pages will flip in Phase 3).
+    ///    - **Phase 2 (Rewrite)**: invoke `visit_roots` with the
+    ///      evacuator in `Rewrite` mode (rewrites mutator-root
+    ///      slots + dirty-card cells via the closure), then walk
+    ///      every live page in `from_gen` / `dest_gen` and rewrite
+    ///      payload Words whose targets carry a forwarding marker.
+    ///    - **Phase 3 (Reclaim)**: walk the chunk's source pages.
+    ///      Pages with pins flip to `dest_gen` in place, preserving
+    ///      pinned objects; pages without pins release to Free,
+    ///      growing the budget for the next chunk.
+    /// 4. **Cleanup**: clear pin set, mark bits, recycle-live-counts.
     ///
     /// ## Pre-conditions
     ///
-    /// - The caller has stopped the world (only one mutator —
-    ///   itself — touches the heap).
+    /// - The caller has stopped the world.
     /// - `from_gen` and `dest_gen` are valid generations
     ///   (`G0 / G1 / Tenured`); `Free` is invalid for either.
     ///
     /// ## Post-conditions
     ///
     /// - Every reachable-from-roots object in `from_gen` now lives
-    ///   in `dest_gen`.
-    /// - Pinned objects remain at their original addresses; their
-    ///   page generations have flipped to `dest_gen`.
+    ///   in `dest_gen` (with its in-heap references rewritten),
+    ///   except pinned objects which kept their original addresses.
+    /// - Pinned-page `from_gen` pages have flipped to `dest_gen`;
+    ///   their start bits are cleared except for the pinned starts.
     /// - Unpinned, fully-evacuated pages are back on the free list.
-    /// - `from_gen`'s alloc regions have been reset (their
-    ///   `current_page` may have been released).
-    /// - The pin set and mark bits for `from_gen` are cleared.
+    /// - `from_gen`'s alloc regions have been reset.
+    /// - The pin set, mark bits, and recycle-live-counts are cleared.
     pub fn evacuate_with_roots<F>(
         &mut self,
         from_gen: Generation,
@@ -387,41 +459,30 @@ impl PageHeap {
             "evacuate: dest_gen must not be Free"
         );
 
-        // Snapshot from-pages. After evacuation we'll iterate them
-        // again to decide release / flip.
-        let from_pages: Vec<usize> = self.pages_in_gen(from_gen).collect();
-
-        // Reset every from_gen alloc region. Its current_page may
-        // be a from-page that is about to be released or flipped.
-        // Future allocations into from_gen (if any — typically a
-        // mutator wouldn't ask for from_gen mid-cycle, but be
-        // defensive) re-acquire from the free list.
-        for kind in [PageKind::Cons, PageKind::Boxed] {
-            let r = self.alloc_region_mut(from_gen, kind);
-            *r = super::alloc::AllocRegion::empty(from_gen, kind);
+        // Step 1: ensure marks are populated. The production path
+        // runs `mark_minor_with_static` and seeds
+        // `recycle_live_counts` first; tests typically don't, so
+        // we drive an internal mark via the caller's closure.
+        let need_internal_mark =
+            !self.recycle_live_counts_active_for(from_gen);
+        if need_internal_mark {
+            self.clear_mark_bits_in_gen(from_gen);
+            let mut marker = PageEvacuator {
+                heap: self,
+                from_gen,
+                dest_gen,
+                mode: EvacMode::Mark,
+                mark_queue: Vec::new(),
+            };
+            visit_roots(&mut marker);
+            marker.mark_drain();
+            drop(marker);
+            self.prepare_recycle_live_counts_from_marks(from_gen);
         }
 
-        // Run the BFS evacuation.
-        let mut evac = PageEvacuator {
-            heap: self,
-            from_gen,
-            dest_gen,
-            queue: Vec::new(),
-            objects_copied: 0,
-            cells_copied: 0,
-        };
-        visit_roots(&mut evac);
-        evac.drain();
-        let objects_copied = evac.objects_copied;
-        let cells_copied = evac.cells_copied;
-        drop(evac);
-
-        // Snapshot each pinned cell's start-bit pattern BEFORE
-        // clearing page start bits — mutator TLABs intermix conses
-        // and boxed objects on the same `PageKind::Boxed` page, so
-        // page.kind is no longer enough to tell which kind of
-        // start-bit to re-set. `is_cons_start` is true for pair
-        // `11`, false for pair `01`.
+        // Snapshot the pinned cells with their is_cons bit BEFORE
+        // any start-bit clearing happens. Each chunk's Phase 3 uses
+        // this to restore start bits on flipped pages.
         let pinned_with_kind: Vec<(usize, bool)> = self
             .pinned_cells
             .iter()
@@ -434,70 +495,436 @@ impl PageHeap {
             })
             .collect();
 
-        // Walk from_pages: pinned → flip; un-pinned → release.
-        let mut pages_freed = 0;
-        let mut pages_flipped = 0;
-        for &page_idx in &from_pages {
-            if self.desc(page_idx).has_pins() {
-                // Pinned objects stay where they are. The page
-                // flips generation and resets age — sub-phase 8's
-                // age policy starts fresh on the survivors. `kind`,
-                // `words_used`, and `scan_start_offset` are
-                // preserved by virtue of only writing the fields we
-                // need to change. `pin_byte` will be cleared by the
-                // end-of-cycle `clear_all_pins` below.
-                let d = self.desc_mut(page_idx);
-                d.generation = dest_gen;
-                d.age = 0;
-                // Clear start bits on the page. The next loop re-
-                // sets the bits on pinned-object starts so future
-                // scanners can still find them; forwarded-cell
-                // markers and abandoned garbage on the page become
-                // invisible.
-                clear_page_start_bits(self.start_bits_slice(), page_idx);
-                pages_flipped += 1;
-            } else {
-                // No pins → page is garbage / fully evacuated.
-                // Release back to Free and zero its start bits.
-                self.desc_mut(page_idx).release();
-                clear_page_start_bits(self.start_bits_slice(), page_idx);
-                pages_freed += 1;
-            }
+        // Snapshot from_pages. Phase 3 of each chunk releases the
+        // chunk's zero-mark unpinned pages and counts them in
+        // `pages_freed`; we don't pre-release here so the EvacResult
+        // tally captures every reclaim.
+        let from_pages: Vec<usize> =
+            self.pages_in_gen(from_gen).collect();
+
+        // Reset from_gen alloc regions. Any prior `current_page`
+        // may be a page that got pre-released or will be released
+        // by a chunk; future allocs into from_gen re-acquire from
+        // the free list.
+        for kind in [PageKind::Cons, PageKind::Boxed] {
+            let r = self.alloc_region_mut(from_gen, kind);
+            *r = super::alloc::AllocRegion::empty(from_gen, kind);
         }
 
-        // Re-set start bits for the pinned cells using the snapshot
-        // taken before clearing. This preserves cons-vs-boxed
-        // distinction even when the page is `PageKind::Boxed` with
-        // a mix of object types.
-        let bits = self.start_bits_slice();
-        for (cell_idx, is_cons) in pinned_with_kind {
-            if is_cons {
-                set_cons_start_bit_at(bits, cell_idx);
-            } else {
-                set_start_bit_at(bits, cell_idx);
-            }
+        let mut total_objects_copied = 0usize;
+        let mut total_cells_copied = 0usize;
+        let mut total_pages_freed = 0usize;
+        let mut total_pages_flipped = 0usize;
+
+        // Step 3: chunked loop.
+        let mut idx = 0;
+        while idx < from_pages.len() {
+            let avail_free = self.count_pages_in_gen(Generation::Free);
+            // Pick chunk_size at 7/8 of avail_free. The 1/8 margin
+            // absorbs two sources of dest-demand slop:
+            //   - per-page density variance (older source pages
+            //     have more dead cells than newer ones; the
+            //     "1 source → 1 dest" worst case is conservative on
+            //     average but can be exceeded on dense tails),
+            //   - dest allocator fragmentation when a boxed object
+            //     can't fit in the current dest page's tail.
+            // Floor at 1 to guarantee progress; cap at remaining.
+            let chunk_size = ((avail_free * 7) / 8)
+                .max(1)
+                .min(from_pages.len() - idx);
+            let chunk_pages: Vec<usize> =
+                from_pages[idx..idx + chunk_size].to_vec();
+
+            let (chunk_objects, chunk_cells) = self.phase1_copy_chunk(
+                from_gen,
+                dest_gen,
+                &chunk_pages,
+                total_objects_copied,
+                total_cells_copied,
+                total_pages_freed,
+            );
+            total_objects_copied += chunk_objects;
+            total_cells_copied += chunk_cells;
+
+            self.phase2_rewrite(from_gen, dest_gen, &mut visit_roots);
+
+            let (released, flipped) = self.phase3_reclaim(
+                dest_gen,
+                &chunk_pages,
+                &pinned_with_kind,
+            );
+            total_pages_freed += released;
+            total_pages_flipped += flipped;
+
+            idx += chunk_size;
         }
 
-        // End of cycle: clear pins and mark bits for from_gen.
-        // (Pins were tracked against from_gen; flipped pages keep
-        // their PageDesc.pin_byte cleared so the next cycle starts
-        // fresh.)
+        // Step 4: end-of-cycle cleanup.
         self.clear_all_pins();
         self.clear_mark_bits_in_gen(from_gen);
+        self.clear_recycle_live_counts();
 
         EvacResult {
-            objects_copied,
-            cells_copied,
-            pages_freed,
-            pages_flipped,
+            objects_copied: total_objects_copied,
+            cells_copied: total_cells_copied,
+            pages_freed: total_pages_freed,
+            pages_flipped: total_pages_flipped,
         }
     }
 
+    /// Phase 1: iterate marked starts on each of `chunk`'s source
+    /// pages and copy them to `dest_gen`, writing in-heap forwarding
+    /// markers at the source. Pinned cells are skipped (they stay
+    /// in place; their pages will flip in Phase 3).
+    ///
+    /// Returns `(objects_copied, cells_copied)` for this chunk.
+    /// The carry-in tallies feed `GcStallError` on dest exhaustion.
+    fn phase1_copy_chunk(
+        &mut self,
+        from_gen: Generation,
+        dest_gen: Generation,
+        chunk: &[usize],
+        total_objects_so_far: usize,
+        total_cells_so_far: usize,
+        total_pages_freed_so_far: usize,
+    ) -> (usize, usize) {
+        let mut objs = 0usize;
+        let mut cells = 0usize;
+        for &page_idx in chunk {
+            // A page may have been pre-released for zero-mark or
+            // flipped during an earlier chunk; filter by current
+            // generation each iteration.
+            if self.desc(page_idx).generation != from_gen {
+                continue;
+            }
+            let first_cell = page_idx * PAGE_SIZE_CELLS;
+            let last_cell =
+                first_cell + self.desc(page_idx).words_used as usize;
+            let mut cell_idx = first_cell;
+            while cell_idx < last_cell {
+                if !self.is_marked(cell_idx) {
+                    cell_idx += 1;
+                    continue;
+                }
+                if !is_start_at(self.start_bits_slice(), cell_idx) {
+                    cell_idx += 1;
+                    continue;
+                }
+                let src = read_heap_cell(self, cell_idx);
+                if is_real_forward_target_at(self, cell_idx, src).is_some() {
+                    // Defensive — shouldn't fire under mark-driven
+                    // iteration, but harmless. NB: `Word::is_forward`
+                    // only checks the low 3 bits — a `Float`
+                    // HeapHeader (TYPE = 7 = 0b111) would otherwise
+                    // look identical. `is_real_forward_target` also
+                    // validates the encoded target sits inside the
+                    // reservation, which a Float header's tiny
+                    // payload bits never do.
+                    cell_idx += 1;
+                    continue;
+                }
+                let is_cons = super::alloc::is_cons_start_at(
+                    self.start_bits_slice(),
+                    cell_idx,
+                );
+                let size = if is_cons {
+                    2
+                } else {
+                    let h = HeapHeader::from_raw(src);
+                    1 + h.length_cells() as usize
+                };
+                if self.is_pinned_cell(cell_idx) {
+                    cell_idx += size;
+                    continue;
+                }
+
+                let dest_ptr = if is_cons {
+                    match self.try_alloc_cons_in(dest_gen) {
+                        Some(p) => p,
+                        None => std::panic::panic_any(
+                            GcStallError::mid_evac_oom(
+                                self,
+                                from_gen,
+                                dest_gen,
+                                size,
+                                PageKind::Cons,
+                                total_objects_so_far + objs,
+                                total_cells_so_far + cells,
+                                total_pages_freed_so_far,
+                            ),
+                        ),
+                    }
+                } else {
+                    match self.try_alloc_boxed_in(dest_gen, size) {
+                        Some(p) => p,
+                        None => std::panic::panic_any(
+                            GcStallError::mid_evac_oom(
+                                self,
+                                from_gen,
+                                dest_gen,
+                                size,
+                                PageKind::Boxed,
+                                total_objects_so_far + objs,
+                                total_cells_so_far + cells,
+                                total_pages_freed_so_far,
+                            ),
+                        ),
+                    }
+                };
+
+                let src_ptr = unsafe {
+                    (self.base_ptr() as *mut u64).add(cell_idx)
+                };
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        src_ptr,
+                        dest_ptr.as_ptr(),
+                        size,
+                    );
+                }
+                unsafe {
+                    *src_ptr =
+                        Word::forward(dest_ptr.as_ptr() as *const ()).raw();
+                }
+                objs += 1;
+                cells += size;
+                cell_idx += size;
+            }
+        }
+        (objs, cells)
+    }
+
+    /// Phase 2: rewrite Words that point at forwarding markers.
+    /// Walks (a) caller's roots + dirty cards via the closure, and
+    /// (b) every live page in `from_gen` and `dest_gen` to find
+    /// in-heap pointers.
+    fn phase2_rewrite<F>(
+        &mut self,
+        from_gen: Generation,
+        dest_gen: Generation,
+        visit_roots: &mut F,
+    ) where
+        F: FnMut(&mut PageEvacuator<'_>),
+    {
+        // 2a: walk caller-provided roots in Rewrite mode. The
+        // production closure also walks static-area and reservation
+        // dirty cards via `scan_dirty_cards_as_roots` (which goes
+        // through `evac.visit_cell`); both paths see the same mode.
+        {
+            let mut rewriter = PageEvacuator {
+                heap: self,
+                from_gen,
+                dest_gen,
+                mode: EvacMode::Rewrite,
+                mark_queue: Vec::new(),
+            };
+            visit_roots(&mut rewriter);
+        }
+
+        // 2b: walk every live page in EVERY generation (not just
+        // from/dest). This is over-cautious — a clean write-barrier
+        // implementation guarantees that any older-gen Word pointing
+        // at `from_gen` was already dirtied and is scanned by the
+        // closure above. But while debugging Life we keep getting
+        // crashes from stale older-gen refs, suggesting a missing
+        // barrier somewhere. Walking everything closes that hole
+        // even at the cost of a full older-gen sweep. Revisit once
+        // Life is green; per-card walking is the long-term plan.
+        let live_pages: Vec<usize> = self
+            .descs()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| {
+                if d.generation != Generation::Free {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for page_idx in live_pages {
+            self.rewrite_page(from_gen, page_idx);
+        }
+    }
+
+    /// Walk one page's objects (via start bits), rewriting payload
+    /// Words that point at forwarding markers in `from_gen`.
+    fn rewrite_page(&mut self, from_gen: Generation, page_idx: usize) {
+        let desc = self.desc(page_idx);
+        if desc.generation == Generation::Free {
+            return;
+        }
+        let first_cell = page_idx * PAGE_SIZE_CELLS;
+        let last_cell = first_cell + desc.words_used as usize;
+        let mut cell_idx = first_cell;
+        while cell_idx < last_cell {
+            if !is_start_at(self.start_bits_slice(), cell_idx) {
+                cell_idx += 1;
+                continue;
+            }
+            let header_raw = read_heap_cell(self, cell_idx);
+            // A forwarding marker sits at the start cell of a copied
+            // source object. Its start bit is still set (from the
+            // original alloc) but there's no payload to walk — the
+            // cells past the marker were overwritten by neighbouring
+            // copies or are stale. Skip. The reservation check
+            // distinguishes a real forward marker from a `Float`
+            // HeapHeader (whose TYPE=7 also has low 3 = 0b111).
+            if is_real_forward_target_at(self, cell_idx, header_raw).is_some() {
+                cell_idx += 1;
+                continue;
+            }
+            let is_cons = super::alloc::is_cons_start_at(
+                self.start_bits_slice(),
+                cell_idx,
+            );
+            let size = if is_cons {
+                2
+            } else {
+                let h = HeapHeader::from_raw(header_raw);
+                1 + h.length_cells() as usize
+            };
+            let payload_start = if is_cons { cell_idx } else { cell_idx + 1 };
+            let payload_end = cell_idx + size;
+            for c in payload_start..payload_end {
+                let cell_ptr =
+                    unsafe { (self.base_ptr() as *mut u64).add(c) };
+                let raw = unsafe { *cell_ptr };
+                let w = Word::from_raw(raw);
+                if let Some(new) = self.maybe_rewrite_word(from_gen, w) {
+                    unsafe { *cell_ptr = new.raw() };
+                }
+            }
+            cell_idx += size;
+        }
+    }
+
+    /// Free-function-style `maybe_rewrite` for use inside
+    /// `rewrite_page` where we hold a `&mut self` and don't want to
+    /// construct a `PageEvacuator`.
+    ///
+    /// Unlike the `PageEvacuator::maybe_rewrite` method, this does
+    /// NOT gate on `page.gen == from_gen`. After a promotion
+    /// (`G0 → G1`), a page that was a from_gen source can end up
+    /// flipped to `dest_gen` (if pinned), with forward markers still
+    /// in its non-pinned cells. A Word elsewhere pointing at one of
+    /// those source cells must still follow the forward — the
+    /// generation gate would mis-fire and leave the Word dangling.
+    /// `is_real_forward_target` already validates the encoded target
+    /// lives in the heap reservation, which is enough.
+    fn maybe_rewrite_word(
+        &self,
+        _from_gen: Generation,
+        w: Word,
+    ) -> Option<Word> {
+        let tag = w.tag();
+        if !matches!(
+            tag,
+            Tag::Cons | Tag::Symbol | Tag::Vector | Tag::Function | Tag::String
+        ) {
+            return None;
+        }
+        let target_addr = (w.raw() & PAYLOAD_MASK) as usize;
+        let page_idx = self.page_of(target_addr as *const u8)?;
+        if self.desc(page_idx).generation == Generation::Free {
+            return None;
+        }
+        let cell_idx = (target_addr - self.base_ptr() as usize) / 8;
+        let src_raw = read_heap_cell(self, cell_idx);
+        is_real_forward_target_at(self, cell_idx, src_raw).map(|new_addr| {
+            Word::from_ptr(new_addr as *const u8, tag)
+        })
+    }
+
+    /// Phase 3: reclaim a chunk's source pages. Pages with pins
+    /// flip to `dest_gen` in place (preserving pinned objects);
+    /// pages without pins release to Free. Forwarding markers on
+    /// released pages drop with the page; markers on flipped pages
+    /// persist as unreachable cells (their start bits cleared so
+    /// future scans don't see them).
+    fn phase3_reclaim(
+        &mut self,
+        dest_gen: Generation,
+        chunk: &[usize],
+        pinned_with_kind: &[(usize, bool)],
+    ) -> (usize, usize) {
+        let mut released = 0usize;
+        let mut flipped = 0usize;
+        for &page_idx in chunk {
+            let desc = self.desc(page_idx);
+            if desc.generation == Generation::Free {
+                // Pre-released for zero-mark — skip here.
+                continue;
+            }
+            if desc.has_pins() {
+                // FLIP. Collect the pinned objects' byte ranges
+                // FIRST (we need to read each boxed header to know
+                // its length, before we zero anything around it).
+                let mut pinned_ranges: Vec<(usize, usize)> = Vec::new();
+                for &(cell_idx, is_cons) in pinned_with_kind {
+                    if cell_idx / PAGE_SIZE_CELLS != page_idx {
+                        continue;
+                    }
+                    let size = if is_cons {
+                        2
+                    } else {
+                        let header_raw = read_heap_cell(self, cell_idx);
+                        let h = HeapHeader::from_raw(header_raw);
+                        1 + h.length_cells() as usize
+                    };
+                    pinned_ranges.push((cell_idx, size));
+                }
+
+                let d = self.desc_mut(page_idx);
+                d.generation = dest_gen;
+                d.age = 0;
+                clear_page_start_bits(self.start_bits_slice(), page_idx);
+                let bits = self.start_bits_slice();
+                for &(cell_idx, is_cons) in pinned_with_kind {
+                    if cell_idx / PAGE_SIZE_CELLS != page_idx {
+                        continue;
+                    }
+                    if is_cons {
+                        set_cons_start_bit_at(bits, cell_idx);
+                    } else {
+                        set_start_bit_at(bits, cell_idx);
+                    }
+                }
+
+                // ZERO every cell on the page that isn't inside a
+                // pinned object's byte range. Non-pinned cells held
+                // either forward markers (from Phase 1) or original
+                // payload bytes of objects that have since been
+                // copied to dest. Leaving them readable means a
+                // stale Word elsewhere — one Phase 2 didn't reach
+                // — can be dereferenced and yield a
+                // valid-looking Lisp value (forward marker, cons
+                // header, etc.). Zeroing them turns any such
+                // dereference into "Fixnum 0", which the JIT
+                // can't mistake for a pointer.
+                zero_page_outside_ranges(self, page_idx, &pinned_ranges);
+
+                flipped += 1;
+            } else {
+                // RELEASE. The page goes to Free; its bytes are
+                // useless to anyone post-cycle. Zero them now so a
+                // stale Word that points into this page between
+                // release and the next `acquire_free_page` reads
+                // Fixnum 0 instead of a forward marker (or live-
+                // looking bytes from the just-copied object).
+                self.desc_mut(page_idx).release();
+                clear_page_start_bits(self.start_bits_slice(), page_idx);
+                zero_whole_page(self, page_idx);
+                released += 1;
+            }
+        }
+        (released, flipped)
+    }
+
     /// Convenience: evacuate using an array of root Words. Each
-    /// root is visited via `PageEvacuator::visit`; the array is
-    /// updated in place. Used primarily by tests and by simple
-    /// driver code; the production path takes `visit_roots` and
-    /// walks stack frames itself.
+    /// root is visited via [`PageEvacuator::visit`]; the array is
+    /// updated in place. Used primarily by tests; the production
+    /// path passes its own `visit_roots` closure.
     pub fn evacuate_from_word_roots(
         &mut self,
         from_gen: Generation,
@@ -510,6 +937,127 @@ impl PageHeap {
             }
         })
     }
+}
+
+/// Module-level helper: read a raw u64 from a global cell index.
+/// Free-function form to avoid clashing with `mark::PageHeap::read_cell`
+/// (which is private to that module).
+fn read_heap_cell(heap: &PageHeap, cell_idx: usize) -> u64 {
+    debug_assert!(cell_idx < heap.total_cells());
+    let p = unsafe { (heap.base_ptr() as *const u64).add(cell_idx) };
+    unsafe { *p }
+}
+
+/// Zero every cell of page `page_idx`. Used by Phase 3 when a page
+/// is released to Free — between release and the next
+/// `acquire_free_page`, the cells must not look like Lisp values to
+/// any stale Word that points at them.
+fn zero_whole_page(heap: &PageHeap, page_idx: usize) {
+    let first_cell = page_idx * PAGE_SIZE_CELLS;
+    let base = heap.base_ptr() as *mut u64;
+    unsafe {
+        core::ptr::write_bytes(base.add(first_cell), 0, PAGE_SIZE_CELLS);
+    }
+}
+
+/// Zero every cell on page `page_idx` that does NOT lie inside one
+/// of the given `(start_cell, size)` ranges. Used by Phase 3 when a
+/// page is flipped (gen changed in place because of pins): pinned
+/// objects' bytes must be preserved; everything else — including
+/// the forward markers Phase 1 wrote at non-pinned object starts —
+/// must be erased so the page can't accidentally answer a stale
+/// dereference with a Lisp-looking Word.
+///
+/// The ranges are arbitrary positions on the page; this walks
+/// cell-by-cell and skips past any range it lands inside.
+fn zero_page_outside_ranges(
+    heap: &PageHeap,
+    page_idx: usize,
+    pinned_ranges: &[(usize, usize)],
+) {
+    let first_cell = page_idx * PAGE_SIZE_CELLS;
+    let last_cell = first_cell + PAGE_SIZE_CELLS;
+    let base = heap.base_ptr() as *mut u64;
+    let mut c = first_cell;
+    while c < last_cell {
+        // If `c` falls inside a pinned-object range, jump past it.
+        let mut inside = None;
+        for &(start, size) in pinned_ranges {
+            if c >= start && c < start + size {
+                inside = Some(start + size);
+                break;
+            }
+        }
+        match inside {
+            Some(skip_to) => {
+                c = skip_to;
+            }
+            None => {
+                unsafe { *base.add(c) = 0 };
+                c += 1;
+            }
+        }
+    }
+}
+
+/// Check whether the cell at `cell_idx` is a real `Word::forward`
+/// marker written by Phase 1 in the CURRENT cycle.
+///
+/// Three gates:
+///   1. Cell content must have low 3 bits = `Tag::Forward` (0b111).
+///   2. The encoded target must lie inside the heap reservation.
+///   3. The cell's start bit must still be set.
+///
+/// Why each matters:
+///   - Gate 1 alone matches `Word::from_raw(...).is_forward()`, but
+///     a `HeapHeader` for `HeapType::Float` (TYPE=7=0b111) looks
+///     identical and would otherwise be followed as a forward.
+///   - Gate 2 rejects Float headers — their decoded "target" is the
+///     `length / gc_bits` field, typically under a few hundred,
+///     never a heap address.
+///   - Gate 3 distinguishes a CURRENT-cycle forward marker from a
+///     STALE one. Phase 1 writes the marker at an object's start
+///     cell (which has its start bit set). Phase 3 clears start
+///     bits for non-pinned cells on flipped pages and on released
+///     pages. So a stale marker from a prior cycle, lingering on a
+///     flipped page that survived to a later cycle, has had its
+///     start bit cleared — gate 3 rejects it. Without this check,
+///     `maybe_rewrite_word` would follow stale markers and rewrite
+///     references to invalid addresses (the source of the
+///     `<Cons:0x...>` + `<forward:0x...>` mutator crashes in
+///     `demos/life.lisp`).
+fn is_real_forward_target_at(
+    heap: &PageHeap,
+    cell_idx: usize,
+    raw: u64,
+) -> Option<*const ()> {
+    let w = Word::from_raw(raw);
+    if !w.is_forward() {
+        return None;
+    }
+    if !is_start_at(heap.start_bits_slice(), cell_idx) {
+        return None;
+    }
+    let target = w.forward_target()?;
+    if heap.page_of(target as *const u8).is_none() {
+        return None;
+    }
+    Some(target)
+}
+
+/// Variant that infers `cell_idx` from a raw heap pointer. Used by
+/// Phase 1's defensive "is this already forwarded?" check, where we
+/// know the cell index but want to call from a different impl block.
+fn is_real_forward_target(heap: &PageHeap, raw: u64) -> Option<*const ()> {
+    let w = Word::from_raw(raw);
+    if !w.is_forward() {
+        return None;
+    }
+    let target = w.forward_target()?;
+    if heap.page_of(target as *const u8).is_none() {
+        return None;
+    }
+    Some(target)
 }
 
 /// Zero every start-bit pair on the page `page_idx`. The page's
@@ -1060,6 +1608,39 @@ mod tests {
     }
 
     #[test]
+    fn boxed_evacuation_can_use_pages_reserved_from_mutator_slabs() {
+        // Regression: slab growth must stop before it consumes
+        // every Free page, otherwise within-gen evacuation has
+        // nowhere to land a boxed survivor.
+        let mut h = small_heap();
+        let boxed = h.try_alloc_boxed_in(Generation::G0, 2).unwrap();
+        unsafe {
+            *boxed.as_ptr() = HeapHeader::new(HeapType::Vector, 1).raw();
+            *boxed.as_ptr().add(1) = Word::fixnum(7).raw();
+        }
+        let original_addr = boxed.as_ptr() as usize;
+
+        while h.young_try_alloc_slab(super::super::space::PAGE_SIZE_CELLS).is_some() {}
+
+        let free_before_gc = h.count_pages_in_gen(Generation::Free);
+        assert!(
+            free_before_gc > 0,
+            "mutator slab growth must stop before consuming every free page"
+        );
+
+        let mut roots = [Word::from_ptr(boxed.as_ptr() as *const u8, Tag::Vector)];
+        let result = h.evacuate_from_word_roots(
+            Generation::G0,
+            Generation::G0,
+            &mut roots,
+        );
+        assert_eq!(result.objects_copied, 1, "boxed survivor should evacuate");
+
+        let new_addr = (roots[0].raw() & PAYLOAD_MASK) as usize;
+        assert_ne!(new_addr, original_addr, "boxed root should move during evacuation");
+    }
+
+    #[test]
     fn false_positive_payload_word_is_rejected() {
         // Regression: a payload Word whose bit pattern tags as
         // Cons but whose target is a non-start cell within
@@ -1248,20 +1829,162 @@ mod tests {
             is_cons_start_at(h.start_bits_slice(), p1_cell),
             "pinned cell keeps its cons-start bit"
         );
-        // p2 was evacuated: its old cell should have a forwarding
-        // pointer and NO start bit (we cleared the page's start
-        // bits and only re-set pinned ones).
+        // p2 was evacuated: its old cell should have NO start bit
+        // (Phase 3 cleared the page's start bits and only re-set
+        // pinned ones) AND the cell content should be zero (Phase 3
+        // also zeroes non-pinned cells on flipped pages so a stale
+        // Word elsewhere reading this cell yields Fixnum 0 instead
+        // of a forward marker that the JIT might dereference). See
+        // `zero_page_outside_ranges` and `docs/GC_CHUNKED_INVARIANTS.md`
+        // invariant I-6.
         let p2_cell = (p2.as_ptr() as usize - h.base_ptr() as usize) / 8;
         assert!(
             !is_start_at(h.start_bits_slice(), p2_cell),
             "evacuated cell's start bit cleared"
         );
-        // p2's CELL still contains a Forward Word for diagnostic
-        // purposes, but the start bit is gone so scanners ignore
-        // it.
         unsafe {
-            let w = Word::from_raw(*p2.as_ptr());
-            assert!(w.is_forward());
+            assert_eq!(
+                *p2.as_ptr(),
+                0,
+                "evacuated cell zeroed on flip (no stale forward marker)"
+            );
+        }
+    }
+
+    #[test]
+    fn mid_evac_oom_reports_structured_gc_stall() {
+        let mut h = PageHeap::with_reservation(64 * 1024);
+        let boxed = h.try_alloc_boxed_in(Generation::G0, 2).unwrap();
+        unsafe {
+            *boxed.as_ptr() = HeapHeader::new(crate::heap::HeapType::Vector, 1).raw();
+            *boxed.as_ptr().add(1) = Word::fixnum(9).raw();
+        }
+        let mut roots = [Word::from_ptr(boxed.as_ptr() as *const u8, Tag::Vector)];
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.evacuate_from_word_roots(Generation::G0, Generation::G0, &mut roots)
+        }))
+        .expect_err("within-gen evac on a one-page heap must stall");
+
+        let stall = panic
+            .downcast_ref::<GcStallError>()
+            .expect("panic payload should be GcStallError");
+        assert_eq!(stall.reason, GcStallReason::MidEvacOOM);
+        assert_eq!(stall.from_gen, Generation::G0);
+        assert_eq!(stall.dest_gen, Generation::G0);
+        assert_eq!(stall.attempted_kind, PageKind::Boxed);
+        assert_eq!(stall.attempted_cells, 2);
+        assert_eq!(stall.free_pages, 0);
+        assert_eq!(stall.g0_pages, 1);
+        assert_eq!(stall.objects_copied_before_failure, 0);
+        assert_eq!(stall.cells_copied_before_failure, 0);
+    }
+
+    #[test]
+    fn marked_within_gen_evacuation_recycles_from_pages() {
+        let mut h = small_heap();
+        let mut roots = Vec::new();
+
+        for marker in 0..7 {
+            let ptr = h
+                .try_alloc_boxed_in(Generation::G0, PAGE_SIZE_CELLS)
+                .expect("one page-sized object per page");
+            unsafe {
+                *ptr.as_ptr() =
+                    HeapHeader::new(HeapType::Vector, (PAGE_SIZE_CELLS - 1) as u32).raw();
+                for i in 1..PAGE_SIZE_CELLS {
+                    *ptr.as_ptr().add(i) = Word::fixnum(marker).raw();
+                }
+            }
+            roots.push(Word::from_ptr(ptr.as_ptr() as *const u8, Tag::Vector));
+        }
+
+        h.mark_from_roots(Generation::G0, &roots);
+        h.prepare_recycle_live_counts_from_marks(Generation::G0);
+
+        let result = h.evacuate_from_word_roots(
+            Generation::G0,
+            Generation::G0,
+            roots.as_mut_slice(),
+        );
+
+        assert_eq!(result.objects_copied, 7);
+        assert_eq!(h.count_pages_in_gen(Generation::G0), 7);
+        assert_eq!(h.count_pages_in_gen(Generation::Free), 1);
+    }
+
+    #[test]
+    fn promotion_recycle_skips_reused_pages_and_flips_pinned_pages() {
+        // With the chunked two-phase evacuator a chunk's source
+        // pages are released only after that chunk's Phase 3, so
+        // mid-cycle source-page reuse (Cheney's old recycler) no
+        // longer fires. The test now verifies the cycle's exposed
+        // invariants:
+        //
+        // - both non-pinned objects copied,
+        // - pinned page flipped (not released),
+        // - G0 fully drained,
+        // - G1 ends with one page per surviving object (two new
+        //   dest pages + one flipped),
+        // - root Words rewritten to live on G1 pages.
+        let mut h = small_heap();
+
+        let first = h
+            .try_alloc_boxed_in(Generation::G0, PAGE_SIZE_CELLS)
+            .expect("first page-sized object");
+        let pinned = h
+            .try_alloc_boxed_in(Generation::G0, PAGE_SIZE_CELLS)
+            .expect("pinned page-sized object");
+        let third = h
+            .try_alloc_boxed_in(Generation::G0, PAGE_SIZE_CELLS)
+            .expect("third page-sized object");
+
+        for (ptr, marker) in [(first, 11), (pinned, 22), (third, 33)] {
+            unsafe {
+                *ptr.as_ptr() =
+                    HeapHeader::new(HeapType::Vector, (PAGE_SIZE_CELLS - 1) as u32).raw();
+                for i in 1..PAGE_SIZE_CELLS {
+                    *ptr.as_ptr().add(i) = Word::fixnum(marker).raw();
+                }
+            }
+        }
+
+        let pinned_word = Word::from_ptr(pinned.as_ptr() as *const u8, Tag::Vector);
+        let pinned_stack: Box<[u64]> = vec![pinned_word.raw()].into_boxed_slice();
+        let lo = pinned_stack.as_ptr() as usize;
+        let hi = unsafe { pinned_stack.as_ptr().add(pinned_stack.len()) } as usize;
+        h.pin_pointers_in_ranges(Generation::G0, &[(lo, hi)]);
+
+        let mut roots = vec![
+            Word::from_ptr(first.as_ptr() as *const u8, Tag::Vector),
+            Word::from_ptr(third.as_ptr() as *const u8, Tag::Vector),
+        ];
+
+        h.mark_from_roots(Generation::G0, &roots);
+        h.prepare_recycle_live_counts_from_marks(Generation::G0);
+
+        let result = h.evacuate_from_word_roots(
+            Generation::G0,
+            Generation::G1,
+            roots.as_mut_slice(),
+        );
+
+        assert_eq!(result.objects_copied, 2);
+        assert_eq!(result.pages_flipped, 1);
+        assert_eq!(h.count_pages_in_gen(Generation::G0), 0);
+        assert_eq!(h.count_pages_in_gen(Generation::G1), 3);
+
+        // Both root Words must now point at G1 pages — either at
+        // a freshly-allocated dest or at the flipped pinned page.
+        for root in &roots {
+            let addr =
+                (root.raw() & crate::word::PAYLOAD_MASK) as *const u8;
+            let page = h.page_of(addr).expect("root in heap");
+            assert_eq!(
+                h.desc(page).generation,
+                Generation::G1,
+                "root rewritten to a G1 page"
+            );
         }
     }
 }

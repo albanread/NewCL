@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 
 use ncl_compiler::Session;
+use ncl_tests::TestSession;
 
 fn library_path(name: &str) -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -23,7 +24,7 @@ fn library_path(name: &str) -> PathBuf {
     p
 }
 
-fn fresh_session_with_describe() -> Session {
+fn fresh_session_with_describe() -> TestSession {
     let mut s = Session::with_stdlib().expect("session boots");
     s.activate();
     // describe leans on: streams (make-string-output-stream),
@@ -39,7 +40,7 @@ fn fresh_session_with_describe() -> Session {
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         s.eval(&src).unwrap_or_else(|e| panic!("load {name}: {e}"));
     }
-    s
+    TestSession::with_thread_name(s)
 }
 
 /// Capture DESCRIBE's output by passing an explicit
@@ -65,7 +66,9 @@ fn describe_to_string(s: &mut Session, target: &str) -> String {
 
 #[test]
 fn type_of_classifies_every_basic_kind() {
-    let mut s = Session::with_stdlib().expect("session boots");
+    let mut s = TestSession::with_thread_name(
+        Session::with_stdlib().expect("session boots"),
+    );
     s.activate();
     // Each TYPE-OF result is a symbol; the printed form is its name.
     assert_eq!(s.eval("(type-of 42)").unwrap(),       "FIXNUM");
@@ -80,7 +83,9 @@ fn type_of_classifies_every_basic_kind() {
 
 #[test]
 fn boundp_separates_bound_from_unbound() {
-    let mut s = Session::with_stdlib().expect("session boots");
+    let mut s = TestSession::with_thread_name(
+        Session::with_stdlib().expect("session boots"),
+    );
     s.activate();
     let prog = "
         (defparameter *bound-1* 42)
@@ -91,7 +96,9 @@ fn boundp_separates_bound_from_unbound() {
 
 #[test]
 fn symbol_value_reads_value_cell() {
-    let mut s = Session::with_stdlib().expect("session boots");
+    let mut s = TestSession::with_thread_name(
+        Session::with_stdlib().expect("session boots"),
+    );
     s.activate();
     let prog = "
         (defparameter *thing* 99)
@@ -102,7 +109,9 @@ fn symbol_value_reads_value_cell() {
 
 #[test]
 fn symbol_value_signals_for_unbound() {
-    let mut s = Session::with_stdlib().expect("session boots");
+    let mut s = TestSession::with_thread_name(
+        Session::with_stdlib().expect("session boots"),
+    );
     s.activate();
     let r = s.eval(
         "(handler-case (symbol-value 'definitely-not-bound)

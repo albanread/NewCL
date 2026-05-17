@@ -24,6 +24,7 @@
 use std::path::PathBuf;
 
 use ncl_compiler::Session;
+use ncl_tests::TestSession;
 
 /// Path to `Lisp/Library/threads.lisp` relative to the workspace
 /// root. `CARGO_MANIFEST_DIR` is the test crate's dir, so we walk
@@ -38,14 +39,14 @@ fn threads_lisp_path() -> PathBuf {
     p
 }
 
-fn fresh_session_with_threads() -> Session {
+fn fresh_session_with_threads() -> TestSession {
     let mut s = Session::with_stdlib().expect("session boots with stdlib");
     s.activate();
     let path = threads_lisp_path();
     let src = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     s.eval(&src).expect("Library/threads.lisp loads");
-    s
+    TestSession::with_thread_name(s)
 }
 
 #[test]

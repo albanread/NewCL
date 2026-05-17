@@ -21,6 +21,7 @@
 use std::path::PathBuf;
 
 use ncl_compiler::Session;
+use ncl_tests::TestSession;
 
 fn library_path(name: &str) -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -32,14 +33,14 @@ fn library_path(name: &str) -> PathBuf {
     p
 }
 
-fn fresh_session_with_places() -> Session {
+fn fresh_session_with_places() -> TestSession {
     let mut s = Session::with_stdlib().expect("session boots");
     s.activate();
     let path = library_path("places.lisp");
     let src = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     s.eval(&src).expect("Library/places.lisp loads");
-    s
+    TestSession::with_thread_name(s)
 }
 
 // ── (defun (setf NAME) …) — the compiler-side enabler ─────────────────
@@ -49,7 +50,9 @@ fn defun_setf_name_compiles_and_dispatches() {
     // No Library load — just verify the compiler accepts the
     // `(setf NAME)` shape on its own. User defines an accessor +
     // its setter; setf-fallback finds the setter.
-    let mut s = Session::with_stdlib().expect("session boots");
+    let mut s = TestSession::with_thread_name(
+        Session::with_stdlib().expect("session boots"),
+    );
     s.activate();
     let prog = "
         (defun my-foo (obj) (car obj))
@@ -66,7 +69,9 @@ fn defun_setf_supports_multiple_args() {
     // Verify the compiler accepts `(setf NAME)` defuns with more
     // than one place-arg. Stays inside core (no places.lisp
     // dependency) by using only setf-(car) under the hood.
-    let mut s = Session::with_stdlib().expect("session boots");
+    let mut s = TestSession::with_thread_name(
+        Session::with_stdlib().expect("session boots"),
+    );
     s.activate();
     let prog = "
         ;; Two-arg accessor: head of a numbered ALIST entry.

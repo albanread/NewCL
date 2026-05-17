@@ -36,7 +36,7 @@ use ncl_runtime::{
     ncl_abort_pending, ncl_alloc_cons, ncl_apply, ncl_aref_generic, ncl_aset_generic,
     ncl_build_rest_list, ncl_call, ncl_equal, ncl_funcall,
     ncl_length, ncl_load_function, ncl_load_value, ncl_lookup_keyword,
-    ncl_make_closure, ncl_set_car,
+    ncl_make_closure, ncl_pop_root, ncl_push_root, ncl_set_car,
     ncl_set_cdr, ncl_set_mv_many, ncl_set_mv_single, ncl_store_value,
     ncl_string_char, ncl_string_eq, ncl_string_set,
     MutatorState, Tag, Word,
@@ -126,7 +126,15 @@ pub fn jit_add(a: i64, b: i64) -> Result<i64, String> {
 /// parameters and no closure environment. Returns the result as
 /// a tagged `Word`.
 pub fn jit_eval(expr: &Expr, mutator: *mut MutatorState) -> Result<Word, String> {
-    let code = build_lisp_function(expr, 0)?;
+    // Synthetic name for top-level forms — used as the LLVM function
+    // name and registered with the SEH crash-trace symbol registry.
+    // The counter makes successive REPL forms distinguishable when
+    // they appear in a stack trace.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let idx = N.fetch_add(1, Ordering::Relaxed);
+    let name = format!("top_level_form_{idx}");
+    let code = build_lisp_function(&name, expr, 0)?;
     // C-unwind so a Rust panic raised in a runtime helper can
     // propagate through the JIT frame back to whatever
     // catch_unwind boundary called us. Without -unwind, Rust 1.71+
@@ -148,13 +156,21 @@ pub fn jit_eval(expr: &Expr, mutator: *mut MutatorState) -> Result<Word, String>
 ///   `extern "C" fn(*mut MutatorState, env: u64, *const u64, u64) -> u64`
 /// and is valid for the process lifetime. The `env` slot is the
 /// closure's captured-env Vector (or NIL for non-closures).
-pub fn jit_compile_function(arity: u32, body: &Expr) -> Result<usize, String> {
-    build_lisp_function(body, arity)
+pub fn jit_compile_function(
+    name: &str,
+    arity: u32,
+    body: &Expr,
+) -> Result<usize, String> {
+    build_lisp_function(name, body, arity)
 }
 
 // -- Implementation ---------------------------------------------------------
 
-fn build_lisp_function(body: &Expr, arity: u32) -> Result<usize, String> {
+fn build_lisp_function(
+    name: &str,
+    body: &Expr,
+    arity: u32,
+) -> Result<usize, String> {
     let context_ptr = keep_forever(Context::create());
     let context: &'static Context = unsafe { &*context_ptr };
 
@@ -170,7 +186,11 @@ fn build_lisp_function(body: &Expr, arity: u32) -> Result<usize, String> {
         &[ptr_t.into(), i64_t.into(), ptr_t.into(), i64_t.into()],
         false,
     );
-    let function = module.add_function("the_fn", fn_type, None);
+    // LLVM auto-renames duplicate function names within a module, but
+    // each compile uses a fresh module so the visible-name == the
+    // Lisp source name we were handed. That name then gets registered
+    // with the SEH crash-trace symbol registry below.
+    let function = module.add_function(name, fn_type, None);
     // `uwtable` tells the backend to emit unwind tables for this
     // function. On Windows we need them so a Rust panic raised in
     // a runtime helper (e.g. `error_shim`) can unwind back through
@@ -190,13 +210,43 @@ fn build_lisp_function(body: &Expr, arity: u32) -> Result<usize, String> {
 
     let helpers = declare_runtime_helpers(context, &module);
 
-    let mut locals: Vec<IntValue<'_>> = Vec::new();
+    let args_ptr = function.get_nth_param(2).unwrap().into_pointer_value();
+    let mut params: Vec<IntValue<'_>> = Vec::with_capacity(arity as usize);
+    for idx in 0..arity {
+        let i = context.i64_type().const_int(idx as u64, false);
+        let elem_ptr = unsafe {
+            builder
+                .build_in_bounds_gep(context.i64_type(), args_ptr, &[i], "param_ptr")
+                .map_err(|e| format!("gep param: {e}"))?
+        };
+        let val = builder
+            .build_load(context.i64_type(), elem_ptr, "param")
+            .map_err(|e| format!("load param: {e}"))?
+            .into_int_value();
+        params.push(val);
+    }
+
+    // Reserve locals[0] for the closure env. Every JIT'd function
+    // receives env as its second LLVM parameter (a heap-pointer
+    // Word into the env Vector for closures, NIL for plain defuns).
+    // GC can move the env Vector across safepoints inside the body,
+    // so we treat env as a mutable slot tracked by emit_safepoint_wrap:
+    // the wrap pushes locals (including locals[0]) onto the precise
+    // root list before the call and pops them back into fresh SSA
+    // values after, so post-call uses see the post-GC location.
+    //
+    // `Expr::Local(idx)` reads locals[idx + 1] to skip this reserved
+    // slot. `Expr::ClosureRef(idx)` reads locals[0] (rather than
+    // function.get_nth_param(1)) so it always sees the post-GC env.
+    let env_param = function.get_nth_param(1).unwrap().into_int_value();
+    let mut locals: Vec<IntValue<'_>> = vec![env_param];
     let result = emit_expr(
         context,
         &builder,
         &function,
         &helpers,
         arity,
+        &mut params,
         &mut locals,
         body,
     )?;
@@ -259,7 +309,7 @@ fn build_lisp_function(body: &Expr, arity: u32) -> Result<usize, String> {
     // `LLVMExecutionEngineRef` and call `LLVMAddGlobalMapping` /
     // `LLVMGetFunctionAddress` directly. We leak both the module
     // and the engine to match the existing `keep_forever` contract.
-    let addr = build_engine_and_get_fn_addr(&module, &helpers, "the_fn")?;
+    let addr = build_engine_and_get_fn_addr(&module, &helpers, name)?;
 
     let _ = keep_forever(module);
     Ok(addr)
@@ -345,6 +395,8 @@ fn build_engine_and_get_fn_addr(
     }
     unsafe {
         bind(engine, helpers.alloc_cons, ncl_alloc_cons as usize);
+        bind(engine, helpers.push_root, ncl_push_root as usize);
+        bind(engine, helpers.pop_root, ncl_pop_root as usize);
         bind(engine, helpers.call_fn, ncl_call as usize);
         bind(engine, helpers.funcall_fn, ncl_funcall as usize);
         bind(engine, helpers.make_closure, ncl_make_closure as usize);
@@ -387,6 +439,11 @@ fn build_engine_and_get_fn_addr(
         return Err(format!("LLVMGetFunctionAddress({fn_name}) returned 0"));
     }
 
+    // Register the JIT'd function with the crash-handler's symbol
+    // registry so a future SEH stack walk can resolve this RIP back
+    // to the Lisp routine name rather than printing a raw address.
+    ncl_runtime::brk::register_jit_symbol(raw_addr, fn_name);
+
     // Leak the engine. Drop would call LLVMDisposeExecutionEngine
     // which tears down our memory manager and unregisters nothing
     // — we'd be left with stale SEH function tables in the OS.
@@ -398,6 +455,8 @@ fn build_engine_and_get_fn_addr(
 
 struct Helpers<'ctx> {
     alloc_cons: FunctionValue<'ctx>,
+    push_root: FunctionValue<'ctx>,
+    pop_root: FunctionValue<'ctx>,
     call_fn: FunctionValue<'ctx>,
     funcall_fn: FunctionValue<'ctx>,
     make_closure: FunctionValue<'ctx>,
@@ -447,6 +506,22 @@ fn declare_runtime_helpers<'ctx>(
     let alloc_cons = module.add_function(
         "ncl_alloc_cons",
         alloc_cons_type,
+        Some(Linkage::External),
+    );
+
+    // ncl_push_root(mutator, w) -> u64 (root depth before push)
+    let push_root_type = i64_t.fn_type(&[ptr_t.into(), i64_t.into()], false);
+    let push_root = module.add_function(
+        "ncl_push_root",
+        push_root_type,
+        Some(Linkage::External),
+    );
+
+    // ncl_pop_root(mutator) -> u64
+    let pop_root_type = i64_t.fn_type(&[ptr_t.into()], false);
+    let pop_root = module.add_function(
+        "ncl_pop_root",
+        pop_root_type,
         Some(Linkage::External),
     );
 
@@ -701,6 +776,8 @@ fn declare_runtime_helpers<'ctx>(
 
     Helpers {
         alloc_cons,
+        push_root,
+        pop_root,
         call_fn,
         funcall_fn,
         make_closure,
@@ -736,6 +813,8 @@ fn declare_runtime_helpers<'ctx>(
 
 fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>) {
     engine.add_global_mapping(&helpers.alloc_cons, ncl_alloc_cons as *const () as usize);
+    engine.add_global_mapping(&helpers.push_root, ncl_push_root as *const () as usize);
+    engine.add_global_mapping(&helpers.pop_root, ncl_pop_root as *const () as usize);
     engine.add_global_mapping(&helpers.call_fn, ncl_call as *const () as usize);
     engine.add_global_mapping(&helpers.funcall_fn, ncl_funcall as *const () as usize);
     engine.add_global_mapping(&helpers.make_closure, ncl_make_closure as *const () as usize);
@@ -800,6 +879,8 @@ fn emit_overflow_op<'ctx>(
     builder: &Builder<'ctx>,
     function: &FunctionValue<'ctx>,
     helpers: &Helpers<'ctx>,
+    params: &mut Vec<IntValue<'ctx>>,
+    locals: &mut Vec<IntValue<'ctx>>,
     fast_lhs: IntValue<'ctx>,
     fast_rhs: IntValue<'ctx>,
     slow_lhs: IntValue<'ctx>,
@@ -871,19 +952,44 @@ fn emit_overflow_op<'ctx>(
     let fast_end_block = builder.get_insert_block().unwrap();
 
     // Slow-path block: bignum promotion helper.
+    // Snapshot locals/params BEFORE the wrap: the wrap will mutate
+    // them in place via pop-and-reload to track the post-GC values.
+    // We need to merge those mutated slots back at the join block
+    // (the fast path didn't reload anything, so its predecessor
+    // carries the pre-wrap SSA values).
+    let fast_locals_snapshot = locals.clone();
+    let fast_params_snapshot = params.clone();
     builder.position_at_end(slow_block);
     let mutator_arg = function.get_nth_param(0).unwrap();
-    let slow_call = builder
-        .build_call(
-            promote_helper,
-            &[mutator_arg.into(), slow_lhs.into(), slow_rhs.into()],
-            &format!("{op_name}_promote"),
-        )
-        .map_err(|e| format!("call {op_name}_promote: {e}"))?;
-    let slow_result = slow_call
-        .try_as_basic_value()
-        .unwrap_basic()
-        .into_int_value();
+    let extra_roots = [slow_lhs, slow_rhs];
+    let slow_result = emit_safepoint_wrap(
+        builder,
+        function,
+        helpers,
+        params,
+        locals,
+        &extra_roots,
+        || {
+            let slow_call = builder
+                .build_call(
+                    promote_helper,
+                    &[mutator_arg.into(), slow_lhs.into(), slow_rhs.into()],
+                    &format!("{op_name}_promote"),
+                )
+                .map_err(|e| format!("call {op_name}_promote: {e}"))?;
+            Ok(slow_call
+                .try_as_basic_value()
+                .unwrap_basic()
+                .into_int_value())
+        },
+    )?;
+    // The promote helper signals on non-numeric operands (via
+    // ncl_*_full → signal_condition_string). Without this check the
+    // PHI in the join block would observe the NIL placeholder as a
+    // valid arithmetic result.
+    emit_post_call_abort_check(context, builder, function, helpers)?;
+    let slow_locals_post_wrap = locals.clone();
+    let slow_params_post_wrap = params.clone();
     builder
         .build_unconditional_branch(join_block)
         .map_err(|e| format!("br slow→join: {e}"))?;
@@ -898,6 +1004,18 @@ fn emit_overflow_op<'ctx>(
         (&result_val, fast_end_block),
         (&slow_result, slow_end_block),
     ]);
+    merge_locals_params_at_join(
+        context,
+        builder,
+        locals,
+        params,
+        &fast_locals_snapshot,
+        &fast_params_snapshot,
+        fast_end_block,
+        &slow_locals_post_wrap,
+        &slow_params_post_wrap,
+        slow_end_block,
+    )?;
     Ok(phi.as_basic_value().into_int_value())
 }
 
@@ -914,6 +1032,8 @@ fn emit_div_op<'ctx>(
     builder: &Builder<'ctx>,
     function: &FunctionValue<'ctx>,
     helpers: &Helpers<'ctx>,
+    params: &mut Vec<IntValue<'ctx>>,
+    locals: &mut Vec<IntValue<'ctx>>,
     lhs: IntValue<'ctx>,
     rhs: IntValue<'ctx>,
     promote_helper: FunctionValue<'ctx>,
@@ -976,19 +1096,40 @@ fn emit_div_op<'ctx>(
     let fast_end_block = builder.get_insert_block().unwrap();
 
     // Slow path: bignum-aware helper.
+    // Snapshot locals/params before the wrap so we can merge with
+    // PHIs at the join (the wrap mutates them in place).
+    let fast_locals_snapshot = locals.clone();
+    let fast_params_snapshot = params.clone();
     builder.position_at_end(slow_block);
     let mutator_arg = function.get_nth_param(0).unwrap();
-    let slow_call = builder
-        .build_call(
-            promote_helper,
-            &[mutator_arg.into(), lhs.into(), rhs.into()],
-            &format!("{op_name}_promote"),
-        )
-        .map_err(|e| format!("call {op_name}_promote: {e}"))?;
-    let slow_result = slow_call
-        .try_as_basic_value()
-        .unwrap_basic()
-        .into_int_value();
+    let extra_roots = [lhs, rhs];
+    let slow_result = emit_safepoint_wrap(
+        builder,
+        function,
+        helpers,
+        params,
+        locals,
+        &extra_roots,
+        || {
+            let slow_call = builder
+                .build_call(
+                    promote_helper,
+                    &[mutator_arg.into(), lhs.into(), rhs.into()],
+                    &format!("{op_name}_promote"),
+                )
+                .map_err(|e| format!("call {op_name}_promote: {e}"))?;
+            Ok(slow_call
+                .try_as_basic_value()
+                .unwrap_basic()
+                .into_int_value())
+        },
+    )?;
+    // The promote helper signals on division by zero. Without this
+    // check the PHI in the join block would observe the NIL
+    // placeholder as a valid quotient.
+    emit_post_call_abort_check(context, builder, function, helpers)?;
+    let slow_locals_post_wrap = locals.clone();
+    let slow_params_post_wrap = params.clone();
     builder
         .build_unconditional_branch(join_block)
         .map_err(|e| format!("br slow→join: {e}"))?;
@@ -1002,6 +1143,18 @@ fn emit_div_op<'ctx>(
         (&fast_result, fast_end_block),
         (&slow_result, slow_end_block),
     ]);
+    merge_locals_params_at_join(
+        context,
+        builder,
+        locals,
+        params,
+        &fast_locals_snapshot,
+        &fast_params_snapshot,
+        fast_end_block,
+        &slow_locals_post_wrap,
+        &slow_params_post_wrap,
+        slow_end_block,
+    )?;
     Ok(phi.as_basic_value().into_int_value())
 }
 
@@ -1124,6 +1277,141 @@ fn emit_post_call_abort_check<'ctx>(
     Ok(())
 }
 
+/// Merge locals / params at a control-flow join after at least one
+/// predecessor mutated them through `emit_safepoint_wrap`'s
+/// pop-and-reload.
+///
+/// The wrap replaces each `locals[i]` / `params[i]` slot with a
+/// fresh SSA value defined inside the predecessor block. If sibling
+/// branches reach the same join block with different SSA values for
+/// the same slot, the join needs a PHI per slot — otherwise the
+/// post-join uses read whichever branch's value happened to be last
+/// in the slot, which doesn't dominate the join from the other
+/// predecessor and produces NULL dereferences at runtime.
+///
+/// Builder must be positioned at the join block before this is
+/// called. Emits one PHI per slot where the two branches diverged,
+/// and updates `locals` / `params` in place to reference the PHIs.
+fn merge_locals_params_at_join<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    locals: &mut Vec<IntValue<'ctx>>,
+    params: &mut Vec<IntValue<'ctx>>,
+    fast_locals: &[IntValue<'ctx>],
+    fast_params: &[IntValue<'ctx>],
+    fast_end: inkwell::basic_block::BasicBlock<'ctx>,
+    slow_locals: &[IntValue<'ctx>],
+    slow_params: &[IntValue<'ctx>],
+    slow_end: inkwell::basic_block::BasicBlock<'ctx>,
+) -> Result<(), String> {
+    let i64_t = context.i64_type();
+    debug_assert_eq!(fast_locals.len(), slow_locals.len());
+    debug_assert_eq!(fast_params.len(), slow_params.len());
+    debug_assert_eq!(fast_locals.len(), locals.len());
+    debug_assert_eq!(fast_params.len(), params.len());
+    for i in 0..locals.len() {
+        // Equality check is pointer-identity on the LLVM value;
+        // two distinct SSA values compare unequal even if they
+        // hold the same constant.
+        if fast_locals[i] != slow_locals[i] {
+            let phi = builder
+                .build_phi(i64_t, &format!("local_{i}_merge"))
+                .map_err(|e| format!("phi local {i}: {e}"))?;
+            phi.add_incoming(&[
+                (&fast_locals[i], fast_end),
+                (&slow_locals[i], slow_end),
+            ]);
+            locals[i] = phi.as_basic_value().into_int_value();
+        }
+    }
+    for i in 0..params.len() {
+        if fast_params[i] != slow_params[i] {
+            let phi = builder
+                .build_phi(i64_t, &format!("param_{i}_merge"))
+                .map_err(|e| format!("phi param {i}: {e}"))?;
+            phi.add_incoming(&[
+                (&fast_params[i], fast_end),
+                (&slow_params[i], slow_end),
+            ]);
+            params[i] = phi.as_basic_value().into_int_value();
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn emit_safepoint_wrap<'ctx, T>(
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    params: &mut Vec<IntValue<'ctx>>,
+    locals: &mut Vec<IntValue<'ctx>>,
+    extra_roots: &[IntValue<'ctx>],
+    emit_call: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let mutator_arg = function.get_nth_param(0).unwrap();
+
+    for param in params.iter().copied() {
+        builder
+            .build_call(
+                helpers.push_root,
+                &[mutator_arg.into(), param.into()],
+                "push_root",
+            )
+            .map_err(|e| format!("call push_root: {e}"))?;
+    }
+
+    for local in locals.iter().copied() {
+        builder
+            .build_call(
+                helpers.push_root,
+                &[mutator_arg.into(), local.into()],
+                "push_root",
+            )
+            .map_err(|e| format!("call push_root: {e}"))?;
+    }
+
+    for root in extra_roots.iter().copied() {
+        builder
+            .build_call(
+                helpers.push_root,
+                &[mutator_arg.into(), root.into()],
+                "push_root",
+            )
+            .map_err(|e| format!("call push_root: {e}"))?;
+    }
+
+    let result = emit_call()?;
+
+    for _ in 0..extra_roots.len() {
+        builder
+            .build_call(helpers.pop_root, &[mutator_arg.into()], "pop_root")
+            .map_err(|e| format!("call pop_root: {e}"))?;
+    }
+
+    for idx in (0..locals.len()).rev() {
+        let popped = builder
+            .build_call(helpers.pop_root, &[mutator_arg.into()], "pop_root")
+            .map_err(|e| format!("call pop_root: {e}"))?
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+        locals[idx] = popped;
+    }
+
+    for idx in (0..params.len()).rev() {
+        let popped = builder
+            .build_call(helpers.pop_root, &[mutator_arg.into()], "pop_root")
+            .map_err(|e| format!("call pop_root: {e}"))?
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+        params[idx] = popped;
+    }
+
+    Ok(result)
+}
+
 /// Convert an i1 comparison result to a tagged Word (T or NIL).
 fn emit_bool_select<'ctx>(
     builder: &Builder<'ctx>,
@@ -1146,13 +1434,14 @@ fn emit_cmp<'ctx>(
     function: &FunctionValue<'ctx>,
     helpers: &Helpers<'ctx>,
     arity: u32,
+    params: &mut Vec<IntValue<'ctx>>,
     locals: &mut Vec<IntValue<'ctx>>,
     a: &Expr,
     b: &Expr,
     pred: IntPredicate,
 ) -> Result<IntValue<'ctx>, String> {
-    let lhs = emit_expr(context, builder, function, helpers, arity, locals, a)?;
-    let rhs = emit_expr(context, builder, function, helpers, arity, locals, b)?;
+    let lhs = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
+    let rhs = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
     let i64_t = context.i64_type();
     let zero = i64_t.const_zero();
     let seven = i64_t.const_int(7, false);
@@ -1230,12 +1519,13 @@ fn emit_tag_eq<'ctx>(
     function: &FunctionValue<'ctx>,
     helpers: &Helpers<'ctx>,
     arity: u32,
+    params: &mut Vec<IntValue<'ctx>>,
     locals: &mut Vec<IntValue<'ctx>>,
     x: &Expr,
     tag: Tag,
 ) -> Result<IntValue<'ctx>, String> {
     let i64_t = context.i64_type();
-    let v = emit_expr(context, builder, function, helpers, arity, locals, x)?;
+    let v = emit_expr(context, builder, function, helpers, arity, params, locals, x)?;
     let mask = i64_t.const_int(0b111, false);
     let tag_bits = builder
         .build_and(v, mask, "tag_bits")
@@ -1253,6 +1543,7 @@ fn emit_expr<'ctx>(
     function: &FunctionValue<'ctx>,
     helpers: &Helpers<'ctx>,
     arity: u32,
+    params: &mut Vec<IntValue<'ctx>>,
     locals: &mut Vec<IntValue<'ctx>>,
     expr: &Expr,
 ) -> Result<IntValue<'ctx>, String> {
@@ -1264,10 +1555,24 @@ fn emit_expr<'ctx>(
         Expr::Nil => Ok(i64_t.const_int(Word::NIL.raw(), false)),
         Expr::True => Ok(i64_t.const_int(Word::T.raw(), false)),
         Expr::Local(idx) => {
+            // locals[0] is the reserved closure-env slot — see
+            // build_lisp_function. User-visible local idx 0 starts
+            // at locals[1].
             locals
+                .get(*idx + 1)
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "Local({idx}) out of range — only {} user locals in scope",
+                        locals.len().saturating_sub(1),
+                    )
+                })
+        }
+        Expr::Param(idx) => {
+            params
                 .get(*idx)
                 .copied()
-                .ok_or_else(|| format!("Local({idx}) out of range — only {} locals in scope", locals.len()))
+                .ok_or_else(|| format!("Param({idx}) out of range for arity {arity}"))
         }
         Expr::Progn(forms) => {
             if forms.is_empty() {
@@ -1275,7 +1580,7 @@ fn emit_expr<'ctx>(
             }
             let mut last = i64_t.const_int(Word::NIL.raw(), false);
             for f in forms {
-                last = emit_expr(context, builder, function, helpers, arity, locals, f)?;
+                last = emit_expr(context, builder, function, helpers, arity, params, locals, f)?;
             }
             Ok(last)
         }
@@ -1286,37 +1591,15 @@ fn emit_expr<'ctx>(
                 // parallel-binding semantics. The binding doesn't
                 // see itself or sibling bindings.
                 let v = emit_expr(
-                    context, builder, function, helpers, arity, locals, binding,
+                    context, builder, function, helpers, arity, params, locals, binding,
                 )?;
                 locals.push(v);
             }
             let result = emit_expr(
-                context, builder, function, helpers, arity, locals, body,
+                context, builder, function, helpers, arity, params, locals, body,
             )?;
             locals.truncate(saved);
             Ok(result)
-        }
-        Expr::Param(idx) => {
-            if *idx as u32 >= arity {
-                return Err(format!(
-                    "Param({idx}) out of range for arity {arity}"
-                ));
-            }
-            // args_ptr is param 2 (mutator=0, env=1, args=2, n_args=3).
-            let args_ptr = function
-                .get_nth_param(2)
-                .unwrap()
-                .into_pointer_value();
-            let i = i64_t.const_int(*idx as u64, false);
-            let elem_ptr = unsafe {
-                builder
-                    .build_in_bounds_gep(i64_t, args_ptr, &[i], "arg_ptr")
-                    .map_err(|e| format!("gep arg: {e}"))?
-            };
-            let val = builder
-                .build_load(i64_t, elem_ptr, "arg")
-                .map_err(|e| format!("load arg: {e}"))?;
-            Ok(val.into_int_value())
         }
         Expr::BindRest(start) => {
             // ncl_build_rest_list(mutator, args_ptr, start, n_args)
@@ -1324,19 +1607,34 @@ fn emit_expr<'ctx>(
             let args_ptr = function.get_nth_param(2).unwrap();
             let n_args = function.get_nth_param(3).unwrap();
             let start_const = i64_t.const_int(*start as u64, false);
-            let call = builder
-                .build_call(
-                    helpers.build_rest_list,
-                    &[
-                        mutator_arg.into(),
-                        args_ptr.into(),
-                        start_const.into(),
-                        n_args.into(),
-                    ],
-                    "rest",
-                )
-                .map_err(|e| format!("build_call build_rest_list: {e}"))?;
-            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+            let result = emit_safepoint_wrap(
+                builder,
+                function,
+                helpers,
+                params,
+                locals,
+                &[],
+                || {
+                    let call = builder
+                        .build_call(
+                            helpers.build_rest_list,
+                            &[
+                                mutator_arg.into(),
+                                args_ptr.into(),
+                                start_const.into(),
+                                n_args.into(),
+                            ],
+                            "rest",
+                        )
+                        .map_err(|e| format!("build_call build_rest_list: {e}"))?;
+                    Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+                },
+            )?;
+            // ncl_build_rest_list allocates cons cells per iteration;
+            // each allocation can hit a mid-evac OOM that surfaces as a
+            // signalled condition with ABORT_PENDING set.
+            emit_post_call_abort_check(context, builder, function, helpers)?;
+            Ok(result)
         }
         Expr::OptArg { idx, default } => {
             // if (n_args > idx) args[idx] else <default>
@@ -1357,6 +1655,12 @@ fn emit_expr<'ctx>(
             builder
                 .build_conditional_branch(cond, then_bb, else_bb)
                 .map_err(|e| format!("opt br: {e}"))?;
+            // The then-branch only loads from args; it can't mutate
+            // locals/params. The else-branch lowers user code that
+            // may itself call emit_safepoint_wrap and reload locals.
+            // Snapshot the pre-branch state so we can PHI-merge.
+            let then_locals_snapshot = locals.clone();
+            let then_params_snapshot = params.clone();
             // then: load args[idx]
             builder.position_at_end(then_bb);
             let elem_ptr = unsafe {
@@ -1375,18 +1679,32 @@ fn emit_expr<'ctx>(
             // else: lower the default expression
             builder.position_at_end(else_bb);
             let defaulted = emit_expr(
-                context, builder, function, helpers, arity, locals, default,
+                context, builder, function, helpers, arity, params, locals, default,
             )?;
             let else_end = builder.get_insert_block().unwrap();
             builder
                 .build_unconditional_branch(cont_bb)
                 .map_err(|e| format!("opt else br: {e}"))?;
+            let else_locals = locals.clone();
+            let else_params = params.clone();
             // continuation: phi
             builder.position_at_end(cont_bb);
             let phi = builder
                 .build_phi(i64_t, "opt_phi")
                 .map_err(|e| format!("opt phi: {e}"))?;
             phi.add_incoming(&[(&supplied, then_end), (&defaulted, else_end)]);
+            merge_locals_params_at_join(
+                context,
+                builder,
+                locals,
+                params,
+                &then_locals_snapshot,
+                &then_params_snapshot,
+                then_end,
+                &else_locals,
+                &else_params,
+                else_end,
+            )?;
             Ok(phi.as_basic_value().into_int_value())
         }
         Expr::KeyArg { keyword_word, key_start, default } => {
@@ -1424,15 +1742,27 @@ fn emit_expr<'ctx>(
             builder
                 .build_conditional_branch(cond, then_bb, else_bb)
                 .map_err(|e| format!("key br: {e}"))?;
+            // The else-branch is straight-line (no emit_expr, no
+            // locals mutation). The then-branch lowers the default
+            // and may mutate via emit_safepoint_wrap.
+            let else_locals_snapshot = locals.clone();
+            let else_params_snapshot = params.clone();
             // then: lower the default expression
             builder.position_at_end(then_bb);
             let defaulted = emit_expr(
-                context, builder, function, helpers, arity, locals, default,
+                context, builder, function, helpers, arity, params, locals, default,
             )?;
             let then_end = builder.get_insert_block().unwrap();
             builder
                 .build_unconditional_branch(cont_bb)
                 .map_err(|e| format!("key then br: {e}"))?;
+            let then_locals = locals.clone();
+            let then_params = params.clone();
+            // Restore snapshot for the else-branch (which doesn't
+            // mutate, but we want post-merge locals to start from
+            // a known state).
+            *locals = else_locals_snapshot.clone();
+            *params = else_params_snapshot.clone();
             // else: use the supplied raw value
             builder.position_at_end(else_bb);
             let else_end = builder.get_insert_block().unwrap();
@@ -1445,6 +1775,18 @@ fn emit_expr<'ctx>(
                 .build_phi(i64_t, "key_phi")
                 .map_err(|e| format!("key phi: {e}"))?;
             phi.add_incoming(&[(&defaulted, then_end), (&raw, else_end)]);
+            merge_locals_params_at_join(
+                context,
+                builder,
+                locals,
+                params,
+                &then_locals,
+                &then_params,
+                then_end,
+                &else_locals_snapshot,
+                &else_params_snapshot,
+                else_end,
+            )?;
             Ok(phi.as_basic_value().into_int_value())
         }
         Expr::Values(vals) => {
@@ -1470,7 +1812,7 @@ fn emit_expr<'ctx>(
                 .map_err(|e| format!("alloca mv_buf: {e}"))?;
             let mut lowered_vals = Vec::with_capacity(vals.len());
             for (i, v) in vals.iter().enumerate() {
-                let lv = emit_expr(context, builder, function, helpers, arity, locals, v)?;
+                let lv = emit_expr(context, builder, function, helpers, arity, params, locals, v)?;
                 let idx = i64_t.const_int(i as u64, false);
                 let slot = unsafe {
                     builder
@@ -1492,16 +1834,20 @@ fn emit_expr<'ctx>(
             Ok(lowered_vals[0])
         }
         Expr::EnsureSingleMv(primary) => {
-            let v = emit_expr(context, builder, function, helpers, arity, locals, primary)?;
+            let v = emit_expr(context, builder, function, helpers, arity, params, locals, primary)?;
             builder
                 .build_call(helpers.set_mv_single, &[v.into()], "ensure_single")
                 .map_err(|e| format!("call set_mv_single: {e}"))?;
             Ok(v)
         }
         Expr::ClosureRef(idx) => {
-            // env (function param 1) is a Vector-tagged Word. Untag,
-            // skip the header (cell 0), read cell idx+1.
-            let env_word = function.get_nth_param(1).unwrap().into_int_value();
+            // env is tracked in locals[0] (set at function entry by
+            // build_lisp_function), so it gets pushed/popped by
+            // emit_safepoint_wrap and stays fresh across GCs. Reading
+            // function.get_nth_param(1) directly would give the
+            // pre-GC pointer and dereferencing it after a safepoint
+            // would walk into recycled bytes.
+            let env_word = locals[0];
             let mask = i64_t.const_int(!0b111u64, false);
             let untagged = builder
                 .build_and(env_word, mask, "untag_env")
@@ -1523,12 +1869,18 @@ fn emit_expr<'ctx>(
         }
         Expr::Lambda { arity: lam_arity, body, captures } => {
             // 1. JIT-compile the body as a separate function.
-            //    Recursive call to build_lisp_function.
-            let code_addr = build_lisp_function(body, *lam_arity)?;
+            //    Recursive call to build_lisp_function. Anonymous
+            //    lambdas get a synthetic name with a monotonic suffix
+            //    so the SEH crash trace can distinguish them.
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let idx = N.fetch_add(1, Ordering::Relaxed);
+            let lam_name = format!("lambda_{idx}");
+            let code_addr = build_lisp_function(&lam_name, body, *lam_arity)?;
             // 2. Evaluate each capture expression in CURRENT scope.
             let cap_vals: Vec<IntValue> = captures
                 .iter()
-                .map(|c| emit_expr(context, builder, function, helpers, arity, locals, c))
+                .map(|c| emit_expr(context, builder, function, helpers, arity, params, locals, c))
                 .collect::<Result<_, _>>()?;
             // 3. Stack-alloc array for the captured values.
             let n = cap_vals.len();
@@ -1559,27 +1911,43 @@ fn emit_expr<'ctx>(
             let code_const = i64_t.const_int(code_addr as u64, false);
             let arity_const = i64_t.const_int(*lam_arity as u64, false);
             let n_const = i64_t.const_int(n as u64, false);
-            let call = builder
-                .build_call(
-                    helpers.make_closure,
-                    &[
-                        mutator_arg.into(),
-                        code_const.into(),
-                        arity_const.into(),
-                        arr_alloca.into(),
-                        n_const.into(),
-                    ],
-                    "lambda",
-                )
-                .map_err(|e| format!("build_call make_closure: {e}"))?;
-            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+            let result = emit_safepoint_wrap(
+                builder,
+                function,
+                helpers,
+                params,
+                locals,
+                &cap_vals,
+                || {
+                    let call = builder
+                        .build_call(
+                            helpers.make_closure,
+                            &[
+                                mutator_arg.into(),
+                                code_const.into(),
+                                arity_const.into(),
+                                arr_alloca.into(),
+                                n_const.into(),
+                            ],
+                            "lambda",
+                        )
+                        .map_err(|e| format!("build_call make_closure: {e}"))?;
+                    Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+                },
+            )?;
+            // ncl_make_closure is wrapped in catch_gc_stall_as_condition;
+            // a mid-evac OOM is surfaced as a signalled condition with
+            // ABORT_PENDING set. Match the pattern of the other
+            // safepoint-wrapped sites.
+            emit_post_call_abort_check(context, builder, function, helpers)?;
+            Ok(result)
         }
         Expr::Funcall { fn_expr, args } => {
             let fn_val =
-                emit_expr(context, builder, function, helpers, arity, locals, fn_expr)?;
+                emit_expr(context, builder, function, helpers, arity, params, locals, fn_expr)?;
             let arg_vals: Vec<IntValue> = args
                 .iter()
-                .map(|a| emit_expr(context, builder, function, helpers, arity, locals, a))
+                .map(|a| emit_expr(context, builder, function, helpers, arity, params, locals, a))
                 .collect::<Result<_, _>>()?;
             let n = arg_vals.len();
             let arr_type = i64_t.array_type(n.max(1) as u32);
@@ -1606,31 +1974,44 @@ fn emit_expr<'ctx>(
             }
             let mutator_arg = function.get_nth_param(0).unwrap();
             let n_const = i64_t.const_int(n as u64, false);
-            let call = builder
-                .build_call(
-                    helpers.funcall_fn,
-                    &[
-                        mutator_arg.into(),
-                        fn_val.into(),
-                        arr_alloca.into(),
-                        n_const.into(),
-                    ],
-                    "funcall_result",
-                )
-                .map_err(|e| format!("build_call funcall: {e}"))?;
-            let result = call.try_as_basic_value().unwrap_basic().into_int_value();
+            let mut extra_roots = Vec::with_capacity(arg_vals.len() + 1);
+            extra_roots.push(fn_val);
+            extra_roots.extend(arg_vals.iter().copied());
+            let result = emit_safepoint_wrap(
+                builder,
+                function,
+                helpers,
+                params,
+                locals,
+                &extra_roots,
+                || {
+                    let call = builder
+                        .build_call(
+                            helpers.funcall_fn,
+                            &[
+                                mutator_arg.into(),
+                                fn_val.into(),
+                                arr_alloca.into(),
+                                n_const.into(),
+                            ],
+                            "funcall_result",
+                        )
+                        .map_err(|e| format!("build_call funcall: {e}"))?;
+                    Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+                },
+            )?;
             emit_post_call_abort_check(context, builder, function, helpers)?;
             Ok(result)
         }
         Expr::Apply { fn_expr, prefix, tail } => {
             let fn_val =
-                emit_expr(context, builder, function, helpers, arity, locals, fn_expr)?;
+                emit_expr(context, builder, function, helpers, arity, params, locals, fn_expr)?;
             let prefix_vals: Vec<IntValue> = prefix
                 .iter()
-                .map(|a| emit_expr(context, builder, function, helpers, arity, locals, a))
+                .map(|a| emit_expr(context, builder, function, helpers, arity, params, locals, a))
                 .collect::<Result<_, _>>()?;
             let tail_val =
-                emit_expr(context, builder, function, helpers, arity, locals, tail)?;
+                emit_expr(context, builder, function, helpers, arity, params, locals, tail)?;
             let n = prefix_vals.len();
             // Allocate even when n=0, but use a single-slot dummy
             // — the runtime ignores prefix when n_prefix=0, so the
@@ -1660,46 +2041,60 @@ fn emit_expr<'ctx>(
             }
             let mutator_arg = function.get_nth_param(0).unwrap();
             let n_const = i64_t.const_int(n as u64, false);
-            let call = builder
-                .build_call(
-                    helpers.apply,
-                    &[
-                        mutator_arg.into(),
-                        fn_val.into(),
-                        arr_alloca.into(),
-                        n_const.into(),
-                        tail_val.into(),
-                    ],
-                    "apply_result",
-                )
-                .map_err(|e| format!("build_call apply: {e}"))?;
-            let result = call.try_as_basic_value().unwrap_basic().into_int_value();
+            let mut extra_roots = Vec::with_capacity(prefix_vals.len() + 2);
+            extra_roots.push(fn_val);
+            extra_roots.extend(prefix_vals.iter().copied());
+            extra_roots.push(tail_val);
+            let result = emit_safepoint_wrap(
+                builder,
+                function,
+                helpers,
+                params,
+                locals,
+                &extra_roots,
+                || {
+                    let call = builder
+                        .build_call(
+                            helpers.apply,
+                            &[
+                                mutator_arg.into(),
+                                fn_val.into(),
+                                arr_alloca.into(),
+                                n_const.into(),
+                                tail_val.into(),
+                            ],
+                            "apply_result",
+                        )
+                        .map_err(|e| format!("build_call apply: {e}"))?;
+                    Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+                },
+            )?;
             emit_post_call_abort_check(context, builder, function, helpers)?;
             Ok(result)
         }
         Expr::Add(a, b) => {
-            let lhs = emit_expr(context, builder, function, helpers, arity, locals, a)?;
-            let rhs = emit_expr(context, builder, function, helpers, arity, locals, b)?;
+            let lhs = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
+            let rhs = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
             emit_overflow_op(
-                context, builder, function, helpers,
+                context, builder, function, helpers, params, locals,
                 lhs, rhs, lhs, rhs,
                 helpers.sadd_with_overflow, helpers.add_promote,
                 "add",
             )
         }
         Expr::Sub(a, b) => {
-            let lhs = emit_expr(context, builder, function, helpers, arity, locals, a)?;
-            let rhs = emit_expr(context, builder, function, helpers, arity, locals, b)?;
+            let lhs = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
+            let rhs = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
             emit_overflow_op(
-                context, builder, function, helpers,
+                context, builder, function, helpers, params, locals,
                 lhs, rhs, lhs, rhs,
                 helpers.ssub_with_overflow, helpers.sub_promote,
                 "sub",
             )
         }
         Expr::Mul(a, b) => {
-            let lhs = emit_expr(context, builder, function, helpers, arity, locals, a)?;
-            let rhs = emit_expr(context, builder, function, helpers, arity, locals, b)?;
+            let lhs = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
+            let rhs = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
             // (a<<3) * (b<<3) overflows the *fixnum* range when a*b
             // doesn't fit in 61 bits. We pre-shift rhs by 3 so the
             // intrinsic operates on (a<<3) * b (which equals (a*b)<<3).
@@ -1711,69 +2106,86 @@ fn emit_expr<'ctx>(
                 .build_right_shift(rhs, three, true, "untag_rhs")
                 .map_err(|e| format!("ashr: {e}"))?;
             emit_overflow_op(
-                context, builder, function, helpers,
+                context, builder, function, helpers, params, locals,
                 lhs, rhs_untagged, lhs, rhs,
                 helpers.smul_with_overflow, helpers.mul_promote,
                 "mul",
             )
         }
         Expr::Truncate(a, b) => {
-            let lhs = emit_expr(context, builder, function, helpers, arity, locals, a)?;
-            let rhs = emit_expr(context, builder, function, helpers, arity, locals, b)?;
+            let lhs = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
+            let rhs = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
             // Build fast path inline (untag both, sdiv, retag) and
             // fall through to the bignum promote helper for any
             // non-fixnum operand.
             emit_div_op(
-                context, builder, function, helpers,
+                context, builder, function, helpers, params, locals,
                 lhs, rhs, helpers.truncate_promote, false, "trunc",
             )
         }
         Expr::Rem(a, b) => {
-            let lhs = emit_expr(context, builder, function, helpers, arity, locals, a)?;
-            let rhs = emit_expr(context, builder, function, helpers, arity, locals, b)?;
+            let lhs = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
+            let rhs = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
             emit_div_op(
-                context, builder, function, helpers,
+                context, builder, function, helpers, params, locals,
                 lhs, rhs, helpers.rem_promote, true, "rem",
             )
         }
         Expr::Cons(car, cdr) => {
-            let car_val = emit_expr(context, builder, function, helpers, arity, locals, car)?;
-            let cdr_val = emit_expr(context, builder, function, helpers, arity, locals, cdr)?;
+            let car_val = emit_expr(context, builder, function, helpers, arity, params, locals, car)?;
+            let cdr_val = emit_expr(context, builder, function, helpers, arity, params, locals, cdr)?;
             let mutator_arg = function.get_nth_param(0).unwrap();
-            let call = builder
-                .build_call(
-                    helpers.alloc_cons,
-                    &[mutator_arg.into(), car_val.into(), cdr_val.into()],
-                    "cons",
-                )
-                .map_err(|e| format!("build_call alloc_cons: {e}"))?;
-            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+            let extra_roots = [car_val, cdr_val];
+            let result = emit_safepoint_wrap(
+                builder,
+                function,
+                helpers,
+                params,
+                locals,
+                &extra_roots,
+                || {
+                    let call = builder
+                        .build_call(
+                            helpers.alloc_cons,
+                            &[mutator_arg.into(), car_val.into(), cdr_val.into()],
+                            "cons",
+                        )
+                        .map_err(|e| format!("build_call alloc_cons: {e}"))?;
+                    Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+                },
+            )?;
+            // ncl_alloc_cons is wrapped in catch_gc_stall_as_condition;
+            // a mid-evac OOM is surfaced as a signalled condition with
+            // ABORT_PENDING set. Without this check the IR would treat
+            // the returned NIL as a valid cons.
+            emit_post_call_abort_check(context, builder, function, helpers)?;
+            Ok(result)
         }
         Expr::Car(x) => {
-            let cons_val = emit_expr(context, builder, function, helpers, arity, locals, x)?;
+            let cons_val = emit_expr(context, builder, function, helpers, arity, params, locals, x)?;
             emit_car_or_cdr(context, builder, function, cons_val, /*is_cdr=*/false)
         }
         Expr::Cdr(x) => {
-            let cons_val = emit_expr(context, builder, function, helpers, arity, locals, x)?;
+            let cons_val = emit_expr(context, builder, function, helpers, arity, params, locals, x)?;
             emit_car_or_cdr(context, builder, function, cons_val, /*is_cdr=*/true)
         }
-        Expr::Eq(a, b) => emit_cmp(context, builder, function, helpers, arity, locals, a, b, IntPredicate::EQ),
-        Expr::Lt(a, b) => emit_cmp(context, builder, function, helpers, arity, locals, a, b, IntPredicate::SLT),
-        Expr::Gt(a, b) => emit_cmp(context, builder, function, helpers, arity, locals, a, b, IntPredicate::SGT),
-        Expr::Le(a, b) => emit_cmp(context, builder, function, helpers, arity, locals, a, b, IntPredicate::SLE),
-        Expr::Ge(a, b) => emit_cmp(context, builder, function, helpers, arity, locals, a, b, IntPredicate::SGE),
-        Expr::NumEq(a, b) => emit_cmp(context, builder, function, helpers, arity, locals, a, b, IntPredicate::EQ),
+        Expr::Eq(a, b) => emit_cmp(context, builder, function, helpers, arity, params, locals, a, b, IntPredicate::EQ),
+        Expr::Lt(a, b) => emit_cmp(context, builder, function, helpers, arity, params, locals, a, b, IntPredicate::SLT),
+        Expr::Gt(a, b) => emit_cmp(context, builder, function, helpers, arity, params, locals, a, b, IntPredicate::SGT),
+        Expr::Le(a, b) => emit_cmp(context, builder, function, helpers, arity, params, locals, a, b, IntPredicate::SLE),
+        Expr::Ge(a, b) => emit_cmp(context, builder, function, helpers, arity, params, locals, a, b, IntPredicate::SGE),
+        Expr::NumEq(a, b) => emit_cmp(context, builder, function, helpers, arity, params, locals, a, b, IntPredicate::EQ),
         Expr::IsNull(x) => {
-            let v = emit_expr(context, builder, function, helpers, arity, locals, x)?;
+            let v = emit_expr(context, builder, function, helpers, arity, params, locals, x)?;
             let nil = i64_t.const_int(Word::NIL.raw(), false);
             let cmp = builder
                 .build_int_compare(IntPredicate::EQ, v, nil, "is_null")
                 .map_err(|e| format!("icmp: {e}"))?;
             emit_bool_select(builder, cmp, i64_t)
         }
-        Expr::IsCons(x) => emit_tag_eq(context, builder, function, helpers, arity, locals, x, Tag::Cons),
+        Expr::IsCons(x) => emit_tag_eq(context, builder, function, helpers, arity, params, locals, x, Tag::Cons),
         Expr::IsAtom(x) => {
-            let v = emit_expr(context, builder, function, helpers, arity, locals, x)?;
+            let v = emit_expr(context, builder, function, helpers, arity, params, locals, x)?;
             let mask = i64_t.const_int(0b111, false);
             let tag_bits = builder
                 .build_and(v, mask, "tag_bits")
@@ -1789,7 +2201,7 @@ fn emit_expr<'ctx>(
             emit_bool_select(builder, is_atom, i64_t)
         }
         Expr::IsListp(x) => {
-            let v = emit_expr(context, builder, function, helpers, arity, locals, x)?;
+            let v = emit_expr(context, builder, function, helpers, arity, params, locals, x)?;
             let nil = i64_t.const_int(Word::NIL.raw(), false);
             let is_nil = builder
                 .build_int_compare(IntPredicate::EQ, v, nil, "is_nil")
@@ -1808,7 +2220,7 @@ fn emit_expr<'ctx>(
             emit_bool_select(builder, either, i64_t)
         }
         Expr::If(cond, then_branch, else_branch) => {
-            let cond_val = emit_expr(context, builder, function, helpers, arity, locals, cond)?;
+            let cond_val = emit_expr(context, builder, function, helpers, arity, params, locals, cond)?;
             let nil_word = i64_t.const_int(Word::NIL.raw(), false);
             let is_truthy = builder
                 .build_int_compare(IntPredicate::NE, cond_val, nil_word, "is_truthy")
@@ -1822,77 +2234,129 @@ fn emit_expr<'ctx>(
                 .build_conditional_branch(is_truthy, then_block, else_block)
                 .map_err(|e| format!("br: {e}"))?;
 
+            // Snapshot locals/params before either branch. Each
+            // branch's emit_safepoint_wrap calls will rewrite the
+            // slots to fresh SSA values defined inside that branch;
+            // we restore the pre-if state between branches and
+            // re-merge at the merge block.
+            let pre_locals = locals.clone();
+            let pre_params = params.clone();
+
             builder.position_at_end(then_block);
-            let then_val = emit_expr(context, builder, function, helpers, arity, locals, then_branch)?;
+            let then_val = emit_expr(context, builder, function, helpers, arity, params, locals, then_branch)?;
             let then_end = builder.get_insert_block().unwrap();
             builder
                 .build_unconditional_branch(merge_block)
                 .map_err(|e| format!("br: {e}"))?;
+            let then_locals = std::mem::replace(locals, pre_locals.clone());
+            let then_params = std::mem::replace(params, pre_params.clone());
 
             builder.position_at_end(else_block);
-            let else_val = emit_expr(context, builder, function, helpers, arity, locals, else_branch)?;
+            let else_val = emit_expr(context, builder, function, helpers, arity, params, locals, else_branch)?;
             let else_end = builder.get_insert_block().unwrap();
             builder
                 .build_unconditional_branch(merge_block)
                 .map_err(|e| format!("br: {e}"))?;
+            let else_locals = locals.clone();
+            let else_params = params.clone();
 
             builder.position_at_end(merge_block);
             let phi = builder
                 .build_phi(i64_t, "if_result")
                 .map_err(|e| format!("phi: {e}"))?;
             phi.add_incoming(&[(&then_val, then_end), (&else_val, else_end)]);
+            // Merge any locals/params that diverged between the
+            // branches. The two snapshots have the same length
+            // because Let scoping balances additions in both
+            // branches by the time they reach the merge.
+            merge_locals_params_at_join(
+                context,
+                builder,
+                locals,
+                params,
+                &then_locals,
+                &then_params,
+                then_end,
+                &else_locals,
+                &else_params,
+                else_end,
+            )?;
             Ok(phi.as_basic_value().into_int_value())
         }
         Expr::LoadGlobal(sym_word) => {
             let mutator_arg = function.get_nth_param(0).unwrap();
             let sym_const = i64_t.const_int(*sym_word, false);
-            let call = builder
-                .build_call(
-                    helpers.load_value,
-                    &[mutator_arg.into(), sym_const.into()],
-                    "load_value",
-                )
-                .map_err(|e| format!("build_call load_value: {e}"))?;
-            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+            let result = emit_safepoint_wrap(
+                builder,
+                function,
+                helpers,
+                params,
+                locals,
+                &[],
+                || {
+                    let call = builder
+                        .build_call(
+                            helpers.load_value,
+                            &[mutator_arg.into(), sym_const.into()],
+                            "load_value",
+                        )
+                        .map_err(|e| format!("build_call load_value: {e}"))?;
+                    Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+                },
+            )?;
+            emit_post_call_abort_check(context, builder, function, helpers)?;
+            Ok(result)
         }
         Expr::LoadFunction(sym_word) => {
             let mutator_arg = function.get_nth_param(0).unwrap();
             let sym_const = i64_t.const_int(*sym_word, false);
-            let call = builder
-                .build_call(
-                    helpers.load_function,
-                    &[mutator_arg.into(), sym_const.into()],
-                    "load_fn",
-                )
-                .map_err(|e| format!("build_call load_function: {e}"))?;
-            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+            let result = emit_safepoint_wrap(
+                builder,
+                function,
+                helpers,
+                params,
+                locals,
+                &[],
+                || {
+                    let call = builder
+                        .build_call(
+                            helpers.load_function,
+                            &[mutator_arg.into(), sym_const.into()],
+                            "load_fn",
+                        )
+                        .map_err(|e| format!("build_call load_function: {e}"))?;
+                    Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+                },
+            )?;
+            emit_post_call_abort_check(context, builder, function, helpers)?;
+            Ok(result)
         }
         Expr::Length(x) => {
-            let v = emit_expr(context, builder, function, helpers, arity, locals, x)?;
+            let v = emit_expr(context, builder, function, helpers, arity, params, locals, x)?;
             let call = builder
                 .build_call(helpers.length, &[v.into()], "length")
                 .map_err(|e| format!("build_call length: {e}"))?;
             Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
         }
         Expr::Equal(a, b) => {
-            let va = emit_expr(context, builder, function, helpers, arity, locals, a)?;
-            let vb = emit_expr(context, builder, function, helpers, arity, locals, b)?;
+            let va = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
+            let vb = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
             let call = builder
                 .build_call(helpers.equal, &[va.into(), vb.into()], "equal")
                 .map_err(|e| format!("build_call equal: {e}"))?;
             Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
         }
         Expr::StringEq(a, b) => {
-            let va = emit_expr(context, builder, function, helpers, arity, locals, a)?;
-            let vb = emit_expr(context, builder, function, helpers, arity, locals, b)?;
+            let va = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
+            let vb = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
             let call = builder
                 .build_call(helpers.string_eq, &[va.into(), vb.into()], "str_eq")
                 .map_err(|e| format!("build_call string_eq: {e}"))?;
             Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
         }
         Expr::StringChar(s, i) => {
-            let vs = emit_expr(context, builder, function, helpers, arity, locals, s)?;
-            let vi_tagged = emit_expr(context, builder, function, helpers, arity, locals, i)?;
+            let vs = emit_expr(context, builder, function, helpers, arity, params, locals, s)?;
+            let vi_tagged = emit_expr(context, builder, function, helpers, arity, params, locals, i)?;
             // The fixnum is tagged (n << 3); ncl_string_char expects
             // the raw index, so untag with arithmetic shift right.
             let three = i64_t.const_int(3, false);
@@ -1909,8 +2373,8 @@ fn emit_expr<'ctx>(
             Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
         }
         Expr::SetCar(cons, value) => {
-            let vc = emit_expr(context, builder, function, helpers, arity, locals, cons)?;
-            let vv = emit_expr(context, builder, function, helpers, arity, locals, value)?;
+            let vc = emit_expr(context, builder, function, helpers, arity, params, locals, cons)?;
+            let vv = emit_expr(context, builder, function, helpers, arity, params, locals, value)?;
             let mutator_arg = function.get_nth_param(0).unwrap();
             let call = builder
                 .build_call(
@@ -1922,8 +2386,8 @@ fn emit_expr<'ctx>(
             Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
         }
         Expr::SetCdr(cons, value) => {
-            let vc = emit_expr(context, builder, function, helpers, arity, locals, cons)?;
-            let vv = emit_expr(context, builder, function, helpers, arity, locals, value)?;
+            let vc = emit_expr(context, builder, function, helpers, arity, params, locals, cons)?;
+            let vv = emit_expr(context, builder, function, helpers, arity, params, locals, value)?;
             let mutator_arg = function.get_nth_param(0).unwrap();
             let call = builder
                 .build_call(
@@ -1935,9 +2399,9 @@ fn emit_expr<'ctx>(
             Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
         }
         Expr::SetChar { s, idx, ch } => {
-            let vs = emit_expr(context, builder, function, helpers, arity, locals, s)?;
-            let vi_tagged = emit_expr(context, builder, function, helpers, arity, locals, idx)?;
-            let vch = emit_expr(context, builder, function, helpers, arity, locals, ch)?;
+            let vs = emit_expr(context, builder, function, helpers, arity, params, locals, s)?;
+            let vi_tagged = emit_expr(context, builder, function, helpers, arity, params, locals, idx)?;
+            let vch = emit_expr(context, builder, function, helpers, arity, params, locals, ch)?;
             // Index is a tagged fixnum; ncl_string_set wants raw.
             let three = i64_t.const_int(3, false);
             let untagged = builder
@@ -1954,8 +2418,8 @@ fn emit_expr<'ctx>(
         }
         Expr::Aref(v, i) => {
             // ncl_aref_generic(v_word, i_word) — both tagged.
-            let vv = emit_expr(context, builder, function, helpers, arity, locals, v)?;
-            let vi = emit_expr(context, builder, function, helpers, arity, locals, i)?;
+            let vv = emit_expr(context, builder, function, helpers, arity, params, locals, v)?;
+            let vi = emit_expr(context, builder, function, helpers, arity, params, locals, i)?;
             let call = builder
                 .build_call(
                     helpers.aref_generic,
@@ -1968,9 +2432,9 @@ fn emit_expr<'ctx>(
         Expr::SetAref { v, idx, val } => {
             // ncl_aset_generic(mutator, v_word, i_word, val_word).
             let mutator_arg = function.get_nth_param(0).unwrap();
-            let vv = emit_expr(context, builder, function, helpers, arity, locals, v)?;
-            let vi = emit_expr(context, builder, function, helpers, arity, locals, idx)?;
-            let vval = emit_expr(context, builder, function, helpers, arity, locals, val)?;
+            let vv = emit_expr(context, builder, function, helpers, arity, params, locals, v)?;
+            let vi = emit_expr(context, builder, function, helpers, arity, params, locals, idx)?;
+            let vval = emit_expr(context, builder, function, helpers, arity, params, locals, val)?;
             let call = builder
                 .build_call(
                     helpers.aset_generic,
@@ -1982,7 +2446,7 @@ fn emit_expr<'ctx>(
         }
         Expr::StoreGlobal { sym_word, value } => {
             let val =
-                emit_expr(context, builder, function, helpers, arity, locals, value)?;
+                emit_expr(context, builder, function, helpers, arity, params, locals, value)?;
             let mutator_arg = function.get_nth_param(0).unwrap();
             let sym_const = i64_t.const_int(*sym_word, false);
             let call = builder
@@ -1998,7 +2462,7 @@ fn emit_expr<'ctx>(
             // Evaluate each argument first.
             let arg_vals: Vec<IntValue> = args
                 .iter()
-                .map(|a| emit_expr(context, builder, function, helpers, arity, locals, a))
+                .map(|a| emit_expr(context, builder, function, helpers, arity, params, locals, a))
                 .collect::<Result<_, _>>()?;
             let n = arg_vals.len();
 
@@ -2032,19 +2496,29 @@ fn emit_expr<'ctx>(
             let mutator_arg = function.get_nth_param(0).unwrap();
             let sym_const = i64_t.const_int(*sym_word, false);
             let n_const = i64_t.const_int(n as u64, false);
-            let call = builder
-                .build_call(
-                    helpers.call_fn,
-                    &[
-                        mutator_arg.into(),
-                        sym_const.into(),
-                        arr_alloca.into(),
-                        n_const.into(),
-                    ],
-                    "call_result",
-                )
-                .map_err(|e| format!("build_call ncl_call: {e}"))?;
-            let result = call.try_as_basic_value().unwrap_basic().into_int_value();
+            let result = emit_safepoint_wrap(
+                builder,
+                function,
+                helpers,
+                params,
+                locals,
+                &arg_vals,
+                || {
+                    let call = builder
+                        .build_call(
+                            helpers.call_fn,
+                            &[
+                                mutator_arg.into(),
+                                sym_const.into(),
+                                arr_alloca.into(),
+                                n_const.into(),
+                            ],
+                            "call_result",
+                        )
+                        .map_err(|e| format!("build_call ncl_call: {e}"))?;
+                    Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+                },
+            )?;
             emit_post_call_abort_check(context, builder, function, helpers)?;
             Ok(result)
         }
@@ -2292,6 +2766,8 @@ fn build_trampoline_engine(
         return Err("LLVMGetFunctionAddress(ncl_trampoline) returned 0".to_string());
     }
 
+    ncl_runtime::brk::register_jit_symbol(raw_addr, "ncl_trampoline");
+
     let engine_box = Box::new(engine);
     let _ = Box::leak(engine_box);
 
@@ -2327,7 +2803,8 @@ pub extern "C-unwind" fn make_win32_callback_shim(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ncl_runtime::{GcConfig, GcCoordinator, Tag};
+    use ncl_runtime::gc_function;
+    use ncl_runtime::{handler_case_shim, GcConfig, GcCoordinator, Tag};
 
     fn small_config() -> GcConfig {
         GcConfig {
@@ -2359,6 +2836,55 @@ mod tests {
         let coord = GcCoordinator::new(small_config());
         let mut m = coord.register_mutator();
         jit_eval(expr, &mut m as *mut _).unwrap()
+    }
+
+    fn compile_static_function(
+        coord: &std::sync::Arc<GcCoordinator>,
+        name: &str,
+        arity: u32,
+        body: &Expr,
+    ) -> Word {
+        let code = jit_compile_function(name, arity, body).unwrap();
+        gc_function::alloc_function_in_static(
+            coord.static_area(),
+            code,
+            arity,
+            coord.intern(name),
+            Word::NIL,
+        )
+        .expect("static function alloc")
+    }
+
+    fn install_gc_pressure_function(
+        coord: &std::sync::Arc<GcCoordinator>,
+        m: &mut MutatorState,
+        name: &str,
+    ) -> Word {
+        let mut forms = Vec::new();
+        for i in 0..2000 {
+            forms.push(Expr::cons(Expr::Const(i), Expr::Nil));
+        }
+        forms.push(Expr::Const(7));
+        let body = Expr::Progn(forms);
+        let sym = coord.intern(name);
+        let fn_word = compile_static_function(coord, name, 0, &body);
+        m.set_symbol_function(sym, fn_word);
+        sym
+    }
+
+    fn run_handler_case(
+        m: &mut MutatorState,
+        body_word: Word,
+        handler_word: Word,
+    ) -> Word {
+        let args = [body_word.raw(), handler_word.raw()];
+        let result = handler_case_shim(
+            m as *mut _,
+            Word::NIL.raw(),
+            args.as_ptr(),
+            args.len() as u64,
+        );
+        Word::from_raw(result)
     }
 
     #[test]
@@ -2395,6 +2921,97 @@ mod tests {
         assert_eq!(result.as_fixnum(), Some(1));
     }
 
+    #[test]
+    fn live_local_survives_symbol_call_gc() {
+        let coord = GcCoordinator::new(small_config());
+        let mut m = coord.register_mutator();
+        let sym = install_gc_pressure_function(&coord, &mut m, "GC-PRESSURE-CALL");
+
+        let expr = Expr::Let {
+            bindings: vec![Expr::cons(Expr::Const(42), Expr::Nil)],
+            body: Box::new(Expr::Progn(vec![
+                Expr::Call { sym_word: sym.raw(), args: vec![] },
+                Expr::car(Expr::Local(0)),
+            ])),
+        };
+
+        let result = jit_eval(&expr, &mut m as *mut _).unwrap();
+        assert_eq!(result.as_fixnum(), Some(42));
+    }
+
+    #[test]
+    fn live_local_survives_funcall_gc() {
+        let coord = GcCoordinator::new(small_config());
+        let mut m = coord.register_mutator();
+        let sym = install_gc_pressure_function(&coord, &mut m, "GC-PRESSURE-FUNCALL");
+
+        let expr = Expr::Let {
+            bindings: vec![Expr::cons(Expr::Const(99), Expr::Nil)],
+            body: Box::new(Expr::Progn(vec![
+                Expr::Funcall {
+                    fn_expr: Box::new(Expr::LoadFunction(sym.raw())),
+                    args: vec![],
+                },
+                Expr::car(Expr::Local(0)),
+            ])),
+        };
+
+        let result = jit_eval(&expr, &mut m as *mut _).unwrap();
+        assert_eq!(result.as_fixnum(), Some(99));
+    }
+
+    #[test]
+    fn live_local_survives_apply_gc() {
+        let coord = GcCoordinator::new(small_config());
+        let mut m = coord.register_mutator();
+        let sym = install_gc_pressure_function(&coord, &mut m, "GC-PRESSURE-APPLY");
+
+        let expr = Expr::Let {
+            bindings: vec![Expr::cons(Expr::Const(123), Expr::Nil)],
+            body: Box::new(Expr::Progn(vec![
+                Expr::Apply {
+                    fn_expr: Box::new(Expr::LoadFunction(sym.raw())),
+                    prefix: vec![],
+                    tail: Box::new(Expr::Nil),
+                },
+                Expr::car(Expr::Local(0)),
+            ])),
+        };
+
+        let result = jit_eval(&expr, &mut m as *mut _).unwrap();
+        assert_eq!(result.as_fixnum(), Some(123));
+    }
+
+    #[test]
+    fn load_global_signal_aborts_before_follow_on_trap() {
+        let coord = GcCoordinator::new(small_config());
+        let mut m = coord.register_mutator();
+        let missing = coord.intern("MISSING-GLOBAL-FOR-ABORT");
+
+        let body = Expr::string_char(Expr::load_global(missing.raw()), Expr::Const(0));
+        let handler = Expr::Const(77);
+        let body_fn = compile_static_function(&coord, "HC-BODY-LOAD-GLOBAL", 0, &body);
+        let handler_fn = compile_static_function(&coord, "HC-HANDLER-LOAD-GLOBAL", 1, &handler);
+
+        let result = run_handler_case(&mut m, body_fn, handler_fn);
+        assert_eq!(result.as_fixnum(), Some(77));
+    }
+
+    #[test]
+    fn load_function_signal_aborts_before_follow_on_trap() {
+        let coord = GcCoordinator::new(small_config());
+        let mut m = coord.register_mutator();
+        let missing = coord.intern("MISSING-FUNCTION-FOR-ABORT");
+
+        let body = Expr::string_char(Expr::load_function(missing.raw()), Expr::Const(0));
+        let handler = Expr::Const(88);
+        let body_fn = compile_static_function(&coord, "HC-BODY-LOAD-FUNCTION", 0, &body);
+        let handler_fn = compile_static_function(&coord, "HC-HANDLER-LOAD-FUNCTION", 1, &handler);
+
+        let result = run_handler_case(&mut m, body_fn, handler_fn);
+        assert_eq!(result.as_fixnum(), Some(88));
+    }
+
     // -- Function compilation -----------------------------------------------
 
     #[test]
@@ -2403,7 +3020,7 @@ mod tests {
         let coord = GcCoordinator::new(small_config());
         let mut m = coord.register_mutator();
         let body = Expr::Param(0);
-        let code = jit_compile_function(1, &body).unwrap();
+        let code = jit_compile_function("test_fn", 1, &body).unwrap();
         type Fn1 = unsafe extern "C-unwind" fn(*mut MutatorState, u64, *const u64, u64) -> u64;
         let f: Fn1 = unsafe { std::mem::transmute(code) };
         let arg = Word::fixnum(42).raw();
@@ -2417,7 +3034,7 @@ mod tests {
         let coord = GcCoordinator::new(small_config());
         let mut m = coord.register_mutator();
         let body = Expr::add(Expr::Param(0), Expr::Param(0));
-        let code = jit_compile_function(1, &body).unwrap();
+        let code = jit_compile_function("test_fn", 1, &body).unwrap();
         type Fn1 = unsafe extern "C-unwind" fn(*mut MutatorState, u64, *const u64, u64) -> u64;
         let f: Fn1 = unsafe { std::mem::transmute(code) };
         let arg = Word::fixnum(21).raw();

@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::heap::{CardTable, Heap};
+use crate::heap::CardTable;
 use crate::gc;
 use crate::static_area::StaticArea;
 use crate::word::{Tag, Word};
@@ -69,17 +69,74 @@ pub const ELASTIC_STATIC_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
 
 impl Default for GcConfig {
     fn default() -> Self {
+        // Target machine: 32 GB. Page-heap reserves address space
+        // up front and only commits pages as they're allocated into
+        // (Windows `VirtualAlloc(MEM_RESERVE)` + on-demand
+        // `MEM_COMMIT`), so a large reservation costs almost nothing
+        // until the workload actually uses it. Static area is
+        // elastic above ELASTIC_STATIC_THRESHOLD_BYTES, same story.
+        //
+        // All four knobs can be overridden per-run via env vars
+        // (see `env_override_*` helpers below). Useful for:
+        //   - dialing young down to actually exercise the GC under
+        //     load instead of running with so much headroom that
+        //     `(gc-stats)` reports zero cycles;
+        //   - profiling cycle cost vs cycle count tradeoffs;
+        //   - constraining memory on a smaller host.
+        //
+        // Default sizing rationale:
+        //   - young 256 MB: Life-style allocation-heavy workloads
+        //     fill a 16 MB young in milliseconds and pay 100+ ms
+        //     per cycle. 16× larger young = 16× fewer pauses.
+        //   - old 2 GB: room for many promotion cycles before any
+        //     major-collect path would be needed.
+        //   - static 1 GB: closures, defun'd Functions, interned
+        //     strings. Elastic, so this is reservation only.
+        //   - TLAB 2 MB: amortises refill heap-lock cost.
         GcConfig {
-            young_bytes: 16 * 1024 * 1024,
-            old_bytes: 64 * 1024 * 1024,
-            // 256 MB reservation. With the Windows elastic backing
-            // in `StaticArea::new_elastic`, only as many pages as
-            // the session touches are paid for. The cap is generous
-            // enough that a long session loading several big images
-            // won't hit it.
-            static_bytes: 256 * 1024 * 1024,
-            tlab_cells: 65536, // 512 KB
+            young_bytes: env_override_bytes(
+                "NCL_YOUNG_MB",
+                256 * 1024 * 1024,
+            ),
+            old_bytes: env_override_bytes(
+                "NCL_OLD_MB",
+                2 * 1024 * 1024 * 1024,
+            ),
+            static_bytes: env_override_bytes(
+                "NCL_STATIC_MB",
+                1024 * 1024 * 1024,
+            ),
+            tlab_cells: env_override_tlab_cells(
+                "NCL_TLAB_KB",
+                262144, // 2 MB default → 262144 cells × 8 bytes
+            ),
         }
+    }
+}
+
+/// Parse an `NCL_*_MB` env var as a megabyte count and return bytes,
+/// or `default_bytes` if unset / unparseable. Treats "0" as "use
+/// default" (rather than zero-sized heap, which would crash on first
+/// alloc).
+fn env_override_bytes(var: &str, default_bytes: usize) -> usize {
+    match std::env::var(var) {
+        Ok(s) => match s.trim().parse::<usize>() {
+            Ok(0) | Err(_) => default_bytes,
+            Ok(mb) => mb.saturating_mul(1024 * 1024),
+        },
+        Err(_) => default_bytes,
+    }
+}
+
+/// Parse `NCL_TLAB_KB` as a kilobyte count and return cells
+/// (cells = kb * 128). Default same fall-through rules as MB vars.
+fn env_override_tlab_cells(var: &str, default_cells: usize) -> usize {
+    match std::env::var(var) {
+        Ok(s) => match s.trim().parse::<usize>() {
+            Ok(0) | Err(_) => default_cells,
+            Ok(kb) => kb.saturating_mul(128), // 1 KB = 128 cells
+        },
+        Err(_) => default_cells,
     }
 }
 
@@ -173,14 +230,18 @@ pub struct GcStats {
     // Wall-clock microseconds the most-recent minor GC spent stopped
     // (from the moment all mutators parked to the moment the flag
     // cleared). `*_total` accumulates across the run for throughput-
-    // style ratios; `*_max` is the worst single pause observed.
+    // style ratios; `*_max` is the worst single pause observed;
+    // `*_min` is the best (initialised to u64::MAX; readers should
+    // treat that sentinel as "no cycle yet").
     // All atomic so the GC trigger thread can publish without
     // anyone else's lock.
     pub last_minor_pause_us: AtomicU64,
     pub max_minor_pause_us: AtomicU64,
+    pub min_minor_pause_us: AtomicU64,
     pub total_minor_pause_us: AtomicU64,
     pub last_full_pause_us: AtomicU64,
     pub max_full_pause_us: AtomicU64,
+    pub min_full_pause_us: AtomicU64,
     pub total_full_pause_us: AtomicU64,
 }
 
@@ -195,9 +256,13 @@ impl Default for GcStats {
             pinned_residual_cells: AtomicU64::new(0),
             last_minor_pause_us: AtomicU64::new(0),
             max_minor_pause_us: AtomicU64::new(0),
+            // u64::MAX is the "no cycle yet" sentinel — the first
+            // `fetch_min` call replaces it with the real pause.
+            min_minor_pause_us: AtomicU64::new(u64::MAX),
             total_minor_pause_us: AtomicU64::new(0),
             last_full_pause_us: AtomicU64::new(0),
             max_full_pause_us: AtomicU64::new(0),
+            min_full_pause_us: AtomicU64::new(u64::MAX),
             total_full_pause_us: AtomicU64::new(0),
         }
     }
@@ -236,7 +301,7 @@ impl GcCoordinator {
         } else {
             Arc::new(StaticArea::new(config.static_bytes))
         };
-        Arc::new(GcCoordinator {
+        let coord = Arc::new(GcCoordinator {
             heap: Mutex::new(heap),
             config,
             stop_requested: AtomicBool::new(false),
@@ -252,7 +317,19 @@ impl GcCoordinator {
             intern_table: Mutex::new(HashMap::new()),
             macros: Mutex::new(HashMap::new()),
             stats: GcStats::default(),
-        })
+        });
+        // Hand the coordinator to the crash-report builder so an
+        // SEH dump can include GC + heap state.
+        crate::brk::install_gc_coordinator(Arc::clone(&coord));
+        coord
+    }
+
+    /// Public accessor for the heap mutex — used by the crash handler
+    /// to dump per-generation page counts in a post-mortem report.
+    /// Production callers use `lock()` via `MutatorState`; this is for
+    /// diagnostics that already need raw access.
+    pub fn heap_mutex(&self) -> &Mutex<gc::Heap> {
+        &self.heap
     }
 
     /// Install (or replace) a macro by name. The Word must be a
@@ -586,7 +663,7 @@ impl MutatorState {
     /// trigger a GC (if young is exhausted). Loops until a fresh
     /// slab is held.
     fn refill_tlab(&mut self, min_cells: usize) {
-        let slab_cells = self.coord.config.tlab_cells.max(min_cells);
+        let requested_cells = self.coord.config.tlab_cells.max(min_cells);
         loop {
             // Cooperate with any pending GC first.
             if self.coord.stop_requested.load(Ordering::Acquire) {
@@ -597,12 +674,20 @@ impl MutatorState {
             // Try to allocate a slab.
             let slab_opt = {
                 let mut heap = self.coord.heap.lock().unwrap();
-                heap.young_try_alloc_slab(slab_cells)
+                heap.young_try_alloc_slab(requested_cells)
             };
-            if let Some(slab) = slab_opt {
+            if let Some((slab, granted_cells)) = slab_opt {
+                assert!(
+                    granted_cells >= min_cells && granted_cells <= requested_cells,
+                    "young_try_alloc_slab contract violated for {} backend: requested {} cells, min {} cells, granted {} cells",
+                    crate::gc::ACTIVE_BACKEND_NAME,
+                    requested_cells,
+                    min_cells,
+                    granted_cells,
+                );
                 self.tlab.base = slab.as_ptr();
                 self.tlab.top = 0;
-                self.tlab.limit = slab_cells;
+                self.tlab.limit = granted_cells;
                 return;
             }
 
@@ -716,6 +801,30 @@ impl MutatorState {
         let pause_start = std::time::Instant::now();
         {
             let mut heap = self.coord.heap.lock().unwrap();
+            #[cfg(feature = "gc-page-heap")]
+            {
+                let mut visit_mark =
+                    |scanner: &mut crate::page_heap::mark::MarkScanner<'_, '_>| {
+                        {
+                            let mut my = my_handle.roots.lock().unwrap();
+                            for r in my.iter_mut() {
+                                scanner.visit(r);
+                            }
+                        }
+                        for h in &other_handles {
+                            let mut other = h.roots.lock().unwrap();
+                            for r in other.iter_mut() {
+                                scanner.visit(r);
+                            }
+                        }
+                    };
+                heap.mark_minor_with_static(
+                    &static_cards,
+                    static_base,
+                    static_cells,
+                    &mut visit_mark,
+                );
+            }
             // The heap method takes `&mut dyn FnMut(&mut
             // RootScanner)`, not `impl FnMut`. We bind the closure
             // to a local first so Rust can infer its concrete
@@ -774,8 +883,11 @@ impl MutatorState {
             .store(pinned_cells as u64, Ordering::Relaxed);
 
         // Publish the pause timing. `last_*` is just a store; the
-        // running `max_*` does a CAS-up retry; `total_*` is a
-        // straight fetch_add.
+        // running `max_*` / `min_*` do CAS-up / CAS-down retries
+        // respectively; `total_*` is a straight fetch_add. `min_*`
+        // starts at u64::MAX so the first cycle always wins the
+        // CAS — readers should treat that sentinel as "no cycle
+        // yet."
         let stats = &self.coord.stats;
         stats.last_minor_pause_us.store(pause_us, Ordering::Relaxed);
         stats
@@ -791,6 +903,18 @@ impl MutatorState {
             ) {
                 Ok(_) => break,
                 Err(now) => prev_max = now,
+            }
+        }
+        let mut prev_min = stats.min_minor_pause_us.load(Ordering::Relaxed);
+        while pause_us < prev_min {
+            match stats.min_minor_pause_us.compare_exchange(
+                prev_min,
+                pause_us,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(now) => prev_min = now,
             }
         }
 
@@ -998,6 +1122,17 @@ impl MutatorState {
         self.handle.roots.lock().unwrap().len()
     }
 
+    /// Drop every root above `depth`. Used by the panic-recovery path
+    /// in `catch_gc_stall_as_condition` to discard any roots that a
+    /// signal-aborted callee pushed but didn't pop. Calling with
+    /// `depth > root_count()` is a no-op.
+    pub fn truncate_roots(&self, depth: usize) {
+        let mut roots = self.handle.roots.lock().unwrap();
+        if depth < roots.len() {
+            roots.truncate(depth);
+        }
+    }
+
     // -- Force a GC (tests, explicit user calls) ----------------------------
 
     /// Force a minor GC. The current thread becomes the trigger.
@@ -1085,13 +1220,34 @@ pub extern "C-unwind" fn gc_stats_shim(
     let s = &coord.stats;
     let static_area = coord.static_area();
 
-    let pairs: [(&str, i64); 16] = [
+    // MIN pause uses u64::MAX as "no cycle yet" sentinel. Surface 0
+    // in that case so Lisp consumers don't see an arbitrary giant
+    // fixnum.
+    let raw_min_minor = s.min_minor_pause_us.load(Ordering::Relaxed);
+    let min_minor = if raw_min_minor == u64::MAX { 0 } else { raw_min_minor };
+    #[cfg(feature = "gc-page-heap")]
+    let (mark_live_bytes, mark_live_pages, zero_live_pages_released) = {
+        let heap = coord.heap.lock().unwrap();
+        (
+            heap.last_mark_live_bytes() as i64,
+            heap.last_mark_live_pages() as i64,
+            heap.last_zero_live_pages_released() as i64,
+        )
+    };
+    #[cfg(not(feature = "gc-page-heap"))]
+    let (mark_live_bytes, mark_live_pages, zero_live_pages_released) =
+        (0i64, 0i64, 0i64);
+
+    let pairs: [(&str, i64); 20] = [
         ("MINOR-GCS",             s.minor_gcs.load(Ordering::Relaxed) as i64),
         ("FULL-GCS",              s.full_gcs.load(Ordering::Relaxed) as i64),
         ("BYTES-PROMOTED-TOTAL",  s.bytes_promoted_total.load(Ordering::Relaxed) as i64),
         ("OBJECTS-PINNED-TOTAL",  s.objects_pinned_total.load(Ordering::Relaxed) as i64),
         ("PINNED-RESIDUAL-CELLS", s.pinned_residual_cells.load(Ordering::Relaxed) as i64),
         ("PEAK-YOUNG-BYTES",      s.peak_young_used_bytes.load(Ordering::Relaxed) as i64),
+        ("MARK-LIVE-BYTES",       mark_live_bytes),
+        ("MARK-LIVE-PAGES",       mark_live_pages),
+        ("ZERO-LIVE-PAGES-RELEASED", zero_live_pages_released),
         ("YOUNG-USED",            coord.young_used_bytes() as i64),
         ("YOUNG-CAP",             coord.config.young_bytes as i64),
         ("OLD-USED",              coord.old_used_bytes() as i64),
@@ -1104,11 +1260,11 @@ pub extern "C-unwind" fn gc_stats_shim(
         // it equals STATIC-CAP.
         ("STATIC-COMMITTED",      static_area.committed_bytes() as i64),
         // Per-cycle wall-clock pause times in microseconds.
-        // LAST-MINOR-PAUSE-US is the most recent cycle; MAX is the
-        // worst observed; TOTAL is the cumulative pause time over
-        // the run (so MINOR-GCS / TOTAL-MINOR-PAUSE-US gives mean
-        // throughput-relative work per cycle).
+        // LAST-MINOR-PAUSE-US is the most recent cycle; MIN/MAX
+        // bracket the distribution; TOTAL is the cumulative pause
+        // time over the run (so TOTAL / MINOR-GCS gives the mean).
         ("LAST-MINOR-PAUSE-US",   s.last_minor_pause_us.load(Ordering::Relaxed) as i64),
+        ("MIN-MINOR-PAUSE-US",    min_minor as i64),
         ("MAX-MINOR-PAUSE-US",    s.max_minor_pause_us.load(Ordering::Relaxed) as i64),
         ("TOTAL-MINOR-PAUSE-US",  s.total_minor_pause_us.load(Ordering::Relaxed) as i64),
     ];
@@ -1133,6 +1289,22 @@ pub extern "C-unwind" fn gc_stats_shim(
         result = m.alloc_cons(kw, result);
     }
     result.raw()
+}
+
+/// `(gc)` — force a minor GC cycle. Used by diagnostic Lisp code
+/// (and integration tests) when the natural workload wouldn't fill
+/// the nursery and `(gc-stats)` would otherwise show zero cycles.
+/// Returns NIL.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn gc_force_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    _args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    let m = unsafe { &mut *mutator };
+    m.collect_minor();
+    Word::NIL.raw()
 }
 
 #[inline(always)]
@@ -1197,6 +1369,18 @@ mod tests {
         assert_eq!(coord.young_used_bytes(), 128 * 8);
     }
 
+    #[cfg(feature = "gc-page-heap")]
+    #[test]
+    fn page_heap_caps_default_tlab_to_one_page() {
+        let coord = GcCoordinator::new(GcConfig::default());
+        let mut m = coord.register_mutator();
+
+        m.alloc_cons(Word::fixnum(1), Word::NIL);
+
+        assert_eq!(m.tlab.limit, crate::page_heap::PAGE_SIZE_CELLS);
+        assert!(m.tlab.top <= m.tlab.limit);
+    }
+
     #[test]
     fn rooted_cons_survives_minor_gc() {
         let coord = GcCoordinator::new(small_config());
@@ -1225,6 +1409,114 @@ mod tests {
         // size assertion is backend-agnostic — `used_bytes` aggregates
         // across all generations.
         assert!(coord.used_bytes() >= 16);
+    }
+
+    #[test]
+    fn root_abi_push_pop_round_trip() {
+        let coord = GcCoordinator::new(small_config());
+        let mut m = coord.register_mutator();
+
+        let rooted = m.alloc_cons(Word::fixnum(42), Word::NIL);
+
+        assert_eq!(m.root_count(), 0);
+        let depth = crate::abi::ncl_push_root(&mut m as *mut _, rooted.raw());
+        assert_eq!(depth, 0);
+        assert_eq!(m.root_count(), 1);
+        assert_eq!(m.root_at(depth as usize).raw(), rooted.raw());
+
+        let popped = Word::from_raw(crate::abi::ncl_pop_root(&mut m as *mut _));
+        assert_eq!(popped.raw(), rooted.raw());
+        assert_eq!(m.root_count(), 0);
+    }
+
+    // Gated to page-heap: this exercises precise-root traversal +
+    // evacuation behavior end-to-end. The semispace backend's
+    // precise-roots wiring is a separate landing — see
+    // docs/GC_PRECISE_ROOTS_PLAN.md.
+    #[cfg(feature = "gc-page-heap")]
+    #[test]
+    fn build_rest_list_roots_unread_args_across_gc() {
+        // Verifies that ncl_build_rest_list keeps every input arg
+        // alive across the per-iteration alloc_cons calls — which
+        // themselves can trigger a GC and move the inputs.
+        //
+        // Setup discipline: each input cons must be alive at the
+        // moment ncl_build_rest_list reads from `raw_args`. Pushing
+        // each cons into the mutator's precise root list right after
+        // allocating it ensures it survives any setup-side GC that
+        // a later alloc_cons triggers — `raw_args` itself is a Rust
+        // Vec (its buffer lives outside the GC reservation, so the
+        // conservative stack scan doesn't cover its u64 contents).
+        let coord = GcCoordinator::new(small_config());
+        let mut m = coord.register_mutator();
+
+        // small_config gives 2048-cell young under semispace.
+        // N=600 inputs + 600 outputs = 2400 cells > 2048 → at least
+        // one GC fires inside ncl_build_rest_list (the regression
+        // this test exercises). Under page-heap the reservation
+        // rounds up to 4×64KB pages, so the inside-build GC may not
+        // fire — the test still validates the rooting protocol on
+        // that backend even when GC is quiescent.
+        const N: i64 = 600;
+        let root_base = m.root_count();
+        for i in 0..N {
+            // Each input arg is a Cons-tagged Word whose own car is
+            // fixnum(i). Walking input → its car gives back i, which
+            // is what we use to detect "this arg survived the GC."
+            let cell = m.alloc_cons(Word::fixnum(i), Word::NIL);
+            m.push_root(cell);
+        }
+        // Force a setup-side GC so the inputs are guaranteed to
+        // have moved at least once before raw_args is built. If
+        // precise rooting works, the root list's Words point at
+        // post-GC locations and the snapshot below captures those.
+        m.collect_minor();
+        // Snapshot the (now-post-GC) Words from the root list. No
+        // GC can fire between this collect() and the
+        // ncl_build_rest_list call below — Vec::collect doesn't
+        // allocate from the GC heap.
+        let raw_args: Vec<u64> =
+            (root_base..root_base + N as usize).map(|i| m.root_at(i).raw()).collect();
+
+        let list = Word::from_raw(crate::abi::ncl_build_rest_list(
+            &mut m as *mut _,
+            raw_args.as_ptr(),
+            0,
+            raw_args.len() as u64,
+        ));
+
+        let mut cur = list;
+        for i in 0..N {
+            assert!(cur.is_cons(), "rest list truncated at {i}");
+            let p = cur.as_ptr::<u64>(Tag::Cons).unwrap();
+            // Rest-list element[i] is the i-th input arg (a Cons
+            // Word). The precise root for that input was kept in
+            // sync by GC, so its current location matches the
+            // rest-list car. Walk one level deeper to find the
+            // fixnum we stamped in at setup.
+            let arg = Word::from_raw(unsafe { *p });
+            assert!(arg.is_cons(), "rest list element {i} not a cons");
+            assert_eq!(
+                arg.raw(),
+                m.root_at(root_base + i as usize).raw(),
+                "rest list element {i} pointer diverged from rooted input",
+            );
+            let arg_ptr = arg.as_ptr::<u64>(Tag::Cons).unwrap();
+            let arg_car = Word::from_raw(unsafe { *arg_ptr });
+            assert_eq!(
+                arg_car.as_fixnum(),
+                Some(i),
+                "rest list element {i} car lost across GC"
+            );
+            cur = Word::from_raw(unsafe { *p.add(1) });
+        }
+        assert!(cur.is_nil(), "rest list has trailing junk");
+
+        // Drop the N precise roots we pushed above.
+        for _ in 0..N {
+            m.pop_root().expect("setup-rooted input missing");
+        }
+        assert_eq!(m.root_count(), root_base);
     }
 
     #[test]
@@ -1558,6 +1850,16 @@ mod tests {
 
         assert_eq!(coord.static_area().cards().dirty_count(), 1);
         m.collect_minor();
+        // Backend-specific clear policy:
+        //   - semispace: unconditional clear after every minor.
+        //   - page-heap: `clear_cards_unless_intergen` keeps a card
+        //     dirty while any cell in it holds a heap-pointer Word.
+        //     The static slot still points at y (or its forwarded
+        //     location), so the card MUST stay dirty so the next
+        //     cycle's static-area scan re-finds the inter-gen ref.
+        #[cfg(feature = "gc-page-heap")]
+        assert_eq!(coord.static_area().cards().dirty_count(), 1);
+        #[cfg(not(feature = "gc-page-heap"))]
         assert_eq!(coord.static_area().cards().dirty_count(), 0);
     }
 

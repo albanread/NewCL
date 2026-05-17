@@ -37,12 +37,76 @@
 //! independent: marked = "is alive", pinned = "do not move."
 //! Sub-phase 7 evacuation reads both bits.
 
-use crate::heap::{HeapHeader, HeapType};
+use crate::heap::HeapHeader;
 use crate::word::{Tag, Word};
 
 use super::alloc::{is_cons_start_at, is_start_at};
 use super::page_desc::{Generation, PageKind};
 use super::space::{PageHeap, PAGE_SIZE_CELLS};
+
+pub(crate) struct PageMarker<'a> {
+    heap: &'a mut PageHeap,
+    target: Generation,
+    queue: Vec<usize>,
+}
+
+impl<'a> PageMarker<'a> {
+    pub(crate) fn new(heap: &'a mut PageHeap, target: Generation) -> Self {
+        heap.clear_mark_bits_in_gen(target);
+        Self {
+            heap,
+            target,
+            queue: Vec::new(),
+        }
+    }
+
+    /// Constructor that does NOT clear existing mark bits. Used by
+    /// `extend_mark_from_pinned` to add to the existing mark set
+    /// rather than replace it.
+    pub(crate) fn new_without_clear(
+        heap: &'a mut PageHeap,
+        target: Generation,
+    ) -> Self {
+        Self {
+            heap,
+            target,
+            queue: Vec::new(),
+        }
+    }
+
+    pub(crate) fn visit(&mut self, slot: &mut Word) {
+        self.visit_word(*slot);
+    }
+
+    pub(crate) fn visit_word(&mut self, word: Word) {
+        self.heap.try_mark_root(word, self.target, &mut self.queue);
+    }
+
+    pub(crate) unsafe fn visit_cell(&mut self, cell_ptr: *mut u64) {
+        self.visit_word(Word::from_raw(unsafe { *cell_ptr }));
+    }
+
+    pub(crate) fn drain(&mut self) {
+        while let Some(cell_idx) = self.queue.pop() {
+            self.heap
+                .scan_marked_object(cell_idx, self.target, &mut self.queue);
+        }
+    }
+}
+
+pub struct MarkScanner<'s, 'a: 's> {
+    marker: &'s mut PageMarker<'a>,
+}
+
+impl<'s, 'a: 's> MarkScanner<'s, 'a> {
+    pub(crate) fn new(marker: &'s mut PageMarker<'a>) -> Self {
+        Self { marker }
+    }
+
+    pub fn visit(&mut self, slot: &mut Word) {
+        self.marker.visit(slot);
+    }
+}
 
 impl PageHeap {
     /// Mark all objects in `target` generation reachable from
@@ -59,21 +123,11 @@ impl PageHeap {
     /// ignored — useful for minor-only marks where roots may
     /// include G1/Tenured pointers from older code.
     pub fn mark_from_roots(&mut self, target: Generation, roots: &[Word]) {
-        // 1. Clear bits on the target generation.
-        self.clear_mark_bits_in_gen(target);
-
-        // 2. Seed the work queue with marked roots.
-        let mut queue: Vec<usize> = Vec::with_capacity(roots.len() * 2);
+        let mut marker = PageMarker::new(self, target);
         for &root in roots {
-            self.try_mark_root(root, target, &mut queue);
+            marker.visit_word(root);
         }
-
-        // 3. Drain the queue. Each entry is the global cell index
-        //    of a marked object's first cell. We inspect the
-        //    payload and recurse via try_mark_root.
-        while let Some(cell_idx) = queue.pop() {
-            self.scan_marked_object(cell_idx, target, &mut queue);
-        }
+        marker.drain();
     }
 
     /// If `w` is a heap-pointer Word into the target generation
@@ -129,6 +183,13 @@ impl PageHeap {
             // Sub-phase 6 will harden this for the conservative
             // pinner; sub-phase 5 just skips.
             return;
+        }
+        let is_cons_start = is_cons_start_at(self.start_bits_slice(), cell_idx);
+        match tag {
+            Tag::Cons if is_cons_start => {}
+            Tag::Symbol | Tag::Vector | Tag::Function | Tag::String
+                if !is_cons_start => {}
+            _ => return,
         }
         // Mark; if already marked, no re-queueing.
         if self.mark_cell(cell_idx) {
@@ -214,6 +275,130 @@ impl PageHeap {
         debug_assert!(cell_idx < self.total_cells());
         let ptr = unsafe { (self.base_ptr() as *const u64).add(cell_idx) };
         unsafe { *ptr }
+    }
+
+    /// Cross-generation extension: seed `target`'s mark BFS from
+    /// pinned objects whose own page is in a DIFFERENT generation.
+    /// Walks each such pinned object's payload Words and offers them
+    /// to `try_mark_root(_, target, _)`; the BFS then propagates
+    /// transitively through `target`.
+    ///
+    /// Closes a heap-walk hole identified in `docs/GC_HEAP_WALK_CLOSURE.md`:
+    /// the conservative pin scan retains G1 cells via stack-resident
+    /// pointer-shaped values, and those pinned G1 objects' fields may
+    /// point at G0 cells. Without this extension, the cross-gen G0
+    /// children are never marked → Phase 1 doesn't evacuate them →
+    /// Phase 3 releases their pages → the pinned-G1 field dangles.
+    ///
+    /// The pinned object itself is NOT marked in `target`'s bitmap:
+    /// it lives in a different gen and stays put under the pin
+    /// contract; only its payload's `target`-gen children get marked.
+    pub fn extend_mark_from_cross_gen_pinned(&mut self, target: Generation) -> usize {
+        if self.pinned_cells.is_empty() {
+            return 0;
+        }
+        let pinned: Vec<usize> = self.pinned_cells.iter().copied().collect();
+        let mut marker = PageMarker::new_without_clear(self, target);
+        let mut new_seeds = 0usize;
+        for cell_idx in pinned {
+            let page_idx = cell_idx / PAGE_SIZE_CELLS;
+            let pinned_gen = marker.heap.desc(page_idx).generation;
+            // Same-gen pins are covered by `extend_mark_from_pinned(target)`.
+            // Free and Large pages aren't legal pin targets.
+            if pinned_gen == target {
+                continue;
+            }
+            if !matches!(
+                pinned_gen,
+                Generation::G0 | Generation::G1 | Generation::Tenured
+            ) {
+                continue;
+            }
+            let kind = marker.heap.desc(page_idx).kind;
+            if !matches!(kind, PageKind::Cons | PageKind::Boxed) {
+                continue;
+            }
+            if !is_start_at(marker.heap.start_bits_slice(), cell_idx) {
+                continue;
+            }
+            let is_cons =
+                is_cons_start_at(marker.heap.start_bits_slice(), cell_idx);
+            let size_cells = if is_cons {
+                2
+            } else {
+                let header_word = marker.heap.read_cell(cell_idx);
+                let h = HeapHeader::from_raw(header_word);
+                1 + h.length_cells() as usize
+            };
+            let payload_start = if is_cons { cell_idx } else { cell_idx + 1 };
+            let payload_end = cell_idx + size_cells;
+            for c in payload_start..payload_end {
+                let w = Word::from_raw(marker.heap.read_cell(c));
+                let before = marker.queue.len();
+                marker
+                    .heap
+                    .try_mark_root(w, target, &mut marker.queue);
+                if marker.queue.len() > before {
+                    new_seeds += marker.queue.len() - before;
+                }
+            }
+        }
+        marker.drain();
+        new_seeds
+    }
+
+    /// Extend the mark by treating every cell in `pinned_cells` as an
+    /// additional root: walk each pinned object's payload, marking
+    /// targets transitively. Returns the number of newly-marked
+    /// objects.
+    ///
+    /// Why this is needed: the conservative pin scan runs AFTER the
+    /// precise mark pass, so objects that are only reachable via a
+    /// conservatively-pinned object's payload (i.e. the precise root
+    /// graph doesn't include the pinned object, but it's kept alive
+    /// by a register-spilled stack candidate) are missed by the
+    /// initial mark. They would then not be copied by evacuation,
+    /// their pages would be reclaimed, and any Word inside the
+    /// pinned object that points at them would dangle.
+    ///
+    /// This extension uses the same `PageMarker` walker as
+    /// `mark_from_roots`, just seeded from the pinned cells instead
+    /// of caller-supplied roots.
+    ///
+    /// Covers same-gen pinning only — pinned objects whose page is
+    /// in `target`. Cross-gen children of pinned objects in OTHER
+    /// generations are handled by `extend_mark_from_cross_gen_pinned`.
+    pub fn extend_mark_from_pinned(&mut self, target: Generation) -> usize {
+        if self.pinned_cells.is_empty() {
+            return 0;
+        }
+        let pinned: Vec<usize> = self.pinned_cells.iter().copied().collect();
+        let mut marker = PageMarker::new_without_clear(self, target);
+        let mut newly_marked = 0usize;
+        for cell_idx in pinned {
+            let page_idx = cell_idx / PAGE_SIZE_CELLS;
+            if marker.heap.desc(page_idx).generation != target {
+                continue;
+            }
+            let kind = marker.heap.desc(page_idx).kind;
+            if !matches!(kind, PageKind::Cons | PageKind::Boxed) {
+                continue;
+            }
+            if !is_start_at(marker.heap.start_bits_slice(), cell_idx) {
+                continue;
+            }
+            // `mark_cell` returns the PREVIOUS state. If it was
+            // already marked, the precise mark pass already walked
+            // its payload — don't re-queue. If it was not previously
+            // marked, queue for traversal.
+            if marker.heap.mark_cell(cell_idx) {
+                continue;
+            }
+            newly_marked += 1;
+            marker.queue.push(cell_idx);
+        }
+        marker.drain();
+        newly_marked
     }
 
     /// Diagnostic: walk all marked cells in `target` generation

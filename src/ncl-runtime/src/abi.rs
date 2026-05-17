@@ -12,6 +12,89 @@
 use crate::mutator::MutatorState;
 use crate::word::{Tag, Word};
 
+/// Common tail for every signal-a-condition path: store the
+/// condition in the per-thread slot, set both the per-thread
+/// CONDITION_PENDING flag (read by `%handler-case`) and the
+/// unified ABORT_PENDING flag (polled by JIT-emitted post-call
+/// abort checks). Returns NIL as the call-site's value; callers
+/// return that NIL upward and the JIT's abort-check trips next.
+///
+/// Factored out because forgetting to set ABORT_PENDING was the
+/// exact bug `Expr::LoadGlobal` / `Expr::LoadFunction` exposed —
+/// the three flags must move together at every signal site.
+fn record_pending_condition(cond_raw: u64) -> u64 {
+    CONDITION_SLOT.with(|s| s.set(cond_raw));
+    CONDITION_PENDING.with(|p| p.set(true));
+    ABORT_PENDING.with(|p| p.set(true));
+    Word::NIL.raw()
+}
+
+fn signal_condition_word_and_abort(cond: Word) -> u64 {
+    if HANDLER_DEPTH.with(|d| d.get()) == 0 {
+        let msg = crate::printer::format_word_aesthetic(cond);
+        eprintln!("unhandled condition: {msg}");
+        std::process::abort();
+    }
+    record_pending_condition(cond.raw())
+}
+
+fn signal_static_condition_string_and_abort(
+    mutator: *mut crate::mutator::MutatorState,
+    msg: &str,
+) -> u64 {
+    let m = unsafe { &mut *mutator };
+    let cond = crate::gc_string::alloc_string_in_static(
+        m.coord().static_area(),
+        msg,
+    )
+    .unwrap_or_else(|| {
+        eprintln!("gc-stall: static-area condition allocation failed; original message: {msg}");
+        Word::NIL
+    });
+    signal_condition_word_and_abort(cond)
+}
+
+fn catch_gc_stall_as_condition<F>(
+    mutator: *mut crate::mutator::MutatorState,
+    body: F,
+) -> u64
+where
+    F: FnOnce() -> u64,
+{
+    #[cfg(feature = "gc-page-heap")]
+    {
+        crate::page_heap::evac::install_quiet_gc_stall_panic_hook();
+        // Snapshot root depth so a mid-body unwind can't leave
+        // half-pushed roots in place. Callees like
+        // `ncl_build_rest_list` push roots around their alloc loop;
+        // a panic from `alloc_cons` would otherwise leak them.
+        let saved_root_depth = unsafe { (*mutator).root_count() };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+            Ok(value) => value,
+            Err(payload) => {
+                unsafe { (*mutator).truncate_roots(saved_root_depth) };
+                if let Some(stall) =
+                    payload.downcast_ref::<crate::page_heap::evac::GcStallError>()
+                {
+                    let m = unsafe { &mut *mutator };
+                    let static_area = m.coord().static_area();
+                    let msg = stall.render_with_runtime_context(
+                        "young exhausted",
+                        static_area.used_bytes(),
+                        static_area.committed_bytes(),
+                    );
+                    return signal_static_condition_string_and_abort(mutator, &msg);
+                }
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+    #[cfg(not(feature = "gc-page-heap"))]
+    {
+        body()
+    }
+}
+
 /// Allocate a cons cell. JIT'd `(cons car cdr)` lowers to a call
 /// here.
 ///
@@ -22,10 +105,12 @@ use crate::word::{Tag, Word};
 /// call.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn ncl_alloc_cons(mutator: *mut MutatorState, car: u64, cdr: u64) -> u64 {
-    let m = unsafe { &mut *mutator };
-    let car_w = Word::from_raw(car);
-    let cdr_w = Word::from_raw(cdr);
-    m.alloc_cons(car_w, cdr_w).raw()
+    catch_gc_stall_as_condition(mutator, || {
+        let m = unsafe { &mut *mutator };
+        let car_w = Word::from_raw(car);
+        let cdr_w = Word::from_raw(cdr);
+        m.alloc_cons(car_w, cdr_w).raw()
+    })
 }
 
 /// Read the car field of a cons cell. JIT'd `(car x)` lowers to
@@ -285,10 +370,52 @@ pub extern "C-unwind" fn ncl_call(
         );
     }
     let env = crate::gc_function::env(fn_value);
+    // Diagnostic: an env that isn't NIL and isn't a Vector pointer
+    // means the Function's env field has been corrupted (typically
+    // by a missed card-rewrite). Catch it here with full context
+    // instead of letting the JIT'd code crash on a stale deref.
+    debug_assert_closure_env_valid("ncl_call", sym_word, fn_value, env);
     let code = crate::gc_function::code_ptr(fn_value);
     let f: crate::gc_function::LispCodeFn =
         unsafe { std::mem::transmute(code) };
     unsafe { f(mutator, env.raw(), args, n_args) }
+}
+
+/// Verify that a Function's env field is in the expected shape
+/// before we hand it to JIT-compiled code. NIL means "no captures
+/// (plain defun)"; a Vector-tagged Word means "closure with a
+/// captured env Vector." Anything else is a corruption signature
+/// — almost always a Fixnum 0 left behind by `phase3_reclaim`
+/// after the env Vector's page was reclaimed and the static-area
+/// env cell wasn't rewritten because the mark pass missed the
+/// Vector or the card was inadvertently cleared.
+fn debug_assert_closure_env_valid(
+    site: &str,
+    sym_word: u64,
+    fn_value: Word,
+    env: Word,
+) {
+    if env.is_nil() {
+        return;
+    }
+    if env.tag() == Tag::Vector {
+        return;
+    }
+    let sym_name = crate::sym_names::lookup(sym_word)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("{sym_word:#x}"));
+    eprintln!(
+        "[{site}] CORRUPT closure env: sym={sym_name} fn={fn_value:?} env_raw={:#x} env_tag={:?}",
+        env.raw(),
+        env.tag(),
+    );
+    if let Some(p) = fn_value.as_ptr::<u8>(Tag::Function) {
+        let cell_addr = unsafe { p.add(crate::gc_function::ENV_OFFSET * 8) };
+        eprintln!(
+            "[{site}] env cell address: {cell_addr:p} (static-area? card-marked at make_closure)"
+        );
+    }
+    std::process::abort();
 }
 
 /// Call a Function value directly (no symbol lookup). Used by
@@ -300,15 +427,18 @@ pub extern "C-unwind" fn ncl_funcall(
     args: *const u64,
     n_args: u64,
 ) -> u64 {
-    let f_word = Word::from_raw(fn_word);
-    if f_word.tag() != Tag::Function {
-        panic!("funcall: not a function: {f_word:?}");
-    }
-    let env = crate::gc_function::env(f_word);
-    let code = crate::gc_function::code_ptr(f_word);
-    let f: crate::gc_function::LispCodeFn =
-        unsafe { std::mem::transmute(code) };
-    unsafe { f(mutator, env.raw(), args, n_args) }
+    catch_gc_stall_as_condition(mutator, || {
+        let f_word = Word::from_raw(fn_word);
+        if f_word.tag() != Tag::Function {
+            panic!("funcall: not a function: {f_word:?}");
+        }
+        let env = crate::gc_function::env(f_word);
+        debug_assert_closure_env_valid("ncl_funcall", 0, f_word, env);
+        let code = crate::gc_function::code_ptr(f_word);
+        let f: crate::gc_function::LispCodeFn =
+            unsafe { std::mem::transmute(code) };
+        unsafe { f(mutator, env.raw(), args, n_args) }
+    })
 }
 
 /// Allocate a closure: a Function in static with the given code,
@@ -336,43 +466,71 @@ pub extern "C-unwind" fn ncl_make_closure(
     captures: *const u64,
     n_captures: u64,
 ) -> u64 {
-    let m = unsafe { &mut *mutator };
-    let env_word = if n_captures == 0 {
-        Word::NIL
-    } else {
-        let vec = m.alloc_vector(n_captures as u32);
-        // Vec layout: cell 0 is header, cells 1..=n are payload.
-        let p = vec
-            .as_mut_ptr::<u64>(Tag::Vector)
-            .expect("vector ptr");
-        unsafe {
+    catch_gc_stall_as_condition(mutator, || {
+        let m = unsafe { &mut *mutator };
+        let env_word = if n_captures == 0 {
+            Word::NIL
+        } else {
+            // Each capture is potentially a heap pointer held only in
+            // the caller's stack alloca (`cap_buf`), which the GC
+            // does NOT cover via precise roots. If we read them
+            // before alloc_vector and the alloc triggers a GC,
+            // the post-GC objects move but our copies in cap_buf
+            // stay stale — the env Vector ends up holding dangling
+            // pointers, and the closure crashes on first dereference
+            // (the demos/life.lisp gen-25 / `lambda_1317` crash).
+            //
+            // Fix: push every capture into the mutator's precise
+            // root list BEFORE alloc_vector, then read them back
+            // from the root list afterward. The GC walks the root
+            // list during any cycle inside alloc_vector and
+            // forwards-updates them, so the read-back gives the
+            // post-GC pointer.
+            let root_base = m.root_count();
             for i in 0..n_captures {
-                *p.add(1 + i as usize) = *captures.add(i as usize);
+                let cap = Word::from_raw(unsafe { *captures.add(i as usize) });
+                m.push_root(cap);
             }
-        }
-        vec
-    };
-    // Lambdas live in static for now (with the env-pointer card
-    // marked if env is in young — see below).
-    let coord = m.coord();
-    let fn_word = crate::gc_function::alloc_function_in_static(
-        coord.static_area(),
-        code_ptr as usize,
-        arity as u32,
-        Word::NIL, // anonymous lambdas have no name
-        env_word,
-    )
-    .expect("static area exhausted in lambda creation");
-    // If env is a young-heap Vector, the Function in static now
-    // contains a static→young pointer. Mark the card.
-    if !env_word.is_nil() {
-        let env_cell_addr = unsafe {
-            (fn_word.as_ptr::<u8>(Tag::Function).unwrap() as *const u8)
-                .add(crate::gc_function::ENV_OFFSET * 8)
+            let vec = m.alloc_vector(n_captures as u32);
+            // Vec layout: cell 0 is header, cells 1..=n are payload.
+            let p = vec
+                .as_mut_ptr::<u64>(Tag::Vector)
+                .expect("vector ptr");
+            for i in 0..n_captures {
+                let cap_post_gc = m.root_at(root_base + i as usize);
+                unsafe {
+                    *p.add(1 + i as usize) = cap_post_gc.raw();
+                }
+            }
+            // Drop the precise roots — the env Vector now owns them
+            // (the Function structure we allocate next will hold the
+            // Vector, and the returned Function Word is the caller's
+            // single live reference to the whole closure).
+            for _ in 0..n_captures {
+                m.pop_root().expect("make_closure capture root missing");
+            }
+            vec
         };
-        coord.mark_card(env_cell_addr);
-    }
-    fn_word.raw()
+        // Lambdas live in static for now (with the env-pointer card
+        // marked if env is in young — see below).
+        let coord = m.coord();
+        let fn_word = crate::gc_function::alloc_function_in_static(
+            coord.static_area(),
+            code_ptr as usize,
+            arity as u32,
+            Word::NIL,
+            env_word,
+        )
+        .expect("static area exhausted in lambda creation");
+        if !env_word.is_nil() {
+            let env_cell_addr = unsafe {
+                (fn_word.as_ptr::<u8>(Tag::Function).unwrap() as *const u8)
+                    .add(crate::gc_function::ENV_OFFSET * 8)
+            };
+            coord.mark_card(env_cell_addr);
+        }
+        fn_word.raw()
+    })
 }
 
 /// Mutate the car field of a cons cell. JIT'd `(setf (car x) v)`
@@ -486,9 +644,7 @@ pub fn signal_condition_string(
     }
     let m = unsafe { &mut *mutator };
     let cond = crate::gc_string::alloc_string_in_young(m, msg);
-    CONDITION_SLOT.with(|s| s.set(cond.raw()));
-    CONDITION_PENDING.with(|p| p.set(true));
-    Word::NIL.raw()
+    record_pending_condition(cond.raw())
 }
 
 /// `(error condition-or-message)` — signal a condition. With a
@@ -515,13 +671,7 @@ pub extern "C-unwind" fn error_shim(
         eprintln!("unhandled condition: {msg}");
         std::process::abort();
     }
-    CONDITION_SLOT.with(|s| s.set(cond));
-    CONDITION_PENDING.with(|p| p.set(true));
-    // Also flip the unified abort flag so the call-site
-    // instrumentation propagates this condition out of the body
-    // immediately rather than waiting for natural return.
-    ABORT_PENDING.with(|p| p.set(true));
-    Word::NIL.raw()
+    record_pending_condition(cond)
 }
 
 /// `(%handler-case body-thunk handler-fn)` — internal primitive
@@ -975,6 +1125,7 @@ pub extern "C-unwind" fn ncl_apply(
     }
 
     let env = crate::gc_function::env(f_word);
+    debug_assert_closure_env_valid("ncl_apply", 0, f_word, env);
     let code = crate::gc_function::code_ptr(f_word);
     let f: crate::gc_function::LispCodeFn =
         unsafe { std::mem::transmute(code) };
@@ -994,18 +1145,33 @@ pub extern "C-unwind" fn ncl_build_rest_list(
     start: u64,
     n_args: u64,
 ) -> u64 {
-    let m = unsafe { &mut *mutator };
-    let mut result = Word::NIL;
-    if n_args > start {
-        // Cons right-to-left so the list ends up in order.
+    catch_gc_stall_as_condition(mutator, || {
+        let m = unsafe { &mut *mutator };
+        if n_args <= start {
+            return Word::NIL.raw();
+        }
+
+        let root_base = m.root_count();
+        for i in start..n_args {
+            let arg_w = Word::from_raw(unsafe { *args.add(i as usize) });
+            m.push_root(arg_w);
+        }
+        let result_idx = m.push_root(Word::NIL);
+
         let mut i = n_args;
         while i > start {
             i -= 1;
-            let arg_w = Word::from_raw(unsafe { *args.add(i as usize) });
-            result = m.alloc_cons(arg_w, result);
+            let arg_idx = root_base + (i - start) as usize;
+            let next = m.alloc_cons(m.root_at(arg_idx), m.root_at(result_idx));
+            m.set_root_at(result_idx, next);
         }
-    }
-    result.raw()
+
+        let result = m.pop_root().expect("rest-list result root missing");
+        for _ in start..n_args {
+            m.pop_root().expect("rest-list arg root missing");
+        }
+        result.raw()
+    })
 }
 
 /// Mutate the i-th codepoint of a string. JIT'd
@@ -1759,6 +1925,24 @@ pub extern "C-unwind" fn ncl_abort_pending() -> i32 {
     } else {
         0
     }
+}
+
+/// JIT-callable explicit root push. Returns the root depth before
+/// the push, mirroring `MutatorState::push_root`.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn ncl_push_root(mutator: *mut MutatorState, w: u64) -> u64 {
+    let m = unsafe { &mut *mutator };
+    m.push_root(Word::from_raw(w)) as u64
+}
+
+/// JIT-callable explicit root pop. Returns the popped raw Word.
+/// Popping an empty root stack is a compiler/runtime contract bug.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn ncl_pop_root(mutator: *mut MutatorState) -> u64 {
+    let m = unsafe { &mut *mutator };
+    m.pop_root()
+        .expect("ncl_pop_root called with an empty root stack")
+        .raw()
 }
 
 /// `(%native-block NAME THUNK)` — the primitive behind the

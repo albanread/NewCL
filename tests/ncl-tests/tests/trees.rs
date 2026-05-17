@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 
 use ncl_compiler::Session;
+use ncl_tests::TestSession;
 
 fn library_path(name: &str) -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -21,14 +22,14 @@ fn library_path(name: &str) -> PathBuf {
     p
 }
 
-fn fresh_session_with_trees() -> Session {
+fn fresh_session_with_trees() -> TestSession {
     let mut s = Session::with_stdlib().expect("session boots with stdlib");
     s.activate();
     let path = library_path("trees.lisp");
     let src = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     s.eval(&src).expect("Library/trees.lisp loads");
-    s
+    TestSession::with_thread_name(s)
 }
 
 #[test]

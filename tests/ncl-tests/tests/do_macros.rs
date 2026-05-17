@@ -16,11 +16,12 @@
 //!   * DO* sequential init/step semantics differ from DO
 
 use ncl_compiler::Session;
+use ncl_tests::TestSession;
 
-fn fresh() -> Session {
+fn fresh() -> TestSession {
     let mut s = Session::with_stdlib().expect("session boots");
     s.activate();
-    s
+    TestSession::with_thread_name(s)
 }
 
 // ── DO ────────────────────────────────────────────────────────────────

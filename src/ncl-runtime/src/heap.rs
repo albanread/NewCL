@@ -611,10 +611,15 @@ impl Heap {
     }
 
     /// Reserve a slab in young for a TLAB. Returns `None` if young
-    /// can't fit the slab. The caller (a `MutatorState`) bump-
-    /// allocates within the returned slab without locks.
-    pub fn young_try_alloc_slab(&mut self, cells: usize) -> Option<NonNull<u64>> {
-        self.young.try_alloc_cells(cells)
+    /// can't fit the slab. On success returns both the slab base
+    /// pointer and the number of cells actually granted. The caller
+    /// (a `MutatorState`) bump-allocates within the granted prefix
+    /// without locks.
+    pub fn young_try_alloc_slab(
+        &mut self,
+        cells: usize,
+    ) -> Option<(NonNull<u64>, usize)> {
+        self.young.try_alloc_cells(cells).map(|slab| (slab, cells))
     }
 
     pub fn young_capacity_bytes(&self) -> usize { self.young.capacity_bytes() }

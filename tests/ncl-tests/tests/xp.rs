@@ -11,6 +11,7 @@
 
 use std::path::PathBuf;
 use ncl_compiler::Session;
+use ncl_tests::TestSession;
 
 fn library_path(name: &str) -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -22,7 +23,7 @@ fn library_path(name: &str) -> PathBuf {
     p
 }
 
-fn fresh_session_with_xp() -> Session {
+fn fresh_session_with_xp() -> TestSession {
     let mut s = Session::with_stdlib().expect("session boots");
     s.activate();
     // XP needs streams (string-output-stream, with-output-to-string),
@@ -45,7 +46,7 @@ fn fresh_session_with_xp() -> Session {
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         s.eval(&src).unwrap_or_else(|e| panic!("load {name}: {e}"));
     }
-    s
+    TestSession::with_thread_name(s)
 }
 
 #[test]

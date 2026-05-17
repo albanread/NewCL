@@ -71,6 +71,19 @@ pub struct PinScanResult {
     pub n_cells: usize,
 }
 
+/// Per-gate counters for one pin pass. Exposed only via the
+/// `NCL_GC_VERBOSE` diagnostic dump in `pin_pointers_in_ranges`.
+#[derive(Default)]
+struct PinStats {
+    candidates: u64,
+    tag_pass: u64,
+    in_range_pass: u64,
+    in_heap_pass: u64,
+    in_gen_pass: u64,
+    start_bit_pass: u64,
+    new_pins: usize,
+}
+
 impl PageHeap {
     /// Conservative-pin scan. For each candidate `Word` found in
     /// the byte ranges, set the matching pin bit if the target is
@@ -91,12 +104,36 @@ impl PageHeap {
         target: Generation,
         ranges: &[(usize, usize)],
     ) -> PinScanResult {
-        let mut newly_pinned: usize = 0;
+        // Diagnostic: NCL_NO_CONSERVATIVE_PIN=1 makes this a no-op.
+        // If Life crashes earlier and in a different place, precise
+        // roots are missing a genuinely-live value (the conservative
+        // scan was masking the gap). If Life crashes the same way,
+        // the bug is reachable through precise roots and conservative
+        // pin isn't relevant.
+        if std::env::var_os("NCL_NO_CONSERVATIVE_PIN").is_some() {
+            return PinScanResult::default();
+        }
+        let verbose = std::env::var_os("NCL_GC_VERBOSE").is_some();
+        let mut stats = PinStats::default();
         for &(range_lo, range_hi) in ranges {
-            newly_pinned += self.pin_range_one(target, range_lo, range_hi);
+            self.pin_range_one(target, range_lo, range_hi, &mut stats);
+        }
+        if verbose {
+            eprintln!(
+                "[pin target={target:?}] candidates={} tag_pass={} \
+                 in_range_pass={} in_heap_pass={} in_gen_pass={} \
+                 start_bit_pass={} new_pins={}",
+                stats.candidates,
+                stats.tag_pass,
+                stats.in_range_pass,
+                stats.in_heap_pass,
+                stats.in_gen_pass,
+                stats.start_bit_pass,
+                stats.new_pins,
+            );
         }
         PinScanResult {
-            n_objects: newly_pinned,
+            n_objects: stats.new_pins,
             n_cells: 0, // populated by sub-phase 7 once size is known
         }
     }
@@ -118,16 +155,17 @@ impl PageHeap {
         target: Generation,
         range_lo: usize,
         range_hi: usize,
-    ) -> usize {
+        stats: &mut PinStats,
+    ) {
         if range_lo >= range_hi {
-            return 0;
+            return;
         }
         let scan_start = (range_lo + 7) & !7;
         let scan_end = range_hi & !7;
         let mut p = scan_start as *const u64;
         let end = scan_end as *const u64;
-        let mut new_pins = 0usize;
         while p < end {
+            stats.candidates += 1;
             let raw = unsafe { *p };
             let w = Word::from_raw(raw);
             let tag = w.tag();
@@ -139,6 +177,7 @@ impl PageHeap {
                 p = unsafe { p.add(1) };
                 continue;
             }
+            stats.tag_pass += 1;
             let target_addr =
                 (raw & crate::word::PAYLOAD_MASK) as usize;
             // 2. Self-stack-exclusion — pointer back into our own
@@ -147,6 +186,7 @@ impl PageHeap {
                 p = unsafe { p.add(1) };
                 continue;
             }
+            stats.in_range_pass += 1;
             // 3. Page lookup.
             let target_ptr = target_addr as *const u8;
             let page_idx = match self.page_of(target_ptr) {
@@ -156,11 +196,13 @@ impl PageHeap {
                     continue;
                 }
             };
+            stats.in_heap_pass += 1;
             // 4. Generation gate.
             if self.desc(page_idx).generation != target {
                 p = unsafe { p.add(1) };
                 continue;
             }
+            stats.in_gen_pass += 1;
             // 5. Cell-start gate. Compute global cell index and
             //    require the start bit be set.
             let cell_idx = (target_addr - self.base_ptr() as usize) / 8;
@@ -168,10 +210,11 @@ impl PageHeap {
                 p = unsafe { p.add(1) };
                 continue;
             }
+            stats.start_bit_pass += 1;
             // 6. Record the pin. HashSet::insert returns true if
             //    this is a new entry; track for the result count.
             if self.pinned_cells.insert(cell_idx) {
-                new_pins += 1;
+                stats.new_pins += 1;
             }
             // Set page-byte slot. The slot is the sub-region the
             // pinned cell falls into.
@@ -181,7 +224,6 @@ impl PageHeap {
 
             p = unsafe { p.add(1) };
         }
-        new_pins
     }
 
     /// Test whether the object at `cell_idx` is pinned by the most
