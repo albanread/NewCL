@@ -190,5 +190,54 @@
   (and (= (length a) (length b))
        (%string-equal-from a b 0 (length a))))
 
+;; ── equalp ──────────────────────────────────────────────────────────────
+;;
+;; CL's most permissive built-in equality:
+;;
+;;   * numbers: value compare, ignores type — `(equalp 1 1.0) => T`,
+;;     `(equalp 2 2/1) => T`.
+;;   * characters: CHAR-EQUAL (case-insensitive).
+;;   * strings: same length + every pair CHAR-EQUAL (case-insensitive).
+;;   * conses: recursive on car and cdr.
+;;   * vectors: same length + every element EQUALP.
+;;   * everything else: falls through to EQ.
+;;
+;; Per the spec, EQUALP on hash tables and structures requires
+;; deeper structural inspection; we don't have a hash-table walker
+;; yet and structs are EQ-only for now. Both fall through to EQ,
+;; which matches user-visible expectations for the ANSI hyperspec
+;; examples (which only exercise number/char/string/cons/vector).
+;;
+;; Lives at the end of characters.lisp so STRING-EQUAL and CHAR-EQUAL
+;; are already defined. The function is dependency-free past those
+;; two; modules loaded after characters.lisp (lists, places, numbers,
+;; xp, describe, …) can use it freely.
+
+(defun %vector-equalp-from (a b i n)
+  (cond
+    ((>= i n) t)
+    ((equalp (svref a i) (svref b i))
+     (%vector-equalp-from a b (+ i 1) n))
+    (t nil)))
+
+(defun equalp (a b)
+  "Common-Lisp EQUALP. T iff A and B are equal under the loosest
+   built-in test: numbers compared by VALUE across types, characters
+   and strings case-insensitively, and conses/vectors recursively."
+  (cond
+    ((eq a b) t)
+    ((and (numberp a) (numberp b)) (= a b))
+    ((and (characterp a) (characterp b)) (char-equal a b))
+    ;; Strings are vectors at the heap level, so the string check
+    ;; comes first to dispatch on case-insensitive compare.
+    ((and (stringp a) (stringp b)) (string-equal a b))
+    ((and (consp a) (consp b))
+     (and (equalp (car a) (car b))
+          (equalp (cdr a) (cdr b))))
+    ((and (vectorp a) (vectorp b))
+     (and (= (length a) (length b))
+          (%vector-equalp-from a b 0 (length a))))
+    (t nil)))
+
 (provide 'characters)
 nil

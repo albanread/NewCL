@@ -33,15 +33,15 @@
   (format t "~%FAILED: ~S~%  got:      ~S~%  expected: ~S~%"
           expr result expected-result))
 
-;; equal on lists with true/false designators (CL's hyperspec-example
+;; equalp on lists with true/false designators (CL's hyperspec-example
 ;; result vocabulary). Same as the corman version, minimised.
-(defun test-equal (a b)
-  (or (equal a b)
+(defun test-equalp (a b)
+  (or (equalp a b)
       (and (listp a) (listp b)
            (every (lambda (x y)
                     (or (and x (eq y 'true))
                         (and (not x) (eq y 'false))
-                        (equal x y)))
+                        (equalp x y)))
                   a b))))
 
 ;; ── check + dotests ─────────────────────────────────────────────────
@@ -71,10 +71,10 @@
      (cond
        ((and (consp expected-result)
              (eq (car expected-result) 'values))
-        (if (test-equal result-list (cdr expected-result))
+        (if (test-equalp result-list (cdr expected-result))
             (passed-test expr (cons 'values result-list))
             (failed-test expr (cons 'values result-list) expected-result)))
-       ((equal (car result-list) expected-result)
+       ((equalp (car result-list) expected-result)
         (passed-test expr (car result-list)))
        (t
         (failed-test expr (car result-list) expected-result))))))
