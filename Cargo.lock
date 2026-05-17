@@ -168,6 +168,7 @@ dependencies = [
  "ncl-llvm",
  "ncl-reader",
  "ncl-runtime",
+ "new-asm",
 ]
 
 [[package]]
@@ -202,6 +203,7 @@ dependencies = [
  "llvm-sys",
  "ncl-ir",
  "ncl-runtime",
+ "new-asm",
 ]
 
 [[package]]
@@ -245,6 +247,10 @@ dependencies = [
  "ncl-reader",
  "ncl-runtime",
 ]
+
+[[package]]
+name = "new-asm"
+version = "0.1.0"
 
 [[package]]
 name = "notify"

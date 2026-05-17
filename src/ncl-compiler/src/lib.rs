@@ -16,6 +16,7 @@ use std::sync::Arc;
 use ncl_runtime::{
     format_word, gc_function, GcConfig, GcCoordinator, MutatorState, Value, Word,
 };
+use new_asm;
 
 pub mod lower;
 pub mod macroexpand;
@@ -107,6 +108,9 @@ impl Session {
         if let Some((name, params, body_forms)) = match_defun(v)? {
             return self.handle_defun(&name, &params, &body_forms);
         }
+        if let Some((name, params, body_lines)) = match_defasm(v)? {
+            return self.handle_defasm(&name, &params, &body_lines);
+        }
         // Otherwise: macroexpand fully, then compile.
         let expanded = macroexpand_all(v, &self.coord, &mut self.mutator)?;
         // CL convention: `(progn …)` at top level treats each body
@@ -155,6 +159,10 @@ impl Session {
         }
         if let Some((name, params, body_forms)) = match_defun(v)? {
             self.handle_defun(&name, &params, &body_forms)?;
+            return Ok(());
+        }
+        if let Some((name, params, body_lines)) = match_defasm(v)? {
+            self.handle_defasm(&name, &params, &body_lines)?;
             return Ok(());
         }
         // Macroexpand so we can decide what kind of form this is
@@ -240,6 +248,54 @@ impl Session {
         let fn_word =
             self.compile_function(name, params, body_wrapped.as_deref().unwrap_or(body_forms))?;
         let sym_word = self.coord.intern(name);
+        self.mutator.set_symbol_function(sym_word, fn_word);
+        Ok(Word::NIL)
+    }
+
+    fn handle_defasm(
+        &mut self,
+        name: &str,
+        param_names: &[String],
+        body_lines: &[String],
+    ) -> Result<Word, EvalError> {
+        // CL upcases symbol names by default, but assembly conventions
+        // are lowercase and don't accept hyphens in labels — `.globl
+        // FAST-ADD` errors at the inline-asm parser with "unexpected
+        // token". We mangle the name to a valid asm label by lowering
+        // case and substituting `-` with `_`; the Lisp-side binding
+        // keeps the original (FAST-ADD) so `(fast-add ...)` finds the
+        // function as written.
+        //
+        // Same dance for parameter names: writing `#a` in a body
+        // string is natural Lisp style, but the param symbol is
+        // interned as `A`, and `substitute_params` is case-sensitive.
+        // Lower the param names too so `#a`/`#b` substitutes cleanly.
+        let asm_label = name.to_ascii_lowercase().replace('-', "_");
+        let params: Vec<new_asm::AsmParam> = param_names
+            .iter()
+            .map(|n| new_asm::AsmParam {
+                name: n.to_ascii_lowercase(),
+                ty: new_asm::AsmType::Word,
+            })
+            .collect();
+        let body = body_lines.join("\n");
+        let proc = new_asm::AsmProc {
+            name: asm_label,
+            params,
+            return_type: new_asm::AsmRetType::Word,
+            body,
+        };
+        let code_ptr = ncl_llvm::jit_compile_asm_proc(&proc).map_err(EvalError::Jit)?;
+        let arity = param_names.len() as u32;
+        let sym_word = self.coord.intern(name);
+        let fn_word = gc_function::alloc_function_in_static(
+            self.coord.static_area(),
+            code_ptr,
+            arity,
+            sym_word,
+            Word::NIL,
+        )
+        .ok_or_else(|| EvalError::Jit("static area exhausted".to_string()))?;
         self.mutator.set_symbol_function(sym_word, fn_word);
         Ok(Word::NIL)
     }
@@ -1589,6 +1645,53 @@ fn match_defmacro(
     v: &Value,
 ) -> Result<Option<(String, ParamSpec, Vec<Value>)>, EvalError> {
     match_defun_like(v, "DEFMACRO")
+}
+
+/// Recognise `(defasm name (param...) "line1" "line2" ...)`.
+/// Returns `(name, param_names, body_lines)` or None.
+fn match_defasm(
+    v: &Value,
+) -> Result<Option<(String, Vec<String>, Vec<String>)>, EvalError> {
+    let Value::Cons(c) = v else { return Ok(None) };
+    let Value::Symbol(head) = &c.car else { return Ok(None) };
+    if &*head.name != "DEFASM" {
+        return Ok(None);
+    }
+    let args = list_to_vec_of_value(&c.cdr).map_err(|e| {
+        EvalError::Compile(CompileError::ImproperList(e))
+    })?;
+    if args.len() < 2 {
+        return Err(EvalError::Compile(CompileError::BadDefun(
+            "defasm needs name and param list".to_string(),
+        )));
+    }
+    let name = match &args[0] {
+        Value::Symbol(s) => s.name.to_string(),
+        _ => return Err(EvalError::Compile(CompileError::BadDefun(
+            "defasm name must be a symbol".to_string(),
+        ))),
+    };
+    let param_names: Vec<String> = {
+        let param_list = list_to_vec_of_value(&args[1]).map_err(|e| {
+            EvalError::Compile(CompileError::ImproperList(e))
+        })?;
+        param_list.iter().map(|p| match p {
+            Value::Symbol(s) => Ok(s.name.to_string()),
+            _ => Err(EvalError::Compile(CompileError::BadDefun(
+                "defasm param must be a symbol".to_string(),
+            ))),
+        }).collect::<Result<Vec<_>, _>>()?
+    };
+    let body_lines: Vec<String> = args[2..]
+        .iter()
+        .map(|form| match form {
+            Value::String(s) => Ok(s.as_ref().clone()),
+            _ => Err(EvalError::Compile(CompileError::BadDefun(
+                "defasm body lines must be string literals".to_string(),
+            ))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some((name, param_names, body_lines)))
 }
 
 fn match_defun_like(

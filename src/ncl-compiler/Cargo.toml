@@ -21,6 +21,7 @@ ncl-ir = { path = "../ncl-ir" }
 ncl-reader = { path = "../ncl-reader", default-features = false }
 ncl-runtime = { path = "../ncl-runtime", default-features = false }
 ncl-llvm = { path = "../ncl-llvm", default-features = false }
+new-asm = { path = "../../../../new-asm" }
 
 [lints]
 workspace = true

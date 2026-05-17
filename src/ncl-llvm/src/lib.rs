@@ -15,6 +15,7 @@
 use std::sync::Mutex;
 
 use inkwell::AddressSpace;
+use new_asm;
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
 use inkwell::builder::Builder;
@@ -162,6 +163,206 @@ pub fn jit_compile_function(
     body: &Expr,
 ) -> Result<usize, String> {
     build_lisp_function(name, body, arity)
+}
+
+/// JIT-compile a native-ABI assembly procedure and wrap it with a
+/// thin Lisp-ABI shim. Returns the shim's code address.
+///
+/// The user writes Win64 ABI assembly (`#paramname` substitution
+/// maps positional integer params to rcx/rdx/r8/r9). The shim has
+/// the unified Lisp signature and extracts params from the args
+/// array before calling the native function.
+///
+/// The returned pointer has the standard Lisp signature:
+///   `extern "C" fn(*mut MutatorState, env: u64, *const u64, u64) -> u64`
+pub fn jit_compile_asm_proc(proc: &new_asm::AsmProc) -> Result<usize, String> {
+    build_asm_shim(proc)
+}
+
+fn build_asm_shim(proc: &new_asm::AsmProc) -> Result<usize, String> {
+    let context_ptr = keep_forever(Context::create());
+    let context: &'static Context = unsafe { &*context_ptr };
+
+    let native_name = &proc.name;
+    let shim_name = format!("{native_name}__lisp_shim");
+
+    let module = context.create_module("ncl_asm");
+
+    // Append the module-level inline ASM (Intel syntax, .globl, body).
+    let asm_str = new_asm::build_module_asm_string(proc);
+    unsafe {
+        inkwell::llvm_sys::core::LLVMAppendModuleInlineAsm(
+            module.as_mut_ptr(),
+            asm_str.as_ptr() as *const std::ffi::c_char,
+            asm_str.len(),
+        );
+    }
+
+    let i64_t = context.i64_type();
+    let ptr_t = context.ptr_type(AddressSpace::default());
+
+    // Declare the native ASM function so the shim can call it.
+    // All NCL defasm params are i64 (tagged Lisp words passed as integers).
+    let native_param_types: Vec<inkwell::types::BasicMetadataTypeEnum<'_>> =
+        proc.params.iter().map(|p| {
+            match p.ty {
+                new_asm::AsmType::Float | new_asm::AsmType::FQuad | new_asm::AsmType::FOct => {
+                    context.f64_type().into()
+                }
+                new_asm::AsmType::Word => i64_t.into(),
+            }
+        }).collect();
+    let native_ret_ty: inkwell::types::AnyTypeEnum<'_> = match proc.return_type {
+        new_asm::AsmRetType::Void => context.void_type().into(),
+        new_asm::AsmRetType::Float | new_asm::AsmRetType::FQuad | new_asm::AsmRetType::FOct => {
+            context.f64_type().into()
+        }
+        new_asm::AsmRetType::Word => i64_t.into(),
+    };
+    let native_fn_type = match native_ret_ty {
+        inkwell::types::AnyTypeEnum::VoidType(v) => v.fn_type(&native_param_types, false),
+        inkwell::types::AnyTypeEnum::IntType(i) => i.fn_type(&native_param_types, false),
+        inkwell::types::AnyTypeEnum::FloatType(f) => f.fn_type(&native_param_types, false),
+        _ => i64_t.fn_type(&native_param_types, false),
+    };
+    let native_fn = module.add_function(native_name, native_fn_type, Some(Linkage::External));
+
+    // Shim: Lisp ABI → native call.
+    let shim_type = i64_t.fn_type(
+        &[ptr_t.into(), i64_t.into(), ptr_t.into(), i64_t.into()],
+        false,
+    );
+    let shim = module.add_function(&shim_name, shim_type, None);
+    let kind_id = inkwell::attributes::Attribute::get_named_enum_kind_id("uwtable");
+    let attr = context.create_enum_attribute(kind_id, 2);
+    shim.add_attribute(AttributeLoc::Function, attr);
+
+    let builder = context.create_builder();
+    let entry = context.append_basic_block(shim, "entry");
+    builder.position_at_end(entry);
+
+    // Extract params from the args array.
+    let args_ptr = shim.get_nth_param(2).unwrap().into_pointer_value();
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum<'_>> =
+        Vec::with_capacity(proc.params.len());
+    for (idx, p) in proc.params.iter().enumerate() {
+        let i = i64_t.const_int(idx as u64, false);
+        let elem_ptr = unsafe {
+            builder
+                .build_in_bounds_gep(i64_t, args_ptr, &[i], "arg_ptr")
+                .map_err(|e| format!("gep arg: {e}"))?
+        };
+        let raw = builder
+            .build_load(i64_t, elem_ptr, "arg_raw")
+            .map_err(|e| format!("load arg: {e}"))?
+            .into_int_value();
+        let typed: inkwell::values::BasicMetadataValueEnum<'_> = match p.ty {
+            new_asm::AsmType::Float | new_asm::AsmType::FQuad | new_asm::AsmType::FOct => {
+                // Bitcast the i64 word to f64 for float params.
+                builder
+                    .build_bit_cast(raw, context.f64_type(), "arg_f64")
+                    .map_err(|e| format!("bitcast: {e}"))?
+                    .into_float_value()
+                    .into()
+            }
+            new_asm::AsmType::Word => raw.into(),
+        };
+        call_args.push(typed);
+    }
+
+    let call = builder
+        .build_call(native_fn, &call_args, "native_ret")
+        .map_err(|e| format!("build_call: {e}"))?;
+
+    let ret_val: inkwell::values::IntValue<'_> = match proc.return_type {
+        new_asm::AsmRetType::Void => i64_t.const_int(
+            ncl_runtime::Word::NIL.raw(),
+            false,
+        ),
+        new_asm::AsmRetType::Float | new_asm::AsmRetType::FQuad | new_asm::AsmRetType::FOct => {
+            let f = call
+                .try_as_basic_value()
+                .unwrap_basic()
+                .into_float_value();
+            builder
+                .build_bit_cast(f, i64_t, "ret_i64")
+                .map_err(|e| format!("bitcast ret: {e}"))?
+                .into_int_value()
+        }
+        new_asm::AsmRetType::Word => call
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value(),
+    };
+    builder
+        .build_return(Some(&ret_val))
+        .map_err(|e| format!("build_return shim: {e}"))?;
+
+    // Use an empty Helpers struct — the shim has no Lisp runtime calls.
+    // We only need the engine for code emission and address lookup.
+    let addr = build_engine_and_get_fn_addr_no_helpers(&module, &shim_name)?;
+    let _ = keep_forever(module);
+    Ok(addr)
+}
+
+/// Engine construction for the ASM shim: no runtime helper bindings needed.
+fn build_engine_and_get_fn_addr_no_helpers(
+    module: &inkwell::module::Module<'_>,
+    fn_name: &str,
+) -> Result<usize, String> {
+    use llvm_sys::execution_engine::{
+        LLVMCreateMCJITCompilerForModule,
+        LLVMExecutionEngineRef, LLVMGetFunctionAddress, LLVMInitializeMCJITCompilerOptions,
+        LLVMLinkInMCJIT, LLVMMCJITCompilerOptions,
+    };
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        use inkwell::targets::{InitializationConfig, Target};
+        unsafe { LLVMLinkInMCJIT(); }
+        Target::initialize_native(&InitializationConfig::default())
+            .expect("Target::initialize_native");
+    });
+    let mut opts: LLVMMCJITCompilerOptions = unsafe { std::mem::zeroed() };
+    unsafe {
+        LLVMInitializeMCJITCompilerOptions(
+            &mut opts,
+            std::mem::size_of::<LLVMMCJITCompilerOptions>(),
+        );
+    }
+    opts.MCJMM = unsafe { jit_mm::make_mm() };
+    let mut engine: LLVMExecutionEngineRef = std::ptr::null_mut();
+    let mut err_msg: *mut std::ffi::c_char = std::ptr::null_mut();
+    let rc = unsafe {
+        LLVMCreateMCJITCompilerForModule(
+            &mut engine,
+            module.as_mut_ptr(),
+            &mut opts,
+            std::mem::size_of::<LLVMMCJITCompilerOptions>(),
+            &mut err_msg,
+        )
+    };
+    if rc != 0 || engine.is_null() {
+        let msg = if err_msg.is_null() {
+            "LLVMCreateMCJITCompilerForModule failed".to_string()
+        } else {
+            let s = unsafe { std::ffi::CStr::from_ptr(err_msg) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { llvm_sys::core::LLVMDisposeMessage(err_msg) };
+            s
+        };
+        return Err(format!("LLVMCreateMCJITCompilerForModule: {msg}"));
+    }
+    let fn_name_cstr = std::ffi::CString::new(fn_name).expect("fn_name NUL");
+    let raw_addr = unsafe { LLVMGetFunctionAddress(engine, fn_name_cstr.as_ptr()) };
+    if raw_addr == 0 {
+        return Err(format!("LLVMGetFunctionAddress({fn_name}) returned 0"));
+    }
+    ncl_runtime::brk::register_jit_symbol(raw_addr, fn_name);
+    let engine_box = Box::new(engine);
+    let _ = Box::leak(engine_box);
+    Ok(raw_addr as usize)
 }
 
 // -- Implementation ---------------------------------------------------------
