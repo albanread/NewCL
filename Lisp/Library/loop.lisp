@@ -160,8 +160,18 @@
      on LIST                          → walk cons cells
      = EXPR [then EXPR]               → bind, optionally step
      from N [to|below|downto|above M] [by STEP]
-     across VECTOR                    → walk vector by index"
+     across VECTOR                    → walk vector by index
+
+   `of-type TYPE` may appear between VAR and the spec keyword:
+     (loop for a of-type integer in '(1 2 3) collect a)
+   The type declaration is accepted but ignored — NCL's compiler
+   doesn't yet act on CL type declarations, and accepting+ignoring
+   matches what the test corpus assumes."
   (let ((var (%cur-eat! cur)))
+    ;; Skip optional `of-type TYPE`. Token-eater eats both; the
+    ;; declared type is discarded.
+    (when (%cur-eat-keyword? cur 'of-type)
+      (%cur-eat! cur))
     (cond
       ;; for VAR in LIST
       ((%cur-eat-keyword? cur 'in)
