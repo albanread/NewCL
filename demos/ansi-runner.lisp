@@ -164,14 +164,8 @@
 (run-ansi-chapter 4)
 (run-ansi-chapter 5)
 (run-ansi-chapter 6)
-(run-ansi-chapter 8)
-;; Chapter 7 last: it exercises method-combination paths that
-;; currently trigger an infinite recursion in CLOS's FIND/
-;; SUBCLASSP (visible as a Windows stack overflow that kills the
-;; process). Running it last preserves the suite's pass/fail tally
-;; for chapters 2-6 and 8. Fix lands when the FIND recursion is
-;; properly bounded.
 (run-ansi-chapter 7)
+(run-ansi-chapter 8)
 
 (format t "~%~%==== ANSI suite summary ====~%")
 (format t "  passed: ~A~%" *ansi-pass-count*)

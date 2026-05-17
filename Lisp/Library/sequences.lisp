@@ -233,19 +233,34 @@
 
 ;; ── Search / position / find / count (generic) ──────────────────────────
 
-;; Stash the original list-only versions captured at LOAD time, so
-;; the redefinitions below can fast-path lists without re-walking
-;; everything.
-
-(defparameter %list-find     (symbol-function 'find))
-(defparameter %list-position (symbol-function 'position))
-(defparameter %list-remove   (symbol-function 'remove))
-;; COUNT didn't exist before this file — no list-only fast path
-;; to capture. The generic walker below handles all sequence types.
+;; List fast-path is inline (a local LOOP) rather than a funcall back
+;; to the captured original. The earlier shape captured the pre-
+;; redefinition `find` in `%list-find` and the polymorphic shim then
+;; funcall'd into it. That triggered a stack blow-up in heavy CLOS
+;; method dispatch: the captured original's body had a recursive
+;; `(find item (cdr lst) ...)` call which resolves through the
+;; symbol-function cell at runtime — so each step trampolined
+;; polymorphic → %list-find → polymorphic → %list-find, doubling
+;; the stack growth per element. On Windows' 1 MB default thread
+;; stack, a few hundred subclassp calls during a SHARED-INITIALIZE
+;; :AFTER dispatch sufficed to overflow (chapter 7 of the corman
+;; ANSI hyperspec-examples).
+;;
+;; Folding the list walk inline keeps the recursion contained inside
+;; one function activation and removes the funcall + symbol-cell
+;; hop on every node.
 
 (defun find (item seq &key (test #'eql) (key #'identity))
   (cond
-    ((listp seq) (funcall %list-find item seq :test test :key key))
+    ((listp seq)
+     (let ((lst seq) (result nil) (found nil))
+       (loop
+         (cond
+           (found (return result))
+           ((null lst) (return nil))
+           ((funcall test item (funcall key (car lst)))
+            (setq result (car lst)) (setq found t))
+           (t (setq lst (cdr lst)))))))
     (t
      (let ((i 0) (n (length seq)) (result nil) (found nil))
        (loop
@@ -261,7 +276,17 @@
 
 (defun position (item seq &key (test #'eql) (key #'identity))
   (cond
-    ((listp seq) (funcall %list-position item seq :test test :key key))
+    ((listp seq)
+     ;; Same rationale as FIND above: inline list walk so the heavy
+     ;; CLOS dispatch path doesn't trampoline through %list-position.
+     (let ((lst seq) (i 0) (result nil) (found nil))
+       (loop
+         (cond
+           (found (return result))
+           ((null lst) (return nil))
+           ((funcall test item (funcall key (car lst)))
+            (setq result i) (setq found t))
+           (t (setq lst (cdr lst)) (setq i (+ i 1)))))))
     (t
      (let ((i 0) (n (length seq)) (result nil) (found nil))
        (loop
@@ -288,7 +313,25 @@
   "Return a fresh sequence with elements equal to ITEM removed.
    Result preserves SEQ's type."
   (cond
-    ((listp seq) (funcall %list-remove item seq :test test :key key))
+    ((listp seq)
+     ;; Inline list walk — same rationale as the FIND fix above.
+     ;; The captured %list-remove recurses through symbol-function,
+     ;; which trampolines back into this polymorphic shim and
+     ;; doubles stack growth per element.
+     (let ((acc nil) (lst seq))
+       (loop
+         (cond
+           ((null lst)
+            (return (let ((rev nil))
+                      (loop
+                        (cond
+                          ((null acc) (return rev))
+                          (t (setq rev (cons (car acc) rev))
+                             (setq acc (cdr acc))))))))
+           ((funcall test item (funcall key (car lst)))
+            (setq lst (cdr lst)))
+           (t (setq acc (cons (car lst) acc))
+              (setq lst (cdr lst)))))))
     ((stringp seq)
      (let ((out ""))
        (%seq-foreach

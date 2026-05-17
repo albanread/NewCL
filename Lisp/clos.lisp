@@ -1145,6 +1145,14 @@
             (return-from done nil)))))
     result))
 
+;; SHARED-INITIALIZE, INITIALIZE-INSTANCE, and REINITIALIZE-INSTANCE
+;; are defined as plain DEFUNs at this point in the file because
+;; DEFGENERIC isn't introduced until later. Stage F (after defmethod
+;; is wired) re-installs them as proper generic functions with the
+;; existing body as the primary method on (T ...), so user code can
+;; layer :BEFORE / :AFTER methods on top without losing the primary
+;; behaviour. See "Stage F: standard-GF promotion" below.
+
 (defun shared-initialize (instance slot-names &rest all-keys)
   (dolist (slot (class-effective-slots (class-of instance)))
     (let* ((slot-name (slot-definition-name slot))
@@ -2168,6 +2176,61 @@
 ;; -- A few user-friendly shortcuts ---------------------------------------
 
 (defun class-slots (class) (class-effective-slots class))
+
+;; ─── Stage F: standard-GF promotion ────────────────────────────────────
+;;
+;; Promote the CL standard initializers from plain DEFUNs to proper
+;; generic functions, with the existing body installed as the primary
+;; method on (T …). Until this runs, a user-side
+;; `(defmethod shared-initialize :after ...)` would replace the plain
+;; defun with a fresh GF that had ONLY the user's :after method — no
+;; primary — and `make-instance` would then loop in method dispatch
+;; looking for a primary, blowing the stack (chapter 7 of the corman
+;; ANSI hyperspec-examples triggered exactly that).
+;;
+;; The promotion must run AFTER both DEFGENERIC and DEFMETHOD are
+;; defined; placing it at the end of clos.lisp guarantees that
+;; ordering without weaving a "Stage F" comment block earlier.
+
+;; Stash the plain-defun bodies under fresh symbols so the promoted
+;; GFs can call them by name from inside primary methods. Storing
+;; the function value in a defparameter and then referencing it via
+;; `,VAR` inside a backquote-built method body fails — Function
+;; words don't round-trip through the Value tree the lowerer
+;; consumes. Names round-trip cleanly via QUOTE.
+(defparameter %primary-shared-initialize
+  (symbol-function 'shared-initialize))
+(defparameter %primary-initialize-instance
+  (symbol-function 'initialize-instance))
+(defparameter %primary-reinitialize-instance
+  (symbol-function 'reinitialize-instance))
+
+(defun %primary-shared-initialize-call (instance slot-names &rest all-keys)
+  (apply %primary-shared-initialize instance slot-names all-keys))
+(defun %primary-initialize-instance-call (instance &rest all-keys)
+  (apply %primary-initialize-instance instance all-keys))
+(defun %primary-reinitialize-instance-call (instance &rest all-keys)
+  (apply %primary-reinitialize-instance instance all-keys))
+
+;; Drop the plain defuns so ENSURE-METHOD's GF-or-create path
+;; doesn't see a leftover non-GF function value and refuse to
+;; install the primary.
+(fmakunbound 'shared-initialize)
+(fmakunbound 'initialize-instance)
+(fmakunbound 'reinitialize-instance)
+
+(defgeneric shared-initialize (instance slot-names &rest all-keys))
+(defgeneric initialize-instance (instance &rest all-keys))
+(defgeneric reinitialize-instance (instance &rest all-keys))
+
+(defmethod shared-initialize ((instance t) (slot-names t) &rest all-keys)
+  (apply #'%primary-shared-initialize-call instance slot-names all-keys))
+
+(defmethod initialize-instance ((instance t) &rest all-keys)
+  (apply #'%primary-initialize-instance-call instance all-keys))
+
+(defmethod reinitialize-instance ((instance t) &rest all-keys)
+  (apply #'%primary-reinitialize-instance-call instance all-keys))
 
 ;; Return a printable sentinel.
 nil
