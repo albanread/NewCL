@@ -11,6 +11,7 @@
 //! compiled code only.
 
 pub mod abi;
+pub mod audio;
 pub mod bignum;
 pub mod brk;
 pub mod chars;
@@ -89,6 +90,12 @@ pub use igui::lisp_shims::{
     text_newline_shim, text_reset_pen_shim, text_scroll_up_shim,
     text_set_cursor_shim, text_set_pen_shim, text_show_caret_shim,
     text_write_char_shim, text_write_shim,
+};
+pub use audio::{
+    audio_abc_play_shim, audio_abc_stop_shim, audio_beep_shim, audio_blip_shim,
+    audio_click_shim, audio_coin_shim, audio_hit_shim, audio_jump_shim,
+    audio_master_volume_shim, audio_play_shim, audio_play_vol_shim,
+    audio_start_shim, audio_stop_all_shim, audio_tone_shim, audio_zap_shim,
 };
 pub use printer::{format_word, format_word_aesthetic};
 pub use random::random_shim;

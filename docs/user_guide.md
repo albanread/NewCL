@@ -859,7 +859,69 @@ I/O, strings, time, threads, hash tables, and so on are backed by
 Rust's `std`. The FFI sits beside the language for user code to
 reach; the language itself stays portable.
 
-### 7.7 Inline Assembly
+### 7.7 Audio
+
+NCL embeds the *NewAudio* sibling crate — a pure-Rust synthesis +
+ABC playback library backing onto Windows' `waveOut` and `midiOut`.
+Two surfaces, both Lisp-callable from the moment the REPL starts:
+
+```
+    (AUDIO-START)                ; lazy-init the mixer (idempotent)
+    (AUDIO-COIN 0.4)             ; synthesise → returns a SoundId
+    (AUDIO-PLAY *)               ; play it through waveOut
+```
+
+The presets are the same game-effect family Roger's `winscheme_sound`
+shipped — `COIN`, `JUMP`, `ZAP`, `HIT`, `CLICK`, `BLIP`, `BEEP`,
+plus the lower-level `TONE` for hand-tuned frequencies. Each call
+synthesises a fresh PCM buffer, hands it to the mixer, and returns
+the buffer's `SoundId` as a fixnum:
+
+```
+    > (AUDIO-TONE 440 0.25)      ; sine of 440 Hz for a quarter-sec
+    7
+    > (AUDIO-PLAY 7)
+    nil
+```
+
+`AUDIO-PLAY-VOL` adds volume (0.0–1.0) and pan (-1.0 .. +1.0) for
+stereo positioning:
+
+```
+    (AUDIO-PLAY-VOL ping 0.7 -0.8)   ; play 70% volume, hard left
+```
+
+The master volume control is `(AUDIO-MASTER-VOLUME 0.8)`. To stop
+everything in flight — both PCM voices and the MIDI scheduler —
+call `(AUDIO-STOP-ALL)`.
+
+The second surface is ABC notation. NCL ships the ABC parser, the
+MIDI generator, and a live scheduler that drives Windows' GM synth.
+A complete tune is one call:
+
+```
+    (ABC-PLAY "X:1
+    T:Twinkle
+    M:4/4
+    L:1/4
+    K:C
+    CCGG|AAG2|FFEE|DDC2|")
+```
+
+The full ABC grammar (header fields, chords, broken rhythms, tempo
+and time-signature changes, percussion routing) is documented in
+`E:\NewAudio\NewAudio\USER_GUIDE.md`. `(ABC-STOP)` cuts whatever's
+playing.
+
+Non-Windows builds get NIL-returning stubs for every shim — code
+that conditionalises on `(windows-enabled-p)` runs unchanged on a
+silent machine.
+
+See `demos/audio.lisp` for an end-to-end tour: a SFX volley, a
+C-major arpeggio, a stereo pan sweep, and Twinkle Twinkle through
+the GM synth.
+
+### 7.8 Inline Assembly
 
 When the FFI to a C library is too coarse and you want a tight
 inner loop in handwritten x86_64 — a `popcnt`, a `bsr`, a

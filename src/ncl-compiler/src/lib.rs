@@ -935,6 +935,49 @@ fn install_native_functions(
     // come in a follow-up commit.
     #[cfg(windows)]
     install_igui(coord, mutator);
+
+    // NewAudio shims — synthesis presets, simple playback, ABC.
+    // The shims themselves are cross-platform (non-Windows builds
+    // get NIL-returning stubs), so registration is unconditional;
+    // only the live mixer is Windows-only inside the backend.
+    install_audio(coord, mutator);
+}
+
+fn install_audio(coord: &Arc<GcCoordinator>, mutator: &mut MutatorState) {
+    // Lifecycle.
+    install_native(coord, mutator, "AUDIO-START",
+                   ncl_runtime::audio_start_shim, 0);
+    install_native(coord, mutator, "AUDIO-STOP-ALL",
+                   ncl_runtime::audio_stop_all_shim, 0);
+    install_native(coord, mutator, "AUDIO-MASTER-VOLUME",
+                   ncl_runtime::audio_master_volume_shim, 1);
+    // Playback.
+    install_native(coord, mutator, "AUDIO-PLAY",
+                   ncl_runtime::audio_play_shim, 1);
+    install_native(coord, mutator, "AUDIO-PLAY-VOL",
+                   ncl_runtime::audio_play_vol_shim, 3);
+    // Synthesis (return SoundId fixnum).
+    install_native(coord, mutator, "AUDIO-TONE",
+                   ncl_runtime::audio_tone_shim, 2);
+    install_native(coord, mutator, "AUDIO-BEEP",
+                   ncl_runtime::audio_beep_shim, 2);
+    install_native(coord, mutator, "AUDIO-BLIP",
+                   ncl_runtime::audio_blip_shim, 2);
+    install_native(coord, mutator, "AUDIO-COIN",
+                   ncl_runtime::audio_coin_shim, 1);
+    install_native(coord, mutator, "AUDIO-JUMP",
+                   ncl_runtime::audio_jump_shim, 1);
+    install_native(coord, mutator, "AUDIO-ZAP",
+                   ncl_runtime::audio_zap_shim, 1);
+    install_native(coord, mutator, "AUDIO-HIT",
+                   ncl_runtime::audio_hit_shim, 1);
+    install_native(coord, mutator, "AUDIO-CLICK",
+                   ncl_runtime::audio_click_shim, 1);
+    // ABC.
+    install_native(coord, mutator, "ABC-PLAY",
+                   ncl_runtime::audio_abc_play_shim, 1);
+    install_native(coord, mutator, "ABC-STOP",
+                   ncl_runtime::audio_abc_stop_shim, 0);
 }
 
 /// `(eval-string s)` — feed S into the active Session, return the

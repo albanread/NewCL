@@ -50,6 +50,12 @@ notify = "8"
 
 [target.'cfg(windows)'.dependencies]
 windows-numerics = "0.3"
+# NewAudio — sibling project at E:\NewAudio\NewAudio. PCM synthesis
+# + ABC parser + waveOut/midiOut runtime. Backs the Lisp-side
+# audio shims in src/audio.rs. Windows-only because newaudio-win
+# is the only crate that brings the live mixer; the pure-Rust
+# newaudio-core / newaudio-abc come along under the umbrella.
+newaudio = { path = "../../../../NewAudio/NewAudio/crates/newaudio" }
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
