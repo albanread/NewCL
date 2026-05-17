@@ -466,6 +466,69 @@ pub extern "C-unwind" fn ncl_make_closure(
     captures: *const u64,
     n_captures: u64,
 ) -> u64 {
+    // Fast path: if the env Vector (or NIL for no captures) fits
+    // in the current TLAB, the alloc can't trigger GC, so we don't
+    // need `catch_gc_stall_as_condition` (panic-catch setup), don't
+    // need to root the captures (no GC can move them), and don't
+    // need to read them back from a precise-root list. Just bump
+    // the TLAB, store the captures, alloc the Function record in
+    // static, mark the env card, return.
+    //
+    // This is the closure-allocation hot path. Most closures are
+    // small (n_captures in 0..=4) and the TLAB has plenty of room
+    // — so this branch runs the vast majority of the time. The
+    // slow path below stays as the fully-rooted catch-all.
+    {
+        let m = unsafe { &mut *mutator };
+        let env_word_opt: Option<Word> = if n_captures == 0 {
+            Some(Word::NIL)
+        } else {
+            m.try_alloc_vector_no_gc(n_captures as u32).map(|vec| {
+                // No GC possible between alloc and store: TLAB bump
+                // is pure arithmetic, captures still live at their
+                // original addresses, raw store is safe.
+                let p = vec
+                    .as_mut_ptr::<u64>(Tag::Vector)
+                    .expect("vector ptr");
+                unsafe {
+                    for i in 0..n_captures {
+                        *p.add(1 + i as usize) =
+                            *captures.add(i as usize);
+                    }
+                }
+                vec
+            })
+        };
+        if let Some(env_word) = env_word_opt {
+            let coord = m.coord();
+            let fn_word = match crate::gc_function::alloc_function_in_static(
+                coord.static_area(),
+                code_ptr as usize,
+                arity as u32,
+                Word::NIL,
+                env_word,
+            ) {
+                Some(w) => w,
+                None => {
+                    return signal_static_condition_string_and_abort(
+                        mutator,
+                        "static area exhausted in lambda creation",
+                    );
+                }
+            };
+            if !env_word.is_nil() {
+                let env_cell_addr = unsafe {
+                    (fn_word.as_ptr::<u8>(Tag::Function).unwrap()
+                        as *const u8)
+                        .add(crate::gc_function::ENV_OFFSET * 8)
+                };
+                coord.mark_card(env_cell_addr);
+            }
+            return fn_word.raw();
+        }
+        // Fall through to the slow path: TLAB couldn't fit the env
+        // Vector, so we need a refill, which may GC.
+    }
     catch_gc_stall_as_condition(mutator, || {
         let m = unsafe { &mut *mutator };
         let env_word = if n_captures == 0 {

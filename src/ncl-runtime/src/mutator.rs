@@ -581,6 +581,30 @@ impl MutatorState {
         self.alloc_typed_vector(crate::heap::HeapType::Vector, length_cells)
     }
 
+    /// Non-GC-triggering variant of `alloc_vector`. Returns `None`
+    /// when the TLAB lacks `1 + length_cells` cells; the caller can
+    /// then decide to refill (which may GC) or take a different
+    /// path. Used by `ncl_make_closure`'s fast path so that closure
+    /// creation can skip the catch-panic + root-the-captures setup
+    /// when the env Vector fits in the current TLAB.
+    pub fn try_alloc_vector_no_gc(&mut self, length_cells: u32) -> Option<Word> {
+        let total = 1 + length_cells as usize;
+        if self.tlab.top + total > self.tlab.limit {
+            return None;
+        }
+        let p = unsafe { self.tlab.base.add(self.tlab.top) };
+        unsafe {
+            *p = crate::heap::HeapHeader::new(
+                crate::heap::HeapType::Vector,
+                length_cells,
+            )
+            .raw();
+        }
+        self.mark_young_start(p);
+        self.tlab.top += total;
+        Some(Word::from_ptr(p as *const u8, Tag::Vector))
+    }
+
     /// Like alloc_vector but lets the caller pick the HeapType.
     /// Used for heap kinds that share the Vector tag — currently
     /// only Bignum (raw u64 limb cells the printer / typep
