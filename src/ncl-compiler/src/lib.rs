@@ -4724,9 +4724,27 @@ mod end_to_end_tests {
     // -- Errors ------------------------------------------------------------
 
     #[test]
-    fn defun_at_nested_position_errors() {
-        let r = eval_str("(if t (defun foo () 1) 2)");
-        assert!(matches!(r, Err(EvalError::Compile(CompileError::BadDefun(_)))));
+    fn nested_defun_installs_function_and_returns_name() {
+        // `(defun ...)` in non-top-level position lowers to
+        // (%set-symbol-function 'NAME (lambda ...)) and returns
+        // 'NAME — the form value is the symbol per CL spec, and
+        // the function is reachable through subsequent calls.
+        let mut s = Session::with_stdlib().expect("session boots");
+        s.activate();
+        assert_eq!(s.eval("(if t (defun add3 (n) (+ n 3)) 'unreached)").unwrap(), "ADD3");
+        assert_eq!(s.eval("(add3 10)").unwrap(), "13");
+    }
+
+    #[test]
+    fn nested_defun_captures_enclosing_let() {
+        // CL semantics: a nested defun captures the surrounding
+        // lexical scope. The function is globally named but holds a
+        // closure over the let frame. SBCL / CCL behave this way.
+        let mut s = Session::with_stdlib().expect("session boots");
+        s.activate();
+        assert_eq!(s.eval(
+            "(let ((x 42)) (defun get-x () x)) (get-x)"
+        ).unwrap(), "42");
     }
 
     #[test]

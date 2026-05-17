@@ -806,9 +806,7 @@ fn lower_call_in_mut(
                 .collect();
             Ok(Expr::values(lowered?))
         }
-        "DEFUN" => Err(CompileError::BadDefun(
-            "(defun ...) is only allowed at top level".into(),
-        )),
+        "DEFUN" => lower_nested_defun(args, env, coord),
         // Unknown head: it's a function call. First check the
         // Lisp-2 function namespace — if NAME is bound by an
         // enclosing flet/labels, emit Funcall on the local; else
@@ -1713,6 +1711,72 @@ fn lower_lambda(
     Ok(Expr::lambda(params.required.len() as u32, body_expr, captures))
 }
 
+/// Lower a non-top-level `(defun NAME PARAMS BODY...)` into the
+/// equivalent runtime install:
+///
+///     (progn
+///       (%set-symbol-function 'NAME (lambda PARAMS BODY...))
+///       'NAME)
+///
+/// The top-level path (see `handle_defun` in lib.rs) compiles the
+/// function eagerly at top level and installs it directly without
+/// going through the global call. Inside a function body that's
+/// impossible — the form might never execute, or might execute many
+/// times — so we emit the same setup the JIT would emit for an
+/// explicit `(setf (symbol-function 'NAME) (lambda …))`. The lambda
+/// captures the enclosing lexical scope per CL conformance (SBCL /
+/// CCL behave the same way), so e.g.
+///
+///     (let ((x 10))
+///       (defun foo () x))
+///
+/// installs a closure that returns 10 when called.
+///
+/// The `block NAME` wrap that the top-level path optionally adds
+/// when the body uses `return-from` is NOT applied here — wiring
+/// that through the runtime-install path requires more machinery
+/// (the block name has to land in the lambda's macro environment,
+/// not the lexical one). The known corman ANSI hyperspec-examples
+/// uses don't exercise `return-from` inside nested defuns, so we
+/// punt for now. A user who needs it can `(block NAME body…)` by
+/// hand.
+///
+/// `(defun (setf NAME) …)` is rejected here — the mangling lives in
+/// `match_defun_like` and only fires from the top-level path. Add
+/// it back when a test surfaces a real need.
+fn lower_nested_defun(
+    args: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
+    if args.len() < 2 {
+        return Err(CompileError::BadDefun(format!(
+            "defun needs at least name and params, got {} args",
+            args.len()
+        )));
+    }
+    let name = match &args[0] {
+        Value::Symbol(s) => Arc::clone(&s.name),
+        other => {
+            return Err(CompileError::BadDefun(format!(
+                "nested defun name must be a symbol \
+                 (the (setf …) shape is top-level only); got {other:?}"
+            )));
+        }
+    };
+    // args[0] = NAME, args[1] = PARAMS, args[2..] = BODY. lower_lambda
+    // takes (PARAMS, BODY...), exactly args[1..].
+    let lambda_expr = lower_lambda(&args[1..], env, coord)?;
+    let sym_word = coord.intern(&name);
+    let setter_sym = coord.intern("%SET-SYMBOL-FUNCTION");
+    let install_call = Expr::call(
+        setter_sym.raw(),
+        vec![Expr::Word(sym_word.raw()), lambda_expr],
+    );
+    // CL: `defun` returns the function name as the form's value.
+    Ok(Expr::progn(vec![install_call, Expr::Word(sym_word.raw())]))
+}
+
 /// Recursively reconcile a parent_clone chain back into its
 /// outer_env chain after a lambda body has been lowered.
 ///
@@ -2107,11 +2171,32 @@ mod tests {
     }
 
     #[test]
-    fn defun_at_nested_position_errors() {
+    fn nested_defun_lowers_to_install_plus_name() {
+        // `(defun ...)` in non-top-level position now lowers (it used
+        // to error with BadDefun). The expansion is
+        // (progn (%set-symbol-function 'foo (lambda …)) 'foo) — we
+        // don't assert the exact Expr shape here (too much detail
+        // about closure-env layout) but we do require the lowering
+        // succeeds. The integration tests in
+        // `nested_defun_installs_function_and_returns_name` and
+        // `nested_defun_captures_enclosing_let` cover the runtime
+        // behaviour end-to-end.
         let coord = small_coord();
         let v = read_one("(if t (defun foo () 1) 2)").unwrap();
+        lower(&v, &coord).expect("nested defun should lower");
+    }
+
+    #[test]
+    fn nested_defun_with_non_symbol_name_errors() {
+        // The (setf NAME) mangling lives in match_defun_like and only
+        // fires at top level. A nested-position defun with a non-symbol
+        // name should fail loudly so users don't accidentally try
+        // (defun (setf foo) …) inside a let and get silent garbage.
+        let coord = small_coord();
+        let v = read_one("(progn (defun (setf foo) (v) v))").unwrap();
         let r = lower(&v, &coord);
-        assert!(matches!(r, Err(CompileError::BadDefun(_))));
+        assert!(matches!(r, Err(CompileError::BadDefun(_))),
+                "expected BadDefun, got {r:?}");
     }
 
     #[test]
