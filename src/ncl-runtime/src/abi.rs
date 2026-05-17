@@ -2008,6 +2008,73 @@ pub extern "C-unwind" fn ncl_pop_root(mutator: *mut MutatorState) -> u64 {
         .raw()
 }
 
+/// Debug trap for `(car x)` / `(cdr x)` when `x` is neither NIL nor
+/// a Cons. The JIT calls this after the nil-check in
+/// `emit_car_or_cdr` if `NCL_TRAP_BAD_CONS=1` was set at process
+/// start; otherwise it isn't emitted at all (zero runtime cost).
+///
+/// On a bad Word the helper prints a structured line naming the
+/// raw value, the tag bits, and the canonical Tag interpretation,
+/// then aborts so the SEH crash handler in `brk.rs` writes the
+/// full register / stack dump. The aborted-here site is much
+/// closer to the corruption source than the eventual NULL deref
+/// in the JIT-emitted `untag-and-load`.
+///
+/// Returns the input Word unchanged on the happy path so the
+/// JIT can chain it inline: `let validated = ncl_debug_check_cons(w);`
+/// then untag-and-load on `validated`.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn ncl_debug_check_cons(w: u64) -> u64 {
+    let tag_bits = w & crate::word::TAG_MASK;
+    let payload = w & !crate::word::TAG_MASK;
+
+    // Gate 1: tag must be Cons.
+    let tag_ok = tag_bits == Tag::Cons as u64;
+
+    // Gate 2: payload must point above the Windows null-page reserve
+    // (the bottom 64 KB is always unmapped on Windows, and 0..32 KB
+    // on most Linuxes too). Any "Cons" Word whose payload lands
+    // there is from a Fixnum-0 / NULL-pointer corruption — the
+    // tag bits LOOK right but the address is impossible. Catching
+    // these closes the case rbx left open in the GETF crash:
+    // tag=Cons, payload=very-small-or-zero.
+    const NULL_PAGE_CEILING: u64 = 0x1_0000; // 64 KB
+    let payload_ok = payload >= NULL_PAGE_CEILING;
+
+    if tag_ok && payload_ok {
+        return w;
+    }
+
+    let tag = Word::from_raw(w).tag();
+    let reason = match (tag_ok, payload_ok) {
+        (false, _) => "wrong tag (not Cons, not NIL)",
+        (true, false) => "Cons tag but payload in null-page region (likely zeroed-recycle)",
+        (true, true) => unreachable!(),
+    };
+    eprintln!(
+        "[CAR/CDR TRAP] bad cons word: {w:#018x}  tag={tag_bits:03b} ({tag:?})  \
+         payload={payload:#x}  reason: {reason}"
+    );
+    eprintln!(
+        "[CAR/CDR TRAP] JIT-emitted car/cdr would untag to {payload:#x} and \
+         load from there. Forcing a NULL-deref now so the SEH crash \
+         dumper in brk.rs catches it and writes a full stack/register \
+         report — `abort()` would skip the SEH filter and we'd lose \
+         the trace. Re-run with NCL_TRAP_BAD_CONS unset to disable."
+    );
+    // Force the same fault the JIT-emitted code WOULD have taken,
+    // routing through SetUnhandledExceptionFilter → brk's dumper.
+    // The crash dump's stack will show the JIT-emitted car/cdr call
+    // site as the topmost frame.
+    unsafe {
+        let null: *mut u64 = core::ptr::null_mut();
+        core::ptr::write_volatile(null, 0);
+    }
+    // Unreachable: the write_volatile above always faults on
+    // Windows / Linux because page 0 is unmapped.
+    std::process::abort();
+}
+
 /// `(%native-block NAME THUNK)` — the primitive behind the
 /// `block` macro. Pushes a frame, invokes the body thunk, then
 /// inspects the abort-pending flag: if set and targeting our

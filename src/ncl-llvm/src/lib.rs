@@ -424,6 +424,11 @@ fn build_engine_and_get_fn_addr(
         bind(engine, helpers.truncate_promote, ncl_truncate_promote as usize);
         bind(engine, helpers.rem_promote, ncl_rem_promote as usize);
         bind(engine, helpers.cmp_int, ncl_cmp_full as usize);
+        bind(
+            engine,
+            helpers.debug_check_cons,
+            ncl_runtime::ncl_debug_check_cons as usize,
+        );
     }
     // sadd/ssub/smul.with.overflow are LLVM intrinsics — LLVM
     // resolves them itself, no mapping needed.
@@ -492,6 +497,14 @@ struct Helpers<'ctx> {
     sadd_with_overflow: FunctionValue<'ctx>,
     ssub_with_overflow: FunctionValue<'ctx>,
     smul_with_overflow: FunctionValue<'ctx>,
+    /// Debug-only: validates that a Word about to be untagged-as-Cons
+    /// actually has the Cons tag. Only referenced when
+    /// `NCL_TRAP_BAD_CONS=1` was set at process start (see
+    /// `trap_bad_cons_enabled`). Aborts with a structured message
+    /// on a wrong-tag Word, which catches reclamation-corruption
+    /// bugs (Fixnum 0 / stale-pointer) at the exact dereference
+    /// point instead of letting them NULL-deref in JIT'd code.
+    debug_check_cons: FunctionValue<'ctx>,
 }
 
 fn declare_runtime_helpers<'ctx>(
@@ -774,6 +787,15 @@ fn declare_runtime_helpers<'ctx>(
         Some(Linkage::External),
     );
 
+    // Debug-only car/cdr Cons-tag validator. Always declared so the
+    // module IR is uniform; only CALLED when trap_bad_cons_enabled().
+    let debug_check_cons_type = i64_t.fn_type(&[i64_t.into()], false);
+    let debug_check_cons = module.add_function(
+        "ncl_debug_check_cons",
+        debug_check_cons_type,
+        Some(Linkage::External),
+    );
+
     Helpers {
         alloc_cons,
         push_root,
@@ -808,7 +830,18 @@ fn declare_runtime_helpers<'ctx>(
         sadd_with_overflow,
         ssub_with_overflow,
         smul_with_overflow,
+        debug_check_cons,
     }
+}
+
+/// Whether the JIT should emit a `ncl_debug_check_cons` call into
+/// every `(car x)` / `(cdr x)` site. Read once from `NCL_TRAP_BAD_CONS`
+/// at process start so a single boolean is checked at IR-emit time;
+/// no runtime cost when the env var is unset.
+fn trap_bad_cons_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NCL_TRAP_BAD_CONS").is_some())
 }
 
 fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>) {
@@ -846,6 +879,10 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(&helpers.truncate_promote, ncl_truncate_promote as *const () as usize);
     engine.add_global_mapping(&helpers.rem_promote, ncl_rem_promote as *const () as usize);
     engine.add_global_mapping(&helpers.cmp_int, ncl_cmp_full as *const () as usize);
+    engine.add_global_mapping(
+        &helpers.debug_check_cons,
+        ncl_runtime::ncl_debug_check_cons as *const () as usize,
+    );
     // sadd/ssub/smul.with.overflow are LLVM intrinsics — no
     // global mapping; LLVM resolves them itself.
 }
@@ -1165,6 +1202,7 @@ fn emit_car_or_cdr<'ctx>(
     context: &'ctx Context,
     builder: &Builder<'ctx>,
     function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
     cons_val: IntValue<'ctx>,
     is_cdr: bool,
 ) -> Result<IntValue<'ctx>, String> {
@@ -1192,10 +1230,28 @@ fn emit_car_or_cdr<'ctx>(
         .map_err(|e| format!("br nil→join: {e}"))?;
     let nil_end = builder.get_insert_block().unwrap();
 
-    // cons → load car/cdr
+    // cons → optional debug-trap, then load car/cdr
     builder.position_at_end(cons_block);
+    // When NCL_TRAP_BAD_CONS=1 was set at process start, call the
+    // runtime trap so a Fixnum-0 (or other non-Cons non-NIL Word)
+    // aborts here with a structured message — closer to the
+    // corruption source than the eventual NULL deref two
+    // instructions later. The helper returns the input unchanged
+    // so we keep using the same SSA value.
+    let cons_word = if trap_bad_cons_enabled() {
+        let call = builder
+            .build_call(
+                helpers.debug_check_cons,
+                &[cons_val.into()],
+                "debug_check_cons",
+            )
+            .map_err(|e| format!("call debug_check_cons: {e}"))?;
+        call.try_as_basic_value().unwrap_basic().into_int_value()
+    } else {
+        cons_val
+    };
     let untagged = builder
-        .build_and(cons_val, mask, "untag_cons")
+        .build_and(cons_word, mask, "untag_cons")
         .map_err(|e| format!("and: {e}"))?;
     let ptr = builder
         .build_int_to_ptr(untagged, ptr_t, "as_ptr")
@@ -2163,11 +2219,11 @@ fn emit_expr<'ctx>(
         }
         Expr::Car(x) => {
             let cons_val = emit_expr(context, builder, function, helpers, arity, params, locals, x)?;
-            emit_car_or_cdr(context, builder, function, cons_val, /*is_cdr=*/false)
+            emit_car_or_cdr(context, builder, function, helpers, cons_val, /*is_cdr=*/false)
         }
         Expr::Cdr(x) => {
             let cons_val = emit_expr(context, builder, function, helpers, arity, params, locals, x)?;
-            emit_car_or_cdr(context, builder, function, cons_val, /*is_cdr=*/true)
+            emit_car_or_cdr(context, builder, function, helpers, cons_val, /*is_cdr=*/true)
         }
         Expr::Eq(a, b) => emit_cmp(context, builder, function, helpers, arity, params, locals, a, b, IntPredicate::EQ),
         Expr::Lt(a, b) => emit_cmp(context, builder, function, helpers, arity, params, locals, a, b, IntPredicate::SLT),
