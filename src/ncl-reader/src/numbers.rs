@@ -87,6 +87,39 @@ fn looks_like_integer(text: &str) -> bool {
     i == bytes.len()
 }
 
+/// Parse a ratio literal under a non-decimal radix: same shape as
+/// [`parse_ratio`] (`[sign]digits/digits`), but each digit is in
+/// `radix` (2..=36). Used by the reader's `#b` / `#o` / `#x` / `#nr`
+/// dispatch path so `(read "#o-101/75")` produces a Value::Ratio
+/// rather than failing.
+///
+/// Both halves are converted to decimal strings on the way out so
+/// downstream consumers (the lowerer's `Value::Ratio → heap-ratio`
+/// path) see the same shape as a decimal-literal ratio. The sign,
+/// per CL, is folded onto the numerator — `#o-1/2` becomes the
+/// ratio with numerator `-1` and denominator `2`.
+pub fn parse_ratio_radix(text: &str, radix: u32) -> Option<Value> {
+    let slash = text.find('/')?;
+    let num_part = &text[..slash];
+    let den_part = &text[slash + 1..];
+    if num_part.is_empty() || den_part.is_empty() {
+        return None;
+    }
+    // CL: sign is only allowed on the numerator.
+    if den_part.starts_with('+') || den_part.starts_with('-') {
+        return None;
+    }
+    let num = parse_integer(num_part, radix)?;
+    let den = parse_integer(den_part, radix)?;
+    if den == 0 {
+        return None;
+    }
+    Some(Value::Ratio(
+        std::sync::Arc::new(num.to_string()),
+        std::sync::Arc::new(den.to_string()),
+    ))
+}
+
 /// Parse an integer in the given radix. Allows optional leading `+`
 /// or `-`. For radix 10 only, allows an optional trailing `.` (CL
 /// quirk: `123.` is the integer 123, not a float).
@@ -253,5 +286,39 @@ mod tests {
         assert_eq!(parse_integer("ZZ", 36), Some(35 * 36 + 35));
         assert_eq!(parse_integer("-FF", 16), Some(-255));
         assert_eq!(parse_integer("FG", 16), None);
+    }
+
+    fn rat(v: &Value) -> (&str, &str) {
+        match v {
+            Value::Ratio(n, d) => (&**n, &**d),
+            _ => panic!("not ratio: {v:?}"),
+        }
+    }
+
+    #[test]
+    fn ratio_under_radix() {
+        // `#o-101/75` (corman ANSI chapter-2 RATIO-FORMAT block):
+        // octal -101 = -65, octal 75 = 61 → -65/61.
+        assert_eq!(rat(&parse_ratio_radix("-101/75", 8).unwrap()),
+                   ("-65", "61"));
+        // `#3r120/21`: ternary 120 = 15, ternary 21 = 7 → 15/7.
+        assert_eq!(rat(&parse_ratio_radix("120/21", 3).unwrap()),
+                   ("15", "7"));
+        // `#Xbc/ad`: hex bc = 188, hex ad = 173 → 188/173.
+        assert_eq!(rat(&parse_ratio_radix("bc/ad", 16).unwrap()),
+                   ("188", "173"));
+        // Positive sign on numerator survives.
+        assert_eq!(rat(&parse_ratio_radix("+10/11", 8).unwrap()),
+                   ("8", "9"));
+        // Sign on denominator: rejected (sign-on-numerator is the CL
+        // convention; reader must fall through to the symbol path).
+        assert!(parse_ratio_radix("10/-11", 8).is_none());
+        // Zero denominator: reject.
+        assert!(parse_ratio_radix("10/0", 8).is_none());
+        // Missing half: reject.
+        assert!(parse_ratio_radix("/3", 8).is_none());
+        assert!(parse_ratio_radix("3/", 8).is_none());
+        // Out-of-radix digit: reject.
+        assert!(parse_ratio_radix("9/2", 8).is_none());
     }
 }

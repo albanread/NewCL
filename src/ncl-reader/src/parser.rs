@@ -9,7 +9,7 @@ use std::sync::Arc;
 use ncl_runtime::{universe, Package, Symbol, Value, Visibility};
 
 use crate::lexer::{LexError, Lexer};
-use crate::numbers::{parse_integer, try_parse_number};
+use crate::numbers::{parse_integer, parse_ratio_radix, try_parse_number};
 use crate::readtable::Readtable;
 use crate::token::{AtomText, Span, SpannedToken, Token};
 
@@ -490,17 +490,23 @@ impl<'a> Parser<'a> {
                         Some(st.span),
                     ));
                 }
-                parse_integer(&a.raw, radix)
-                    .map(Value::Fixnum)
-                    .ok_or_else(|| {
-                        self.err_at(
-                            ReaderErrorKind::BadRadixDigits {
-                                radix,
-                                text: a.raw,
-                            },
-                            Some(st.span),
-                        )
-                    })
+                // Try integer first, then ratio (`numerator/denominator`,
+                // sign-on-numerator). Without the ratio fallback,
+                // `#o-101/75` would surface as BadRadixDigits because
+                // parse_integer chokes on the `/`. See parse_ratio_radix.
+                if let Some(n) = parse_integer(&a.raw, radix) {
+                    return Ok(Value::Fixnum(n));
+                }
+                if let Some(r) = parse_ratio_radix(&a.raw, radix) {
+                    return Ok(r);
+                }
+                Err(self.err_at(
+                    ReaderErrorKind::BadRadixDigits {
+                        radix,
+                        text: a.raw,
+                    },
+                    Some(st.span),
+                ))
             }
             other => Err(self.err_at(
                 ReaderErrorKind::UnexpectedToken {
