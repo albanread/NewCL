@@ -4751,6 +4751,34 @@ mod end_to_end_tests {
     }
 
     #[test]
+    fn setq_setf_accept_multi_pair_forms() {
+        // CL's `(setq v1 e1 v2 e2 ...)` and
+        // `(setf p1 e1 p2 e2 ...)` are even-arity multi-assignment
+        // forms; the value of the form is the last assignment.
+        // Chapter 3 of the corman ANSI suite aborts mid-suite without
+        // this — the EVAL block has `(setq a 1 b 2 c 3)` as its first
+        // setup line.
+        let mut s = Session::with_stdlib().expect("session boots");
+        s.activate();
+        // Multi-pair setq into globals.
+        s.eval("(defparameter aa 0) (defparameter bb 0) (defparameter cc 0)").unwrap();
+        assert_eq!(s.eval("(setq aa 1 bb 2 cc 3)").unwrap(), "3");
+        assert_eq!(s.eval("(list aa bb cc)").unwrap(), "(1 2 3)");
+        // Multi-pair setq into local lets.
+        assert_eq!(
+            s.eval("(let ((x 0) (y 0)) (setq x 7 y 8) (list x y))").unwrap(),
+            "(7 8)"
+        );
+        // Multi-pair setf — bare symbols and recognised places.
+        s.eval("(defparameter pp (cons 1 2))").unwrap();
+        s.eval("(setf (car pp) 'a (cdr pp) 'b)").unwrap();
+        assert_eq!(s.eval("pp").unwrap(), "(A . B)");
+        // Empty: returns nil per CL spec.
+        assert_eq!(s.eval("(setq)").unwrap(), "nil");
+        assert_eq!(s.eval("(setf)").unwrap(), "nil");
+    }
+
+    #[test]
     fn funcall_apply_accept_symbol_designators() {
         // CL spec: funcall/apply take a function DESIGNATOR — either a
         // function or a symbol whose function cell is bound. Without

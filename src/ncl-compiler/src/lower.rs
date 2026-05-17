@@ -880,25 +880,37 @@ fn collect_mutations(
 
     match head_name.as_str() {
         "QUOTE" => {}
-        "SETQ" if args.len() == 2 => {
-            if let Value::Symbol(s) = &args[0] {
-                if !shadowed.contains(&s.name) {
-                    into.insert(Arc::clone(&s.name));
+        "SETQ" if args.len() % 2 == 0 => {
+            // (setq v1 e1 v2 e2 ...) — record each var and recurse
+            // into each value form. Walk in pairs.
+            let mut i = 0;
+            while i + 1 < args.len() {
+                if let Value::Symbol(s) = &args[i] {
+                    if !shadowed.contains(&s.name) {
+                        into.insert(Arc::clone(&s.name));
+                    }
                 }
+                collect_mutations(&args[i + 1], shadowed, into);
+                i += 2;
             }
-            collect_mutations(&args[1], shadowed, into);
         }
-        "SETF" if args.len() == 2 => {
-            if let Value::Symbol(s) = &args[0] {
-                if !shadowed.contains(&s.name) {
-                    into.insert(Arc::clone(&s.name));
+        "SETF" if args.len() % 2 == 0 => {
+            // (setf p1 v1 p2 v2 ...) — for each (place, value):
+            // if place is a bare symbol, record it as mutated;
+            // otherwise recurse into the place sub-args. Then
+            // recurse into the value form.
+            let mut i = 0;
+            while i + 1 < args.len() {
+                if let Value::Symbol(s) = &args[i] {
+                    if !shadowed.contains(&s.name) {
+                        into.insert(Arc::clone(&s.name));
+                    }
+                } else {
+                    collect_mutations(&args[i], shadowed, into);
                 }
-            } else {
-                // (setf (place ...) v) — recurse into both place
-                // sub-args and the new-value form.
-                collect_mutations(&args[0], shadowed, into);
+                collect_mutations(&args[i + 1], shadowed, into);
+                i += 2;
             }
-            collect_mutations(&args[1], shadowed, into);
         }
         "LET" if !args.is_empty() => {
             if let Ok(bindings) = list_to_vec(&args[0]) {
@@ -1409,18 +1421,51 @@ fn lower_setq(
     env: &mut LocalEnv,
     coord: &Arc<GcCoordinator>,
 ) -> Result<Expr, CompileError> {
-    if args.len() != 2 {
+    // CL spec: `(setq var1 val1 var2 val2 ...)`. Evaluates and
+    // assigns each pair in left-to-right order; returns the value
+    // of the LAST assignment. `(setq)` with zero args returns nil.
+    if args.is_empty() {
+        return Ok(Expr::Nil);
+    }
+    if args.len() % 2 != 0 {
         return Err(CompileError::BadArity {
             head: head.to_string(),
-            expected: "2",
+            expected: "an even number of args (var/value pairs)",
             got: args.len(),
         });
     }
-    let name = match &args[0] {
+    // Common case: exactly one pair. Emit a single assignment so
+    // the IR stays flat — no Progn wrap.
+    if args.len() == 2 {
+        return lower_setq_pair(head, &args[0], &args[1], env, coord);
+    }
+    // Multi-pair: lower each pair to its single-assignment Expr,
+    // chain them with Progn. The Progn's value is its last form's
+    // value, matching CL's "returns the last assignment's value."
+    let mut exprs: Vec<Expr> = Vec::with_capacity(args.len() / 2);
+    let mut i = 0;
+    while i + 1 < args.len() {
+        exprs.push(lower_setq_pair(head, &args[i], &args[i + 1], env, coord)?);
+        i += 2;
+    }
+    Ok(Expr::progn(exprs))
+}
+
+/// Single-pair `(setq var value)` lowering — the original body of
+/// `lower_setq`. Split out so the multi-pair entry point can loop
+/// over pairs without re-implementing the local-vs-global resolve.
+fn lower_setq_pair(
+    head: &str,
+    name_form: &Value,
+    value_form: &Value,
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
+    let name = match name_form {
         Value::Symbol(s) => Arc::clone(&s.name),
         other => {
             return Err(CompileError::NotImplemented(format!(
-                "setq's first argument must be a symbol, got {other:?}"
+                "{head} target must be a symbol, got {other:?}"
             )));
         }
     };
@@ -1432,7 +1477,7 @@ fn lower_setq(
     // function parameter (param boxing isn't wired yet). That's a
     // compile error rather than a silent miscompile.
     if let Some(b) = env.find_or_capture(&name) {
-        let value = lower_in_mut(&args[1], env, coord)?;
+        let value = lower_in_mut(value_form, env, coord)?;
         return match b {
             Binding::LocalCell(i) => Ok(Expr::set_car(Expr::Local(i), value)),
             Binding::ParamCell(i) => Ok(Expr::set_car(Expr::Param(i), value)),
@@ -1452,7 +1497,7 @@ fn lower_setq(
         };
     }
     let sym_word = coord.intern(&name);
-    let value = lower_in_mut(&args[1], env, coord)?;
+    let value = lower_in_mut(value_form, env, coord)?;
     Ok(Expr::store_global(sym_word.raw(), value))
 }
 
@@ -1473,12 +1518,29 @@ fn lower_setf(
     env: &mut LocalEnv,
     coord: &Arc<GcCoordinator>,
 ) -> Result<Expr, CompileError> {
-    if args.len() != 2 {
+    // CL spec: `(setf p1 v1 p2 v2 ...)`. Left-to-right evaluation
+    // and assignment; returns the value of the LAST assignment.
+    // Zero args is nil. Odd args is a syntax error.
+    if args.is_empty() {
+        return Ok(Expr::Nil);
+    }
+    if args.len() % 2 != 0 {
         return Err(CompileError::BadArity {
             head: "SETF".into(),
-            expected: "2",
+            expected: "an even number of args (place/value pairs)",
             got: args.len(),
         });
+    }
+    if args.len() > 2 {
+        // Multi-pair: lower each pair separately, sequence with Progn.
+        let mut exprs: Vec<Expr> = Vec::with_capacity(args.len() / 2);
+        let mut i = 0;
+        while i + 1 < args.len() {
+            let pair = [args[i].clone(), args[i + 1].clone()];
+            exprs.push(lower_setf(&pair, env, coord)?);
+            i += 2;
+        }
+        return Ok(Expr::progn(exprs));
     }
     let place = &args[0];
     let value_form = &args[1];
