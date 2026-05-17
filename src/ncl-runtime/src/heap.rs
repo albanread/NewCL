@@ -385,6 +385,33 @@ impl Semispace {
     /// below pinned objects are wasted until those objects are
     /// unpinned (next cycle if no conservative ref still points at
     /// them). Returns the number of cells still occupied.
+    ///
+    /// # SOUNDNESS — do NOT "simplify" to promote-and-forward
+    ///
+    /// This routine looks like it could be replaced with "copy the
+    /// pinned object to old-space, leave a forwarding marker, reset
+    /// young to zero." That would be wrong, and the NewOpenDylan port
+    /// caught their agent attempting exactly that simplification on
+    /// review (NCL_GC_FEEDBACK.md from the OD team, 2026-05-17).
+    ///
+    /// The conservative pinner discovers *candidate* roots — stack
+    /// words whose bit patterns happen to look like heap pointers.
+    /// We can't know which of those candidates is a real Lisp value
+    /// vs. an integer that coincidentally points into the heap; the
+    /// only safe disposition is to leave the pinned object at its
+    /// original address so any conservative root that pointed at it
+    /// still does. Promoting + forwarding works only if every
+    /// dereference site goes through a forwarding-aware loader, and
+    /// conservative scanning by definition cannot guarantee that
+    /// (the scanner can't insert a load barrier into a stack-resident
+    /// `usize` it's already classified as "looks like a pointer").
+    ///
+    /// The fragmentation cost (free cells below pinned objects
+    /// stranded until the next cycle frees the pin) is the price of
+    /// admission for conservative scanning. The cost is paid here,
+    /// in this rewind logic. Don't try to recover the cells by
+    /// promoting the pinned object — you'll trade fragmentation for
+    /// dangling pointers, which is a much worse trade.
     pub fn rewind_past_pinned(&mut self) -> usize {
         let old_top = self.top;
         let mut highest_end: usize = 0;

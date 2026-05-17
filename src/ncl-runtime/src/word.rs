@@ -328,12 +328,37 @@ mod tests {
 
     #[test]
     fn forward_round_trip() {
+        // Sweep across multiple 8-byte alignments inside one 64-byte
+        // window. The NewOpenDylan GC port (NCL_GC_FEEDBACK.md,
+        // 2026-05-17) caught a forwarding-encoding bug that had
+        // slipped past a single-pointer round-trip test — the address
+        // they happened to pick was 256-byte aligned and the encoding
+        // was lossy below that. A sweep across `0x..00`, `0x..08`,
+        // `0x..10`, … `0x..38` would have caught it on the first
+        // run. We have no equivalent lossy case (Tag::Forward leaves
+        // 61 bits for the payload — no compression), but sweep
+        // anyway so the test pattern doesn't lull a future encoding
+        // change into the same trap.
+        let base: usize = 0x0000_7FF8_DEAD_BE00;
+        for off in (0..64).step_by(8) {
+            let p = (base + off) as *const ();
+            let w = Word::forward(p);
+            assert!(w.is_forward(), "lost forward tag at offset {off:#x}");
+            assert_eq!(
+                w.forward_target(),
+                Some(p),
+                "lossy at base+{off:#x} (raw {:#018x})",
+                w.raw(),
+            );
+            assert_eq!(w.as_fixnum(), None);
+        }
+        // Sanity: stack-resident pointer still works (the historical
+        // test shape).
         let dummy: u64 = 0;
         let p = (&dummy as *const u64) as *const ();
         let w = Word::forward(p);
         assert!(w.is_forward());
         assert_eq!(w.forward_target(), Some(p));
-        assert_eq!(w.as_fixnum(), None);
     }
 
     #[test]
