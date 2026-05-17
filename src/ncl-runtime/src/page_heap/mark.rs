@@ -246,23 +246,25 @@ impl PageHeap {
                 return;
             }
         };
-        let size_cells = if is_cons {
-            2
-        } else {
-            let header_word = self.read_cell(cell_idx);
-            let h = HeapHeader::from_raw(header_word);
-            1 + h.length_cells() as usize
+        if is_cons {
+            // Both cells (car, cdr) are Words.
+            for c in cell_idx..cell_idx + 2 {
+                let w = Word::from_raw(self.read_cell(c));
+                self.try_mark_root(w, target, queue);
+            }
+            return;
+        }
+        // Boxed: dispatch on HeapType so we skip non-Word fields
+        // (Function::code_ptr & arity, Bignum limbs, Float bits,
+        // String/FfiBlock raw data). The old "treat every cell as
+        // a candidate Word" path made the gates reject those after
+        // the fact; now we don't even look.
+        let header_word = self.read_cell(cell_idx);
+        let h = HeapHeader::from_raw(header_word);
+        let Some((first, last)) = h.ty().word_field_range(h.length_cells()) else {
+            return;
         };
-        // Walk payload. For Cons, both cells are Words. For Boxed,
-        // cells 1..size_cells are payload; cell 0 is the header
-        // and we skip it. SOME boxed objects have non-Word cells
-        // in their payload (Function::code_ptr, Bignum limbs,
-        // Float bits) but the conservative scanner treats them
-        // as candidate Words and harmlessly rejects non-pointer
-        // bit patterns.
-        let payload_start = if is_cons { cell_idx } else { cell_idx + 1 };
-        let payload_end = cell_idx + size_cells;
-        for c in payload_start..payload_end {
+        for c in (cell_idx + first)..=(cell_idx + last) {
             let w = Word::from_raw(self.read_cell(c));
             self.try_mark_root(w, target, queue);
         }
@@ -323,16 +325,17 @@ impl PageHeap {
             }
             let is_cons =
                 is_cons_start_at(marker.heap.start_bits_slice(), cell_idx);
-            let size_cells = if is_cons {
-                2
+            let (payload_start, payload_end) = if is_cons {
+                (cell_idx, cell_idx + 1)
             } else {
                 let header_word = marker.heap.read_cell(cell_idx);
                 let h = HeapHeader::from_raw(header_word);
-                1 + h.length_cells() as usize
+                match h.ty().word_field_range(h.length_cells()) {
+                    Some((f, l)) => (cell_idx + f, cell_idx + l),
+                    None => continue,
+                }
             };
-            let payload_start = if is_cons { cell_idx } else { cell_idx + 1 };
-            let payload_end = cell_idx + size_cells;
-            for c in payload_start..payload_end {
+            for c in payload_start..=payload_end {
                 let w = Word::from_raw(marker.heap.read_cell(c));
                 let before = marker.queue.len();
                 marker

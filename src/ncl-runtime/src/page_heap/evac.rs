@@ -335,16 +335,17 @@ impl<'a> PageEvacuator<'a> {
             ),
             _ => return,
         };
-        let size = if is_cons {
-            2
+        let (payload_start, payload_end) = if is_cons {
+            (cell_idx, cell_idx + 1)
         } else {
             let header_word = self.read_cell(cell_idx);
             let h = HeapHeader::from_raw(header_word);
-            1 + h.length_cells() as usize
+            match h.ty().word_field_range(h.length_cells()) {
+                Some((f, l)) => (cell_idx + f, cell_idx + l),
+                None => return,
+            }
         };
-        let payload_start = if is_cons { cell_idx } else { cell_idx + 1 };
-        let payload_end = cell_idx + size;
-        for c in payload_start..payload_end {
+        for c in payload_start..=payload_end {
             let w = Word::from_raw(self.read_cell(c));
             let mut tmp = w;
             self.mark_visit_slot(&mut tmp);
@@ -796,15 +797,16 @@ impl PageHeap {
         }
         let is_cons =
             super::alloc::is_cons_start_at(self.start_bits_slice(), cell_idx);
-        let size = if is_cons {
-            2
+        let (payload_start, payload_end) = if is_cons {
+            (cell_idx, cell_idx + 1)
         } else {
             let h = HeapHeader::from_raw(header_raw);
-            1 + h.length_cells() as usize
+            match h.ty().word_field_range(h.length_cells()) {
+                Some((f, l)) => (cell_idx + f, cell_idx + l),
+                None => return,
+            }
         };
-        let payload_start = if is_cons { cell_idx } else { cell_idx + 1 };
-        let payload_end = cell_idx + size;
-        for c in payload_start..payload_end {
+        for c in payload_start..=payload_end {
             let cell_ptr = unsafe { (self.base_ptr() as *mut u64).add(c) };
             let raw = unsafe { *cell_ptr };
             let w = Word::from_raw(raw);
@@ -845,21 +847,24 @@ impl PageHeap {
                 self.start_bits_slice(),
                 cell_idx,
             );
-            let size = if is_cons {
-                2
+            let (size, word_range) = if is_cons {
+                (2usize, Some((cell_idx, cell_idx + 1)))
             } else {
                 let h = HeapHeader::from_raw(header_raw);
-                1 + h.length_cells() as usize
+                let size = 1 + h.length_cells() as usize;
+                let range = h.ty().word_field_range(h.length_cells())
+                    .map(|(f, l)| (cell_idx + f, cell_idx + l));
+                (size, range)
             };
-            let payload_start = if is_cons { cell_idx } else { cell_idx + 1 };
-            let payload_end = cell_idx + size;
-            for c in payload_start..payload_end {
-                let cell_ptr =
-                    unsafe { (self.base_ptr() as *mut u64).add(c) };
-                let raw = unsafe { *cell_ptr };
-                let w = Word::from_raw(raw);
-                if let Some(new) = self.maybe_rewrite_word(from_gen, w) {
-                    unsafe { *cell_ptr = new.raw() };
+            if let Some((payload_start, payload_end)) = word_range {
+                for c in payload_start..=payload_end {
+                    let cell_ptr =
+                        unsafe { (self.base_ptr() as *mut u64).add(c) };
+                    let raw = unsafe { *cell_ptr };
+                    let w = Word::from_raw(raw);
+                    if let Some(new) = self.maybe_rewrite_word(from_gen, w) {
+                        unsafe { *cell_ptr = new.raw() };
+                    }
                 }
             }
             cell_idx += size;

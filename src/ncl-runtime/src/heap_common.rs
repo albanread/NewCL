@@ -162,6 +162,60 @@ impl HeapType {
             _ => None,
         }
     }
+
+    /// Range of cell offsets within an object of this type that
+    /// hold Word-valued fields the GC must scan. Offsets are
+    /// relative to the object's first cell (the header is at
+    /// offset 0; payload starts at offset 1).
+    ///
+    /// Returns `None` if there are no Word-bearing cells (string
+    /// data, raw float bits, raw bignum limbs, FFI scratch).
+    ///
+    /// Otherwise returns `Some((first, last))` where both bounds
+    /// are inclusive cell offsets. The walker iterates
+    /// `cell_idx + first ..= cell_idx + last`.
+    ///
+    /// The pre-typed walker treated every payload cell as a
+    /// candidate Word, which:
+    ///   - wasted dispatch on raw u64 fields (code_ptr in Function,
+    ///     f64 bits in Float, limbs in Bignum, char data in String,
+    ///     raw bytes in FfiBlock);
+    ///   - risked false-positive matches when a raw u64 happened to
+    ///     have heap-pointer-shaped tag bits — the downstream
+    ///     reservation + start-bit gates always rejected those, but
+    ///     the work to get there is the slow part.
+    ///
+    /// For `length_cells` = the value in the header (excludes the
+    /// header itself), this returns:
+    ///
+    /// | type          | Word-cell range | non-Word cells              |
+    /// |---------------|-----------------|------------------------------|
+    /// | Vector        | 1..=length      | —                            |
+    /// | Symbol        | 1..=length (7)  | —                            |
+    /// | Ratio         | 1..=length (3)  | —                            |
+    /// | Complex       | 1..=length (3)  | —                            |
+    /// | Other         | 1..=length      | (treated conservatively)     |
+    /// | Function      | 3..=4           | code_ptr (1), arity (2)      |
+    /// | Bignum        | 1..=4           | limbs (5..length)            |
+    /// | Float         | 1..=1           | f64 bits (2)                 |
+    /// | String        | None            | UTF-8 / char data            |
+    /// | FfiBlock      | None            | foreign declaration bytes    |
+    pub fn word_field_range(self, length_cells: u32) -> Option<(usize, usize)> {
+        let len = length_cells as usize;
+        match self {
+            HeapType::Vector
+            | HeapType::Symbol
+            | HeapType::Ratio
+            | HeapType::Complex
+            | HeapType::Other => {
+                if len == 0 { None } else { Some((1, len)) }
+            }
+            HeapType::Function => Some((3, 4)),
+            HeapType::Bignum => Some((1, 4)),
+            HeapType::Float => Some((1, 1)),
+            HeapType::String | HeapType::FfiBlock => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
