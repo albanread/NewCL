@@ -2237,19 +2237,30 @@ pub extern "C-unwind" fn return_from_shim(
 /// touched. Defstruct uses this from its macro expansion to
 /// build constructor / accessor / setter symbol names from the
 /// struct's name.
+///
+/// CL's full signature is `(intern name &optional package)`. NCL
+/// has no package system, but accepts the optional second arg for
+/// source compatibility — it's ignored.
 pub extern "C-unwind" fn intern_shim(
     mutator: *mut crate::mutator::MutatorState,
     _env: u64,
     args: *const u64,
     n_args: u64,
 ) -> u64 {
-    if n_args != 1 {
-        panic!("intern: expected 1 arg (string), got {n_args}");
+    if n_args == 0 || n_args > 2 {
+        return signal_static_condition_string_and_abort(
+            mutator,
+            &format!("intern: expected 1 or 2 args (string [package]), got {n_args}"),
+        );
     }
     let w = Word::from_raw(unsafe { *args });
     if w.tag() != Tag::String {
-        panic!("intern: argument must be a string, got {w:?}");
+        return signal_static_condition_string_and_abort(
+            mutator,
+            &format!("intern: first argument must be a string, got {w:?}"),
+        );
     }
+    // Optional package arg: accepted (any tag), ignored.
     let name: String = crate::gc_string::chars_of(w).collect();
     let m = unsafe { &mut *mutator };
     m.coord().intern(&name).raw()

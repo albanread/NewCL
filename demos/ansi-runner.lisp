@@ -94,7 +94,30 @@
   ;; Walk EXAMPLES three at a time: (expr => expected) (expr => expected) ...
   ;; The macro is hand-rolled because `loop … on … by 'cdddr` and
   ;; `destructuring-bind` aren't on solid ground here yet.
-  (labels ((triples (xs acc)
+  ;;
+  ;; Corman's chapter files use bare commas as English punctuation
+  ;; after the expected result, e.g.
+  ;;
+  ;;     (function-keywords *)  =>  (:C :DEE :E EFF), false
+  ;;
+  ;; Standard CL readers parse `,false` as `(UNQUOTE FALSE)` and
+  ;; reject it outside backquote (we do). Corman's runner happens to
+  ;; collect these as "secondary value" hints which it then ignores.
+  ;; To stay aligned with the (expr => expected) triple cadence we
+  ;; filter UNQUOTE / UNQUOTE-SPLICING forms out of the example list
+  ;; before grouping — same net effect.
+  (labels ((unquote-form-p (x)
+             (and (consp x)
+                  (consp (cdr x))
+                  (symbolp (car x))
+                  (or (eq (car x) 'unquote)
+                      (eq (car x) 'unquote-splicing))))
+           (strip-unquotes (xs)
+             (cond
+               ((null xs) nil)
+               ((unquote-form-p (car xs)) (strip-unquotes (cdr xs)))
+               (t (cons (car xs) (strip-unquotes (cdr xs))))))
+           (triples (xs acc)
              (cond
                ((null xs) (nreverse acc))
                ((or (null (cdr xs)) (null (cddr xs)))
@@ -105,7 +128,7 @@
                     (declare (ignore arrow))
                     (triples (cdddr xs)
                              (cons (list expr expected) acc)))))))
-    (let ((groups (triples examples nil)))
+    (let ((groups (triples (strip-unquotes examples) nil)))
       `(progn
          (format t "~&Testing ~A " ',symbol)
          (force-output)
@@ -141,8 +164,14 @@
 (run-ansi-chapter 4)
 (run-ansi-chapter 5)
 (run-ansi-chapter 6)
-(run-ansi-chapter 7)
 (run-ansi-chapter 8)
+;; Chapter 7 last: it exercises method-combination paths that
+;; currently trigger an infinite recursion in CLOS's FIND/
+;; SUBCLASSP (visible as a Windows stack overflow that kills the
+;; process). Running it last preserves the suite's pass/fail tally
+;; for chapters 2-6 and 8. Fix lands when the FIND recursion is
+;; properly bounded.
+(run-ansi-chapter 7)
 
 (format t "~%~%==== ANSI suite summary ====~%")
 (format t "  passed: ~A~%" *ansi-pass-count*)
