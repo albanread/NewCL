@@ -109,10 +109,18 @@
   (name nil)            ; named block tag, or NIL
   (with-bindings nil)   ; ((var . init-form) ...)
   (iter-bindings nil)   ; ((var . init-form) ...) for for-clause vars
-  (iter-tests nil)      ; forms — evaluating to NIL means stop
+  (iter-tests nil)      ; pre-body tests — for/while/until BEFORE first do
+  (post-body-tests nil) ; post-body tests — while/until AFTER do clauses.
+                        ; CL `(loop do EXPR until COND)` runs EXPR first,
+                        ; then tests COND — Corman's quicksort relies on
+                        ; this. The split tracks which side of the body a
+                        ; test landed in.
   (iter-steps nil)      ; forms — run after body to advance iterators
   (initially nil)       ; forms — run before main loop
   (body nil)            ; forms — main per-iteration body
+  (body-seen nil)       ; flipped to T once a do/doing clause was parsed;
+                        ; subsequent while/until tests are routed to
+                        ; post-body-tests.
   (finally nil)         ; forms — run after natural completion
   (accumulators nil)    ; ((kind var . extras) ...) for the result computation
   )
@@ -128,8 +136,13 @@
                 (list (cons var init)))))
 
 (defun %plan-add-test (plan form)
-  (setf (loop-plan-iter-tests plan)
-        (append (loop-plan-iter-tests plan) (list form))))
+  (cond
+    ((loop-plan-body-seen plan)
+     (setf (loop-plan-post-body-tests plan)
+           (append (loop-plan-post-body-tests plan) (list form))))
+    (t
+     (setf (loop-plan-iter-tests plan)
+           (append (loop-plan-iter-tests plan) (list form))))))
 
 (defun %plan-add-step (plan form)
   (setf (loop-plan-iter-steps plan)
@@ -137,7 +150,8 @@
 
 (defun %plan-add-body (plan form)
   (setf (loop-plan-body plan)
-        (append (loop-plan-body plan) (list form))))
+        (append (loop-plan-body plan) (list form)))
+  (setf (loop-plan-body-seen plan) t))
 
 (defun %plan-add-initially (plan form)
   (setf (loop-plan-initially plan)
@@ -485,11 +499,17 @@
            (mapcar (lambda (pair) `(,(car pair) ,(cdr pair)))
                    (loop-plan-iter-bindings plan))))
          (tests (loop-plan-iter-tests plan))
+         (post-tests (loop-plan-post-body-tests plan))
          (test-form
           (cond
             ((null tests) 'nil)            ; no automatic termination
             ((null (cdr tests)) (car tests))
             (t `(or ,@tests))))
+         (post-test-form
+          (cond
+            ((null post-tests) 'nil)       ; no post-body termination
+            ((null (cdr post-tests)) (car post-tests))
+            (t `(or ,@post-tests))))
          ;; Rewrite (return X) → (return-from NAME X) so user
          ;; code's `return` inside body/initially/finally reaches
          ;; the implicit block. The body's accumulator-setq forms
@@ -509,16 +529,37 @@
     ;; else run body + steps. The cond branch with `return` is the
     ;; ONLY form in that branch — nothing follows to execute after
     ;; the return-flag is set.
-    `(block ,name
-       (let* ,all-bindings
-         ,@initially
-         (loop
-           (cond
-             (,test-form (return nil))
-             (t ,@body
-                ,@steps)))
-         ,@finally
-         ,result))))
+    ;; Iteration shape:
+    ;;   pre-body tests first (for / while / until that appeared BEFORE
+    ;;   any do clause), then body, then post-body tests (while / until
+    ;;   that appeared AFTER do clauses), then steps. Each test bails
+    ;;   out of the implicit block. With only pre-tests this collapses
+    ;;   to the original shape.
+    ;;
+    ;; A non-trivial subtlety: when STEPS is empty, the inner
+    ;; `(t ,@steps)` clause becomes `(t)`, which NCL's lowerer rejects
+    ;; ("cond clause with only a test"). Splice a NIL body in that
+    ;; case so the resulting cond is always well-formed.
+    (let* ((step-clause (if steps `(t ,@steps) '(t nil)))
+           (post-test-cond
+            (cond
+              ;; No post-test → skip the inner cond entirely; just
+              ;; run steps after body.
+              ((null post-tests) `(progn ,@steps))
+              (t
+               `(cond
+                  (,post-test-form (return nil))
+                  ,step-clause)))))
+      `(block ,name
+         (let* ,all-bindings
+           ,@initially
+           (loop
+             (cond
+               (,test-form (return nil))
+               (t ,@body
+                  ,post-test-cond)))
+           ,@finally
+           ,result)))))
 
 ;; ── Macro redefinition ────────────────────────────────────────────────────
 ;;

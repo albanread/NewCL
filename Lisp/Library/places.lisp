@@ -142,5 +142,100 @@
        (defun (setf ,access-fn) (,val &rest ,args)
          (apply (function ,setter-fn) (append ,args (list ,val)))))))
 
+;; ── INCF / DECF ─────────────────────────────────────────────────────────
+;;
+;; CL's INCF and DECF are sugar for (setf place (+ place delta)) and
+;; (setf place (- place delta)) — delta defaults to 1. Same caveat
+;; about side-effecting subforms as ROTATEF below; CL's "full" form
+;; uses get-setf-expansion to evaluate subforms once.
+
+(defmacro incf (place &optional (delta 1))
+  "Increment PLACE by DELTA (default 1). Returns the new value."
+  `(setf ,place (+ ,place ,delta)))
+
+(defmacro decf (place &optional (delta 1))
+  "Decrement PLACE by DELTA (default 1). Returns the new value."
+  `(setf ,place (- ,place ,delta)))
+
+;; ── ROTATEF / SHIFTF ────────────────────────────────────────────────────
+;;
+;; ROTATEF rotates the values stored at N places one step to the LEFT:
+;;
+;;   (rotatef A B)         ; swap   — A gets B, B gets A
+;;   (rotatef A B C)       ; rotate — A←B, B←C, C←A
+;;
+;; SHIFTF shifts values RIGHT through N places, returning the leftmost
+;; value (the one that "falls off"):
+;;
+;;   (shiftf A B 99)       ; A's old value is returned; A←B, B←99
+;;
+;; CL's full versions use get-setf-expansion so subforms of each place
+;; are evaluated only once. We don't have that yet, so the macros below
+;; assume the places are either bare symbols or simple accessor forms
+;; whose subforms are side-effect-free. Corman's `quicksort.lisp` uses
+;; `(rotatef (elt vec i) (elt vec j))` which qualifies — `elt`'s
+;; subforms are just variable reads.
+;;
+;; If a caller hands us a place with side-effecting subforms (rare
+;; outside CL bootstrap code), the result will be wrong; that's the
+;; same trade-off our PUSH and INCF make today.
+
+(defmacro rotatef (&rest places)
+  "Rotate values stored at PLACES one step to the left.
+   (rotatef a b c) ≡ A←B, B←C, C←A. Returns NIL."
+  (cond
+    ((null places) nil)
+    ((null (cdr places)) nil)  ; single place — no-op
+    (t
+     (let ((temps (mapcar (lambda (p) (declare (ignore p)) (gensym "ROT-"))
+                          places))
+           (vals  (mapcar (lambda (p) p) places)))
+       ;; LET binds each temp to its place's current value, then we
+       ;; SETF each place to its left-neighbour's saved value. The
+       ;; first place gets the last temp.
+       (let ((bindings (mapcar #'list temps vals))
+             (writes  (let ((ws nil))
+                        (do ((ps places (cdr ps))
+                             (ts (cdr temps) (cdr ts)))
+                            ((null (cdr ps))
+                             (setq ws (cons `(setf ,(car ps) ,(car temps)) ws))
+                             (nreverse ws))
+                          (setq ws (cons `(setf ,(car ps) ,(car ts)) ws))))))
+         `(let ,bindings
+            ,@writes
+            nil))))))
+
+(defmacro shiftf (&rest args)
+  "Shift values stored at PLACES one step to the right; returns the
+   leftmost old value (the one that falls off).
+   (shiftf a b c new) ≡ saves a, then A←B, B←C, C←new; returns saved.
+   At least 2 args required: N-1 places + 1 incoming value."
+  (cond
+    ((or (null args) (null (cdr args)))
+     (error "SHIFTF needs at least 2 args (one place + one value), got ~A"
+            (length args)))
+    (t
+     (let* ((places (let ((all args) (out nil))
+                      ;; All but last: places to shift through.
+                      (do ()
+                          ((null (cdr all)) (nreverse out))
+                        (setq out (cons (car all) out))
+                        (setq all (cdr all)))))
+            (new-val (car (last args)))
+            (temps   (mapcar (lambda (p) (declare (ignore p))
+                               (gensym "SHIFT-"))
+                             places))
+            (bindings (mapcar #'list temps places))
+            (writes   (let ((ws nil))
+                        (do ((ps places (cdr ps))
+                             (ts (cdr temps) (cdr ts)))
+                            ((null (cdr ps))
+                             (setq ws (cons `(setf ,(car ps) ,new-val) ws))
+                             (nreverse ws))
+                          (setq ws (cons `(setf ,(car ps) ,(car ts)) ws))))))
+       `(let ,bindings
+          ,@writes
+          ,(car temps))))))
+
 (provide 'places)
 nil

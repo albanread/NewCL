@@ -882,17 +882,38 @@ pub extern "C-unwind" fn native_loop_shim(
             unsafe { std::mem::transmute(code) };
         let body_value = unsafe { f(mutator, env.raw(), std::ptr::null(), 0) };
 
-        // Block return / condition signal in flight — exit the
-        // loop and propagate. Without this, a (return-from N V)
-        // from inside a loop body would set ABORT_PENDING, the
-        // body's call-site instrumentation would early-return,
-        // and the loop would just keep iterating (we'd never
-        // observe the abort or the value).
+        // Three exit paths the body can request:
+        //
+        //   (1) LOOP_BREAK_PENDING — set by `(return ...)` inside a
+        //       simple loop. The loop_return_shim now ALSO sets
+        //       ABORT_PENDING so the JIT's per-call abort-check
+        //       early-returns through any nested call sites, giving
+        //       (return) proper unwind semantics — forms following
+        //       the (return) in the body don't run. Without that
+        //       short-circuit, code like
+        //
+        //         (loop (if (< j i) (return)) (rotatef ...))
+        //
+        //       would still run the rotatef after the return, which
+        //       broke corman's quicksort and any other code that
+        //       relies on return-skips-tail semantics.
+        //
+        //   (2) ABORT_PENDING alone — a (return-from BLOCK V) or a
+        //       signal-pending condition. Exit the loop and let the
+        //       outer block / handler observe the flag.
+        //
+        //   (3) Body returns normally — iterate again.
+        //
+        // Check LOOP_BREAK first so we report the user's intended
+        // exit value (not the body's tail value, which is NIL after
+        // a return). Clear ABORT_PENDING only in path (1) since
+        // path (2)'s abort needs to propagate up to a real handler.
+        if LOOP_BREAK_PENDING.with(|p| p.get()) {
+            ABORT_PENDING.with(|p| p.set(false));
+            break LOOP_BREAK_VALUE.with(|v| v.get());
+        }
         if ABORT_PENDING.with(|p| p.get()) {
             break body_value;
-        }
-        if LOOP_BREAK_PENDING.with(|p| p.get()) {
-            break LOOP_BREAK_VALUE.with(|v| v.get());
         }
     };
 
@@ -918,6 +939,13 @@ pub extern "C-unwind" fn loop_return_shim(
     };
     LOOP_BREAK_VALUE.with(|v| v.set(value));
     LOOP_BREAK_PENDING.with(|p| p.set(true));
+    // Also raise ABORT_PENDING so the JIT's post-call abort check
+    // unwinds out of any nested calls between the (return) site and
+    // the enclosing %native-loop. Without this, forms following the
+    // (return) inside the loop body would keep running. The matching
+    // %native-loop clears ABORT_PENDING on exit (see the comment
+    // there).
+    ABORT_PENDING.with(|p| p.set(true));
     Word::NIL.raw()
 }
 
