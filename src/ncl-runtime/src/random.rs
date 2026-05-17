@@ -267,11 +267,14 @@ pub fn ensure_stirrer_started(young_starts: crate::heap::StartBits) {
 
 // ─── Lisp shim ──────────────────────────────────────────────────────────────
 
-/// `(random N)` — N must be a positive fixnum. Returns a non-negative
-/// fixnum less than N. Float-limit support is intentionally absent
-/// for v1; the spec allows it but no current demo needs it.
+/// `(random N)` — N may be a positive fixnum, in which case the
+/// result is a non-negative fixnum strictly less than N, or a
+/// positive float, in which case the result is a float in `[0, N)`
+/// rendered as one of 2^53 evenly-spaced doubles in that range.
+/// Matches CL's polymorphic spec well enough for the corman demos
+/// (`baby.lisp` calls `(random 2.0)`).
 pub extern "C-unwind" fn random_shim(
-    _mutator: *mut crate::mutator::MutatorState,
+    mutator: *mut crate::mutator::MutatorState,
     _env: u64,
     args: *const u64,
     n_args: u64,
@@ -280,14 +283,29 @@ pub extern "C-unwind" fn random_shim(
         panic!("random: expected 1 arg (limit), got {n_args}");
     }
     let w = Word::from_raw(unsafe { *args });
-    let Some(limit) = w.as_fixnum() else {
-        panic!("random: limit must be a fixnum, got {w:?}");
-    };
-    if limit <= 0 {
-        panic!("random: limit must be positive, got {limit}");
+    // Fixnum path: return a fixnum in [0, N).
+    if let Some(limit) = w.as_fixnum() {
+        if limit <= 0 {
+            panic!("random: limit must be positive, got {limit}");
+        }
+        let r = random_in_range(limit as u64);
+        return Word::fixnum(r as i64).raw();
     }
-    let r = random_in_range(limit as u64);
-    Word::fixnum(r as i64).raw()
+    // Float path: return a float in [0, N).
+    if crate::float::is_float(w) {
+        let limit_f = crate::float::float_value(w);
+        if !(limit_f > 0.0) {
+            panic!("random: limit must be positive, got {limit_f}");
+        }
+        // Draw 53 bits of randomness and scale to [0, 1) — the
+        // standard rounding-bias-free way to build a double in
+        // [0, 1) from a u64 — then multiply by the limit.
+        let bits = rng().lock().unwrap().next_u64() >> 11;
+        let unit = (bits as f64) * (1.0_f64 / ((1_u64 << 53) as f64));
+        let m = unsafe { &mut *mutator };
+        return crate::float::alloc_float(m, unit * limit_f).raw();
+    }
+    panic!("random: limit must be a positive number (fixnum or float), got {w:?}");
 }
 
 #[cfg(test)]
