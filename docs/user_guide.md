@@ -859,6 +859,112 @@ I/O, strings, time, threads, hash tables, and so on are backed by
 Rust's `std`. The FFI sits beside the language for user code to
 reach; the language itself stays portable.
 
+### 7.7 Inline Assembly
+
+When the FFI to a C library is too coarse and you want a tight
+inner loop in handwritten x86_64 — a `popcnt`, a `bsr`, a
+SIMD-friendly reduction — NCL gives you the `DEFASM` form:
+
+```
+    (DEFASM NAME (PARAMS...) "line1" "line2" ... "ret")
+```
+
+Each body line is a string of Intel-syntax x86_64. Parameter names
+appear in the body prefixed with `#` — the assembler substitutes
+each `#NAME` for the Windows x64 register that holds that
+positional integer argument. The first four integer parameters
+travel in `rcx`, `rdx`, `r8`, `r9`; parameters five and above sit
+on the stack at `[rsp+40]`, `[rsp+48]`, and so on. Integer return
+goes in `rax`. This is the Microsoft x64 calling convention, the
+same one every Win32 function uses, with no NCL embellishment.
+
+A first example:
+
+```
+    (DEFASM FAST-ADD (A B)
+      "mov rax, #a"
+      "add rax, #b"
+      "ret")
+
+    > (FAST-ADD 17 25)
+    42
+```
+
+That worked without a single tag instruction — and it had to,
+because the body never wrote one. The reason is bookkeeping NCL
+arranges on your behalf: fixnums are stored as the integer shifted
+left by three (the low three bits are the tag, `000` for fixnum).
+Addition is *tag-preserving* — adding two left-shifted integers
+gives you the left-shifted sum — so `add` between two fixnum
+words drops out a fixnum word with no further work.
+
+Multiplication is not so generous. `(a<<3) * (b<<3) = (a*b)<<6`,
+which has six low zero bits where the fixnum tag wants three. You
+must shift one operand back down by 3 before multiplying:
+
+```
+    (DEFASM FAST-MUL (A B)
+      "mov rax, #a"
+      "sar rax, 3"     ; untag A to its raw integer
+      "imul rax, #b"   ; (a) * (b<<3) = (a*b)<<3 — correctly tagged
+      "ret")
+
+    > (FAST-MUL 17 25)
+    425
+```
+
+This is the asm-side discipline you inherit: incoming params arrive
+shifted-left-by-three; the value returned in `rax` must also be a
+tagged Lisp word. For pointer-returning code that means the low
+three bits encode the tag class (cons = `001`, vector = `011`,
+function = `100`, string = `101`); for fixnums it means the value
+left-shifted by three. NCL does not check this for you. If you
+return a raw integer for what the caller treats as a fixnum, the
+caller will see it as eight times your intended value. The bug
+will look the way it should.
+
+The reach-down pays off when you want a CPU instruction the language
+does not expose. `popcnt`, `bsr`, `lzcnt`, `bswap`, `pdep`/`pext`,
+the AES-NI family, the AVX gather/scatter ops — every one of them is
+a `DEFASM` away. A bit-population count:
+
+```
+    (DEFASM POPCOUNT (N)
+      "mov rax, #n"
+      "sar rax, 3"            ; untag N
+      "popcnt rax, rax"       ; hardware bit-count
+      "shl rax, 3"            ; retag as fixnum
+      "ret")
+
+    > (POPCOUNT 255)          ; 0xFF — eight bits set
+    8
+    > (POPCOUNT 1024)         ; 0x400 — one bit set
+    1
+```
+
+The runtime mechanics, briefly: each `DEFASM` form goes to LLVM as a
+module-level inline-asm blob (Intel-syntax, with the `#name`
+substitutions resolved to registers), and the JIT generates a thin
+shim that adapts NCL's call ABI to the Win64 ABI and back. The shim
+is what NCL's symbol cell points at; you never see it. Calling
+`(POPCOUNT 255)` from compiled Lisp jumps through the shim, into
+your handwritten asm, and back out — three call instructions to
+get from a `defun` call site down to a `popcnt`.
+
+The same warnings that apply to handwritten asm anywhere apply
+here. The asm body sees the world as Win64 sees it: `rcx`, `rdx`,
+`r8`, `r9` are the first four parameter registers; `rax`, `rcx`,
+`rdx`, `r8`–`r11`, `xmm0`–`xmm5` are volatile (you may clobber them
+freely); `rbx`, `rbp`, `rsi`, `rdi`, `r12`–`r15`, `xmm6`–`xmm15` are
+non-volatile (save and restore if you touch them). A function
+longer than a handful of lines should `push rbp / mov rbp, rsp` at
+entry and pop on exit; the unwinder thanks you.
+
+`DEFASM` is the reach-down for the cycle-pressing hot inner loop and
+for getting at instructions the CPU offers but CL does not name. The
+manifesto reserves "no handwritten assembly" for *our* implementation,
+not for *yours*; this is where yours lives.
+
 ---
 
 ## SECTION 8 — The Driver
