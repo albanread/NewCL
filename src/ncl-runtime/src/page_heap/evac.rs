@@ -695,9 +695,32 @@ impl PageHeap {
     }
 
     /// Phase 2: rewrite Words that point at forwarding markers.
-    /// Walks (a) caller's roots + dirty cards via the closure, and
-    /// (b) every live page in `from_gen` and `dest_gen` to find
-    /// in-heap pointers.
+    ///
+    /// Three sources of stale pointers:
+    ///   (a) Caller-supplied roots — mutator stacks, static area,
+    ///       reservation dirty cards on G1/Tenured. Walked via the
+    ///       `visit_roots` closure.
+    ///   (b) Newly-copied objects in `dest_gen` — Phase 1 copied
+    ///       payload bytes verbatim, so any intra-from-gen Word
+    ///       still references the source location; that source now
+    ///       has a forward marker that needs to be followed.
+    ///   (c) Pinned objects — they stayed at their original address
+    ///       and aren't on any dirty-card list, but their payload
+    ///       Words may point at evacuated from-gen targets.
+    ///
+    /// Earlier this code walked EVERY live page in EVERY generation
+    /// "over-cautiously" while debugging Life's stale-pointer crash
+    /// class. Once the env-arg-rooting fix landed, the over-walk
+    /// became pure overhead: scanning 4096 Tenured pages on every
+    /// minor for cells that haven't moved since they were promoted.
+    /// The dirty-card scan in (a) already covers older-gen → from-gen
+    /// references; the per-page sweep added nothing the cards didn't.
+    ///
+    /// Reduced sweep: walk `dest_gen` pages only, plus the precise
+    /// pinned-cells set. Skips the Tenured fleet entirely (typically
+    /// 90%+ of the heap on a long-running session) and skips
+    /// from-gen pages (forward markers there are the *target* of
+    /// rewrites, not the source).
     fn phase2_rewrite<F>(
         &mut self,
         from_gen: Generation,
@@ -721,29 +744,73 @@ impl PageHeap {
             visit_roots(&mut rewriter);
         }
 
-        // 2b: walk every live page in EVERY generation (not just
-        // from/dest). This is over-cautious — a clean write-barrier
-        // implementation guarantees that any older-gen Word pointing
-        // at `from_gen` was already dirtied and is scanned by the
-        // closure above. But while debugging Life we keep getting
-        // crashes from stale older-gen refs, suggesting a missing
-        // barrier somewhere. Walking everything closes that hole
-        // even at the cost of a full older-gen sweep. Revisit once
-        // Life is green; per-card walking is the long-term plan.
-        let live_pages: Vec<usize> = self
+        // 2b: walk dest-gen pages — these contain the just-copied
+        // objects whose payload pointers still reference from-gen
+        // (where the source object now has a forward marker).
+        //
+        // For within-gen evac (G0 → G0) this also catches from-gen
+        // pages since they share the generation, which is harmless
+        // — `rewrite_page` skips forward-marker headers and only
+        // rewrites real Word fields.
+        let dest_pages: Vec<usize> = self
             .descs()
             .iter()
             .enumerate()
             .filter_map(|(i, d)| {
-                if d.generation != Generation::Free {
+                if d.generation == dest_gen {
                     Some(i)
                 } else {
                     None
                 }
             })
             .collect();
-        for page_idx in live_pages {
+        for page_idx in dest_pages {
             self.rewrite_page(from_gen, page_idx);
+        }
+
+        // 2c: walk pinned objects' payloads. Pinned objects stay
+        // at their original addresses in from-gen until Phase 3
+        // flips their page, so they're not in `dest_pages` above.
+        // Their fields can still point at from-gen objects that
+        // got evacuated, and those references need rewriting before
+        // Phase 3 clears the source forward markers' start bits.
+        let pinned_cells: Vec<usize> =
+            self.pinned_cells.iter().copied().collect();
+        for cell_idx in pinned_cells {
+            self.rewrite_pinned_object(from_gen, cell_idx);
+        }
+    }
+
+    /// Rewrite the payload of a single pinned object. Same shape as
+    /// `rewrite_page`'s inner loop but with the start cell known
+    /// (not discovered by scanning start bits) so we don't depend
+    /// on the page's start-bit table being intact.
+    fn rewrite_pinned_object(&mut self, from_gen: Generation, cell_idx: usize) {
+        let page_idx = cell_idx / PAGE_SIZE_CELLS;
+        if self.desc(page_idx).generation == Generation::Free {
+            return;
+        }
+        let header_raw = read_heap_cell(self, cell_idx);
+        if is_real_forward_target_at(self, cell_idx, header_raw).is_some() {
+            return;
+        }
+        let is_cons =
+            super::alloc::is_cons_start_at(self.start_bits_slice(), cell_idx);
+        let size = if is_cons {
+            2
+        } else {
+            let h = HeapHeader::from_raw(header_raw);
+            1 + h.length_cells() as usize
+        };
+        let payload_start = if is_cons { cell_idx } else { cell_idx + 1 };
+        let payload_end = cell_idx + size;
+        for c in payload_start..payload_end {
+            let cell_ptr = unsafe { (self.base_ptr() as *mut u64).add(c) };
+            let raw = unsafe { *cell_ptr };
+            let w = Word::from_raw(raw);
+            if let Some(new) = self.maybe_rewrite_word(from_gen, w) {
+                unsafe { *cell_ptr = new.raw() };
+            }
         }
     }
 
