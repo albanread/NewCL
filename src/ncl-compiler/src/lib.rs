@@ -4736,6 +4736,36 @@ mod end_to_end_tests {
     }
 
     #[test]
+    fn let_accepts_bare_symbol_and_short_binding() {
+        // CL allows three shapes per binding entry:
+        //   * (name init)  — explicit
+        //   * (name)       — init defaults to nil
+        //   * name         — bare symbol, same as (name nil)
+        // The bare-symbol shape is the one chapter-5
+        // SUBFORM-EVALUATION uses (`(let (x) …)`).
+        let mut s = Session::with_stdlib().expect("session boots");
+        s.activate();
+        assert_eq!(s.eval("(let (x) x)").unwrap(), "nil");
+        assert_eq!(s.eval("(let ((a 1) (b) c) (list a b c))").unwrap(),
+                   "(1 nil nil)");
+    }
+
+    #[test]
+    fn funcall_apply_accept_symbol_designators() {
+        // CL spec: funcall/apply take a function DESIGNATOR — either a
+        // function or a symbol whose function cell is bound. Without
+        // this `(funcall '+ 1 2)` panicked with "not a function";
+        // chapter 5 APPLY surfaced the gap.
+        let mut s = Session::with_stdlib().expect("session boots");
+        s.activate();
+        assert_eq!(s.eval("(funcall '+ 5 6)").unwrap(), "11");
+        assert_eq!(s.eval("(apply '+ '(1 2 3 4))").unwrap(), "10");
+        assert_eq!(s.eval("(let ((f '*)) (funcall f 3 4))").unwrap(), "12");
+        assert_eq!(s.eval("(let ((f 'list)) (apply f 1 '(2 3)))").unwrap(),
+                   "(1 2 3)");
+    }
+
+    #[test]
     fn nested_defun_captures_enclosing_let() {
         // CL semantics: a nested defun captures the surrounding
         // lexical scope. The function is globally named but holds a

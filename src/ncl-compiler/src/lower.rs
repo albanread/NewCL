@@ -1007,21 +1007,45 @@ fn lower_let(
     // the real named bindings.
     let placeholder_cp = env.checkpoint();
     for binding in &bindings_list {
-        let pair = list_to_vec(binding)?;
-        if pair.len() != 2 {
-            return Err(CompileError::NotImplemented(format!(
-                "let binding must be (name value), got {pair:?}"
-            )));
-        }
-        let name = match &pair[0] {
-            Value::Symbol(s) => Arc::clone(&s.name),
+        // CL allows three shapes for each binding entry:
+        //   * `(name value)` — explicit init form
+        //   * `(name)`       — init defaults to nil
+        //   * `name`         — bare symbol, same as `(name nil)`
+        // The bare-symbol form is what tripped chapter-5
+        // SUBFORM-EVALUATION's `(let (x) …)` setup. Without it the
+        // dotests block aborts at compile time with a confusing
+        // "ImproperList(Symbol(...))" from `list_to_vec`.
+        let (name, init_form) = match binding {
+            Value::Symbol(s) => (Arc::clone(&s.name), None),
+            Value::Cons(_) => {
+                let pair = list_to_vec(binding)?;
+                if pair.is_empty() || pair.len() > 2 {
+                    return Err(CompileError::NotImplemented(format!(
+                        "let binding must be NAME, (NAME), or (NAME VALUE); \
+                         got {pair:?}"
+                    )));
+                }
+                let n = match &pair[0] {
+                    Value::Symbol(s) => Arc::clone(&s.name),
+                    other => {
+                        return Err(CompileError::NotImplemented(format!(
+                            "let binding name must be a symbol, got {other:?}"
+                        )));
+                    }
+                };
+                let init = if pair.len() == 2 { Some(pair[1].clone()) } else { None };
+                (n, init)
+            }
             other => {
                 return Err(CompileError::NotImplemented(format!(
-                    "let binding name must be a symbol, got {other:?}"
+                    "let binding must be a symbol or list, got {other:?}"
                 )));
             }
         };
-        let val_expr = lower_in_mut(&pair[1], env, coord)?;
+        let val_expr = match init_form {
+            Some(form) => lower_in_mut(&form, env, coord)?,
+            None => Expr::Nil,
+        };
         binding_exprs.push(val_expr);
         binding_names.push(name);
         // Reserve a slot so subsequent inits' nested-let indices
@@ -1714,21 +1738,25 @@ fn lower_lambda(
 /// Lower a non-top-level `(defun NAME PARAMS BODY...)` into the
 /// equivalent runtime install:
 ///
-///     (progn
-///       (%set-symbol-function 'NAME (lambda PARAMS BODY...))
-///       'NAME)
+/// ```text
+/// (progn
+///   (%set-symbol-function 'NAME (lambda PARAMS BODY...))
+///   'NAME)
+/// ```
 ///
 /// The top-level path (see `handle_defun` in lib.rs) compiles the
 /// function eagerly at top level and installs it directly without
 /// going through the global call. Inside a function body that's
 /// impossible — the form might never execute, or might execute many
 /// times — so we emit the same setup the JIT would emit for an
-/// explicit `(setf (symbol-function 'NAME) (lambda …))`. The lambda
+/// explicit `(setf (symbol-function 'NAME) (lambda ...))`. The lambda
 /// captures the enclosing lexical scope per CL conformance (SBCL /
 /// CCL behave the same way), so e.g.
 ///
-///     (let ((x 10))
-///       (defun foo () x))
+/// ```text
+/// (let ((x 10))
+///   (defun foo () x))
+/// ```
 ///
 /// installs a closure that returns 10 when called.
 ///

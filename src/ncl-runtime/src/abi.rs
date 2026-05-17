@@ -418,8 +418,49 @@ fn debug_assert_closure_env_valid(
     std::process::abort();
 }
 
-/// Call a Function value directly (no symbol lookup). Used by
-/// `funcall` and by code that has a first-class Function value.
+/// Coerce a "function designator" (CLHS glossary) to a callable
+/// Function Word. CL spec says funcall/apply accept either a function
+/// OR a symbol that names a function (its global function cell is
+/// looked up). Without this, `(apply '+ '(1 2))` and friends panic
+/// with "not a function" — chapter 5 APPLY in the corman ANSI suite
+/// catches it.
+///
+/// Returns the resolved Function Word on success; signals a Lisp
+/// condition (returns NIL) on a bad designator. The signaled
+/// condition flows through the standard handler-case / ABORT_PENDING
+/// machinery, so a caller wrapped in handler-case can recover.
+fn resolve_function_designator(
+    mutator: *mut crate::mutator::MutatorState,
+    site: &str,
+    w: Word,
+) -> Result<Word, u64> {
+    match w.tag() {
+        Tag::Function => Ok(w),
+        Tag::Symbol => {
+            let f = crate::gc_symbol::function_acquire(w);
+            if f.tag() == Tag::Function {
+                Ok(f)
+            } else {
+                let name = crate::sym_names::lookup(w.raw())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("{:#x}", w.raw()));
+                Err(signal_static_condition_string_and_abort(
+                    mutator,
+                    &format!("{site}: symbol {name} has no function binding"),
+                ))
+            }
+        }
+        _ => Err(signal_static_condition_string_and_abort(
+            mutator,
+            &format!("{site}: not a function designator: {w:?}"),
+        )),
+    }
+}
+
+/// Call a Function value directly. Accepts a function designator —
+/// either a Function Word or a symbol whose function cell is bound
+/// to a Function. The latter case is what makes `(funcall '+ 1 2)`
+/// and `(setq f '+) (funcall f 1 2)` work per CL spec.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn ncl_funcall(
     mutator: *mut crate::mutator::MutatorState,
@@ -428,10 +469,11 @@ pub extern "C-unwind" fn ncl_funcall(
     n_args: u64,
 ) -> u64 {
     catch_gc_stall_as_condition(mutator, || {
-        let f_word = Word::from_raw(fn_word);
-        if f_word.tag() != Tag::Function {
-            panic!("funcall: not a function: {f_word:?}");
-        }
+        let raw_word = Word::from_raw(fn_word);
+        let f_word = match resolve_function_designator(mutator, "funcall", raw_word) {
+            Ok(w) => w,
+            Err(nil) => return nil,
+        };
         let env = crate::gc_function::env(f_word);
         debug_assert_closure_env_valid("ncl_funcall", 0, f_word, env);
         let code = crate::gc_function::code_ptr(f_word);
@@ -1157,10 +1199,11 @@ pub extern "C-unwind" fn ncl_apply(
     n_prefix: u64,
     tail_list: u64,
 ) -> u64 {
-    let f_word = Word::from_raw(fn_word);
-    if f_word.tag() != Tag::Function {
-        panic!("apply: not a function: {f_word:?}");
-    }
+    let raw_word = Word::from_raw(fn_word);
+    let f_word = match resolve_function_designator(mutator, "apply", raw_word) {
+        Ok(w) => w,
+        Err(nil) => return nil,
+    };
 
     // Walk tail_list to count its length, then build a combined
     // args buffer of n_prefix + tail_len Words.
