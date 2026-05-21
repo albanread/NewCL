@@ -175,5 +175,116 @@
    list while preserving the suffix's identity."
   (%ldiff-recur lst object nil))
 
+;; ── Member predicates ─────────────────────────────────────────────────────
+
+(defun member-if (pred list &key (key #'identity))
+  "Return the first tail of LIST whose car satisfies PRED (applied
+   after KEY). Returns NIL if no element matches."
+  (cond
+    ((null list) nil)
+    ((funcall pred (funcall key (car list))) list)
+    (t (member-if pred (cdr list) :key key))))
+
+(defun member-if-not (pred list &key (key #'identity))
+  "Return the first tail of LIST whose car does NOT satisfy PRED."
+  (member-if (complement pred) list :key key))
+
+;; ── Alist search ──────────────────────────────────────────────────────────
+
+(defun assoc-if (pred alist &key (key #'identity))
+  "Return the first pair in ALIST whose car satisfies PRED (applied
+   after KEY). Returns NIL if none match."
+  (dolist (pair alist nil)
+    (when (and (consp pair)
+               (funcall pred (funcall key (car pair))))
+      (return pair))))
+
+(defun assoc-if-not (pred alist &key (key #'identity))
+  "Return the first pair in ALIST whose car does NOT satisfy PRED."
+  (assoc-if (complement pred) alist :key key))
+
+(defun rassoc (item alist &key (key #'identity) (test #'eql))
+  "Return the first pair in ALIST whose cdr matches ITEM under TEST
+   (KEY applied to the cdr before testing)."
+  (dolist (pair alist nil)
+    (when (and (consp pair)
+               (funcall test item (funcall key (cdr pair))))
+      (return pair))))
+
+(defun rassoc-if (pred alist &key (key #'identity))
+  "Return the first pair in ALIST whose cdr satisfies PRED."
+  (dolist (pair alist nil)
+    (when (and (consp pair)
+               (funcall pred (funcall key (cdr pair))))
+      (return pair))))
+
+(defun rassoc-if-not (pred alist &key (key #'identity))
+  "Return the first pair in ALIST whose cdr does NOT satisfy PRED."
+  (rassoc-if (complement pred) alist :key key))
+
+(defun copy-alist (alist)
+  "Return a fresh alist whose pairs are fresh cons cells sharing the
+   original keys and values. Non-cons elements are copied as-is."
+  (mapcar (lambda (pair)
+            (if (consp pair)
+                (cons (car pair) (cdr pair))
+                pair))
+          alist))
+
+;; ── Adjoin / pushnew ─────────────────────────────────────────────────────
+
+(defun adjoin (item list &key (key #'identity) (test #'eql))
+  "Return LIST unchanged if (funcall test (funcall key item)
+   (funcall key element)) is true for some element. Otherwise
+   return (cons item list)."
+  (if (member (funcall key item) list :key key :test test)
+      list
+      (cons item list)))
+
+(defmacro pushnew (item place &rest keyword-args)
+  "Push ITEM onto PLACE (a generalized variable holding a list) only
+   if it is not already a member according to ADJOIN's :key and
+   :test. Returns the updated list."
+  `(setf ,place (adjoin ,item ,place ,@keyword-args)))
+
+;; ── Set operations ────────────────────────────────────────────────────────
+;;
+;; intersection, union, set-difference are defined in core.lisp.
+;; We add the remaining CL set functions here.
+
+(defun subsetp (list-1 list-2 &key (key #'identity) (test #'eql))
+  "Return T if every element of LIST-1 appears in LIST-2 (under
+   TEST applied after KEY)."
+  (every (lambda (x)
+           (member (funcall key x) list-2 :key key :test test))
+         list-1))
+
+(defun set-exclusive-or (list-1 list-2 &key (key #'identity) (test #'eql))
+  "Elements in LIST-1 but not LIST-2 plus elements in LIST-2 but not
+   LIST-1 — the symmetric difference. Order is unspecified."
+  (append (set-difference list-1 list-2 :key key :test test)
+          (set-difference list-2 list-1 :key key :test test)))
+
+(defun nset-exclusive-or (list-1 list-2 &key (key #'identity) (test #'eql))
+  "Potentially destructive SET-EXCLUSIVE-OR. Currently delegates to
+   the non-destructive version."
+  (nconc (set-difference list-1 list-2 :key key :test test)
+         (set-difference list-2 list-1 :key key :test test)))
+
+(defun nintersection (list-1 list-2 &key (key #'identity) (test #'eql))
+  "Potentially destructive INTERSECTION. Currently delegates to
+   the non-destructive version."
+  (intersection list-1 list-2 :key key :test test))
+
+(defun nset-difference (list-1 list-2 &key (key #'identity) (test #'eql))
+  "Potentially destructive SET-DIFFERENCE. Currently delegates to
+   the non-destructive version."
+  (set-difference list-1 list-2 :key key :test test))
+
+(defun nunion (list-1 list-2 &key (key #'identity) (test #'eql))
+  "Potentially destructive UNION. Currently delegates to the
+   non-destructive version."
+  (union list-1 list-2 :key key :test test))
+
 (provide 'lists)
 nil

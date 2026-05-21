@@ -522,5 +522,132 @@
         (t (%set-elt target (+ start1 i) (elt source (+ start2 i)))
            (setq i (+ i 1)))))))
 
+;; ── Negated predicate variants ──────────────────────────────────────────
+
+(defun find-if-not (pred seq &key (key #'identity))
+  "Return the first element of SEQ for which PRED returns NIL."
+  (find-if (complement pred) seq :key key))
+
+(defun position-if-not (pred seq &key (key #'identity))
+  "Return the index of the first element for which PRED returns NIL."
+  (position-if (complement pred) seq :key key))
+
+(defun count-if-not (pred seq &key (key #'identity))
+  "Count elements of SEQ for which PRED returns NIL."
+  (count-if (complement pred) seq :key key))
+
+;; ── Substitute predicate variants ──────────────────────────────────────
+
+(defun substitute-if (new pred seq &key (key #'identity))
+  "Return a fresh sequence with each element satisfying PRED
+   replaced by NEW. KEY is applied to each element before testing."
+  (substitute new nil seq
+              :test (lambda (_ ek) (funcall pred ek))
+              :key key))
+
+(defun substitute-if-not (new pred seq &key (key #'identity))
+  "Return a fresh sequence with each element NOT satisfying PRED
+   replaced by NEW."
+  (substitute new nil seq
+              :test (lambda (_ ek) (not (funcall pred ek)))
+              :key key))
+
+;; ── Delete predicate variants ───────────────────────────────────────────
+;; NCL's delete is already non-destructive (it delegates to remove).
+;; delete-if / delete-if-not follow the same pattern.
+
+(defun delete-if (pred seq &key (key #'identity))
+  "Remove elements of SEQ satisfying PRED. May destructively modify
+   SEQ (currently delegates to REMOVE-IF)."
+  (remove-if pred seq :key key))
+
+(defun delete-if-not (pred seq &key (key #'identity))
+  "Remove elements of SEQ NOT satisfying PRED. May destructively
+   modify SEQ (currently delegates to REMOVE-IF-NOT)."
+  (remove-if-not pred seq :key key))
+
+;; ── Sort with :key — override core.lisp's two-arg sort ─────────────────
+;;
+;; core.lisp's SORT takes only (lst cmp) with no :key support. We
+;; replace it here with a version that handles :key and also works on
+;; vectors and strings (via list round-trip).
+;;
+;; The merge sort is stable: equal elements from the left sequence
+;; (first argument to %sort-merge) always appear before equal elements
+;; from the right, preserving the original relative order.
+
+(defun %sort-merge (a b cmp key)
+  "Merge two sorted lists A and B under CMP (with KEY applied)."
+  (cond
+    ((null a) b)
+    ((null b) a)
+    ((funcall cmp (funcall key (car a)) (funcall key (car b)))
+     (cons (car a) (%sort-merge (cdr a) b cmp key)))
+    (t (cons (car b) (%sort-merge a (cdr b) cmp key)))))
+
+(defun %sort-list (lst cmp key)
+  "Recursive merge-sort of LST under CMP/KEY."
+  (cond
+    ((or (null lst) (null (cdr lst))) lst)
+    (t (let* ((split (%split-list lst))
+              (left  (%sort-list (car split) cmp key))
+              (right (%sort-list (cdr split) cmp key)))
+         (%sort-merge left right cmp key)))))
+
+;; coerce vector/string → list without depending on core's coerce
+;; (which doesn't have the vector→list path yet).
+(defun %seq-to-list (seq)
+  (cond
+    ((listp seq) seq)
+    (t (let ((n (length seq)) (acc nil) (i 0))
+         (loop
+           (when (>= i n) (return (nreverse acc)))
+           (setq acc (cons (elt seq i) acc))
+           (setq i (+ i 1)))))))
+
+(defun sort (seq cmp &key (key #'identity))
+  "Sort SEQ (a list, vector, or string) by CMP. CMP is called with two
+   elements (after KEY is applied) and should return true if the first
+   should precede the second. Stable for lists (merge sort). For
+   vectors/strings, sorts elements in-place via a list round-trip."
+  (cond
+    ((listp seq)
+     (%sort-list seq cmp key))
+    ((vectorp seq)
+     (let* ((sorted (%sort-list (%seq-to-list seq) cmp key))
+            (i 0))
+       (dolist (x sorted seq)
+         (setf (svref seq i) x)
+         (setq i (+ i 1)))))
+    ((stringp seq)
+     (let* ((sorted (%sort-list (%seq-to-list seq) cmp key))
+            (i 0))
+       (dolist (c sorted seq)
+         (setf (char seq i) c)
+         (setq i (+ i 1)))))
+    (t (error "sort: not a sequence: ~S" seq))))
+
+(defun stable-sort (seq cmp &key (key #'identity))
+  "Sort SEQ stably under CMP. In NCL, SORT is already a stable merge
+   sort, so this is an alias."
+  (sort seq cmp :key key))
+
+;; ── merge ────────────────────────────────────────────────────────────────
+
+(defun merge (result-type seq1 seq2 pred &key (key #'identity))
+  "Merge two sequences SEQ1 and SEQ2 (assumed sorted by PRED/KEY)
+   into a single sorted sequence of RESULT-TYPE. RESULT-TYPE must
+   be LIST, VECTOR, or STRING."
+  (let* ((lst1 (%seq-to-list seq1))
+         (lst2 (%seq-to-list seq2))
+         (merged (%sort-merge lst1 lst2 pred key)))
+    (cond
+      ((eq result-type 'list) merged)
+      ((or (eq result-type 'vector) (eq result-type 'simple-vector))
+       (coerce merged 'vector))
+      ((eq result-type 'string)
+       (coerce merged 'string))
+      (t (error "merge: unsupported result-type ~S" result-type)))))
+
 (provide 'sequences)
 nil
