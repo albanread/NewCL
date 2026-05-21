@@ -549,6 +549,7 @@ pub extern "C-unwind" fn ncl_make_closure(
                 arity as u32,
                 Word::NIL,
                 env_word,
+                true, // lambda — Lisp-compiled; manages its own MV slot
             ) {
                 Some(w) => w,
                 None => {
@@ -625,6 +626,7 @@ pub extern "C-unwind" fn ncl_make_closure(
             arity as u32,
             Word::NIL,
             env_word,
+            true, // lambda — Lisp-compiled; manages its own MV slot
         )
         .expect("static area exhausted in lambda creation");
         if !env_word.is_nil() {

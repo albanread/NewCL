@@ -35,7 +35,14 @@ pub const CODE_PTR_OFFSET: usize = 1;
 pub const ARITY_OFFSET: usize = 2;
 pub const NAME_OFFSET: usize = 3;
 pub const ENV_OFFSET: usize = 4;
-pub const FUNCTION_PAYLOAD_CELLS: u32 = 4;
+/// Cell 5: 1 if this Function was compiled by the NCL Lisp compiler
+/// (defun / lambda); 0 for native Rust shims. Used by
+/// `instrument_tail_for_mv` to decide whether to skip the
+/// `EnsureSingleMv` wrapper in tail position — compiled Lisp
+/// functions manage the multi-value slot themselves, so wrapping
+/// them would clobber secondary return values.
+pub const IS_LISP_OFFSET: usize = 5;
+pub const FUNCTION_PAYLOAD_CELLS: u32 = 5;
 
 /// Allocate a fresh Function in the static area. The code_ptr is a
 /// raw machine-code address; the JIT keeps the underlying engine
@@ -47,12 +54,17 @@ pub const FUNCTION_PAYLOAD_CELLS: u32 = 4;
 /// and is documented in `docs/GC_DESIGN.md` — it requires GC-layer
 /// fixes (Phase 3 in that doc: page-based heap with age-threshold
 /// tenuring) before it's safe to use for lambdas.
+///
+/// `is_lisp` must be `true` for functions compiled by the NCL Lisp
+/// compiler and `false` for native Rust shims. The value is stored in
+/// cell `IS_LISP_OFFSET` and checked by `is_lisp_compiled`.
 pub fn alloc_function_in_static(
     static_area: &StaticArea,
     code_ptr: usize,
     arity: u32,
     name: Word,
     env: Word,
+    is_lisp: bool,
 ) -> Option<Word> {
     let header_ptr =
         static_area.try_alloc_with_header(HeapType::Function, FUNCTION_PAYLOAD_CELLS)?;
@@ -62,8 +74,17 @@ pub fn alloc_function_in_static(
         *p.add(ARITY_OFFSET) = arity as u64;
         *p.add(NAME_OFFSET) = name.raw();
         *p.add(ENV_OFFSET) = env.raw();
+        *p.add(IS_LISP_OFFSET) = is_lisp as u64;
     }
     Some(Word::from_ptr(p as *const u8, Tag::Function))
+}
+
+/// Return `true` if this Function was compiled by the NCL Lisp
+/// compiler (i.e. it manages the multi-value slot on its own), or
+/// `false` if it is a native Rust shim.
+pub fn is_lisp_compiled(fn_word: Word) -> bool {
+    let p = fn_ptr(fn_word);
+    unsafe { *p.add(IS_LISP_OFFSET) != 0 }
 }
 
 /// Read the code pointer from a Function-tagged Word.
@@ -138,7 +159,7 @@ mod tests {
     #[test]
     fn function_layout() {
         let s = fresh_static();
-        let f = alloc_function_in_static(&s, 0xdeadbeef, 2, Word::NIL, Word::NIL).unwrap();
+        let f = alloc_function_in_static(&s, 0xdeadbeef, 2, Word::NIL, Word::NIL, true).unwrap();
         assert_eq!(f.tag(), Tag::Function);
         assert_eq!(header(f).ty(), HeapType::Function);
         assert_eq!(header(f).length_cells(), FUNCTION_PAYLOAD_CELLS);
@@ -146,5 +167,6 @@ mod tests {
         assert_eq!(arity(f), 2);
         assert!(name(f).is_nil());
         assert!(env(f).is_nil());
+        assert!(is_lisp_compiled(f));
     }
 }

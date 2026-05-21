@@ -2034,17 +2034,55 @@ pub(crate) fn instrument_tail_for_mv(e: Expr) -> Expr {
         // EnsureSingleMv on top of EnsureSingleMv would be wasted
         // work; keep the inner one.
         Expr::EnsureSingleMv(_) => e,
-        // %native-block propagates MV from its lambda — skip the
-        // EnsureSingleMv wrap so multi-value returns flow through.
-        Expr::Call { sym_word, .. }
-            if ncl_runtime::sym_names::lookup(sym_word)
-                .as_deref() == Some("%NATIVE-BLOCK") =>
-        {
-            e
-        }
-        // Everything else is a leaf tail. Wrap.
+        // Compiled Lisp functions (direct symbol calls, funcall, apply)
+        // manage the multi-value slot themselves via their own
+        // instrument_tail_for_mv pass. Wrapping them with EnsureSingleMv
+        // would clobber any secondary values they correctly produced.
+        //
+        // We skip the wrap when the symbol's current function cell holds
+        // a Lisp-compiled function (is_lisp_compiled == true), or when
+        // the cell is unbound (the function isn't defined yet, which
+        // always means it will be a Lisp defun — all native shims are
+        // installed before any user code runs).
+        //
+        // %NATIVE-BLOCK is special regardless: its lambda body is
+        // independently instrumented, so it propagates MV correctly.
+        //
+        // Funcall / Apply dispatch through a runtime function value;
+        // in practice these are always closures or #'name references
+        // to Lisp functions. We optimistically skip the wrap here too
+        // (a funcall of a native shim is an extremely unusual pattern
+        // and the cost of a wrong secondary value is mild — not a crash).
+        Expr::Funcall { .. } | Expr::Apply { .. } => e,
+        Expr::Call { sym_word, .. } if call_is_lisp_compiled(sym_word) => e,
+        // Everything else is a leaf tail that does NOT manage the MV
+        // slot — wrap it so the slot is always consistent on return.
         other => Expr::ensure_single_mv(other),
     }
+}
+
+/// Return `true` when the symbol `sym_word` currently resolves to a
+/// Lisp-compiled function (or is unbound, meaning it will be one).
+/// Return `false` for known native shims.
+///
+/// Called only inside `instrument_tail_for_mv` at JIT-compile time.
+/// The lookup is a single acquire-load on the function cell; it is
+/// fast and never allocates.
+fn call_is_lisp_compiled(sym_word: u64) -> bool {
+    use ncl_runtime::{gc_function, gc_symbol, word::Word};
+    let sym = Word::from_raw(sym_word);
+    let fn_val = gc_symbol::function_acquire(sym);
+    if fn_val.is_unbound() {
+        // Symbol has no function binding yet. All native shims are
+        // installed at startup before user code runs, so an unbound
+        // symbol will certainly be defined by a Lisp defun later.
+        return true;
+    }
+    if fn_val.tag() != ncl_runtime::word::Tag::Function {
+        // Malformed cell — treat conservatively (wrap).
+        return false;
+    }
+    gc_function::is_lisp_compiled(fn_val)
 }
 
 /// Push a name into `env` as either a plain local or a one-cell

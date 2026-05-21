@@ -32,6 +32,7 @@
 (require 'places)                        ; (setf first/rest/cddr/...) + defsetf short form
 (require 'numbers)                       ; polymorphic floor/ceiling/round/truncate/mod/rem
 (require 'xp)                            ; XP pretty-printer (Waters, MIT 1991)
+(require 'strings)                       ; full string library: trim, cmp, make-string, probe-file
 (require 'describe)                      ; (describe obj) — REPL inspection
 (require 'events)                        ; iGui event-loop / with-events-from
 (require 'hot-reload)                    ; (start-hot-reload), (check-reloads)

@@ -294,6 +294,7 @@ impl Session {
             arity,
             sym_word,
             Word::NIL,
+            false, // asm proc — not Lisp-compiled; doesn't manage MV slot
         )
         .ok_or_else(|| EvalError::Jit("static area exhausted".to_string()))?;
         self.mutator.set_symbol_function(sym_word, fn_word);
@@ -401,6 +402,7 @@ impl Session {
             arity,
             sym_word,
             Word::NIL, // top-level functions and macros have no closure env
+            true,      // Lisp-compiled; manages its own MV slot
         )
         .ok_or_else(|| EvalError::Jit("static area exhausted".to_string()))
     }
@@ -1495,6 +1497,7 @@ fn install_native(
         arity,
         sym_word,
         Word::NIL, // native functions don't carry a closure env
+        false,     // native Rust shim; does NOT manage the MV slot itself
     )
     .expect("static area exhausted while installing native function");
     mutator.set_symbol_function(sym_word, fn_word);

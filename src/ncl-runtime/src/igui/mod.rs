@@ -40,7 +40,7 @@ mod dwrite;
 mod executor;
 mod font_metrics;
 pub mod lisp_shims;
-mod log_view;
+pub mod log_view;
 mod menu;
 pub(crate) mod ledit;
 pub(crate) mod rope_buffer;

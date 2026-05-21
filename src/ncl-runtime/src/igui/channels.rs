@@ -315,7 +315,9 @@ pub fn next_event(timeout_ms: i64) -> Option<IGuiEvent> {
             }
         };
         match &filter_snapshot {
-            None => return Some(ev),
+            None => {
+                return Some(ev);
+            }
             Some(filter) => {
                 if matches_filter(&ev, filter) {
                     return Some(ev);

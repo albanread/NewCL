@@ -4,7 +4,11 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::mem::MaybeUninit;
 use std::process::ExitCode;
+use std::sync::mpsc::{self, TryRecvError};
 use std::sync::Mutex;
+use std::thread;
+#[cfg(not(windows))]
+use std::time::Duration;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -288,7 +292,11 @@ fn lisp_main(raw_args: Vec<String>) -> ExitCode {
     }
 
     if want_repl {
-        return run_repl(&mut session);
+        // `--windows` was already consumed by main() to set up the UI
+        // thread, but lisp_main still needs to know about it so the
+        // REPL can interleave iGui-mailbox draining with stdin reads.
+        let with_windows = std::env::args().any(|a| a == "--windows" || a == "-W");
+        return run_repl(&mut session, with_windows);
     }
 
     ExitCode::SUCCESS
@@ -459,18 +467,31 @@ fn wrap_for_repl(src: &str) -> String {
 /// Exit on Ctrl+D / EOF, or by typing `(exit)` or `(quit)` at the
 /// top-level prompt. Panics inside the eval are caught via a
 /// setjmp/longjmp pair and the prompt is restored.
-fn run_repl(session: &mut ncl_compiler::Session) -> ExitCode {
+///
+/// When `with_windows` is true, the loop also drains the iGui event
+/// mailbox between stdin reads. The motivating case is `:eval-buffer`
+/// events fired by ledit's F5/Ctrl+R: those land in the mailbox and
+/// would otherwise be ignored unless a Lisp-level `(event-loop-for ...)`
+/// happens to be running. With this interleaving, F5 in the editor
+/// always evaluates the buffer through the active session, even when
+/// the user is just sitting at the REPL prompt — matching the NewFB
+/// and NewBCPL "run from the IDE" model.
+///
+/// The mailbox poll is a 50ms blocking recv; stdin is a `try_recv`
+/// against a channel fed by a helper thread. Stdin has priority but
+/// each iteration always touches both sources, so the worst-case
+/// keystroke latency is ~50ms.
+fn run_repl(session: &mut ncl_compiler::Session, with_windows: bool) -> ExitCode {
     install_repl_panic_hook();
 
     println!("NewCormanLisp {VERSION} REPL");
     println!("  (exit) or Ctrl+D / Ctrl+Z to leave");
     println!();
 
-    let stdin = io::stdin();
+    let stdin_rx = spawn_stdin_reader();
     let mut buf = String::new();
-    let mut handle = stdin.lock();
 
-    loop {
+    'repl: loop {
         // Between prompts, drain any hot-reload pending queue. This
         // is a Lisp-level call; if hot-reload was never enabled,
         // (check-reloads) is a NIL-returning no-op. We swallow any
@@ -480,24 +501,63 @@ fn run_repl(session: &mut ncl_compiler::Session) -> ExitCode {
         if buf.trim().is_empty() {
             let _ = session.eval("(check-reloads)");
         }
-        let prompt = if buf.trim().is_empty() { "ncl> " } else { "...> " };
-        print!("{prompt}");
-        let _ = io::stdout().flush();
+        print_prompt(buf.trim().is_empty());
 
-        let mut line = String::new();
-        match handle.read_line(&mut line) {
-            Ok(0) => {
-                println!();
-                break;
+        // Wait for the next line of input. With `--windows`, between
+        // try_recv polls of stdin we also drain the iGui mailbox so
+        // F5 in ledit reaches the active session.
+        let line_result = loop {
+            match stdin_rx.try_recv() {
+                Ok(r) => break r,
+                Err(TryRecvError::Disconnected) => {
+                    // Reader thread died — treat like EOF.
+                    println!();
+                    break 'repl;
+                }
+                Err(TryRecvError::Empty) => {
+                    if with_windows {
+                        #[cfg(windows)]
+                        {
+                            if let Some(ev) =
+                                ncl_runtime::igui::channels::next_event(50)
+                            {
+                                handle_repl_event(session, ev);
+                            }
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            thread::sleep(Duration::from_millis(50));
+                        }
+                    } else {
+                        // No iGui mailbox to drain — block on stdin so
+                        // we don't busy-wait. recv_timeout(forever) is
+                        // recv().
+                        match stdin_rx.recv() {
+                            Ok(r) => break r,
+                            Err(_) => {
+                                println!();
+                                break 'repl;
+                            }
+                        }
+                    }
+                }
             }
-            Ok(_) => {}
+        };
+
+        let line = match line_result {
+            Ok(s) => s,
             Err(e) => {
                 eprintln!("ncl: stdin: {e}");
                 return ExitCode::from(1);
             }
+        };
+        if line.is_empty() {
+            // EOF (Ctrl+D / Ctrl+Z).
+            println!();
+            break;
         }
-        buf.push_str(&line);
 
+        buf.push_str(&line);
         let trimmed = buf.trim();
         if trimmed.is_empty() {
             buf.clear();
@@ -516,6 +576,8 @@ fn run_repl(session: &mut ncl_compiler::Session) -> ExitCode {
             }
             Err(e) => {
                 if is_incomplete(&e) {
+                    // Multi-line continuation: keep buf, prompt with
+                    // "...> " next iteration.
                     continue;
                 }
                 eprintln!("ncl: read error: {:?}", e.kind);
@@ -526,6 +588,111 @@ fn run_repl(session: &mut ncl_compiler::Session) -> ExitCode {
 
     let _ = std::panic::take_hook();
     ExitCode::SUCCESS
+}
+
+/// Print "ncl> " for a fresh input or "...> " when continuing a
+/// multi-line form. Flush stdout so the prompt actually appears
+/// before we block on stdin.
+fn print_prompt(fresh: bool) {
+    let prompt = if fresh { "ncl> " } else { "...> " };
+    print!("{prompt}");
+    let _ = io::stdout().flush();
+}
+
+/// Spawn a thread that drains stdin line-by-line into a channel.
+/// Each item is either `Ok(line)` (with the trailing `\n`) or
+/// `Ok("")` to signal EOF; on read error we send `Err(e)` once and
+/// exit. Decoupling stdin from the main thread lets the main loop
+/// also poll the iGui mailbox.
+fn spawn_stdin_reader() -> mpsc::Receiver<io::Result<String>> {
+    let (tx, rx) = mpsc::channel::<io::Result<String>>();
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut handle = stdin.lock();
+        loop {
+            let mut line = String::new();
+            match handle.read_line(&mut line) {
+                Ok(0) => {
+                    // EOF — send empty line as sentinel and exit.
+                    let _ = tx.send(Ok(String::new()));
+                    break;
+                }
+                Ok(_) => {
+                    if tx.send(Ok(line)).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    break;
+                }
+            }
+        }
+    });
+    rx
+}
+
+/// Handle one iGui event during a REPL idle tick. Today we care
+/// about `EvalBuffer` (the editor's F5 / Ctrl+R run-buffer event);
+/// every other event kind is dropped, because no Lisp-level
+/// `(event-loop-for ...)` is consuming them and there's no other
+/// listener to forward to.
+///
+/// `EvalBuffer` runs the buffer source through `session.eval`. The
+/// result lands in the iGui log overlay (Ctrl+Shift+L) so the user
+/// gets immediate feedback even though they're focused on the
+/// editor pane, not the REPL pane.
+#[cfg(windows)]
+fn handle_repl_event(
+    session: &mut ncl_compiler::Session,
+    ev: ncl_runtime::igui::channels::IGuiEvent,
+) {
+    use ncl_runtime::igui::channels::IGuiEvent;
+    use ncl_runtime::igui::log_view;
+    match ev {
+        IGuiEvent::EvalBuffer { source } => {
+            log_view::append(&format!(
+                "[F5] evaluating {} chars from editor", source.len()
+            ));
+            match session.eval(&source) {
+                Ok(result) => {
+                    let summary = summarize_eval_result(&result);
+                    log_view::append(&format!("[F5] => {summary}"));
+                }
+                Err(e) => {
+                    log_view::append(&format!("[F5] error: {e}"));
+                }
+            }
+        }
+        _ => {
+            // No active listener — drop. Demos that want events
+            // start their own (event-loop-for ...) inside the form
+            // they run; while that form is on the stack, this REPL
+            // poll loop is paused, so the demo gets first crack at
+            // every event from the mailbox.
+        }
+    }
+}
+
+/// Condense an eval result to one short line for the log overlay.
+/// Multi-line results just get a "(N lines)" tag — the user can
+/// re-run from a window with their own clause to see the full text.
+#[cfg(windows)]
+fn summarize_eval_result(result: &str) -> String {
+    let trimmed = result.trim_end();
+    if trimmed.is_empty() {
+        return "nil".to_string();
+    }
+    if let Some(idx) = trimmed.find('\n') {
+        let head: String = trimmed[..idx].chars().take(60).collect();
+        let lines = 1 + trimmed.bytes().filter(|b| *b == b'\n').count();
+        return format!("({lines} lines) {head}...");
+    }
+    if trimmed.chars().count() <= 80 {
+        return trimmed.to_string();
+    }
+    let head: String = trimmed.chars().take(77).collect();
+    format!("{head}...")
 }
 
 /// Run one eval inside a setjmp shield. If the eval panics, the

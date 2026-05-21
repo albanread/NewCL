@@ -3108,6 +3108,7 @@ mod tests {
             arity,
             coord.intern(name),
             Word::NIL,
+            true, // test helper — JIT-compiled, treat as Lisp
         )
         .expect("static function alloc")
     }
