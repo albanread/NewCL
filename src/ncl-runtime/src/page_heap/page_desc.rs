@@ -152,7 +152,7 @@ impl PageKind {
 ///   offset 7   kind               u8    (1 byte)
 ///   offset 8   pin_byte           u8    (1 byte)
 ///   offset 9   age                u8    (1 byte)
-///   offset 10  _pad               u16   (2 bytes)
+///   offset 10  n_span             u16   (2 bytes)
 ///   total                              = 12 bytes
 /// ```
 ///
@@ -189,10 +189,17 @@ pub struct PageDesc {
     /// the page flips to `gen.promoted()` after the next cycle.
     /// Reset to 0 on every page-state change.
     pub age: u8,
-    /// Reserved to pad PageDesc to 12 bytes, aligning the next
-    /// array element on a 4-byte boundary so `scan_start_offset`
-    /// of element N+1 stays naturally aligned.
-    _pad: u16,
+    /// For `PageKind::Large` pages only — number of consecutive
+    /// pages in this large-object run. Set to `n_pages` on the
+    /// HEAD page of the run (the first page, where the object
+    /// header lives). Set to `0` on all CONTINUATION pages. For
+    /// all non-Large pages this field is `1` (Cons/Boxed) or `0`
+    /// (Free), but must never be read as a span length unless the
+    /// kind is Large.
+    ///
+    /// Repurposes the former `_pad: u16` field; the `PageDesc` size
+    /// (12 bytes) and alignment (4 bytes) are unchanged.
+    pub n_span: u16,
 }
 
 impl PageDesc {
@@ -205,13 +212,18 @@ impl PageDesc {
         kind: PageKind::Free,
         pin_byte: 0,
         age: 0,
-        _pad: 0,
+        n_span: 0,
     };
 
     /// Construct a fresh page descriptor for a page just assigned
     /// to a generation/kind cohort. `words_used` starts at 0;
     /// `scan_start_offset` starts at 0; `pin_byte` and `age` are
     /// cleared.
+    ///
+    /// `n_span` is initialised to `1` for normal object pages
+    /// (Cons, Boxed) and `0` for Free and Large pages. For Large
+    /// pages the caller must set `n_span` on the head page after
+    /// calling `fresh`.
     pub fn fresh(generation: Generation, kind: PageKind) -> PageDesc {
         PageDesc {
             scan_start_offset: 0,
@@ -220,8 +232,23 @@ impl PageDesc {
             kind,
             pin_byte: 0,
             age: 0,
-            _pad: 0,
+            n_span: match kind {
+                PageKind::Cons | PageKind::Boxed => 1,
+                _ => 0, // Free and Large start at 0
+            },
         }
+    }
+
+    /// Returns `true` if this is the head page of a large-object run
+    /// (`kind == Large` and `n_span >= 1`).
+    pub fn is_large_head(&self) -> bool {
+        self.kind == PageKind::Large && self.n_span >= 1
+    }
+
+    /// Returns `true` if this is a continuation page of a large-object
+    /// run (`kind == Large` and `n_span == 0`).
+    pub fn is_large_cont(&self) -> bool {
+        self.kind == PageKind::Large && self.n_span == 0
     }
 
     /// Reset to FREE while preserving the page-index identity.
@@ -362,5 +389,35 @@ mod tests {
         d.scan_start_offset = 17;
         d.release();
         assert_eq!(d, PageDesc::FREE);
+    }
+
+    #[test]
+    fn n_span_is_zero_for_free_page() {
+        assert_eq!(PageDesc::FREE.n_span, 0);
+    }
+
+    #[test]
+    fn n_span_is_one_for_cons_and_boxed() {
+        let d_cons = PageDesc::fresh(Generation::G0, PageKind::Cons);
+        assert_eq!(d_cons.n_span, 1, "Cons page n_span must be 1");
+        let d_boxed = PageDesc::fresh(Generation::G1, PageKind::Boxed);
+        assert_eq!(d_boxed.n_span, 1, "Boxed page n_span must be 1");
+    }
+
+    #[test]
+    fn large_head_and_cont_predicates() {
+        // Fresh Large desc has n_span == 0 → cont (caller sets n_span on head).
+        let mut head = PageDesc::fresh(Generation::G0, PageKind::Large);
+        assert!(!head.is_large_head(), "before n_span set, not head");
+        assert!(head.is_large_cont(), "n_span == 0 is a cont");
+
+        head.n_span = 3;
+        assert!(head.is_large_head(), "n_span = 3 is the head");
+        assert!(!head.is_large_cont());
+
+        let cont = PageDesc::fresh(Generation::G0, PageKind::Large);
+        // n_span stays 0
+        assert!(!cont.is_large_head());
+        assert!(cont.is_large_cont());
     }
 }

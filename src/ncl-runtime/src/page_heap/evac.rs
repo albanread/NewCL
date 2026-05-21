@@ -288,6 +288,36 @@ impl<'a> PageEvacuator<'a> {
             return;
         }
         let kind = self.heap.desc(page_idx).kind;
+
+        // Large objects are never evacuated — treat them as pinned so
+        // phase3_reclaim flips their generation in-place. Pin every
+        // page in the run and record the head cell in pinned_cells so
+        // phase2_rewrite can walk the payload and fix up any
+        // forward-pointer references to evacuated small objects.
+        if kind == PageKind::Large {
+            let head_page_idx = if self.heap.desc(page_idx).is_large_head() {
+                page_idx
+            } else {
+                // Slot points into a continuation page; walk backwards
+                // to find the head.
+                let mut h = page_idx;
+                while h > 0 && self.heap.desc(h).is_large_cont() {
+                    h -= 1;
+                }
+                h
+            };
+            let n_span = self.heap.desc(head_page_idx).n_span as usize;
+            for i in 0..n_span {
+                let pidx = head_page_idx + i;
+                self.heap.desc_mut(pidx).set_pin(0);
+            }
+            // Only the head cell is inserted — rewrite walks the full
+            // payload via the header's length field.
+            let head_cell = head_page_idx * PAGE_SIZE_CELLS;
+            self.heap.pinned_cells.insert(head_cell);
+            return;
+        }
+
         if !matches!(kind, PageKind::Cons | PageKind::Boxed) {
             return;
         }
@@ -596,6 +626,11 @@ impl PageHeap {
             // flipped during an earlier chunk; filter by current
             // generation each iteration.
             if self.desc(page_idx).generation != from_gen {
+                continue;
+            }
+            // Large pages are never evacuated (their objects stay in
+            // place and are handled by phase3_reclaim). Skip them here.
+            if self.desc(page_idx).kind == PageKind::Large {
                 continue;
             }
             let first_cell = page_idx * PAGE_SIZE_CELLS;
@@ -928,6 +963,47 @@ impl PageHeap {
                 // Pre-released for zero-mark — skip here.
                 continue;
             }
+
+            // Large continuation pages are handled when their head
+            // page is processed. Skip here to avoid double-processing.
+            if desc.is_large_cont() {
+                continue;
+            }
+
+            // Large head pages: process the entire n_span run together.
+            if desc.is_large_head() {
+                let n_span = desc.n_span as usize;
+                if desc.has_pins() {
+                    // Live large object: flip all pages to dest_gen.
+                    for i in 0..n_span {
+                        let pidx = page_idx + i;
+                        let d = self.desc_mut(pidx);
+                        d.generation = dest_gen;
+                        d.age = 0;
+                        d.pin_byte = 0;
+                        // Preserve the head's start bit at cell 0;
+                        // clear stale bits on continuation pages only.
+                        if i > 0 {
+                            clear_page_start_bits(
+                                self.start_bits_slice(),
+                                pidx,
+                            );
+                        }
+                    }
+                    flipped += n_span;
+                } else {
+                    // Dead large object: release all pages in the run.
+                    for i in 0..n_span {
+                        let pidx = page_idx + i;
+                        clear_page_start_bits(self.start_bits_slice(), pidx);
+                        zero_whole_page(self, pidx);
+                        self.desc_mut(pidx).release();
+                    }
+                    released += n_span;
+                }
+                continue;
+            }
+
             if desc.has_pins() {
                 // FLIP. Collect the pinned objects' byte ranges
                 // FIRST (we need to read each boxed header to know

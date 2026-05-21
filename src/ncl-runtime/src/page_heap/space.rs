@@ -69,11 +69,12 @@ pub const PAGE_SIZE_BYTES: usize = 64 * 1024;
 /// Size of a page in cells (64-bit words).
 pub const PAGE_SIZE_CELLS: usize = PAGE_SIZE_BYTES / 8;
 
-/// Default reservation size: 1 GB → 16384 pages. Sized for a
-/// long-running session with plenty of headroom. Costs ~16 KB of
-/// commit-bitmap storage and one entry in the OS VAD tree; no
+/// Default reservation size: 2 GB → 32768 pages. Sized for a
+/// long-running session with plenty of headroom for large-object
+/// allocation (which needs contiguous free-page runs). Costs ~32 KB
+/// of commit-bitmap storage and one entry in the OS VAD tree; no
 /// physical RAM until pages are committed.
-pub const DEFAULT_RESERVATION_BYTES: usize = 1024 * 1024 * 1024;
+pub const DEFAULT_RESERVATION_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 /// The page-heap reservation.
 ///

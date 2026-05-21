@@ -47,7 +47,7 @@
 
 use super::evac::{EvacResult, PageEvacuator};
 use super::page_desc::Generation;
-use super::space::PageHeap;
+use super::space::{PageHeap, PAGE_SIZE_BYTES};
 
 /// Minor cycles a G0 cohort survives before promotion to G1.
 /// Default 3 — matches the design doc / SBCL conservative value.
@@ -239,6 +239,78 @@ impl PageHeap {
     pub fn g0_promotes_since_g1_promote(&self) -> u32 {
         self.g0_promotes_since_g1_promote
     }
+
+    /// Run a full collection: evacuate all three generations in one
+    /// stop-the-world pass, reclaiming everything in Tenured that is
+    /// not reachable from the supplied root closure.
+    ///
+    /// ## Three-pass algorithm
+    ///
+    /// 1. **G0 → G1 (forced)**: every live G0 object graduates to G1
+    ///    regardless of age.  Roots are supplied by the caller.
+    /// 2. **G1 → Tenured (forced)**: every live G1 object (including
+    ///    survivors of pass 1) graduates to Tenured.  Same root
+    ///    closure is replayed.
+    /// 3. **Tenured → Tenured**: the entire Tenured generation is
+    ///    mark-evacuated.  After passes 1 and 2, the complete live
+    ///    heap is in Tenured, so **only explicit roots are needed**
+    ///    here — no card scan required.  Unreachable Tenured objects
+    ///    (garbage accumulated since the last full collect) are freed.
+    ///
+    /// Both promotion counters are reset after the three passes so the
+    /// next minor cycle starts with a clean cohort slate.
+    pub fn collect_full<F>(&mut self, mut visit_roots: F) -> FullCollectResult
+    where
+        F: FnMut(&mut PageEvacuator<'_>),
+    {
+        // Pass 1: G0 → G1 (forced).
+        let g0_evac = self.evacuate_with_roots(
+            Generation::G0,
+            Generation::G1,
+            |e| visit_roots(e),
+        );
+
+        // Pass 2: G1 → Tenured (forced).
+        let g1_evac = self.evacuate_with_roots(
+            Generation::G1,
+            Generation::Tenured,
+            |e| visit_roots(e),
+        );
+
+        // Pass 3: Tenured → Tenured, explicit roots only.
+        // G0 and G1 are now empty so no card scan is needed.
+        let tenured_evac = self.evacuate_with_roots(
+            Generation::Tenured,
+            Generation::Tenured,
+            |e| visit_roots(e),
+        );
+
+        self.minors_since_g0_promote = 0;
+        self.g0_promotes_since_g1_promote = 0;
+
+        FullCollectResult {
+            g0_evac,
+            g1_evac,
+            tenured_evac,
+            tenured_freed_bytes: tenured_evac.pages_freed * PAGE_SIZE_BYTES,
+        }
+    }
+}
+
+/// Summary of a full three-pass collection (`collect_full`).
+/// Returned to the caller for diagnostics and trigger-policy
+/// accounting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FullCollectResult {
+    /// Evacuation result for the G0 → G1 forced pass.
+    pub g0_evac: EvacResult,
+    /// Evacuation result for the G1 → Tenured forced pass.
+    pub g1_evac: EvacResult,
+    /// Evacuation result for the Tenured → Tenured reclaim pass.
+    pub tenured_evac: EvacResult,
+    /// Bytes freed from Tenured by the reclaim pass.
+    /// `tenured_evac.pages_freed × PAGE_SIZE_BYTES`.
+    pub tenured_freed_bytes: usize,
 }
 
 #[cfg(test)]

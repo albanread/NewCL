@@ -37,7 +37,7 @@ pub mod scanner;
 pub mod space;
 
 pub use alloc::{AllocRegion, PageStartBits};
-pub use cycle::{CollectResult, G0_PROMOTION_THRESHOLD, G1_PROMOTION_THRESHOLD};
+pub use cycle::{CollectResult, FullCollectResult, G0_PROMOTION_THRESHOLD, G1_PROMOTION_THRESHOLD};
 pub use evac::{EvacResult, PageEvacuator};
 pub use page_desc::{Generation, PageDesc, PageKind};
 pub use space::{PageHeap, PAGE_SIZE_BYTES, PAGE_SIZE_CELLS};
