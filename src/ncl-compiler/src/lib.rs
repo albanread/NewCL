@@ -5172,4 +5172,107 @@ mod end_to_end_tests {
             "(1 (2 3))"
         );
     }
+
+    // ── boole / derived bitwise ops ──────────────────────────────────────────
+
+    const BOOLE_PRELUDE: &str = r#"
+(defun logandc1 (i1 i2) (logand (lognot i1) i2))
+(defun logandc2 (i1 i2) (logand i1 (lognot i2)))
+(defun logorc1  (i1 i2) (logior (lognot i1) i2))
+(defun logorc2  (i1 i2) (logior i1 (lognot i2)))
+(defun lognor   (i1 i2) (lognot (logior i1 i2)))
+(defun logeqv   (i1 i2) (lognot (logxor i1 i2)))
+(defun lognand  (i1 i2) (lognot (logand i1 i2)))
+(defconstant boole-clr   0)
+(defconstant boole-and   1)
+(defconstant boole-andc1 2)
+(defconstant boole-2     3)
+(defconstant boole-andc2 4)
+(defconstant boole-1     5)
+(defconstant boole-xor   6)
+(defconstant boole-ior   7)
+(defconstant boole-nor   8)
+(defconstant boole-eqv   9)
+(defconstant boole-c1    10)
+(defconstant boole-orc1  11)
+(defconstant boole-c2    12)
+(defconstant boole-orc2  13)
+(defconstant boole-nand  14)
+(defconstant boole-set   15)
+(defun boole (op i1 i2)
+  (unless (integerp i1) (error "boole: not integer"))
+  (unless (integerp i2) (error "boole: not integer"))
+  (case op
+    (0  0)
+    (1  (logand   i1 i2))
+    (2  (logandc1 i1 i2))
+    (3  i2)
+    (4  (logandc2 i1 i2))
+    (5  i1)
+    (6  (logxor  i1 i2))
+    (7  (logior  i1 i2))
+    (8  (lognor  i1 i2))
+    (9  (logeqv  i1 i2))
+    (10 (lognot  i1))
+    (11 (logorc1 i1 i2))
+    (12 (lognot  i2))
+    (13 (logorc2 i1 i2))
+    (14 (lognand i1 i2))
+    (15 -1)
+    (otherwise (error "boole: bad op"))))
+"#;
+
+    #[test]
+    fn boole_basic_ops() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(BOOLE_PRELUDE).unwrap();
+        // boole-clr always returns 0
+        assert_eq!(s.eval("(boole 0 #xF0 #x0F)").unwrap(), "0");
+        // boole-and: #xF0 & #x0F = 0
+        assert_eq!(s.eval("(boole 1 #xF0 #x0F)").unwrap(), "0");
+        // boole-ior: #xF0 | #x0F = 255
+        assert_eq!(s.eval("(boole 7 #xF0 #x0F)").unwrap(), "255");
+        // boole-xor: #xFF ^ #x0F = #xF0 = 240
+        assert_eq!(s.eval("(boole 6 #xFF #x0F)").unwrap(), "240");
+        // boole-set always returns -1
+        assert_eq!(s.eval("(boole 15 0 0)").unwrap(), "-1");
+        // boole-1 returns i1
+        assert_eq!(s.eval("(boole 5 42 99)").unwrap(), "42");
+        // boole-2 returns i2
+        assert_eq!(s.eval("(boole 3 42 99)").unwrap(), "99");
+    }
+
+    #[test]
+    fn boole_derived_ops() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(BOOLE_PRELUDE).unwrap();
+        // lognand: (lognot (logand #xF0 #xFF)) = (lognot #xF0) = -241
+        assert_eq!(s.eval("(lognand #xF0 #xFF)").unwrap(), "-241");
+        // lognor: (lognot (logior #xF0 #x0F)) = (lognot #xFF) = -256
+        assert_eq!(s.eval("(lognor #xF0 #x0F)").unwrap(), "-256");
+        // logeqv: (lognot (logxor #xFF #x0F)) = (lognot #xF0) = -241
+        assert_eq!(s.eval("(logeqv #xFF #x0F)").unwrap(), "-241");
+        // logandc1: (logand (lognot #xF0) #xFF) = 15
+        assert_eq!(s.eval("(logandc1 #xF0 #xFF)").unwrap(), "15");
+        // logandc2: (logand #xFF (lognot #x0F)) = 240
+        assert_eq!(s.eval("(logandc2 #xFF #x0F)").unwrap(), "240");
+        // boole-eqv via boole fn
+        assert_eq!(s.eval("(boole 9 #xFF #x0F)").unwrap(), "-241");
+        // boole-nand
+        assert_eq!(s.eval("(boole 14 #xF0 #xFF)").unwrap(), "-241");
+    }
+
+    #[test]
+    fn boole_constant_values() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(BOOLE_PRELUDE).unwrap();
+        assert_eq!(s.eval("boole-clr").unwrap(),  "0");
+        assert_eq!(s.eval("boole-set").unwrap(),  "15");
+        assert_eq!(s.eval("boole-and").unwrap(),  "1");
+        assert_eq!(s.eval("boole-ior").unwrap(),  "7");
+        assert_eq!(s.eval("boole-xor").unwrap(),  "6");
+        assert_eq!(s.eval("boole-nor").unwrap(),  "8");
+        assert_eq!(s.eval("boole-eqv").unwrap(),  "9");
+        assert_eq!(s.eval("boole-nand").unwrap(), "14");
+    }
 }
