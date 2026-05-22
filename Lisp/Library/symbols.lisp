@@ -15,6 +15,12 @@
 ;;;;   Assertions:
 ;;;;     assert  — signal an error when a condition is false
 ;;;;
+;;;;   Error handling:
+;;;;     ignore-errors  — catch errors, return (values nil condition)
+;;;;
+;;;;   Symbols:
+;;;;     copy-symbol    — fresh uninterned copy of a symbol
+;;;;
 ;;;;   Destructuring:
 ;;;;     destructuring-bind   — required, &optional, &rest, dotted rest,
 ;;;;                            nested sub-patterns, &key (basic form).
@@ -236,6 +242,40 @@
        `(let ((,sym (let ((tail (member ',key-kw (nthcdr ,index ,form-sym))))
                       (if tail (cadr tail) ,def))))
           ,(%dbb-key-expand (cdr keys) form-sym body index))))))
+
+;; ── ignore-errors ────────────────────────────────────────────────────────────
+;;
+;; (ignore-errors &body body) — evaluate BODY; if a condition of type ERROR
+;; is signalled, return (values nil condition) instead of propagating it.
+;; On success returns the values of BODY.
+
+(defmacro ignore-errors (&body body)
+  "Evaluate BODY, returning its values normally.
+If an ERROR condition is signalled, return (values nil condition) instead."
+  (let ((e-g (gensym "IE")))
+    `(handler-case (progn ,@body)
+       (error (,e-g) (values nil ,e-g)))))
+
+;; ── copy-symbol ───────────────────────────────────────────────────────────────
+;;
+;; (copy-symbol sym &optional copy-props) — return a fresh uninterned symbol
+;; whose name is (symbol-name sym).  When COPY-PROPS is non-nil, also copy
+;; the value, function, and property-list bindings.
+
+(defun copy-symbol (sym &optional copy-props)
+  "Return a fresh uninterned symbol with the same name as SYM.
+If COPY-PROPS is non-nil, also copy the value (if bound), the function
+binding (if fbound), and the property list."
+  (let ((new-sym (make-symbol (symbol-name sym))))
+    (when copy-props
+      (when (boundp sym)
+        (set new-sym (symbol-value sym)))
+      (when (fboundp sym)
+        (setf (symbol-function new-sym) (symbol-function sym)))
+      (let ((plist (symbol-plist sym)))
+        (when plist
+          (setf (symbol-plist new-sym) plist))))
+    new-sym))
 
 ;; ── remf ─────────────────────────────────────────────────────────────────────
 ;;

@@ -529,6 +529,30 @@
       ((eq type 't) `(t ,@body))
       (t `((typep ,keyvar ',type) ,@body)))))
 
+(defmacro etypecase (keyform &rest clauses)
+  "Like TYPECASE but signals an error if no clause matches.
+No OTHERWISE / T clause is expected."
+  (let ((k (gensym "ETYPECASE-KEY")))
+    `(let ((,k ,keyform))
+       (cond
+         ,@(mapcar (lambda (clause)
+                     (typecase-clause-expand clause k))
+                   clauses)
+         (t (error "etypecase: no matching clause for ~S of type ~A"
+                   ,k (type-of ,k)))))))
+
+(defmacro ctypecase (keyplace &rest clauses)
+  "Like TYPECASE but signals a correctable error if no clause matches.
+NCL does not support interactive restarts; this behaves like ETYPECASE."
+  (let ((k (gensym "CTYPECASE-KEY")))
+    `(let ((,k ,keyplace))
+       (cond
+         ,@(mapcar (lambda (clause)
+                     (typecase-clause-expand clause k))
+                   clauses)
+         (t (error "ctypecase: no matching clause for ~S of type ~A"
+                   ,k (type-of ,k)))))))
+
 (defmacro dolist (binding &rest body)
   "(dolist (var list [result-form]) body…) — bind VAR to each
    element of LIST in turn, evaluate BODY. Returns RESULT-FORM

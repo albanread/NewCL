@@ -5417,4 +5417,110 @@ mod end_to_end_tests {
         // list → list: identity
         assert_eq!(s.eval("(coerce '(1 2) 'list)").unwrap(), "(1 2)");
     }
+
+    // ── etypecase / ctypecase ─────────────────────────────────────────────────
+
+    #[test]
+    fn etypecase_matches_type() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(etypecase 42 (string 'str) (integer 'int) (t 'other))").unwrap(),
+            "INT"
+        );
+        assert_eq!(
+            s.eval("(etypecase \"hi\" (string 'str) (integer 'int))").unwrap(),
+            "STR"
+        );
+    }
+
+    #[test]
+    fn etypecase_signals_on_no_match() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(handler-case \
+                      (etypecase 3.14 (string 'str) (integer 'int)) \
+                      (error (e) e 'no-match))").unwrap(),
+            "NO-MATCH"
+        );
+    }
+
+    // ── ignore-errors ─────────────────────────────────────────────────────────
+
+    // ignore-errors needs the symbols prelude for handler-case to work
+    const IGNORE_ERRORS_PRELUDE: &str = r#"
+(defmacro ignore-errors (&body body)
+  (let ((e-g (gensym "IE")))
+    `(handler-case (progn ,@body)
+       (error (,e-g) (values nil ,e-g)))))
+"#;
+
+    #[test]
+    fn ignore_errors_passes_through_success() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(IGNORE_ERRORS_PRELUDE).unwrap();
+        assert_eq!(s.eval("(ignore-errors (+ 1 2))").unwrap(), "3");
+    }
+
+    #[test]
+    fn ignore_errors_catches_error() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(IGNORE_ERRORS_PRELUDE).unwrap();
+        // On error: first value is nil
+        assert_eq!(
+            s.eval("(car (multiple-value-list \
+                      (ignore-errors (error \"oops\"))))").unwrap(),
+            "nil"
+        );
+    }
+
+    // ── copy-symbol ───────────────────────────────────────────────────────────
+
+    const COPY_SYMBOL_PRELUDE: &str = r#"
+(defvar *symbol-plists* (make-hash-table :test 'eq))
+(defun symbol-plist (sym) (gethash sym *symbol-plists*))
+(defun (setf symbol-plist) (new-plist sym)
+  (if (null new-plist) (remhash sym *symbol-plists*)
+      (setf (gethash sym *symbol-plists*) new-plist))
+  new-plist)
+(defun copy-symbol (sym &optional copy-props)
+  (let ((new-sym (make-symbol (symbol-name sym))))
+    (when copy-props
+      (when (boundp sym)
+        (set new-sym (symbol-value sym)))
+      (when (fboundp sym)
+        (setf (symbol-function new-sym) (symbol-function sym)))
+      (let ((plist (symbol-plist sym)))
+        (when plist (setf (symbol-plist new-sym) plist))))
+    new-sym))
+"#;
+
+    #[test]
+    fn copy_symbol_same_name() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(COPY_SYMBOL_PRELUDE).unwrap();
+        // NCL's make-symbol can't create truly uninterned symbols: the copy
+        // gets a unique name that STARTS WITH the original name.
+        assert_eq!(
+            s.eval("(let ((c (copy-symbol 'foo))) \
+                      (and (not (eq c 'foo)) \
+                           (> (length (symbol-name c)) 0)))").unwrap(),
+            "T"
+        );
+        // The copy is a different object than the original
+        assert_eq!(
+            s.eval("(eq (copy-symbol 'foo) 'foo)").unwrap(),
+            "nil"
+        );
+    }
+
+    #[test]
+    fn copy_symbol_copies_value() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(COPY_SYMBOL_PRELUDE).unwrap();
+        s.eval("(defvar *my-sym* 99)").unwrap();
+        assert_eq!(
+            s.eval("(symbol-value (copy-symbol '*my-sym* t))").unwrap(),
+            "99"
+        );
+    }
 }
