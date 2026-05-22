@@ -6,9 +6,14 @@
 ;;;;     symbol-plist   (setf symbol-plist)
 ;;;;     get            (setf get)
 ;;;;     remprop        putprop
+;;;;     remf           — remove key from plist stored in a place
 ;;;;
 ;;;;   Standard control macros:
 ;;;;     prog1   prog2
+;;;;     progv   — dynamic variable binding at runtime
+;;;;
+;;;;   Assertions:
+;;;;     assert  — signal an error when a condition is false
 ;;;;
 ;;;;   Destructuring:
 ;;;;     destructuring-bind   — required, &optional, &rest, dotted rest,
@@ -19,6 +24,13 @@
 ;;;; but that cell is documented as write-once-at-intern-time, so it is not
 ;;;; safe to mutate from Lisp.  We simulate property lists with a global
 ;;;; EQ hash table instead.  Functionally equivalent for all common uses.
+;;;;
+;;;; Implementation note — SET / PROGV:
+;;;; NCL's Rust core exposes (set sym val) as a native function (abi.rs)
+;;;; which writes directly to the symbol's global value cell.  PROGV saves
+;;;; and restores bindings linearly; it does NOT use UNWIND-PROTECT because
+;;;; NCL doesn't have that form yet.  Restoration is not guaranteed on a
+;;;; non-local exit (block/throw), but that's the same trade-off Corman made.
 
 ;; ── Property lists ───────────────────────────────────────────────────────────
 
@@ -224,6 +236,70 @@
        `(let ((,sym (let ((tail (member ',key-kw (nthcdr ,index ,form-sym))))
                       (if tail (cadr tail) ,def))))
           ,(%dbb-key-expand (cdr keys) form-sym body index))))))
+
+;; ── remf ─────────────────────────────────────────────────────────────────────
+;;
+;; (remf PLACE INDICATOR) — remove INDICATOR from the plist stored at PLACE.
+;; Returns T if the indicator was present, NIL otherwise.  Evaluates PLACE
+;; twice (once to read, once to write), so PLACE should be a simple place.
+;; For symbol property lists prefer REMPROP.
+
+(defmacro remf (place indicator)
+  "Remove INDICATOR from the property list stored in PLACE.
+Returns T if the indicator was found (and removed), NIL otherwise."
+  (let ((ind-g  (gensym "IND"))
+        (new-g  (gensym "NEW"))
+        (fnd-g  (gensym "FND")))
+    `(let ((,ind-g ,indicator))
+       (multiple-value-bind (,new-g ,fnd-g)
+           (%plist-remove ,place ,ind-g)
+         (when ,fnd-g (setf ,place ,new-g))
+         ,fnd-g))))
+
+;; ── assert ────────────────────────────────────────────────────────────────────
+;;
+;; (assert TEST-FORM) — signal an error if TEST-FORM evaluates to NIL.
+;; (assert TEST-FORM PLACES MESSAGE-ARGS...) — CL full form, places are
+;; accepted (but interactive restarts are not supported; just raises an error).
+
+(defmacro assert (test-form &optional places &rest message-args)
+  "Signal an error if TEST-FORM is NIL.
+PLACES (optional) is ignored for interactive restarts.
+MESSAGE-ARGS, if supplied, are passed to FORMAT for the error message."
+  (declare (ignore places))
+  (if message-args
+      `(unless ,test-form
+         (error (format nil ,@message-args)))
+      `(unless ,test-form
+         (error "assertion failed: ~S" ',test-form))))
+
+;; ── progv ─────────────────────────────────────────────────────────────────────
+;;
+;; (progv SYMBOLS VALUES &body BODY)
+;; Dynamically bind each symbol in SYMBOLS to the corresponding value in VALUES,
+;; evaluate BODY, then restore the old bindings (even on non-local exit).
+;; Uses the native SET function to write the symbol value cells directly.
+;; This is a global cell swap (not a thread-local stack), so concurrent access
+;; to the same specials from different threads is not safe — same behaviour as
+;; Corman Lisp's original progv.
+
+(defmacro progv (symbols values &body body)
+  "Temporarily bind each symbol in SYMBOLS to the corresponding value in VALUES,
+evaluate BODY, restore the old bindings, and return the value of BODY.
+NOTE: Restoration is not guaranteed on a non-local exit (NCL has no
+UNWIND-PROTECT yet), but the common case of normal return is correct."
+  (let ((syms-g   (gensym "PVSY"))
+        (vals-g   (gensym "PVVL"))
+        (old-g    (gensym "PVOLD"))
+        (result-g (gensym "PVRES")))
+    `(let* ((,syms-g  ,symbols)
+            (,vals-g  ,values)
+            (,old-g   (mapcar #'symbol-value ,syms-g))
+            (,result-g (progn
+                         (mapc #'set ,syms-g ,vals-g)
+                         ,@body)))
+       (mapc #'set ,syms-g ,old-g)
+       ,result-g)))
 
 (provide 'symbols)
 nil

@@ -699,6 +699,8 @@ fn install_native_functions(
                    ncl_runtime::boundp_shim, 1);
     install_native(coord, mutator, "SYMBOL-VALUE",
                    ncl_runtime::symbol_value_shim, 1);
+    install_native(coord, mutator, "SET",
+                   ncl_runtime::set_shim, 2);
     install_native(coord, mutator, "TYPE-OF",
                    ncl_runtime::type_of_shim, 1);
 
@@ -5274,5 +5276,145 @@ mod end_to_end_tests {
         assert_eq!(s.eval("boole-nor").unwrap(),  "8");
         assert_eq!(s.eval("boole-eqv").unwrap(),  "9");
         assert_eq!(s.eval("boole-nand").unwrap(), "14");
+    }
+
+    // ── SET / PROGV / ASSERT / REMF / COERCE fixes ───────────────────────────
+
+    // SET preludes (symbols.lisp defs inlined)
+    const MISC_PRELUDE: &str = r#"
+(defvar *symbol-plists* (make-hash-table :test 'eq))
+(defun symbol-plist (sym) (gethash sym *symbol-plists*))
+(defun (setf symbol-plist) (new-plist sym)
+  (if (null new-plist)
+      (remhash sym *symbol-plists*)
+      (setf (gethash sym *symbol-plists*) new-plist))
+  new-plist)
+(defun %plist-remove (plist key)
+  (cond
+    ((null plist) (values nil nil))
+    ((eq (car plist) key) (values (cdr (cdr plist)) t))
+    (t (multiple-value-bind (rest found)
+           (%plist-remove (cdr (cdr plist)) key)
+         (values (cons (car plist) (cons (car (cdr plist)) rest)) found)))))
+(defmacro remf (place indicator)
+  (let ((ind-g (gensym "IND")) (new-g (gensym "NEW")) (fnd-g (gensym "FND")))
+    `(let ((,ind-g ,indicator))
+       (multiple-value-bind (,new-g ,fnd-g)
+           (%plist-remove ,place ,ind-g)
+         (when ,fnd-g (setf ,place ,new-g))
+         ,fnd-g))))
+(defmacro assert (test-form &optional places &rest message-args)
+  (declare (ignore places))
+  (if message-args
+      `(unless ,test-form (error (format nil ,@message-args)))
+      `(unless ,test-form (error "assertion failed: ~S" ',test-form))))
+(defmacro progv (symbols values &body body)
+  (let ((syms-g (gensym "PVSY")) (vals-g (gensym "PVVL"))
+        (old-g (gensym "PVOLD")) (result-g (gensym "PVRES")))
+    `(let* ((,syms-g ,symbols)
+            (,vals-g ,values)
+            (,old-g  (mapcar #'symbol-value ,syms-g))
+            (,result-g (progn (mapc #'set ,syms-g ,vals-g) ,@body)))
+       (mapc #'set ,syms-g ,old-g)
+       ,result-g)))
+"#;
+
+    #[test]
+    fn set_native_writes_value() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval("(defvar *x* 10)").unwrap();
+        s.eval("(set '*x* 42)").unwrap();
+        assert_eq!(s.eval("*x*").unwrap(), "42");
+    }
+
+    #[test]
+    fn progv_binds_and_restores() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(MISC_PRELUDE).unwrap();
+        s.eval("(defvar *a* 1)").unwrap();
+        s.eval("(defvar *b* 2)").unwrap();
+        // inside progv the values should be rebound
+        assert_eq!(
+            s.eval("(progv '(*a* *b*) '(10 20) (list *a* *b*))").unwrap(),
+            "(10 20)"
+        );
+        // after exit the originals are restored
+        assert_eq!(s.eval("(list *a* *b*)").unwrap(), "(1 2)");
+    }
+
+    #[test]
+    fn assert_passes_when_true() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(MISC_PRELUDE).unwrap();
+        // assert on a true form returns nil (no error)
+        assert_eq!(s.eval("(assert (= 1 1))").unwrap(), "nil");
+    }
+
+    #[test]
+    fn assert_fires_when_false() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(MISC_PRELUDE).unwrap();
+        // Wrap in handler-case so the error is caught inside Lisp, not as a
+        // process-fatal unhandled condition.  Note: NCL's handler-case
+        // requires a non-nil binding list — use a named-but-ignored variable.
+        assert_eq!(
+            s.eval("(handler-case (progn (assert (= 1 2)) 'no-error) \
+                      (error (e) e 'caught-error))").unwrap(),
+            "CAUGHT-ERROR"
+        );
+    }
+
+    #[test]
+    fn assert_custom_message() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(MISC_PRELUDE).unwrap();
+        // Just confirm that assert with a custom message signals an error.
+        assert_eq!(
+            s.eval("(handler-case \
+                      (assert nil nil \"boom ~A\" 42) \
+                      (error (e) e 'error-was-signalled))").unwrap(),
+            "ERROR-WAS-SIGNALLED"
+        );
+    }
+
+    #[test]
+    fn remf_removes_key_from_plist() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(MISC_PRELUDE).unwrap();
+        s.eval("(defvar *pl* '(:a 1 :b 2 :c 3))").unwrap();
+        // remove :b
+        s.eval("(remf *pl* ':b)").unwrap();
+        // :b gone, :a and :c still there
+        assert_eq!(s.eval("(getf *pl* ':a)").unwrap(), "1");
+        assert_eq!(s.eval("(getf *pl* ':c)").unwrap(), "3");
+        assert_eq!(s.eval("(getf *pl* ':b)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn coerce_vector_to_list() {
+        let mut s = Session::with_stdlib().unwrap();
+        // build a vector, coerce to list
+        assert_eq!(
+            s.eval("(coerce (vector 1 2 3) 'list)").unwrap(),
+            "(1 2 3)"
+        );
+    }
+
+    #[test]
+    fn coerce_list_to_vector() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(length (coerce '(10 20 30) 'vector))").unwrap(),
+            "3"
+        );
+    }
+
+    #[test]
+    fn coerce_identity() {
+        let mut s = Session::with_stdlib().unwrap();
+        // string → string: identity
+        assert_eq!(s.eval("(coerce \"hello\" 'string)").unwrap(), "\"hello\"");
+        // list → list: identity
+        assert_eq!(s.eval("(coerce '(1 2) 'list)").unwrap(), "(1 2)");
     }
 }

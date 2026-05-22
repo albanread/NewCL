@@ -708,14 +708,14 @@
 
 ;; -- Property lists ----------------------------------------------------------
 
-(defun getf (plist key)
-  "Walk PLIST, returning the value paired with KEY, or nil if not
+(defun getf (plist key &optional default)
+  "Walk PLIST, returning the value paired with KEY, or DEFAULT (nil) if not
    found. The plist is a flat list of alternating keys and values:
    (:a 1 :b 2 :c 3)."
   (cond
-    ((null plist) nil)
+    ((null plist) default)
     ((eq (car plist) key) (car (cdr plist)))
-    (t (getf (cdr (cdr plist)) key))))
+    (t (getf (cdr (cdr plist)) key default))))
 
 ;; -- Conditions --------------------------------------------------------------
 ;;
@@ -907,28 +907,49 @@
     ((or (null lst) (<= n 0)) nil)
     (t (cons (car lst) (subseq-take (cdr lst) (- n 1))))))
 
+(defun %coerce-vector-to-list (v i n)
+  (cond ((>= i n) nil)
+        (t (cons (aref v i) (%coerce-vector-to-list v (+ i 1) n)))))
+
 (defun coerce (object result-type)
-  "Limited coerce: list <-> simple list/vector identity-ish;
-   STRING from a list of characters; LIST from a string. CL's
-   full coerce is overloaded — we cover what Closette uses.
-   RESULT-TYPE is a symbol."
+  "Coerce OBJECT to RESULT-TYPE.  Handles the cases Closette and the
+   standard library need: identity, list<->vector, list<->string,
+   character->string, number type widening."
   (cond
+    ;; ── identity ────────────────────────────────────────────────────
+    ((typep object result-type) object)
+    ;; ── → LIST ──────────────────────────────────────────────────────
     ((eq result-type 'list)
      (cond
        ((listp object) object)
        ((stringp object) (coerce-string-to-list object 0 (length object)))
-       (t (error "coerce: cannot coerce ~A to LIST" object))))
+       ((vectorp object) (%coerce-vector-to-list object 0 (length object)))
+       (t (error "coerce: cannot coerce ~S to LIST" object))))
+    ;; ── → STRING ────────────────────────────────────────────────────
     ((eq result-type 'string)
      (cond
        ((stringp object) object)
+       ((characterp object) (make-string 1 :initial-element object))
        ((listp object) (coerce-list-to-string object))
-       (t (error "coerce: cannot coerce ~A to STRING" object))))
+       ((vectorp object) (coerce-list-to-string
+                           (%coerce-vector-to-list object 0 (length object))))
+       (t (error "coerce: cannot coerce ~S to STRING" object))))
+    ;; ── → VECTOR / SIMPLE-VECTOR ────────────────────────────────────
     ((or (eq result-type 'vector) (eq result-type 'simple-vector))
      (cond
        ((vectorp object) object)
        ((listp object) (apply #'vector object))
-       (t (error "coerce: cannot coerce ~A to VECTOR" object))))
-    (t (error "coerce: unsupported result-type ~A" result-type))))
+       ((stringp object)
+        (apply #'vector (coerce-string-to-list object 0 (length object))))
+       (t (error "coerce: cannot coerce ~S to VECTOR" object))))
+    ;; ── numeric widenings ───────────────────────────────────────────
+    ((eq result-type 'float)
+     (if (numberp object) (* 1.0 object)
+         (error "coerce: cannot coerce ~S to FLOAT" object)))
+    ((eq result-type 'integer)
+     (if (integerp object) object
+         (error "coerce: cannot coerce ~S to INTEGER" object)))
+    (t (error "coerce: unsupported result-type ~S" result-type))))
 
 (defun coerce-string-to-list (s i n)
   (cond

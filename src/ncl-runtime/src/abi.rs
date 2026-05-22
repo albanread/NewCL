@@ -2444,6 +2444,31 @@ pub extern "C-unwind" fn symbol_value_shim(
     v.raw()
 }
 
+/// `(set sym val)` — store VAL into the global value cell of the symbol SYM.
+/// CL's `set` function; the functional equivalent of `(setq sym val)` when
+/// the symbol is only known at run time.  Returns VAL.
+pub extern "C-unwind" fn set_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        return signal_condition_string(mutator, "set: expected 2 args (symbol value)");
+    }
+    let sym = Word::from_raw(unsafe { *args });
+    let val = Word::from_raw(unsafe { *args.add(1) });
+    if sym.tag() != Tag::Symbol {
+        return signal_condition_string(
+            mutator,
+            &format!("set: first arg must be a symbol, got {sym:?}"),
+        );
+    }
+    let m = unsafe { &mut *mutator };
+    m.set_symbol_value(sym, val);
+    val.raw()
+}
+
 /// `(type-of x)` — a symbol naming the most specific type of X.
 /// CL spec says the result is implementation-defined for many
 /// cases; we return the obvious symbol that matches our TYPEP
