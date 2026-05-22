@@ -286,5 +286,24 @@
    non-destructive version."
   (union list-1 list-2 :key key :test test))
 
+;; ── nth-value ────────────────────────────────────────────────────────
+;;
+;; (nth-value N FORM) — return the Nth (zero-indexed) of the multiple
+;; values returned by FORM. Both N and FORM are evaluated exactly once.
+;; Standard in ANSI CL §5.3.3. Commonly used to pick out one value
+;; from floor, decode-float, gethash, etc.
+;;
+;;   (nth-value 0 (floor 17 5))  => 3
+;;   (nth-value 1 (floor 17 5))  => 2
+
+(defmacro nth-value (n form)
+  "Return the Nth multiple value (zero-indexed) of FORM.
+   Both N and FORM are evaluated exactly once."
+  (let ((n-g (gensym "NV-N"))
+        (r-g (gensym "NV-R")))
+    `(let* ((,n-g ,n)
+            (,r-g (multiple-value-list ,form)))
+       (nth ,n-g ,r-g))))
+
 (provide 'lists)
 nil

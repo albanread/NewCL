@@ -141,5 +141,193 @@
 ;; return that, so no further refinement is needed here. Future
 ;; tightening can layer on top.
 
+;; ── ccase ────────────────────────────────────────────────────────────
+;;
+;; (ccase KEYPLACE CLAUSE*) — correctable CASE.
+;; Like ECASE, but the CL spec says a mismatch should signal a
+;; correctable error with a STORE-VALUE restart so the caller can
+;; supply a new key. NCL does not yet have interactive restarts, so
+;; we degrade gracefully to a non-continuable error — same as ECASE —
+;; while preserving the correct macro syntax so code that uses CCASE
+;; at least compiles and runs.
+
+(defmacro ccase (keyplace &rest clauses)
+  "Like CASE but signals a correctable error if no clause matches.
+   (NCL: restarts not yet supported; signals a non-continuable error.)"
+  (let ((k (gensym "CCASE-KEY")))
+    `(let ((,k ,keyplace))
+       (cond
+         ,@(mapcar (lambda (clause) (case-clause-expand clause k))
+                   clauses)
+         (t (error "ccase: no matching clause for ~S" ,k))))))
+
+;; ── deftype / extended typep ──────────────────────────────────────────
+;;
+;; (deftype NAME LAMBDA-LIST &body BODY) — register a type expander.
+;;
+;; The ANSI CL built-in `typep` in NCL only handles simple symbol type
+;; names — compound specifiers like `(integer 0 100)`, `(or A B)`,
+;; etc. all return NIL. We replace `typep` with a Lisp wrapper that:
+;;
+;;   1. Expands user-defined types registered via DEFTYPE.
+;;   2. Handles the common compound built-in specifiers directly.
+;;   3. Falls through to the original Rust shim for simple symbols.
+;;
+;; Architecture note: we save the original in a `defparameter` BEFORE
+;; redefining typep, rather than using a `(let ((orig #'typep)) (defun
+;; typep ...))` closure. The closure approach causes an infinite loop
+;; in NCL because the `defun` form updates the function cell while the
+;; let-frame reference may alias it.
+;;
+;; Lambda-list uses DESTRUCTURING-BIND semantics (from symbols.lisp).
+
+(defvar *type-expanders* (make-hash-table :test 'eq)
+  "Maps user-defined type names to their expander lambdas.")
+
+;; Save the native typep BEFORE we shadow it.
+(defparameter *%original-typep%* #'typep)
+
+(defmacro deftype (name lambda-list &body body)
+  "Define a derived type specifier NAME with LAMBDA-LIST and BODY.
+   The body should return a type specifier (a symbol or compound form).
+   The lambda-list is applied to the arguments of the compound type
+   specifier: `(typep x '(NAME arg1 arg2 ...))` calls the expander
+   with args `(arg1 arg2 ...)`."
+  (let ((form-g (gensym "DTFORM")))
+    `(progn
+       (setf (gethash ',name *type-expanders*)
+             (lambda (,form-g)
+               (destructuring-bind ,lambda-list
+                   (if (consp ,form-g) (cdr ,form-g) '())
+                 ,@body)))
+       ',name)))
+
+;; ── Helpers for compound type dispatch ──────────────────────────────
+
+(defun %typep-in-range (n lo hi)
+  "Return T if N satisfies LO <= N <= HI. * means unbounded."
+  (and (or (eq lo '*) (>= n lo))
+       (or (eq hi '*) (<= n hi))))
+
+;; ── Extended TYPEP implementation ────────────────────────────────────
+;;
+;; CRITICAL ARCHITECTURE NOTE — avoiding symbolp→typep→%new-typep loop
+;; ─────────────────────────────────────────────────────────────────────
+;; core.lisp defines  (defun symbolp (x) (typep x 'symbol))  and
+;; similar predicates for integerp, floatp, stringp, etc.  After
+;; types.lisp redefines typep as a Lisp wrapper, every call to
+;; (symbolp x) goes through typep → %new-typep.
+;;
+;; Therefore %new-typep MUST NOT call symbolp (or any predicate that
+;; calls typep) in its top-level dispatch test, or it will recurse
+;; infinitely: symbolp → typep → %new-typep → symbolp → …
+;;
+;; Solution: use (consp type) — a compiler INTRINSIC that emits a
+;; direct tag-check and never calls typep — as the first branch.
+;; Everything that is not a cons falls into the catch-all (t …)
+;; branch, which handles symbol type names and nil.  Calling
+;; (integerp object) etc. inside the compound branches is safe
+;; because those calls eventually reach the Rust shim in O(1) via
+;;   integerp → typep → %new-typep → (consp 'integer) = NO
+;;                                 → (t) → gethash → funcall shim
+;;
+;; The `case` macro used for built-in compound dispatch is also safe:
+;; it expands (at macro-expand / compile time) to cond+eql, and both
+;; cond and eql are compiler intrinsics that never touch typep.
+
+(defun %new-typep (object type)
+  "Internal implementation for the extended TYPEP.
+   Dispatch order: compound cons specs first, symbol/nil catch-all
+   second.  Never calls SYMBOLP to avoid a typep-recursion loop."
+  (cond
+    ;; ── Compound type specs: (head arg…) ─────────────────────────────
+    ;; consp is a compiler intrinsic — no typep call.
+    ((consp type)
+     (let* ((head (car type))
+            (args (cdr type))
+            (expander (gethash head *type-expanders*)))
+       (if expander
+           ;; User-defined compound: expand and recurse.
+           (%new-typep object (funcall expander type))
+           ;; Built-in compound specifiers.
+           (case head
+             ;; Numeric ranges
+             ((integer)
+              (and (integerp object)
+                   (%typep-in-range object
+                                    (if args (car args) '*)
+                                    (if (cdr args) (cadr args) '*))))
+             ((float single-float double-float short-float long-float)
+              (and (floatp object)
+                   (or (null args)
+                       (%typep-in-range object (car args)
+                                        (if (cdr args) (cadr args) '*)))))
+             ((real)
+              (and (or (integerp object) (floatp object))
+                   (or (null args)
+                       (%typep-in-range object (car args)
+                                        (if (cdr args) (cadr args) '*)))))
+             ((rational)
+              (or (integerp object)
+                  (and (numberp object)
+                       (not (floatp object))
+                       (not (integerp object)))))
+             ;; Logical combinators
+             ((or)
+              (let ((ok nil))
+                (dolist (t2 args) (when (%new-typep object t2) (setq ok t)))
+                ok))
+             ((and)
+              (let ((ok t))
+                (dolist (t2 args) (unless (%new-typep object t2) (setq ok nil)))
+                ok))
+             ((not)
+              (not (%new-typep object (car args))))
+             ;; Structural types
+             ((cons)
+              (and (consp object)
+                   (or (null args)       (eq (car args) '*)
+                       (%new-typep (car object) (car args)))
+                   (or (null (cdr args)) (eq (cadr args) '*)
+                       (%new-typep (cdr object) (cadr args)))))
+             ;; Membership / equality
+             ((member)
+              (not (null (member object args))))
+             ((eql)
+              (eql object (car args)))
+             ;; Predicate
+             ((satisfies)
+              (not (null (funcall (car args) object))))
+             ;; String/vector with optional length
+             ((string simple-string)
+              (and (stringp object)
+                   (or (null args) (eq (car args) '*)
+                       (= (length object) (car args)))))
+             ((vector simple-vector array)
+              (and (vectorp object)
+                   (or (null args) (eq (car args) '*)
+                       (= (length object) (car args)))))
+             ;; Unknown compound — try just the head as a symbol.
+             (t (funcall *%original-typep%* object head))))))
+    ;; ── Symbol / nil type names — catch-all ──────────────────────────
+    ;; Anything reaching here is a symbol (or nil, which CL treats as a
+    ;; symbol too).  We do NOT use (symbolp type) — see note above.
+    (t
+     (let ((expander (gethash type *type-expanders*)))
+       (if expander
+           ;; User-defined: expand and recurse.
+           (%new-typep object (funcall expander type))
+           ;; Built-in named type: delegate to the Rust shim.
+           (funcall *%original-typep%* object type))))))
+
+;; Wrap with optional environment parameter for CL compliance.
+(defun typep (object type &optional environment)
+  "Return T if OBJECT is of the given TYPE specifier.
+   Handles user-defined types (DEFTYPE), compound built-in specs
+   (integer, or, and, not, cons, member, eql, satisfies, …), and
+   delegates simple symbol types to the native type checker."
+  (declare (ignore environment))
+  (%new-typep object type))
+
 (provide 'types)
 nil
