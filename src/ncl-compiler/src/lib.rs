@@ -113,6 +113,17 @@ impl Session {
         }
         // Otherwise: macroexpand fully, then compile.
         let expanded = macroexpand_all(v, &self.coord, &mut self.mutator)?;
+        // After full expansion, re-run the fast-path recognisers so that
+        // macros which expand to `defmacro` / `defun` are properly handled.
+        // Example: `(define-modify-macro appendf (&rest r) append)` expands
+        // to `(defmacro appendf …)` which must be installed, not JIT-compiled
+        // as a generic call.
+        if let Some((name, params, body_forms)) = match_defmacro(&expanded)? {
+            return self.handle_defmacro(&name, &params, &body_forms);
+        }
+        if let Some((name, params, body_forms)) = match_defun(&expanded)? {
+            return self.handle_defun(&name, &params, &body_forms);
+        }
         // CL convention: `(progn …)` at top level treats each body
         // form as itself a top-level form. This is what lets a
         // macro expand into multiple top-level definitions (e.g.

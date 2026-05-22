@@ -237,5 +237,164 @@
           ,@writes
           ,(car temps))))))
 
+;; ── PSETQ / PSETF ────────────────────────────────────────────────────────────
+;;
+;; Parallel assignment: all right-hand sides are evaluated first (in
+;; left-to-right order), then all assignments are performed.  Returns NIL.
+;;
+;; PSETQ assigns bare symbols; PSETF is the general version that handles
+;; any setf-able place (same caveat as ROTATEF: compound places with
+;; side-effecting subforms are evaluated in the binding phase, which is
+;; good — each subform is evaluated once in order).
+
+(defmacro psetq (&rest pairs)
+  "Parallel SETQ: evaluate all right-hand sides, then set all variables.
+   Returns NIL.  Unlike SETQ, assignment order does not matter — all
+   old values are captured first."
+  (when (oddp (length pairs))
+    (error "PSETQ: odd number of arguments (~A)" (length pairs)))
+  (let ((vs nil) (es nil) (ts nil))
+    (do ((p pairs (cddr p)))
+        ((null p))
+      (push (car p)  vs)
+      (push (cadr p) es)
+      (push (gensym) ts))
+    (let ((vs (nreverse vs))
+          (es (nreverse es))
+          (ts (nreverse ts)))
+      `(let ,(mapcar #'list ts es)
+         ,@(mapcar (lambda (v tmp) `(setq ,v ,tmp)) vs ts)
+         nil))))
+
+(defmacro psetf (&rest pairs)
+  "Parallel SETF: evaluate all right-hand sides, then set all places.
+   Returns NIL.  All old values are captured before any assignment."
+  (when (oddp (length pairs))
+    (error "PSETF: odd number of arguments (~A)" (length pairs)))
+  (let ((places nil) (es nil) (ts nil))
+    (do ((p pairs (cddr p)))
+        ((null p))
+      (push (car p)  places)
+      (push (cadr p) es)
+      (push (gensym) ts))
+    (let ((places (nreverse places))
+          (es     (nreverse es))
+          (ts     (nreverse ts)))
+      `(let ,(mapcar #'list ts es)
+         ,@(mapcar (lambda (place tmp) `(setf ,place ,tmp)) places ts)
+         nil))))
+
+;; ── GET-SETF-EXPANSION ───────────────────────────────────────────────────────
+;;
+;; Returns five values describing how to read and write a generalised place:
+;;
+;;   vars       — list of gensyms, one per subform of the accessor call
+;;   vals       — list of the actual subforms (parallel to vars)
+;;   stores     — list of one gensym: the "new value" variable
+;;   writer     — form: using the vars and stores, writes the new value
+;;   reader     — form: using the vars, reads the current value
+;;
+;; Callers bind `(let* ,(mapcar #'list vars vals) ...)` to evaluate
+;; each accessor subform exactly once, then bind `(let ((store ...)) ...)`
+;; for the new value, evaluate `writer` to commit it, and use `reader`
+;; to observe the old value.
+;;
+;; NCL's setf model: `(defun (setf f) (new-val arg1 ... argN) ...)` registers
+;; as `%SETF-F`; `(setf (f arg1 ...argN) val)` calls `(%SETF-F val arg1...argN)`.
+;; For standard built-in places (car, cdr, aref, gethash, …) the compiler
+;; handles them natively without going through %SETF-*.
+;;
+;; The ENVIRONMENT argument is accepted for CL compatibility but ignored;
+;; NCL does not yet have compile-time environment objects.
+
+(defun get-setf-expansion (place &optional environment)
+  "Return (values vars vals stores writer reader) for the generalised place PLACE.
+   ENVIRONMENT is accepted for compatibility but ignored in NCL."
+  (declare (ignore environment))
+  (cond
+    ;; Bare symbol — read/write directly.
+    ((symbolp place)
+     (let ((store (gensym "STORE-")))
+       (values nil nil (list store)
+               `(setq ,place ,store)
+               place)))
+    ;; (accessor arg1 ... argN) — general case.
+    ((consp place)
+     (let* ((fn    (car place))
+            (args  (cdr place))
+            (vars  (mapcar (lambda (a) (declare (ignore a)) (gensym "G-")) args))
+            (store (gensym "STORE-")))
+       (values vars
+               args
+               (list store)
+               `(setf (,fn ,@vars) ,store)
+               `(,fn ,@vars))))
+    (t
+     (error "get-setf-expansion: cannot expand place ~S" place))))
+
+;; ── DEFINE-MODIFY-MACRO ──────────────────────────────────────────────────────
+;;
+;; Creates a read-modify-write macro analogous to INCF or PUSH.
+;;
+;;   (define-modify-macro name lambda-list function &optional doc)
+;;
+;; Generates a macro NAME that reads a generalised place, applies
+;; FUNCTION to the old value and any extra arguments, then writes the
+;; result back.  Example:
+;;
+;;   (define-modify-macro appendf (&rest more) append)
+;;   (appendf my-list '(1 2 3))   ; ≡ (setf my-list (append my-list '(1 2 3)))
+;;
+;; The lambda-list may contain &optional and &rest (but not &key or &aux).
+;; NOTE: the generated macro does NOT accept &environment in NCL because
+;; NCL does not thread compile-time environments through defmacro.
+
+(defmacro define-modify-macro (name lambda-list function &optional doc-string)
+  "Define a read-modify-write macro named NAME.
+   When NAME is called as (NAME place arg…), it is equivalent to
+   (setf place (FUNCTION place arg…)).  The generalised place is
+   evaluated only once."
+  (let ((other-args nil)
+        (rest-arg   nil)
+        (reference  (gensym "PLACE-")))
+    ;; Walk lambda-list to collect extra argument names.
+    (do ((ll lambda-list (cdr ll)))
+        ((null ll))
+      (let ((arg (car ll)))
+        (cond
+          ((eq arg '&optional) nil)      ; skip keyword itself
+          ((eq arg '&rest)
+           (cond
+             ((null (cdr ll))
+              (error "DEFINE-MODIFY-MACRO ~S: &rest must be followed by a name" name))
+             ((symbolp (cadr ll))
+              (setq rest-arg (cadr ll))
+              (return))
+             (t
+              (error "DEFINE-MODIFY-MACRO ~S: &rest arg must be a symbol" name))))
+          ((member arg '(&key &allow-other-keys &aux))
+           (error "DEFINE-MODIFY-MACRO ~S: ~S not allowed in lambda list" name arg))
+          ((symbolp arg)
+           (push arg other-args))
+          ((and (consp arg) (symbolp (car arg)))
+           ;; optional-with-default: (var default) — just want the var name
+           (push (car arg) other-args))
+          (t
+           (error "DEFINE-MODIFY-MACRO ~S: bad lambda-list element ~S" name arg)))))
+    (setq other-args (nreverse other-args))
+    `(defmacro ,name (,reference ,@lambda-list)
+       ,@(when doc-string (list doc-string))
+       (multiple-value-bind (vars vals stores writer reader)
+           (get-setf-expansion ,reference)
+         (let ((let-list (mapcar #'list vars vals)))
+           (push (list (car stores)
+                       ,(if rest-arg
+                            `(list* ',function reader ,@other-args ,rest-arg)
+                            `(list ',function reader ,@other-args)))
+                 let-list)
+           ;; Build (let* (binding...) writer) without nested backquote —
+           ;; NCL does not support nested backquotes yet.
+           (cons 'let* (cons (nreverse let-list) (list writer))))))))
+
 (provide 'places)
 nil

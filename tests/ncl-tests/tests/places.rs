@@ -187,3 +187,132 @@ fn defsetf_passes_multiple_place_args() {
     ";
     assert_eq!(s.eval(prog).unwrap(), "(A B :TWO D)");
 }
+
+// ── PSETQ ────────────────────────────────────────────────────────────
+
+#[test]
+fn psetq_swaps_two_variables() {
+    let mut s = fresh_session_with_places();
+    // Classic swap idiom: both old values are captured before assignment.
+    let prog = "
+        (let ((a 1) (b 2))
+          (psetq a b  b a)
+          (list a b))
+    ";
+    assert_eq!(s.eval(prog).unwrap(), "(2 1)");
+}
+
+#[test]
+fn psetq_evaluates_rhs_before_assignment() {
+    let mut s = fresh_session_with_places();
+    // a and b both start at 10; after (psetq a (+ a 1) b (+ a 2)),
+    // a=11 and b=12 (using OLD value of a=10 for both rhs expressions).
+    let prog = "
+        (let ((a 10) (b 10))
+          (psetq a (+ a 1)
+                 b (+ a 2))
+          (list a b))
+    ";
+    assert_eq!(s.eval(prog).unwrap(), "(11 12)");
+}
+
+#[test]
+fn psetq_returns_nil() {
+    let mut s = fresh_session_with_places();
+    // psetq returns nil (printed lowercase in NCL)
+    let out = s.eval("(let ((x 1)) (psetq x 2))").unwrap();
+    assert!(out.eq_ignore_ascii_case("nil"), "got: {out}");
+}
+
+// ── PSETF ────────────────────────────────────────────────────────────
+
+#[test]
+fn psetf_swaps_via_setf_places() {
+    let mut s = fresh_session_with_places();
+    let prog = "
+        (let ((xs (list 1 2 3)))
+          (psetf (first xs) (second xs)
+                 (second xs) (first xs))
+          xs)
+    ";
+    assert_eq!(s.eval(prog).unwrap(), "(2 1 3)");
+}
+
+// ── GET-SETF-EXPANSION ───────────────────────────────────────────────
+
+#[test]
+fn get_setf_expansion_bare_symbol() {
+    let mut s = fresh_session_with_places();
+    // For a bare symbol, vars and vals are nil, stores has one element,
+    // writer is a setq, reader is the symbol itself.
+    let prog = "
+        (multiple-value-bind (vars vals stores writer reader)
+            (get-setf-expansion 'x)
+          (list (null vars) (null vals) (= 1 (length stores))
+                (car (cdr writer))    ; variable being set (x)
+                reader))
+    ";
+    // vars=nil→T, vals=nil→T, stores has 1 element→T, writer assigns x→X, reader=X
+    assert_eq!(s.eval(prog).unwrap(), "(T T T X X)");
+}
+
+#[test]
+fn get_setf_expansion_accessor_form() {
+    let mut s = fresh_session_with_places();
+    // For (car xs): vars has 1 gensym, vals=(xs), stores has 1,
+    // reader is (car <gensym>), writer is (setf (car <gensym>) <store>).
+    let prog = "
+        (multiple-value-bind (vars vals stores writer reader)
+            (get-setf-expansion '(car xs))
+          (list (= 1 (length vars))   ; one temp var
+                (equal vals '(xs))    ; val is xs
+                (= 1 (length stores)) ; one store var
+                (car writer)          ; writer starts with setf
+                (car reader)          ; reader starts with car
+                ))
+    ";
+    assert_eq!(s.eval(prog).unwrap(), "(T T T SETF CAR)");
+}
+
+// ── DEFINE-MODIFY-MACRO ──────────────────────────────────────────────
+
+#[test]
+fn define_modify_macro_basic() {
+    let mut s = fresh_session_with_places();
+    // APPENDF: (appendf place more) ≡ (setf place (append place more))
+    let prog = "
+        (define-modify-macro appendf (&rest more) append
+          \"Append MORE to the list at PLACE.\")
+        (defparameter *lst* '(1 2 3))
+        (appendf *lst* '(4 5 6))
+        *lst*
+    ";
+    assert_eq!(s.eval(prog).unwrap(), "(1 2 3 4 5 6)");
+}
+
+#[test]
+fn define_modify_macro_with_optional_arg() {
+    let mut s = fresh_session_with_places();
+    // MULTF: multiply place by factor (default 2).
+    let prog = "
+        (define-modify-macro multf (&optional (factor 2)) *)
+        (let ((x 5))
+          (multf x 3)
+          x)
+    ";
+    assert_eq!(s.eval(prog).unwrap(), "15");
+}
+
+#[test]
+fn define_modify_macro_incf_like() {
+    let mut s = fresh_session_with_places();
+    // Re-implement INCF using define-modify-macro to verify the machinery.
+    let prog = "
+        (define-modify-macro my-incf (&optional (delta 1)) +)
+        (let ((n 10))
+          (my-incf n)
+          (my-incf n 5)
+          n)
+    ";
+    assert_eq!(s.eval(prog).unwrap(), "16");
+}
