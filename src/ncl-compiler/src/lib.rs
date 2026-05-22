@@ -4979,4 +4979,197 @@ mod end_to_end_tests {
     // is messy to catch from a unit test, so the behaviour is
     // documented in the commit log instead. Real condition handling
     // arrives later.)
+
+    // ── symbols.lisp inline tests ─────────────────────────────────────
+    //
+    // These tests inline the key definitions from Library/symbols.lisp
+    // so they can run under Session::with_stdlib() without needing the
+    // full init.lisp chain.  They mirror the assertions in
+    // test-symbols.lisp.
+
+    /// Minimal preamble: property-list functions.
+    const PLIST_PRELUDE: &str = r#"
+(defvar *symbol-plists* (make-hash-table :test 'eq))
+(defun symbol-plist (sym) (gethash sym *symbol-plists*))
+(defun (setf symbol-plist) (new-plist sym)
+  (if (null new-plist) (remhash sym *symbol-plists*)
+      (setf (gethash sym *symbol-plists*) new-plist))
+  new-plist)
+(defun %plist-get (plist key default)
+  (cond ((null plist) default)
+        ((eq (car plist) key) (car (cdr plist)))
+        (t (%plist-get (cdr (cdr plist)) key default))))
+(defun %plist-set (plist key val)
+  (cond ((null plist) (list key val))
+        ((eq (car plist) key) (cons key (cons val (cdr (cdr plist)))))
+        (t (cons (car plist) (cons (car (cdr plist))
+                                  (%plist-set (cdr (cdr plist)) key val))))))
+(defun %plist-remove (plist key)
+  (cond ((null plist) (values nil nil))
+        ((eq (car plist) key) (values (cdr (cdr plist)) t))
+        (t (multiple-value-bind (rest found)
+               (%plist-remove (cdr (cdr plist)) key)
+             (values (cons (car plist) (cons (car (cdr plist)) rest)) found)))))
+(defun get (sym indicator &optional default)
+  (%plist-get (symbol-plist sym) indicator default))
+(defun (setf get) (new-value sym indicator)
+  (setf (symbol-plist sym) (%plist-set (symbol-plist sym) indicator new-value))
+  new-value)
+(defun remprop (sym indicator)
+  (multiple-value-bind (new found)
+      (%plist-remove (symbol-plist sym) indicator)
+    (when found (setf (symbol-plist sym) new))
+    found))
+"#;
+
+    #[test]
+    fn property_list_get_set_remprop() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(PLIST_PRELUDE).unwrap();
+        // Initial state — absent key returns nil
+        assert_eq!(s.eval("(get 'foo 'color)").unwrap(), "nil");
+        // Absent key with explicit default — symbols print uppercase in NCL
+        assert_eq!(s.eval("(get 'foo 'color 'red)").unwrap(), "RED");
+        // Set a property
+        s.eval("(setf (get 'foo 'color) 'blue)").unwrap();
+        assert_eq!(s.eval("(get 'foo 'color)").unwrap(), "BLUE");
+        // Second property — first still intact
+        s.eval("(setf (get 'foo 'size) 42)").unwrap();
+        assert_eq!(s.eval("(get 'foo 'size)").unwrap(), "42");
+        assert_eq!(s.eval("(get 'foo 'color)").unwrap(), "BLUE");
+        // Overwrite existing property
+        s.eval("(setf (get 'foo 'color) 'green)").unwrap();
+        assert_eq!(s.eval("(get 'foo 'color)").unwrap(), "GREEN");
+        // remprop returns T when found (printed uppercase), nil when absent
+        assert_eq!(s.eval("(remprop 'foo 'color)").unwrap(), "T");
+        assert_eq!(s.eval("(get 'foo 'color)").unwrap(), "nil");
+        assert_eq!(s.eval("(get 'foo 'size)").unwrap(), "42");
+        assert_eq!(s.eval("(remprop 'foo 'color)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn prog1_returns_first_value() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval("(defmacro prog1 (fst &rest more) (let ((g (gensym \"P1\"))) `(let ((,g ,fst)) ,@more ,g)))").unwrap();
+        assert_eq!(
+            s.eval("(let ((x 0)) (prog1 (progn (setq x (+ x 1)) x) (setq x (+ x 1)) (setq x (+ x 1))))").unwrap(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn prog2_returns_second_value() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval("(defmacro prog2 (f1 f2 &rest more) (let ((g (gensym \"P2\"))) `(progn ,f1 (let ((,g ,f2)) ,@more ,g))))").unwrap();
+        assert_eq!(
+            s.eval("(prog2 100 (+ 1 2) 200)").unwrap(),
+            "3"
+        );
+    }
+
+    /// Inline the core destructuring-bind helpers for testing.
+    const DBB_PRELUDE: &str = r#"
+(defun %dbb-lambda-keyword-p (x)
+  (member x '(&optional &rest &key &allow-other-keys &aux &body &whole &environment)))
+(defun %dbb-expand (pattern form-sym body)
+  (cond
+    ((null pattern) `(progn ,@body))
+    ((symbolp pattern) `(let ((,pattern ,form-sym)) ,@body))
+    ((consp pattern) (%dbb-list-expand pattern form-sym body 0))
+    (t (error "bad dbb pattern ~S" pattern))))
+(defun %dbb-list-expand (pattern form-sym body index)
+  (cond
+    ((null pattern) `(progn ,@body))
+    ((atom pattern) `(let ((,pattern (nthcdr ,index ,form-sym))) ,@body))
+    ((eq (car pattern) '&rest)
+     `(let ((,(cadr pattern) (nthcdr ,index ,form-sym))) ,@body))
+    ((eq (car pattern) '&body)
+     `(let ((,(cadr pattern) (nthcdr ,index ,form-sym))) ,@body))
+    ((eq (car pattern) '&optional)
+     (%dbb-opt-expand (cdr pattern) form-sym body index))
+    ((eq (car pattern) '&key)
+     (%dbb-key-expand (cdr pattern) form-sym body index))
+    ((%dbb-lambda-keyword-p (car pattern)) `(progn ,@body))
+    ((consp (car pattern))
+     (let ((sub (gensym "DBB-N"))
+           (rest-code (%dbb-list-expand (cdr pattern) form-sym body (1+ index))))
+       `(let ((,sub (nth ,index ,form-sym)))
+          ,(%dbb-expand (car pattern) sub (list rest-code)))))
+    (t `(let ((,(car pattern) (nth ,index ,form-sym)))
+          ,(%dbb-list-expand (cdr pattern) form-sym body (1+ index))))))
+(defun %dbb-opt-expand (opts form-sym body index)
+  (cond
+    ((null opts) `(progn ,@body))
+    ((%dbb-lambda-keyword-p (car opts)) (%dbb-list-expand opts form-sym body index))
+    (t (let* ((opt (car opts))
+              (sym (if (consp opt) (car opt) opt))
+              (def (if (consp opt) (cadr opt) nil)))
+         `(let ((,sym (if (nthcdr ,index ,form-sym) (nth ,index ,form-sym) ,def)))
+            ,(%dbb-opt-expand (cdr opts) form-sym body (1+ index)))))))
+(defun %dbb-key-expand (keys form-sym body index)
+  (cond
+    ((null keys) `(progn ,@body))
+    ((%dbb-lambda-keyword-p (car keys)) `(progn ,@body))
+    (t (let* ((key-spec (car keys))
+              (sym (if (consp key-spec) (car key-spec) key-spec))
+              (def (if (consp key-spec) (cadr key-spec) nil))
+              (key-kw (intern (string-concat ":" (symbol-name sym)))))
+         `(let ((,sym (let ((tail (member ',key-kw (nthcdr ,index ,form-sym))))
+                        (if tail (cadr tail) ,def))))
+            ,(%dbb-key-expand (cdr keys) form-sym body index))))))
+(defmacro destructuring-bind (pattern form &body body)
+  (let ((g (gensym "DBB")))
+    `(let ((,g ,form))
+       ,(%dbb-expand pattern g body))))
+"#;
+
+    #[test]
+    fn destructuring_bind_required() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(DBB_PRELUDE).unwrap();
+        assert_eq!(
+            s.eval("(destructuring-bind (a b c) '(1 2 3) (list a b c))").unwrap(),
+            "(1 2 3)"
+        );
+    }
+
+    #[test]
+    fn destructuring_bind_rest() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(DBB_PRELUDE).unwrap();
+        assert_eq!(
+            s.eval("(destructuring-bind (a &rest r) '(1 2 3 4) (list a r))").unwrap(),
+            "(1 (2 3 4))"
+        );
+    }
+
+    #[test]
+    fn destructuring_bind_optional_default() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(DBB_PRELUDE).unwrap();
+        assert_eq!(
+            s.eval("(destructuring-bind (a &optional (b 99)) '(1) (list a b))").unwrap(),
+            "(1 99)"
+        );
+    }
+
+    #[test]
+    fn destructuring_bind_nested() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(DBB_PRELUDE).unwrap();
+        assert_eq!(
+            s.eval("(destructuring-bind ((x y) z) '((10 20) 30) (list x y z))").unwrap(),
+            "(10 20 30)"
+        );
+    }
+
+    #[test]
+    fn destructuring_bind_dotted_rest() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(DBB_PRELUDE).unwrap();
+        assert_eq!(
+            s.eval("(destructuring-bind (a . r) '(1 2 3) (list a r))").unwrap(),
+            "(1 (2 3))"
+        );
+    }
 }
