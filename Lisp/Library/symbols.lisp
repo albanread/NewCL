@@ -360,5 +360,72 @@ UNWIND-PROTECT yet), but the common case of normal return is correct."
        (mapc #'set ,syms-g ,old-g)
        ,result-g)))
 
+;; ── with-gensyms ─────────────────────────────────────────────────────────────
+;;
+;; (with-gensyms (v1 v2 ...) body...)
+;;
+;; Binds each Vi to a fresh gensym, then evaluates BODY (typically a
+;; backquoted macro-expansion form).  This is the idiomatic way to
+;; generate hygenic temporaries in macro definitions:
+;;
+;;   (defmacro swap! (a b)
+;;     (with-gensyms (ta tb)
+;;       `(let ((,ta ,a) (,tb ,b)) (setf ,a ,tb ,b ,ta))))
+;;
+;; The gensym names are derived from the variable name for readability
+;; in macroexpansion traces.
+
+(defmacro with-gensyms (names &body body)
+  "Bind each symbol in NAMES to a fresh gensym, then evaluate BODY.
+   Commonly used inside DEFMACRO bodies to avoid variable-capture."
+  `(let ,(mapcar (lambda (name)
+                   (list name `(gensym ,(symbol-name name))))
+                 names)
+     ,@body))
+
+;; ── once-only ─────────────────────────────────────────────────────────────────
+;;
+;; (once-only (x y ...) body...)
+;;
+;; Wraps the macro expansion so that each place-expression X, Y, ...
+;; is evaluated exactly once, regardless of how many times it appears
+;; in the expansion.  Used at macro-definition time:
+;;
+;;   (defmacro square (x)
+;;     (once-only (x)
+;;       `(* ,x ,x)))
+;;
+;; For `(square (incf n))`, this produces:
+;;   (let ((G-1 (incf n)))
+;;     (* G-1 G-1))
+;;
+;; rather than evaluating (incf n) twice.
+;;
+;; Standard idiom from CMUCL / SBCL / PCL. Not in ANSI CL but nearly
+;; universal in production macro code.
+
+(defmacro once-only (names &body body)
+  "Ensure each name in NAMES is evaluated exactly once in the generated code.
+   Used inside DEFMACRO bodies; each name must already be bound to a form.
+   Rewrites the code so the form is saved in a gensym and the gensym is used.
+
+   Example:
+     (defmacro square (x)
+       (once-only (x)
+         `(* ,x ,x)))
+     ;; (square (incf n)) expands to (let ((G1 (incf n))) (* G1 G1))
+     ;; so (incf n) is called exactly once regardless of how many
+     ;; times ,x appears in the expansion."
+  (let ((gensyms (mapcar (lambda (n) (declare (ignore n)) (gensym "OO-")) names)))
+    ;; Outer let: create one runtime gensym per name.
+    ;; (list 'let ...) builds the binding form without nested backquote.
+    ;; Key insight: (list #:OO-1 x) captures the *original* value of x
+    ;; before the inner let shadows it with the gensym symbol.
+    `(let ,(mapcar (lambda (g n) (list g `(gensym ,(symbol-name n)))) gensyms names)
+       (list 'let
+             (list ,@(mapcar (lambda (g n) `(list ,g ,n)) gensyms names))
+             (let ,(mapcar (lambda (n g) (list n g)) names gensyms)
+               (progn ,@body))))))
+
 (provide 'symbols)
 nil
