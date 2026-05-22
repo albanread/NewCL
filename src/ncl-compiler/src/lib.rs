@@ -5523,4 +5523,101 @@ mod end_to_end_tests {
             "99"
         );
     }
+
+    // ── bits.lisp (byte / ldb / dpb / mask-field / deposit-field) ────────────
+
+    const BITS_PRELUDE: &str = r#"
+(defun byte (size position) (cons size position))
+(defun byte-size (bs) (car bs))
+(defun byte-position (bs) (cdr bs))
+(defun ldb (bytespec integer)
+  (let ((mask (- (ash 1 (byte-size bytespec)) 1)))
+    (logand (ash integer (- (byte-position bytespec))) mask)))
+(defun ldb-test (bytespec integer) (not (zerop (ldb bytespec integer))))
+(defun dpb (newbyte bytespec integer)
+  (let* ((size (byte-size bytespec))
+         (pos  (byte-position bytespec))
+         (mask (ash (- (ash 1 size) 1) pos)))
+    (logior (logand integer (lognot mask))
+            (logand (ash newbyte pos) mask))))
+(defun mask-field (bytespec integer) (logand integer (dpb -1 bytespec 0)))
+(defun deposit-field (newbyte bytespec integer)
+  (let ((mask (mask-field bytespec -1)))
+    (logior (logand newbyte mask) (logand integer (lognot mask)))))
+"#;
+
+    #[test]
+    fn byte_ldb_dpb_basics() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(BITS_PRELUDE).unwrap();
+        // ldb: extract bits 4-7 from #xABCD (= 43981):
+        //   nibble at pos 4 = 0xC = 12
+        assert_eq!(s.eval("(ldb (byte 4 4) #xABCD)").unwrap(), "12");
+        // ldb: low nibble of #xABCD = 0xD = 13
+        assert_eq!(s.eval("(ldb (byte 4 0) #xABCD)").unwrap(), "13");
+        // dpb: replace low nibble of #xABCD with 0 → #xABC0 = 43968
+        assert_eq!(s.eval("(dpb 0 (byte 4 0) #xABCD)").unwrap(), "43968");
+        // dpb: replace low nibble with 7 → #xABC7 = 43975
+        assert_eq!(s.eval("(dpb 7 (byte 4 0) #xABCD)").unwrap(), "43975");
+    }
+
+    #[test]
+    fn byte_ldb_dpb_roundtrip() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(BITS_PRELUDE).unwrap();
+        // dpb/ldb round-trip: put 7 into bits 8-11, read it back
+        assert_eq!(
+            s.eval("(ldb (byte 4 8) (dpb 7 (byte 4 8) 0))").unwrap(),
+            "7"
+        );
+        // ldb-test: true when bits are set
+        assert_eq!(s.eval("(ldb-test (byte 4 4) #xFF)").unwrap(), "T");
+        assert_eq!(s.eval("(ldb-test (byte 4 4) #x000F)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn mask_field_deposit_field() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(BITS_PRELUDE).unwrap();
+        // mask-field: keep only bits 4-7 of #xFF
+        assert_eq!(s.eval("(mask-field (byte 4 4) #xFF)").unwrap(), "240"); // #xF0
+        // deposit-field: replace bits 4-7 of #xFF with bits 4-7 of #x50
+        // #x50 bits 4-7 = 5; result = (#xFF & ~#xF0) | (#x50 & #xF0) = 0xF | 0x50 = 0x5F = 95
+        assert_eq!(s.eval("(deposit-field #x50 (byte 4 4) #xFF)").unwrap(), "95");
+    }
+
+    // ── check-type ────────────────────────────────────────────────────────────
+
+    const CHECK_TYPE_PRELUDE: &str = r#"
+(defmacro check-type (place typespec &optional string)
+  (let ((val-g (gensym "CT")))
+    `(let ((,val-g ,place))
+       (unless (typep ,val-g ',typespec)
+         (error ,(if string
+                     `(format nil "The value of ~S, ~~S, is not ~A." ',place ,string)
+                     `(format nil "The value of ~S, ~~S, is not of type ~A."
+                              ',place ',typespec))
+                ,val-g)))))
+"#;
+
+    #[test]
+    fn check_type_passes() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(CHECK_TYPE_PRELUDE).unwrap();
+        // check-type on a matching type returns nil silently
+        assert_eq!(s.eval("(check-type 42 integer)").unwrap(), "nil");
+        assert_eq!(s.eval("(check-type \"hi\" string)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn check_type_signals_on_mismatch() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(CHECK_TYPE_PRELUDE).unwrap();
+        assert_eq!(
+            s.eval("(handler-case \
+                      (check-type \"hi\" integer) \
+                      (error (e) e 'type-error-signalled))").unwrap(),
+            "TYPE-ERROR-SIGNALLED"
+        );
+    }
 }

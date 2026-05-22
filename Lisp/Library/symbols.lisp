@@ -12,8 +12,9 @@
 ;;;;     prog1   prog2
 ;;;;     progv   — dynamic variable binding at runtime
 ;;;;
-;;;;   Assertions:
-;;;;     assert  — signal an error when a condition is false
+;;;;   Assertions and type-checking:
+;;;;     assert      — signal an error when a condition is false
+;;;;     check-type  — signal a type error when a place has the wrong type
 ;;;;
 ;;;;   Error handling:
 ;;;;     ignore-errors  — catch errors, return (values nil condition)
@@ -242,6 +243,24 @@
        `(let ((,sym (let ((tail (member ',key-kw (nthcdr ,index ,form-sym))))
                       (if tail (cadr tail) ,def))))
           ,(%dbb-key-expand (cdr keys) form-sym body index))))))
+
+;; ── check-type ───────────────────────────────────────────────────────────────
+;;
+;; (check-type PLACE TYPESPEC [STRING]) — signal a correctable type error if
+;; the value of PLACE is not of type TYPESPEC.  In NCL there are no interactive
+;; restarts, so this just signals an error unconditionally on mismatch.
+
+(defmacro check-type (place typespec &optional string)
+  "Signal an error unless (typep PLACE TYPESPEC) is true.
+STRING is an optional description of the expected type used in the message."
+  (let ((val-g (gensym "CT")))
+    `(let ((,val-g ,place))
+       (unless (typep ,val-g ',typespec)
+         (error ,(if string
+                     `(format nil "The value of ~S, ~~S, is not ~A." ',place ,string)
+                     `(format nil "The value of ~S, ~~S, is not of type ~A."
+                              ',place ',typespec))
+                ,val-g)))))
 
 ;; ── ignore-errors ────────────────────────────────────────────────────────────
 ;;
