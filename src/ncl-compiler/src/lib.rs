@@ -5620,4 +5620,98 @@ mod end_to_end_tests {
             "TYPE-ERROR-SIGNALLED"
         );
     }
+
+    // ── ffloor / fceiling / ftruncate / fround / asinh / acosh / atanh ───────
+
+    const NUMBERS_EXT_PRELUDE: &str = r#"
+(defun ffloor (number &optional (divisor 1))
+  (let* ((pair (multiple-value-list (floor number divisor)))
+         (q    (car pair))
+         (r    (cadr pair)))
+    (values (* 1.0 q) r)))
+(defun fceiling (number &optional (divisor 1))
+  (let* ((pair (multiple-value-list (ceiling number divisor)))
+         (q    (car pair))
+         (r    (cadr pair)))
+    (values (* 1.0 q) r)))
+(defun ftruncate (number &optional (divisor 1))
+  (let* ((pair (multiple-value-list (truncate number divisor)))
+         (q    (car pair))
+         (r    (cadr pair)))
+    (values (* 1.0 q) r)))
+(defun fround (number &optional (divisor 1))
+  (let* ((pair (multiple-value-list (round number divisor)))
+         (q    (car pair))
+         (r    (cadr pair)))
+    (values (* 1.0 q) r)))
+(defun asinh (x) (log (+ x (sqrt (+ 1.0 (* x x))))))
+(defun acosh (x) (log (+ x (sqrt (- (* x x) 1.0)))))
+(defun atanh (x) (/ (log (/ (+ 1.0 x) (- 1.0 x))) 2.0))
+"#;
+
+    #[test]
+    fn ffloor_mv_baseline() {
+        // Baseline: does multiple-value-list work on floor at ALL?
+        let mut s = Session::with_stdlib().unwrap();
+        // Step 1: direct values cadr
+        assert_eq!(s.eval("(cadr (multiple-value-list (values 3 1)))").unwrap(), "1", "mvl values 3 1");
+        // Step 2: custom simple function
+        s.eval("(defun %two-vals () (values 3 1))").unwrap();
+        assert_eq!(s.eval("(cadr (multiple-value-list (%two-vals)))").unwrap(), "1", "two-vals cadr");
+        // Step 3: multiple-value-bind on floor
+        assert_eq!(s.eval("(multiple-value-bind (q r) (floor 7 2) (list q r))").unwrap(), "(3 1)", "mvb floor");
+        // Step 4: floor cadr via mvl
+        assert_eq!(s.eval("(car (multiple-value-list (floor 7 2)))").unwrap(), "3", "floor car mvl");
+        assert_eq!(s.eval("(cadr (multiple-value-list (floor 7 2)))").unwrap(), "1", "floor cadr mvl");
+    }
+
+    #[test]
+    fn ffloor_returns_float_quotient() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(NUMBERS_EXT_PRELUDE).unwrap();
+        // (ffloor 7 2) → (values 3.0 1)
+        assert_eq!(
+            s.eval("(let ((p (multiple-value-list (ffloor 7 2)))) (list (car p) (cadr p)))").unwrap(),
+            "(3.0 1)"
+        );
+        // Remainder for negative: (ffloor -7 2) → (values -4.0 1)
+        assert_eq!(
+            s.eval("(let ((p (multiple-value-list (ffloor -7 2)))) (car p))").unwrap(),
+            "-4.0"
+        );
+    }
+
+    #[test]
+    fn fceiling_and_ftruncate() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(NUMBERS_EXT_PRELUDE).unwrap();
+        // (fceiling 7 2) → (values 4.0 -1)
+        assert_eq!(
+            s.eval("(car (multiple-value-list (fceiling 7 2)))").unwrap(),
+            "4.0"
+        );
+        // (ftruncate -7 2) → (values -3.0 -1)
+        assert_eq!(
+            s.eval("(car (multiple-value-list (ftruncate -7 2)))").unwrap(),
+            "-3.0"
+        );
+    }
+
+    #[test]
+    fn inverse_hyperbolic_roundtrip() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(NUMBERS_EXT_PRELUDE).unwrap();
+        // sinh(asinh(x)) ≈ x for x = 1.5
+        let v = s.eval("(let ((x 1.5)) (- (sinh (asinh x)) x))").unwrap();
+        let diff: f64 = v.trim().parse().unwrap();
+        assert!(diff.abs() < 1e-10, "sinh(asinh(1.5)) roundtrip error: {diff}");
+        // cosh(acosh(x)) ≈ x for x = 2.0
+        let v2 = s.eval("(let ((x 2.0)) (- (cosh (acosh x)) x))").unwrap();
+        let diff2: f64 = v2.trim().parse().unwrap();
+        assert!(diff2.abs() < 1e-10, "cosh(acosh(2.0)) roundtrip error: {diff2}");
+        // tanh(atanh(x)) ≈ x for x = 0.5
+        let v3 = s.eval("(let ((x 0.5)) (- (tanh (atanh x)) x))").unwrap();
+        let diff3: f64 = v3.trim().parse().unwrap();
+        assert!(diff3.abs() < 1e-10, "tanh(atanh(0.5)) roundtrip error: {diff3}");
+    }
 }

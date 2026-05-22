@@ -320,3 +320,67 @@ fn bignum_truncate_and_rem() {
         "1"
     );
 }
+
+// ── FFLOOR / FCEILING / FTRUNCATE / FROUND ──────────────────────────
+
+#[test]
+fn ffloor_returns_float_quotient() {
+    let mut s = fresh_session_with_numbers();
+    // Quotient must be a float; remainder is the natural type (integer here).
+    let out = s.eval("(multiple-value-list (ffloor 7 2))").unwrap();
+    assert_eq!(out, "(3.0 1)");
+}
+
+#[test]
+fn fceiling_returns_float_quotient() {
+    let mut s = fresh_session_with_numbers();
+    let out = s.eval("(multiple-value-list (fceiling 7 2))").unwrap();
+    assert_eq!(out, "(4.0 -1)");
+}
+
+#[test]
+fn ftruncate_returns_float_quotient() {
+    let mut s = fresh_session_with_numbers();
+    let out = s.eval("(multiple-value-list (ftruncate -7 2))").unwrap();
+    assert_eq!(out, "(-3.0 -1)");
+}
+
+#[test]
+fn fround_returns_float_quotient() {
+    let mut s = fresh_session_with_numbers();
+    // (round 7 2) = 4 (banker's rounding: 3.5 → even = 4)
+    let out = s.eval("(multiple-value-list (fround 7 2))").unwrap();
+    assert_eq!(out, "(4.0 -1)");
+}
+
+#[test]
+fn ffloor_float_input() {
+    let mut s = fresh_session_with_numbers();
+    // (ffloor 3.7) — single-arg form, divisor defaults to 1.
+    let out = s.eval("(multiple-value-list (ffloor 3.7))").unwrap();
+    // quotient = 3.0, remainder = 3.7 - 3.0*1 = 0.7
+    assert!(out.starts_with("(3.0 0."), "got: {out}");
+}
+
+#[test]
+fn fceiling_and_ftruncate() {
+    let mut s = fresh_session_with_numbers();
+    // (fceiling -3.2) — quotient rounds toward +inf → -3.0, rem = -3.2 + 3.0 = -0.2
+    let fc = s.eval("(car (multiple-value-list (fceiling -3.2)))").unwrap();
+    assert_eq!(fc, "-3.0");
+    // (ftruncate -7.5 2) — truncate-float(-7.5/2) = truncate-float(-3.75) = -3.0
+    let ft = s.eval("(car (multiple-value-list (ftruncate -7.5 2)))").unwrap();
+    assert_eq!(ft, "-3.0");
+}
+
+// ── Inverse hyperbolic functions ─────────────────────────────────────
+
+#[test]
+fn inverse_hyperbolic_roundtrip() {
+    let mut s = fresh_session_with_numbers();
+    // asinh(sinh(x)) ≈ x  for x in a safe range.
+    s.eval("(defun approx= (a b) (< (abs (- a b)) 0.0001))").unwrap();
+    assert_eq!(s.eval("(approx= (asinh (sinh 1.5)) 1.5)").unwrap(), "T");
+    assert_eq!(s.eval("(approx= (acosh (cosh 2.0)) 2.0)").unwrap(), "T");
+    assert_eq!(s.eval("(approx= (atanh (tanh 0.5)) 0.5)").unwrap(), "T");
+}

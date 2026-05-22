@@ -199,5 +199,64 @@
      (let ((q (%i-floor a b)))
        (- a (* q b))))))
 
+;;; ── Floating-point rounding ops (FFLOOR, FCEILING, FTRUNCATE, FROUND) ──────
+;;
+;; Like FLOOR/CEILING/ROUND/TRUNCATE but always return a float quotient and a
+;; remainder.  (CL says the quotient type matches MAX(type(A),type(B))-as-float
+;; and the remainder preserves type; we keep it simple: quotient is always a
+;; float, remainder has the natural type.)
+
+;; NOTE: each fXXX function MUST end with a literal (values ...) form so
+;; the compiler's instrument_tail_for_mv pass recognises it as multi-valued
+;; and leaves the MV slot intact.  Factoring through a helper that calls
+;; (values ...) at tail position would lose the second value.
+
+(defun ffloor (number &optional (divisor 1))
+  "(ffloor a [d]) — like floor but returns (values float-quotient remainder)."
+  (let* ((pair (multiple-value-list (floor number divisor)))
+         (q    (car pair))
+         (r    (cadr pair)))
+    (values (* 1.0 q) r)))
+
+(defun fceiling (number &optional (divisor 1))
+  "(fceiling a [d]) — like ceiling but returns (values float-quotient remainder)."
+  (let* ((pair (multiple-value-list (ceiling number divisor)))
+         (q    (car pair))
+         (r    (cadr pair)))
+    (values (* 1.0 q) r)))
+
+(defun ftruncate (number &optional (divisor 1))
+  "(ftruncate a [d]) — like truncate but returns (values float-quotient remainder)."
+  (let* ((pair (multiple-value-list (truncate number divisor)))
+         (q    (car pair))
+         (r    (cadr pair)))
+    (values (* 1.0 q) r)))
+
+(defun fround (number &optional (divisor 1))
+  "(fround a [d]) — like round but returns (values float-quotient remainder)."
+  (let* ((pair (multiple-value-list (round number divisor)))
+         (q    (car pair))
+         (r    (cadr pair)))
+    (values (* 1.0 q) r)))
+
+;;; ── Inverse hyperbolic functions ─────────────────────────────────────────────
+;;
+;; NCL has SINH/COSH/TANH as native (Rust) but lacks the inverses.
+;; Standard identities from CLHS, valid for all real x.
+
+(defun asinh (x)
+  "Inverse hyperbolic sine: (log (+ x (sqrt (+ 1 (* x x)))))."
+  (log (+ x (sqrt (+ 1.0 (* x x))))))
+
+(defun acosh (x)
+  "Inverse hyperbolic cosine: (log (+ x (sqrt (- (* x x) 1)))).
+X must be >= 1."
+  (log (+ x (sqrt (- (* x x) 1.0)))))
+
+(defun atanh (x)
+  "Inverse hyperbolic tangent: (/ (log (/ (+ 1 x) (- 1 x))) 2).
+X must be in (-1, 1)."
+  (/ (log (/ (+ 1.0 x) (- 1.0 x))) 2.0))
+
 (provide 'numbers)
 nil
