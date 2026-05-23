@@ -457,6 +457,16 @@ fn lisp_main(raw_args: Vec<String>) -> ExitCode {
         // without --windows on the command line).
         let with_windows = std::env::args().any(|a| a == "--windows" || a == "-W")
             || ncl_runtime::win_surface::windows_enabled();
+
+        // In the GUI release build the process has no console: stdin is
+        // attached to NUL and gives immediate EOF, which would make the
+        // REPL exit instantly and close the window.  Run a pure iGui
+        // event loop instead — same event handling, no stdin.
+        #[cfg(feature = "gui-app")]
+        if with_windows {
+            return run_gui_event_loop(&mut session);
+        }
+
         return run_repl(&mut session, with_windows);
     }
 
@@ -618,6 +628,32 @@ fn wrap_for_repl(src: &str) -> String {
     format!(
         "(handler-case (progn {src}) (error (c) (format nil \"** ~A\" c)))"
     )
+}
+
+/// Worker loop for the GUI release build (`gui-app` feature).
+///
+/// No console is attached, so there is no stdin to read. The thread
+/// stays alive by blocking on the iGui event mailbox indefinitely,
+/// forwarding each event to the same handler that the windowed REPL
+/// uses. Exits when the mailbox closes (process shutdown) or when a
+/// `FrameClose` event arrives and the channel drains.
+#[cfg(feature = "gui-app")]
+fn run_gui_event_loop(session: &mut ncl_compiler::Session) -> ExitCode {
+    #[cfg(windows)]
+    {
+        loop {
+            // Block forever (-1) until the next iGui event.
+            match ncl_runtime::igui::channels::next_event(-1) {
+                Some(ev) => handle_repl_event(session, ev),
+                None => break, // channel closed → clean shutdown
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = session;
+    }
+    ExitCode::SUCCESS
 }
 
 /// Interactive read-eval-print loop. Reads from stdin, accumulates
