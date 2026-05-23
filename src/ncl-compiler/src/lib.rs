@@ -516,6 +516,8 @@ impl Session {
             .map_err(EvalError::Jit)?;
 
         startup_timing::push_form(name, lower_elapsed, startup_timing::elapsed(t_jit));
+        #[cfg(windows)]
+        ncl_runtime::igui::splash::tick();
 
         let sym_word = self.coord.intern(name);
         gc_function::alloc_function_in_static(
@@ -1190,6 +1192,17 @@ extern "C-unwind" fn load_file_shim(
         }
     };
 
+    // Update the splash with the module name (file stem, e.g. "streams").
+    #[cfg(windows)]
+    {
+        let stem = std::path::Path::new(&path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&path)
+            .to_string();
+        ncl_runtime::igui::splash::set_module(&stem);
+    }
+
     let session_ptr = ACTIVE_SESSION.with(|c| c.get());
     if session_ptr.is_null() {
         return ncl_runtime::abi::signal_condition_string(
@@ -1607,6 +1620,16 @@ fn install_igui(coord: &Arc<GcCoordinator>, mutator: &mut MutatorState) {
                    ncl_runtime::text_reset_pen_shim, 1);
     install_native(coord, mutator, "TEXT-SHOW-CARET",
                    ncl_runtime::text_show_caret_shim, 2);
+
+    // REPL child
+    install_native(coord, mutator, "OPEN-REPL-WINDOW",
+                   ncl_runtime::open_repl_window_shim, 1);
+    install_native(coord, mutator, "REPL-OUTPUT",
+                   ncl_runtime::repl_output_shim, 2);
+    install_native(coord, mutator, "REPL-ERROR",
+                   ncl_runtime::repl_error_shim, 2);
+    install_native(coord, mutator, "REPL-POP-INPUT",
+                   ncl_runtime::repl_pop_input_shim, 1);
 }
 
 fn install_native(
@@ -1661,6 +1684,8 @@ impl Session {
     }
 
     pub fn load_core_stdlib(&mut self) -> Result<(), EvalError> {
+        #[cfg(windows)]
+        ncl_runtime::igui::splash::set_module("core");
         let t = startup_timing::now();
         self.eval(CORE_LISP_SOURCE)?;
         startup_timing::drain_and_report("core.lisp", startup_timing::elapsed(t));
@@ -1672,6 +1697,8 @@ impl Session {
     /// labels, etc.). Idempotent in the same trivial sense as
     /// `load_core_stdlib`.
     pub fn load_clos(&mut self) -> Result<(), EvalError> {
+        #[cfg(windows)]
+        ncl_runtime::igui::splash::set_module("clos");
         let t = startup_timing::now();
         self.eval(CLOS_LISP_SOURCE)?;
         startup_timing::drain_and_report("clos.lisp", startup_timing::elapsed(t));

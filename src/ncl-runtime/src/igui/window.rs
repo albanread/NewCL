@@ -77,6 +77,9 @@ const WM_IGUI_OPEN_TEXT: u32 = WM_USER + 7;
 /// as an opaque token. Posted (not sent) so a tight write loop
 /// doesn't block on the GUI thread.
 const WM_IGUI_TEXT_FLUSH: u32 = WM_USER + 8;
+/// Open a REPL MDI child. Like WM_IGUI_OPEN_TEXT but uses the
+/// REPL class (split-pane D2D renderer with input editor).
+const WM_IGUI_OPEN_REPL: u32 = WM_USER + 9;
 /// Sent from the language thread to a render-host HWND to install
 /// or clear a Win32 timer driving `EvTick` events.
 /// `wparam` carries the interval in ms (0 = clear), `lparam` is unused.
@@ -557,6 +560,20 @@ unsafe extern "system" fn frame_wnd_proc(
             super::text_view::flush_on_gui_thread(child_id);
             LRESULT(0)
         }
+        WM_IGUI_OPEN_REPL => {
+            let req_ptr = lparam.0 as *mut OpenReplRequest;
+            if !req_ptr.is_null() {
+                let req = unsafe { &mut *req_ptr };
+                if let Some(mdi_client) = mdi_client_hwnd() {
+                    let child_id = registry::allocate_child_id();
+                    let title_w: Vec<u16> = req.title.iter().copied().collect();
+                    if super::repl_child::open_from_gui_thread(mdi_client, &title_w, child_id) {
+                        req.out = Some(child_id);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
         WM_IGUI_CLOSE_CHILD => {
             let req_ptr = lparam.0 as *mut CloseChildRequest;
             if !req_ptr.is_null() {
@@ -667,6 +684,12 @@ unsafe extern "system" fn frame_wnd_proc(
             if cmd_id == super::log_view::MENU_CMD_ID {
                 if mdi.0 as isize != 0 {
                     super::log_view::open(hwnd, mdi);
+                }
+                return LRESULT(0);
+            }
+            if cmd_id == super::repl_child::MENU_CMD_ID {
+                if mdi.0 as isize != 0 {
+                    super::repl_child::open(mdi);
                 }
                 return LRESULT(0);
             }
@@ -845,12 +868,28 @@ fn handle_open_child(req: &OpenChildRequest) -> Option<i64> {
     // otherwise honour what the caller asked for.
     let cx = if req.width  > 0 { req.width  } else { CW_USEDEFAULT };
     let cy = if req.height > 0 { req.height } else { CW_USEDEFAULT };
+
+    // When an explicit size is given, centre the child inside the MDI
+    // client area.  Fall back to CW_USEDEFAULT when no size is set.
+    let (x, y) = if req.width > 0 && req.height > 0 {
+        let mut client_rect = windows::Win32::Foundation::RECT::default();
+        let _ = unsafe { GetClientRect(mdi, &mut client_rect) };
+        let client_w = client_rect.right  - client_rect.left;
+        let client_h = client_rect.bottom - client_rect.top;
+        (
+            ((client_w - req.width)  / 2).max(0),
+            ((client_h - req.height) / 2).max(0),
+        )
+    } else {
+        (CW_USEDEFAULT, CW_USEDEFAULT)
+    };
+
     let mdi_create = MDICREATESTRUCTW {
         szClass: MDI_CHILD_CLASS,
         szTitle: PCWSTR::from_raw(req.title.as_ptr()),
         hOwner: h_owner,
-        x: CW_USEDEFAULT,
-        y: CW_USEDEFAULT,
+        x,
+        y,
         cx,
         cy,
         style: WS_VISIBLE | WS_OVERLAPPEDWINDOW,
@@ -947,6 +986,11 @@ pub(crate) struct OpenTextRequest {
     pub out: Option<i64>,
 }
 
+pub(crate) struct OpenReplRequest {
+    pub title: Vec<u16>,
+    pub out: Option<i64>,
+}
+
 pub(crate) struct CloseChildRequest {
     pub child_id: i64,
     pub ok: bool,
@@ -1008,6 +1052,29 @@ pub fn open_child_sized(title: &str, width: i32, height: i32) -> Option<i64> {
         SendMessageW(
             frame,
             WM_IGUI_OPEN_CHILD,
+            Some(WPARAM(0)),
+            Some(LPARAM(&mut req as *mut _ as isize)),
+        )
+    };
+    req.out
+}
+
+/// Called from the language thread. Opens a graphical REPL MDI child
+/// (split-pane Direct2D renderer with an input editor). Marshals to
+/// the GUI thread via SendMessageW; blocks until the window is live.
+pub fn open_repl_child(title: &str) -> Option<i64> {
+    let frame_raw = *FRAME_HWND.get()?;
+    let frame = HWND(frame_raw as *mut _);
+    let mut title_w: Vec<u16> = title.encode_utf16().collect();
+    title_w.push(0);
+    let mut req = OpenReplRequest {
+        title: title_w,
+        out: None,
+    };
+    unsafe {
+        SendMessageW(
+            frame,
+            WM_IGUI_OPEN_REPL,
             Some(WPARAM(0)),
             Some(LPARAM(&mut req as *mut _ as isize)),
         )

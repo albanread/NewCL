@@ -8,7 +8,7 @@
 //!            Forward S-expr, Backward S-expr, ─,
 //!            Slurp Forward, Barf Forward, Wrap, Splice, Raise
 //!   Demos — one entry per *.lisp discovered in Lisp/demos/
-//!   Tools — ledit (Ctrl+Shift+E), Log (Ctrl+Shift+L)
+//!   Tools — ledit (Ctrl+Shift+E), Log (Ctrl+Shift+L), REPL (Ctrl+Shift+R)
 //!
 //! When the language thread installs its own menu bar via
 //! `iGui.SetMenu`, the Lisp and Tools menus are re-appended to
@@ -25,6 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::ledit;
 use super::log_view;
+use super::repl_child;
 
 // ── Internal helpers ──────────────────────────────────────────────────
 
@@ -104,11 +105,13 @@ pub fn append_demos_menu(bar: HMENU, demos: &[(u16, String)]) {
     attach_popup(bar, popup, "&Demos");
 }
 
-/// Tools menu: ledit editor and log overlay.
+/// Tools menu: ledit editor, log overlay, and REPL.
 pub fn append_tools_menu(bar: HMENU) {
     let Ok(popup) = (unsafe { CreatePopupMenu() }) else { return };
-    append_item(popup, ledit::MENU_CMD_ID,    "ledit\tCtrl+Shift+E");
-    append_item(popup, log_view::MENU_CMD_ID, "Log\tCtrl+Shift+L");
+    append_item(popup, ledit::MENU_CMD_ID,       "ledit\tCtrl+Shift+E");
+    append_item(popup, log_view::MENU_CMD_ID,    "Log\tCtrl+Shift+L");
+    append_sep(popup);
+    append_item(popup, repl_child::MENU_CMD_ID,  "REPL\tCtrl+Shift+R");
     attach_popup(bar, popup, "&Tools");
 }
 
@@ -146,6 +149,7 @@ pub fn build_accelerator_table() -> Option<HACCEL> {
         ACCEL { fVirt: FVIRTKEY,                   key: 0x74_u16,    cmd: ledit::EDIT_CMD_RUN_BUFFER },
         ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: b'E' as u16, cmd: ledit::MENU_CMD_ID },
         ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: b'L' as u16, cmd: log_view::MENU_CMD_ID },
+        ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: b'R' as u16, cmd: repl_child::MENU_CMD_ID },
     ];
     unsafe { CreateAcceleratorTableW(&entries) }
         .ok()

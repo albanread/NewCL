@@ -77,34 +77,23 @@ fn kw(coord: &GcCoordinator, name: &str) -> Word {
 ///
 /// The JoinHandle for the spawned thread is stashed; `(igui-wait)`
 /// blocks the calling thread on it.
-pub extern "C-unwind" fn igui_start_shim(
-    mutator: *mut crate::mutator::MutatorState,
-    _env: u64,
-    _args: *const u64,
-    _n_args: u64,
-) -> u64 {
+/// Ensure the iGui MDI frame is running. Idempotent — safe to call even
+/// if `(igui-start)` has already been called from Lisp or if `begin` was
+/// called by the startup splash. Returns `true` on success.
+///
+/// Spawns the GUI thread and waits up to 5 s for `FRAME_HWND` to appear.
+/// The `JoinHandle` is registered in `GUI_THREAD` so `(igui-wait)` works
+/// regardless of whether the frame was started by this function or by the
+/// Lisp-level `(igui-start)` shim.
+pub(crate) fn ensure_igui_started() -> bool {
     let slot = GUI_THREAD.get_or_init(|| Mutex::new(None));
     {
         let guard = slot.lock().unwrap();
         if guard.is_some() {
-            return Word::T.raw();
+            return true; // already running
         }
     }
 
-    // Kick off the long-uptime entropy stirrer. It naps for an hour
-    // before its first stir, then hashes the young start-bit bitmap
-    // and XORs the result into the global PRNG state every hour
-    // after that. Confined to GUI mode so batch invocations never
-    // pay the (trivial) cost of a sleeping thread.
-    {
-        let m = unsafe { &*mutator };
-        crate::random::ensure_stirrer_started(m.coord().young_starts());
-    }
-
-    // window::run blocks for the lifetime of the message pump, so
-    // it has to live on its own OS thread. The Lisp thread keeps
-    // calling next-event, open-child, etc. against the still-alive
-    // FRAME_HWND.
     let handle = std::thread::spawn(|| {
         match super::run(None::<fn()>) {
             Ok(code) => {
@@ -122,23 +111,35 @@ pub extern "C-unwind" fn igui_start_shim(
         *guard = Some(handle);
     }
 
-    // Wait up to ~5s for FRAME_HWND to appear. window::run sets it
-    // shortly after the CreateWindowExW for the frame returns.
     let deadline = Instant::now() + Duration::from_secs(5);
     while FRAME_HWND.get().is_none() {
         if Instant::now() >= deadline {
-            return Word::NIL.raw();
+            return false;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    // Mark Windows-surface as active so the REPL's event-polling
-    // branch is enabled even when --windows was not passed as a CLI
-    // flag (i.e. the user called (igui-start) via --eval or the REPL
-    // rather than launching with --windows).
     crate::win_surface::set_windows_enabled(true);
+    true
+}
 
-    Word::T.raw()
+pub extern "C-unwind" fn igui_start_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    _args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    // Kick off the long-uptime entropy stirrer before the frame starts.
+    {
+        let m = unsafe { &*mutator };
+        crate::random::ensure_stirrer_started(m.coord().young_starts());
+    }
+
+    if ensure_igui_started() {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
 }
 
 /// `(igui-wait)` — block the calling Lisp thread until the GUI
@@ -531,6 +532,10 @@ fn event_to_plist(
             // Allocate the source text as a Lisp string in young.
             let s = crate::gc_string::alloc_string_in_young(m, source.as_str());
             pairs.push((kw(coord, "SOURCE"), s));
+        }
+        IGuiEvent::ReplSubmit { child_id } => {
+            pairs.push((kw(coord, "KIND"), kw(coord, "REPL-SUBMIT")));
+            pairs.push((kw(coord, "CHILD-ID"), Word::fixnum(child_id)));
         }
     }
     // Build (k1 v1 k2 v2 ...) right-to-left.
@@ -1465,5 +1470,97 @@ pub extern "C-unwind" fn text_show_caret_shim(
         Word::T.raw()
     } else {
         Word::NIL.raw()
+    }
+}
+
+// ─── REPL child shims ─────────────────────────────────────────────────────────
+
+/// `(open-repl-window title)` → child-id or NIL.
+///
+/// Opens a graphical REPL MDI child with the given title string.
+/// Returns the child-id fixnum on success, NIL on failure.
+pub extern "C-unwind" fn open_repl_window_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("open-repl-window: expected 1 arg (title), got {n_args}");
+    }
+    let Some(title) = arg_string(args, 0) else {
+        panic!("open-repl-window: title must be a string");
+    };
+    match window::open_repl_child(&title) {
+        Some(id) => Word::fixnum(id).raw(),
+        None => Word::NIL.raw(),
+    }
+}
+
+/// `(repl-output child-id text)` — append an output line to the REPL
+/// transcript. Returns T.
+pub extern "C-unwind" fn repl_output_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("repl-output: expected 2 args (child-id text), got {n_args}");
+    }
+    let Some(id) = arg_fixnum(args, 0) else {
+        panic!("repl-output: child-id must be a fixnum");
+    };
+    let Some(text) = arg_string(args, 1) else {
+        panic!("repl-output: text must be a string");
+    };
+    super::repl_child::append(id, text, super::repl_child::AppendKind::Output);
+    Word::T.raw()
+}
+
+/// `(repl-error child-id text)` — append an error line (red) to the
+/// REPL transcript. Returns T.
+pub extern "C-unwind" fn repl_error_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("repl-error: expected 2 args (child-id text), got {n_args}");
+    }
+    let Some(id) = arg_fixnum(args, 0) else {
+        panic!("repl-error: child-id must be a fixnum");
+    };
+    let Some(text) = arg_string(args, 1) else {
+        panic!("repl-error: text must be a string");
+    };
+    super::repl_child::append(id, text, super::repl_child::AppendKind::Error);
+    Word::T.raw()
+}
+
+/// `(repl-pop-input child-id)` → string or NIL.
+///
+/// Called by the worker thread after receiving a `ReplSubmit` event.
+/// Pops and returns the next pending input string for the given child,
+/// or NIL if the queue is empty.
+pub extern "C-unwind" fn repl_pop_input_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("repl-pop-input: expected 1 arg (child-id), got {n_args}");
+    }
+    let Some(id) = arg_fixnum(args, 0) else {
+        panic!("repl-pop-input: child-id must be a fixnum");
+    };
+    match super::repl_child::pop_input(id) {
+        Some(s) => {
+            let m = unsafe { &mut *mutator };
+            crate::gc_string::alloc_string_in_young(m, &s).raw()
+        }
+        None => Word::NIL.raw(),
     }
 }

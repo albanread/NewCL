@@ -30,6 +30,7 @@ pub mod kind {
     pub const SURFACE_REPLY: i64 = 12;
     pub const TICK: i64 = 13;
     pub const EVAL_BUFFER: i64 = 14;
+    pub const REPL_SUBMIT: i64 = 15;
 }
 
 /// Mouse-event sub-kinds packed into the `mouse_op` field. Each is a
@@ -129,6 +130,14 @@ pub enum IGuiEvent {
     /// automatically so every iGui app gets the shortcut.
     EvalBuffer {
         source: String,
+    },
+    /// A complete Lisp form has been submitted from the REPL input
+    /// pane. The text has already been pushed onto `PENDING_INPUTS`;
+    /// the worker thread should call `(repl-pop-input child-id)` to
+    /// retrieve it, evaluate it, then call `(repl-output child-id
+    /// text)` / `(repl-error child-id text)` with the results.
+    ReplSubmit {
+        child_id: i64,
     },
 }
 
@@ -242,7 +251,8 @@ fn matches_filter(ev: &IGuiEvent, filter: &HashSet<i64>) -> bool {
         | IGuiEvent::Resize { child_id, .. }
         | IGuiEvent::Close { child_id }
         | IGuiEvent::DpiChange { child_id, .. }
-        | IGuiEvent::Tick { child_id, .. } => filter.contains(child_id),
+        | IGuiEvent::Tick { child_id, .. }
+        | IGuiEvent::ReplSubmit { child_id } => filter.contains(child_id),
     }
 }
 
@@ -260,7 +270,8 @@ fn matches_target(ev: &IGuiEvent, target: i64) -> bool {
         | IGuiEvent::Resize { child_id, .. }
         | IGuiEvent::Close { child_id }
         | IGuiEvent::DpiChange { child_id, .. }
-        | IGuiEvent::Tick { child_id, .. } => *child_id == target,
+        | IGuiEvent::Tick { child_id, .. }
+        | IGuiEvent::ReplSubmit { child_id } => *child_id == target,
     }
 }
 

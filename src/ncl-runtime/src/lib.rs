@@ -91,6 +91,7 @@ pub use igui::lisp_shims::{
     text_newline_shim, text_reset_pen_shim, text_scroll_up_shim,
     text_set_cursor_shim, text_set_pen_shim, text_show_caret_shim,
     text_write_char_shim, text_write_shim,
+    open_repl_window_shim, repl_output_shim, repl_error_shim, repl_pop_input_shim,
 };
 pub use audio::{
     audio_abc_play_shim, audio_abc_stop_shim, audio_beep_shim, audio_blip_shim,

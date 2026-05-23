@@ -25,6 +25,7 @@ fn usage() {
     eprintln!("                       suppressed. Surfaces reader, macroexpand, and compile errors.");
     eprintln!("  --repl,  -r          enter the interactive REPL (default if no flags given)");
     eprintln!("  --lean,  -L          start with core only (no CLOS, no Library/init.lisp)");
+    eprintln!("  --opt-level, -O <n>  JIT optimisation level 0..3 (default 2 = -O2)");
     eprintln!("  --windows, -W        enable the Windows surface: thread 0 runs a Win32");
     eprintln!("                       message pump, Lisp runs on a worker thread, and");
     eprintln!("                       (windows-enabled-p) is T. Without this flag the");
@@ -64,6 +65,28 @@ fn main() -> ExitCode {
     if raw_args.iter().any(|a| a == "--help" || a == "-h") {
         usage();
         return ExitCode::SUCCESS;
+    }
+
+    // --opt-level N: set JIT optimisation level before the first
+    // compilation. Scanned here (before session creation) so it
+    // takes effect from the very first defun in Library/init.lisp.
+    {
+        let mut i = 0;
+        while i < raw_args.len() {
+            if (raw_args[i] == "--opt-level" || raw_args[i] == "-O") && i + 1 < raw_args.len() {
+                match raw_args[i + 1].parse::<u32>() {
+                    Ok(n) => ncl_llvm::set_opt_level(n),
+                    Err(_) => {
+                        eprintln!("ncl: --opt-level requires an integer 0..3");
+                        usage();
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
     }
 
     // --windows: thread 0 becomes the Win32 UI thread (message pump),
@@ -187,6 +210,17 @@ fn lisp_main(raw_args: Vec<String>) -> ExitCode {
     // depend on CLOS — so library bootstrap is suppressed by choice,
     // not by absence).
     if !lean {
+        // ── Startup splash ───────────────────────────────────────────────
+        // In --windows mode open the iGui loading bar before the Library
+        // starts JITting.  Total form count is pre-baked from profiling:
+        //   core ≈ 197  +  clos ≈ 215  +  Library (no xp) ≈ 393  =  805
+        #[cfg(windows)]
+        let with_splash = ncl_runtime::win_surface::windows_enabled();
+        #[cfg(windows)]
+        if with_splash {
+            ncl_runtime::igui::splash::begin(805);
+        }
+
         if let Some(library_dir) = find_library_dir() {
             let setup = format!(
                 "(setq *load-path* (cons \"{}\" *load-path*))",
@@ -208,6 +242,12 @@ fn lisp_main(raw_args: Vec<String>) -> ExitCode {
                     ncl_compiler::Session::drain_startup_timing("Library (top-10 slowest)", lib_ms);
                 }
             }
+        }
+
+        // Close the splash now that the Library is ready.
+        #[cfg(windows)]
+        if with_splash {
+            ncl_runtime::igui::splash::finish();
         }
     }
 
@@ -296,6 +336,11 @@ fn lisp_main(raw_args: Vec<String>) -> ExitCode {
             }
             "--windows" | "-W" => {
                 // Handled in main() before session creation; accept here.
+            }
+            "--opt-level" | "-O" => {
+                // Already applied in the main() early scan; just consume
+                // the value token so the unknown-arg arm doesn't see it.
+                let _ = args.next();
             }
             other => {
                 eprintln!("ncl: unknown argument '{other}'");

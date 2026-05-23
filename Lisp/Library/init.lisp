@@ -35,7 +35,7 @@
 (require 'boole)                         ; boole-* constants + boole fn + derived logops
 (require 'bits)                          ; byte/ldb/dpb/mask-field/deposit-field
 (require 'hash-tables)                   ; with-hash-table-iterator, sxhash
-(require 'xp)                            ; XP pretty-printer (Waters, MIT 1991)
+;; xp is loaded on demand — see lazy stubs below
 (require 'strings)                       ; full string library: trim, cmp, make-string, probe-file
 (require 'describe)                      ; (describe obj) — REPL inspection
 (require 'advice)                        ; (advise fn args body), (unadvise fn)
@@ -57,6 +57,32 @@
 ;;; Example user-side hook: load a personal utilities module if
 ;;; present. Uncomment and rename to taste.
 ;; (require 'my-utils)
+
+;;; ─── Lazy-load stubs ─────────────────────────────────────────────────────
+;;; xp.lisp is NOT auto-loaded at startup (it contributes ~45% of JIT time).
+;;; These thin stubs demand-load it on first call to any pprint entry point.
+;;; After (require 'xp) runs, every symbol in this block is redefined by xp
+;;; and subsequent calls go directly to the real implementations.
+
+(defun pprint (object &optional stream)
+  "Pretty-print OBJECT.  Loads xp on first call."
+  (require 'xp)
+  (pprint object stream))
+
+(defun pprint-fill (stream list &optional (colon? t) atsign?)
+  "Fill-style pretty-print.  Loads xp on first call."
+  (require 'xp)
+  (pprint-fill stream list colon? atsign?))
+
+(defun pprint-linear (stream list &optional (colon? t) atsign?)
+  "Linear-style pretty-print.  Loads xp on first call."
+  (require 'xp)
+  (pprint-linear stream list colon? atsign?))
+
+(defun pprint-tabular (stream list &optional (colon? t) atsign? tabsize)
+  "Tabular-style pretty-print.  Loads xp on first call."
+  (require 'xp)
+  (pprint-tabular stream list colon? atsign? tabsize))
 
 ;;; A user can verify the loader picked this file up by checking
 ;;; *modules* and *load-path* at the REPL.

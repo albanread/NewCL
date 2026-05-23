@@ -24,7 +24,8 @@
       hello-igui     simple panel with shapes
       shapes         exercise all primitive drawing ops
       buttons        clickable buttons
-      gui-repl       in-frame REPL
+      gui-repl       in-frame REPL (text-view based)
+      native-repl    native graphical REPL (expeditor-style, Rust-implemented)
       heap-monitor   live GC bars (worker thread polls (gc-stats))
 
 .PARAMETER Lean
@@ -97,8 +98,11 @@ if ($Lean) {
     $args += '--lean'
 }
 
-# Always start the iGui frame so the demo can open child windows.
-$args += @('--eval', '(igui-start)')
+# --windows enables the iGui surface before Library loading, which lets
+# the startup splash bar run.  The iGui frame is started lazily inside
+# splash::begin() via ensure_igui_started(), so (igui-start) is a no-op
+# by the time demo code or the REPL runs.
+$args += '--windows'
 
 # User-supplied -Eval forms go in next. PowerShell strips embedded
 # double-quotes when passing to native processes, so wrap each form

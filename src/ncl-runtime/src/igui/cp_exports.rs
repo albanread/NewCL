@@ -1257,6 +1257,10 @@ fn write_event(
             // see only the kind tag.
             k = kind::EVAL_BUFFER;
         }
+        IGuiEvent::ReplSubmit { child_id } => {
+            k = kind::REPL_SUBMIT;
+            child = child_id;
+        }
     }
 
     unsafe {

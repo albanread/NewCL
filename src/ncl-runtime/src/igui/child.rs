@@ -43,11 +43,11 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefMDIChildProcW, DefWindowProcW, GetClientRect, GetParent,
+    CreateWindowExW, DefMDIChildProcW, DefWindowProcW, DestroyWindow, GetClientRect, GetParent,
     GetWindowLongPtrW, IsWindow, IsWindowVisible, KillTimer, LoadCursorW, RegisterClassExW,
     SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, CREATESTRUCTW,
     GWLP_USERDATA, IDC_ARROW, MDICREATESTRUCTW, SWP_NOACTIVATE, SWP_NOZORDER,
-    WHEEL_DELTA, WINDOW_EX_STYLE, WM_CHAR, WM_DPICHANGED_AFTERPARENT, WM_ERASEBKGND,
+    WHEEL_DELTA, WINDOW_EX_STYLE, WM_CHAR, WM_CLOSE, WM_DPICHANGED_AFTERPARENT, WM_ERASEBKGND,
     WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
     WM_MBUTTONUP, WM_MDIDESTROY, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY,
     WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTEXT,
@@ -1588,6 +1588,7 @@ pub fn register_classes() -> Result<(), IGuiError> {
     super::ledit::register_class()?;
     super::log_view::register_class()?;
     super::text_view::register_class()?;
+    super::repl_child::register_class()?;
 
     Ok(())
 }
@@ -1679,6 +1680,16 @@ unsafe extern "system" fn mdi_child_wnd_proc(
                 height: ((lparam.0 >> 16) & 0xFFFF) as i64,
             });
             unsafe { DefMDIChildProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_CLOSE => {
+            // Destroy the MDI child directly instead of delegating to
+            // DefMDIChildProcW.  When this is the *last* MDI child,
+            // DefMDIChildProcW's WM_CLOSE handler cascades a WM_CLOSE to
+            // the parent frame — which closes the entire NCL window.
+            // Calling DestroyWindow ourselves skips that cascade while
+            // still triggering WM_NCDESTROY so our cleanup runs normally.
+            let _ = unsafe { DestroyWindow(hwnd) };
+            LRESULT(0)
         }
         WM_NCDESTROY => {
             if child_id != 0 {

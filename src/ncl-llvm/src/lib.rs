@@ -13,6 +13,7 @@
 //! `jit_eval` calls the entry function with `(mutator, null, 0)`.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use inkwell::AddressSpace;
 use new_asm;
@@ -54,6 +55,34 @@ fn keep_forever<T: 'static>(t: T) -> *mut T {
     let p = Box::into_raw(Box::new(t));
     KEEP_ALIVE.lock().unwrap().push(p as usize);
     p
+}
+
+// ─── JIT optimisation level ────────────────────────────────────────────────
+//
+// Default is 2 (equivalent to -O2). Set before the first compilation;
+// all subsequent JIT'd functions pick it up.  The driver exposes this
+// via `--opt-level N` (N = 0..3).
+//
+//   0 = O0  — fastest compile, unoptimised code (good for debugging IR)
+//   1 = O1  — basic opts (mem2reg, instcombine, simplifycfg)
+//   2 = O2  — standard (adds inlining, GVN, LICM, SCCP …)   ← default
+//   3 = O3  — aggressive (auto-vectorise, more unrolling, …)
+//
+// Note: MCJIT doesn't inline across module boundaries, so the main
+// wins are intra-function (mem2reg + instcombine clean up the
+// tag/untag pattern, simplifycfg removes dead fixnum-overflow paths).
+static JIT_OPT_LEVEL: AtomicU32 = AtomicU32::new(2);
+
+/// Override the JIT optimisation level. Call before the first
+/// `jit_compile_function` / `jit_eval`. Values outside 0..=3 are
+/// clamped to 3.
+pub fn set_opt_level(level: u32) {
+    JIT_OPT_LEVEL.store(level.min(3), Ordering::Relaxed);
+}
+
+/// Current JIT optimisation level (0..=3).
+pub fn opt_level() -> u32 {
+    JIT_OPT_LEVEL.load(Ordering::Relaxed)
 }
 
 // -- Phase 2 smoke functions ------------------------------------------------
@@ -482,12 +511,18 @@ fn build_lisp_function(
             .expect("initialize_native");
         let triple = TargetMachine::get_default_triple();
         if let Ok(target) = Target::from_triple(&triple) {
+            let dump_opt = match JIT_OPT_LEVEL.load(Ordering::Relaxed) {
+                0 => OptimizationLevel::None,
+                1 => OptimizationLevel::Less,
+                2 => OptimizationLevel::Default,
+                _ => OptimizationLevel::Aggressive,
+            };
             let tm = target
                 .create_target_machine(
                     &triple,
                     "generic",
                     "",
-                    OptimizationLevel::None,
+                    dump_opt,
                     RelocMode::PIC,
                     CodeModel::Default,
                 )
@@ -555,6 +590,9 @@ fn build_engine_and_get_fn_addr(
             std::mem::size_of::<LLVMMCJITCompilerOptions>(),
         );
     }
+    // LLVMInitializeMCJITCompilerOptions leaves OptLevel at 0; apply our
+    // configured level (default 2 = -O2).
+    opts.OptLevel = JIT_OPT_LEVEL.load(Ordering::Relaxed);
     opts.MCJMM = unsafe { jit_mm::make_mm() };
 
     let mut engine: LLVMExecutionEngineRef = std::ptr::null_mut();
