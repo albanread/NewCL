@@ -132,6 +132,12 @@ pub extern "C-unwind" fn igui_start_shim(
         std::thread::sleep(Duration::from_millis(10));
     }
 
+    // Mark Windows-surface as active so the REPL's event-polling
+    // branch is enabled even when --windows was not passed as a CLI
+    // flag (i.e. the user called (igui-start) via --eval or the REPL
+    // rather than launching with --windows).
+    crate::win_surface::set_windows_enabled(true);
+
     Word::T.raw()
 }
 

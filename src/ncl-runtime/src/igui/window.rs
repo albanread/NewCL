@@ -630,8 +630,20 @@ unsafe extern "system" fn frame_wnd_proc(
                                     let path_clone = path.clone();
                                     // Load into ledit so the user can read/edit it.
                                     super::ledit::load_content(hwnd, mdi, text.clone(), Some(path_clone));
-                                    // Fire EvalBuffer so the demo runs immediately.
-                                    channels::push(IGuiEvent::EvalBuffer { source: text });
+                                    // Append the conventional entry-point call and fire
+                                    // EvalBuffer so the demo both defines its functions
+                                    // AND runs immediately without the user having to
+                                    // press F5 again.
+                                    let stem = path
+                                        .file_stem()
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let run_call = format!(
+                                        "(handler-case (run-{stem}) (error (c) (format t \"[demo] ~A~%\" c)))"
+                                    );
+                                    let source = format!("{}\n{}", text, run_call);
+                                    channels::push(IGuiEvent::EvalBuffer { source });
                                 }
                                 Err(e) => {
                                     eprintln!("[demos] cannot read demo file: {e}");

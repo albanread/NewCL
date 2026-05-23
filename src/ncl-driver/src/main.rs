@@ -295,7 +295,10 @@ fn lisp_main(raw_args: Vec<String>) -> ExitCode {
         // `--windows` was already consumed by main() to set up the UI
         // thread, but lisp_main still needs to know about it so the
         // REPL can interleave iGui-mailbox draining with stdin reads.
-        let with_windows = std::env::args().any(|a| a == "--windows" || a == "-W");
+        // Also poll iGui when igui-start was called (sets windows_enabled
+        // without --windows on the command line).
+        let with_windows = std::env::args().any(|a| a == "--windows" || a == "-W")
+            || ncl_runtime::win_surface::windows_enabled();
         return run_repl(&mut session, with_windows);
     }
 
