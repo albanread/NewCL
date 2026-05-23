@@ -11,6 +11,11 @@ path = "src/main.rs"
 # Page-heap is the one and only GC backend. The gc-page-heap feature
 # propagates to every dependent crate in one shot.
 default = ["gc-page-heap"]
+# gui-app: compiled into the release package.
+#   * sets subsystem = WINDOWS so no console window ever appears
+#   * makes --windows the default (no explicit flag needed)
+#   * embeds a Win32 application manifest (DPI-aware, Vista+ compat)
+gui-app = []
 gc-page-heap = [
     "ncl-runtime/gc-page-heap",
     "ncl-cl/gc-page-heap",
@@ -19,6 +24,12 @@ gc-page-heap = [
     "ncl-loader/gc-page-heap",
     "ncl-reader/gc-page-heap",
 ]
+
+[build-dependencies]
+# Embeds a Win32 application manifest (DPI awareness, OS compatibility
+# declarations). Only active when the `gui-app` feature is set; the
+# crate is a no-op on non-Windows platforms.
+embed-manifest = { version = "1", optional = false }
 
 [dependencies]
 ncl-cl = { path = "../ncl-cl", default-features = false }

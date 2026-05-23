@@ -31,6 +31,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "embed-manifest"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94cdc65b1cf9e871453ce2f86f5aaec24ff2eaa36a1fa3e02e441dddc3613b99"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -182,6 +188,7 @@ dependencies = [
 name = "ncl-driver"
 version = "0.0.0"
 dependencies = [
+ "embed-manifest",
  "ncl-cl",
  "ncl-compiler",
  "ncl-ir",

@@ -1,3 +1,10 @@
+// When compiled as the GUI release package (`--features gui-app`):
+//   * WINDOWS subsystem → the OS never attaches a console window
+//   * --windows surface is implied without an explicit flag
+// In debug / plain console builds this attribute is absent and the
+// binary behaves exactly as before.
+#![cfg_attr(feature = "gui-app", windows_subsystem = "windows")]
+
 use std::cell::Cell;
 use std::env;
 use std::fs;
@@ -91,6 +98,13 @@ fn main() -> ExitCode {
 
     // --windows: thread 0 becomes the Win32 UI thread (message pump),
     // Lisp eval moves to a worker thread. See docs/WINDOWS_FFI.md.
+    //
+    // In the GUI release build (`gui-app` feature) there is no console,
+    // so we always start the windows surface regardless of flags.
+    // In the console build the flag must be explicit.
+    #[cfg(feature = "gui-app")]
+    let want_windows = true;
+    #[cfg(not(feature = "gui-app"))]
     let want_windows = raw_args.iter().any(|a| a == "--windows" || a == "-W");
 
     if want_windows {
