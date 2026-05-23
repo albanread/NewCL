@@ -28,6 +28,9 @@ use super::ledit;
 use super::log_view;
 use super::repl_child;
 
+/// Help → Documentation: spawn doc-crate.exe against the bundled docs/.
+pub const HELP_CMD_DOCS: u16 = 0x5000;
+
 // ── Internal helpers ──────────────────────────────────────────────────
 
 fn append_item(popup: HMENU, id: u16, label: &str) {
@@ -118,7 +121,18 @@ pub fn append_tools_menu(bar: HMENU) {
     attach_popup(bar, popup, "&Tools");
 }
 
-/// Build the default menu bar: File | Edit | Lisp | [Demos] | Tools.
+/// Help menu — Documentation (opens doc-crate.exe against docs/).
+pub fn append_help_menu(bar: HMENU) {
+    let Ok(popup) = (unsafe { CreatePopupMenu() }) else { return };
+    let mut w: Vec<u16> = "&Documentation\tF1".encode_utf16().collect();
+    w.push(0);
+    let _ = unsafe { AppendMenuW(popup, MF_STRING, HELP_CMD_DOCS as usize, PCWSTR(w.as_ptr())) };
+    let mut t: Vec<u16> = "&Help".encode_utf16().collect();
+    t.push(0);
+    let _ = unsafe { AppendMenuW(bar, MF_POPUP, popup.0 as usize, PCWSTR(t.as_ptr())) };
+}
+
+/// Build the default menu bar: File | Edit | Lisp | [Demos] | Tools | Help.
 /// `demos` carries (id, display_name) pairs produced by the frame's
 /// demo-discovery pass.
 pub fn build_default_menu_bar(demos: &[(u16, String)]) -> Option<HMENU> {
@@ -128,6 +142,7 @@ pub fn build_default_menu_bar(demos: &[(u16, String)]) -> Option<HMENU> {
     append_lisp_menu(bar);
     append_demos_menu(bar, demos);
     append_tools_menu(bar);
+    append_help_menu(bar);
     Some(bar)
 }
 
@@ -156,6 +171,8 @@ pub fn build_accelerator_table() -> Option<HACCEL> {
         ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: b'L' as u16, cmd: log_view::MENU_CMD_ID },
         ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: b'R' as u16, cmd: repl_child::MENU_CMD_ID },
         ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: b'X' as u16, cmd: crash_view::MENU_CMD_ID },
+        // Help
+        ACCEL { fVirt: FVIRTKEY,                     key: 0x70_u16,    cmd: HELP_CMD_DOCS },
     ];
     unsafe { CreateAcceleratorTableW(&entries) }
         .ok()

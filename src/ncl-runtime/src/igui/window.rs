@@ -365,6 +365,82 @@ pub(crate) fn gui_thread_id() -> Option<u32> {
     GUI_THREAD_ID.get().copied()
 }
 
+// ── Help / documentation launcher ─────────────────────────────────────────
+
+/// Locate `doc-crate.exe` and the bundled `docs/` directory, then
+/// spawn the documentation browser.
+///
+/// Search order for each asset:
+///
+/// **doc-crate.exe**
+///   1. `<exe_dir>/doc-crate.exe`  — production installation
+///   2. `DOC_CRATE_EXE` env var   — developer override
+///
+/// **docs/**
+///   1. `<exe_dir>/docs/`         — production installation
+///   2. `<exe_dir>/../../docs/`   — dev build (exe is under target/debug/)
+///   3. `CARGO_MANIFEST_DIR/../../docs/` — `cargo run` from anywhere
+pub(crate) fn open_docs() {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+
+    // ── locate doc-crate.exe ──────────────────────────────────────
+    let doc_exe: Option<std::path::PathBuf> = exe_dir
+        .as_ref()
+        .map(|d| d.join("doc-crate.exe"))
+        .filter(|p| p.is_file())
+        .or_else(|| {
+            std::env::var("DOC_CRATE_EXE")
+                .ok()
+                .map(std::path::PathBuf::from)
+                .filter(|p| p.is_file())
+        });
+
+    let Some(doc_exe) = doc_exe else {
+        eprintln!(
+            "[docs] doc-crate.exe not found next to this executable.\n\
+             Copy doc-crate.exe alongside ncl.exe, or set DOC_CRATE_EXE."
+        );
+        return;
+    };
+
+    // ── locate docs/ directory ────────────────────────────────────
+    let docs_dir: Option<std::path::PathBuf> = exe_dir
+        .as_ref()
+        .map(|d| d.join("docs"))
+        .filter(|p| p.is_dir())
+        .or_else(|| {
+            // dev: exe is in target/debug/ or target/release/
+            exe_dir.as_ref()
+                .and_then(|d| d.ancestors().nth(2))
+                .map(|root| root.join("docs"))
+                .filter(|p| p.is_dir())
+        })
+        .or_else(|| {
+            // cargo run — CARGO_MANIFEST_DIR is ncl-runtime; go up 2
+            // to reach the repo root where docs/ lives.
+            let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            manifest.ancestors().nth(2).map(|r| r.join("docs")).filter(|p| p.is_dir())
+        });
+
+    let Some(docs_dir) = docs_dir else {
+        eprintln!(
+            "[docs] docs/ directory not found next to this executable.\n\
+             Expected a docs/ folder alongside ncl.exe."
+        );
+        return;
+    };
+
+    // ── spawn ─────────────────────────────────────────────────────
+    if let Err(e) = std::process::Command::new(&doc_exe)
+        .arg(&docs_dir)
+        .spawn()
+    {
+        eprintln!("[docs] failed to launch {}: {e}", doc_exe.display());
+    }
+}
+
 /// Public entry point. Opens the iGui frame, sets up the MDI client,
 /// runs the Win32 message pump until `WM_QUIT`, and returns the quit
 /// code. If `worker` is provided, it is spawned on a background
@@ -722,6 +798,10 @@ unsafe extern "system" fn frame_wnd_proc(
                 if mdi.0 as isize != 0 {
                     super::crash_view::open(hwnd, mdi);
                 }
+                return LRESULT(0);
+            }
+            if cmd_id == super::tools_menu::HELP_CMD_DOCS {
+                open_docs();
                 return LRESULT(0);
             }
             // Edit-menu commands: forward to the active MDI child.
