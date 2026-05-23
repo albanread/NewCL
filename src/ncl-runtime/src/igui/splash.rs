@@ -143,7 +143,7 @@ fn draw_splash(child_id: i64, done: u32, total: u32, module: &str) {
     // ── Title ───────────────────────────────────────────────────────────
     batch_mod::push(SurfaceCmd::DrawTextRun {
         run: TextRun {
-            text:      "NewCormanLisp".to_string(),
+            text:      "NCL".to_string(),
             origin:    Point { x: 20.0, y: 10.0 },
             family:    "Segoe UI".to_string(),
             size:      16.0,

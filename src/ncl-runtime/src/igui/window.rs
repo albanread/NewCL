@@ -489,7 +489,7 @@ where
         CreateWindowExW(
             WS_EX_APPWINDOW,
             FRAME_CLASS,
-            w!("NewCL"),
+            w!("NCL"),
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,

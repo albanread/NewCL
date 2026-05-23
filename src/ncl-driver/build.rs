@@ -13,6 +13,6 @@
 
 fn main() {
     #[cfg(feature = "gui-app")]
-    embed_manifest::embed_manifest(embed_manifest::new_manifest("NewCormanLisp"))
+    embed_manifest::embed_manifest(embed_manifest::new_manifest("NCL"))
         .expect("failed to embed application manifest");
 }

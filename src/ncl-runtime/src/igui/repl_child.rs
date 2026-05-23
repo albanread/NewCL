@@ -234,7 +234,7 @@ pub fn register_class() -> Result<(), IGuiError> {
 /// Allocates a fresh child_id and fires up the window immediately.
 pub fn open(mdi_client: HWND) {
     let child_id = registry::allocate_child_id();
-    let mut title_w: Vec<u16> = "NewCormanLisp REPL"
+    let mut title_w: Vec<u16> = "NCL REPL"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
@@ -330,7 +330,7 @@ impl ReplState {
             transcript: vec![TranscriptEntry {
                 kind: AppendKind::Banner,
                 text: format!(
-                    "NewCormanLisp {}  —  graphical REPL",
+                    "NCL {}  —  REPL",
                     env!("CARGO_PKG_VERSION")
                 ),
             }],

@@ -66,7 +66,7 @@ fn main() -> ExitCode {
     // `ncl --version`, `ncl --lean --version`, `ncl -e foo -V` all
     // print version-and-exit before any session work.
     if raw_args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("NewCormanLisp {VERSION}");
+        println!("NCL {VERSION}");
         return ExitCode::SUCCESS;
     }
     if raw_args.iter().any(|a| a == "--help" || a == "-h") {
@@ -683,7 +683,7 @@ fn run_gui_event_loop(session: &mut ncl_compiler::Session) -> ExitCode {
 fn run_repl(session: &mut ncl_compiler::Session, with_windows: bool) -> ExitCode {
     install_repl_panic_hook();
 
-    println!("NewCormanLisp {VERSION} REPL");
+    println!("NCL {VERSION} REPL");
     println!("  (exit) or Ctrl+D / Ctrl+Z to leave");
     println!();
 
