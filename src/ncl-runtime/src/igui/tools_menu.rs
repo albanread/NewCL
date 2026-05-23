@@ -23,6 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     FCONTROL, FSHIFT, FVIRTKEY, HACCEL, HMENU, MF_POPUP, MF_SEPARATOR, MF_STRING,
 };
 
+use super::crash_view;
 use super::ledit;
 use super::log_view;
 use super::repl_child;
@@ -105,13 +106,15 @@ pub fn append_demos_menu(bar: HMENU, demos: &[(u16, String)]) {
     attach_popup(bar, popup, "&Demos");
 }
 
-/// Tools menu: ledit editor, log overlay, and REPL.
+/// Tools menu: ledit editor, log overlay, REPL, and crash dump.
 pub fn append_tools_menu(bar: HMENU) {
     let Ok(popup) = (unsafe { CreatePopupMenu() }) else { return };
     append_item(popup, ledit::MENU_CMD_ID,       "ledit\tCtrl+Shift+E");
     append_item(popup, log_view::MENU_CMD_ID,    "Log\tCtrl+Shift+L");
     append_sep(popup);
     append_item(popup, repl_child::MENU_CMD_ID,  "REPL\tCtrl+Shift+R");
+    append_sep(popup);
+    append_item(popup, crash_view::MENU_CMD_ID,  "\u{03BB} Crash dump\tCtrl+Shift+X");
     attach_popup(bar, popup, "&Tools");
 }
 
@@ -139,17 +142,20 @@ pub fn build_default_menu_bar(demos: &[(u16, String)]) -> Option<HMENU> {
 /// | F5               | Run Buffer        |
 /// | Ctrl+Shift+E     | Open ledit        |
 /// | Ctrl+Shift+L     | Open log view     |
+/// | Ctrl+Shift+R     | Open REPL         |
+/// | Ctrl+Shift+X     | Open crash dump   |
 pub fn build_accelerator_table() -> Option<HACCEL> {
     // VK_F5 = 0x74
     let entries = [
-        ACCEL { fVirt: FCONTROL | FVIRTKEY,        key: b'N' as u16, cmd: ledit::FILE_CMD_NEW },
-        ACCEL { fVirt: FCONTROL | FVIRTKEY,        key: b'O' as u16, cmd: ledit::FILE_CMD_OPEN },
-        ACCEL { fVirt: FCONTROL | FVIRTKEY,        key: b'S' as u16, cmd: ledit::FILE_CMD_SAVE },
+        ACCEL { fVirt: FCONTROL | FVIRTKEY,          key: b'N' as u16, cmd: ledit::FILE_CMD_NEW },
+        ACCEL { fVirt: FCONTROL | FVIRTKEY,          key: b'O' as u16, cmd: ledit::FILE_CMD_OPEN },
+        ACCEL { fVirt: FCONTROL | FVIRTKEY,          key: b'S' as u16, cmd: ledit::FILE_CMD_SAVE },
         ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: b'S' as u16, cmd: ledit::FILE_CMD_SAVE_AS },
-        ACCEL { fVirt: FVIRTKEY,                   key: 0x74_u16,    cmd: ledit::EDIT_CMD_RUN_BUFFER },
+        ACCEL { fVirt: FVIRTKEY,                     key: 0x74_u16,    cmd: ledit::EDIT_CMD_RUN_BUFFER },
         ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: b'E' as u16, cmd: ledit::MENU_CMD_ID },
         ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: b'L' as u16, cmd: log_view::MENU_CMD_ID },
         ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: b'R' as u16, cmd: repl_child::MENU_CMD_ID },
+        ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: b'X' as u16, cmd: crash_view::MENU_CMD_ID },
     ];
     unsafe { CreateAcceleratorTableW(&entries) }
         .ok()

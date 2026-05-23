@@ -113,8 +113,20 @@ fn run_without_windows_surface(raw_args: Vec<String>) -> ExitCode {
 /// runs the Win32 message pump. When the worker finishes, it posts
 /// `WM_QUIT` to thread 0; the pump unblocks and we return the
 /// worker's exit code.
+///
+/// Crash recovery: a VEH installed at startup intercepts fatal SEH
+/// exceptions on the worker thread (access violations etc.) and
+/// redirects to ExitThread so the supervisor can detect and display
+/// the crash without taking down the whole process.  Rust panics are
+/// caught by `catch_unwind`.  On either kind of crash the frame stays
+/// alive showing the dump — the user closes it manually.
 fn run_with_windows_surface(raw_args: Vec<String>) -> ExitCode {
     use std::sync::mpsc;
+
+    // Install the VEH crash handler BEFORE spawning the worker so the
+    // handler is in the chain when the very first JIT code runs.
+    #[cfg(windows)]
+    ncl_runtime::igui::crash_handler::install();
 
     // Flip the flag BEFORE spawning the worker so init.lisp sees it.
     ncl_runtime::win_surface::set_windows_enabled(true);
@@ -134,12 +146,51 @@ fn run_with_windows_surface(raw_args: Vec<String>) -> ExitCode {
 
     let (tx, rx) = mpsc::sync_channel::<ExitCode>(1);
 
-    let _worker = match std::thread::Builder::new()
+    let worker = match std::thread::Builder::new()
         .name("ncl-lisp-worker".into())
         .spawn(move || {
-            let code = lisp_main(raw_args);
-            let _ = tx.send(code);
-            ncl_runtime::win_surface::post_quit_to_ui_thread();
+            // Register this thread so the VEH only intercepts our
+            // worker, not the UI thread.
+            #[cfg(windows)]
+            ncl_runtime::igui::crash_handler::register_worker_thread();
+
+            // Wrap in catch_unwind to catch Rust panics before they
+            // unwind into JIT frames (which have no unwind tables).
+            let result = std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| lisp_main(raw_args))
+            );
+
+            #[cfg(windows)]
+            ncl_runtime::igui::crash_handler::unregister_worker_thread();
+
+            match result {
+                Ok(code) => {
+                    // Clean exit: report the code and shut the UI down.
+                    let _ = tx.send(code);
+                    ncl_runtime::win_surface::post_quit_to_ui_thread();
+                }
+                Err(payload) => {
+                    // Rust panic: format and push to the crash view, then
+                    // leave the frame alive so the user can read the report.
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .map(String::from)
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "<unknown Rust panic>".to_string());
+                    let dump = format!(
+                        "kind:    Rust panic (worker thread)\nmessage: {msg}\n\n\
+                         The Lisp worker thread has been terminated.  The session\n\
+                         is no longer available — close the window and restart.\n"
+                    );
+                    #[cfg(windows)]
+                    ncl_runtime::igui::crash_view::push(dump);
+                    #[cfg(not(windows))]
+                    eprintln!("ncl: {dump}");
+                    // Do NOT post WM_QUIT — leave the frame alive so the
+                    // user can read the crash view before closing.
+                }
+            }
         }) {
         Ok(h) => h,
         Err(e) => {
@@ -148,11 +199,31 @@ fn run_with_windows_surface(raw_args: Vec<String>) -> ExitCode {
         }
     };
 
-    // Thread 0 takes over the pump. Returns when the worker posts WM_QUIT.
+    // Supervisor thread: watches the worker for SEH-caught crashes.
+    // If the worker exited via ExitThread (from the VEH thunk), the
+    // Rust catch_unwind never ran so the Rust-panic branch above was
+    // skipped; we detect it here via take_dump().
+    std::thread::Builder::new()
+        .name("ncl-crash-supervisor".into())
+        .spawn(move || {
+            // Wait for the worker to finish (or crash).
+            let _ = worker.join();
+            // Check whether the VEH captured an SEH dump.
+            #[cfg(windows)]
+            if let Some(dump) = ncl_runtime::igui::crash_handler::take_dump() {
+                let text = ncl_runtime::igui::crash_handler::format_dump(&dump);
+                ncl_runtime::igui::crash_view::push(text);
+                // Frame stays alive; WM_QUIT is NOT posted here so the
+                // user can read the crash view before closing.
+            }
+        })
+        .ok(); // Failure to spawn supervisor is non-fatal.
+
+    // Thread 0 takes over the pump. Returns when the worker posts WM_QUIT
+    // (clean exit path) or the user closes the frame.
     ncl_runtime::win_surface::run_message_pump();
 
-    // Read back the worker's exit code (sent before the WM_QUIT post,
-    // so this never blocks).
+    // Read back the worker's exit code if available (sent on clean exit).
     rx.try_recv().unwrap_or(ExitCode::SUCCESS)
 }
 

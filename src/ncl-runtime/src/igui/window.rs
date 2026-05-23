@@ -80,6 +80,9 @@ const WM_IGUI_TEXT_FLUSH: u32 = WM_USER + 8;
 /// Open a REPL MDI child. Like WM_IGUI_OPEN_TEXT but uses the
 /// REPL class (split-pane D2D renderer with input editor).
 const WM_IGUI_OPEN_REPL: u32 = WM_USER + 9;
+/// Posted (from any thread) when a new crash dump is available.
+/// Frame WndProc opens/invalidates the crash_view MDI child.
+pub(super) const WM_IGUI_CRASH_FLUSH: u32 = WM_USER + 10;
 /// Sent from the language thread to a render-host HWND to install
 /// or clear a Win32 timer driving `EvTick` events.
 /// `wparam` carries the interval in ms (0 = clear), `lparam` is unused.
@@ -219,9 +222,26 @@ unsafe extern "system" fn mdi_bg_proc(
     }
 }
 
-fn mdi_client_hwnd() -> Option<HWND> {
+pub(super) fn mdi_client_hwnd() -> Option<HWND> {
     let raw = MDI_CLIENT.lock().ok()?;
     raw.map(|r| HWND(r as *mut _))
+}
+
+/// Post WM_IGUI_CRASH_FLUSH to the frame from any thread.  Called
+/// by crash_view::push() after a new dump is appended.
+pub(super) fn post_crash_flush() {
+    let Some(frame_raw) = super::cp_exports::FRAME_HWND.get() else {
+        return;
+    };
+    let frame = HWND(*frame_raw as *mut _);
+    let _ = unsafe {
+        PostMessageW(
+            Some(frame),
+            WM_IGUI_CRASH_FLUSH,
+            WPARAM(0),
+            LPARAM(0),
+        )
+    };
 }
 
 /// Scan the Lisp/demos/ directory for *.lisp files and return
@@ -383,6 +403,7 @@ where
         return Err(IGuiError::Win32("RegisterClassExW (frame) returned 0".into()));
     }
     child::register_classes()?;
+    super::crash_view::register_class()?;
 
     // Renderer comes up before any window so child WM_NCCREATE can build
     // its swap chain immediately.
@@ -605,6 +626,10 @@ unsafe extern "system" fn frame_wnd_proc(
             }
             LRESULT(0)
         }
+        WM_IGUI_CRASH_FLUSH => {
+            super::crash_view::flush_on_gui_thread(hwnd);
+            LRESULT(0)
+        }
         WM_IGUI_MDI_VERB => {
             // wparam high byte = verb tag (avoid having to allocate
             // a request struct).
@@ -690,6 +715,12 @@ unsafe extern "system" fn frame_wnd_proc(
             if cmd_id == super::repl_child::MENU_CMD_ID {
                 if mdi.0 as isize != 0 {
                     super::repl_child::open(mdi);
+                }
+                return LRESULT(0);
+            }
+            if cmd_id == super::crash_view::MENU_CMD_ID {
+                if mdi.0 as isize != 0 {
+                    super::crash_view::open(hwnd, mdi);
                 }
                 return LRESULT(0);
             }

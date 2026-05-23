@@ -32,6 +32,8 @@
 pub mod batch;
 pub mod channels;
 mod child;
+pub mod crash_handler;
+pub mod crash_view;
 pub mod cp_exports;
 mod cursor;
 pub mod splash;
