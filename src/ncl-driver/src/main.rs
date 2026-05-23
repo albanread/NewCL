@@ -138,6 +138,9 @@ fn run_with_windows_surface(raw_args: Vec<String>) -> ExitCode {
 /// stdlib + Library/init.lisp, processes `--eval` / `--load` flags,
 /// optionally runs the REPL.
 fn lisp_main(raw_args: Vec<String>) -> ExitCode {
+    let startup_timing = std::env::var("NCL_STARTUP_TIMING").is_ok();
+    let t_total = std::time::Instant::now();
+
     // Bare `ncl` invocation drops into the REPL with the stdlib loaded.
     let want_repl = raw_args.is_empty()
         || raw_args.iter().any(|a| a == "--repl" || a == "-r");
@@ -194,9 +197,15 @@ fn lisp_main(raw_args: Vec<String>) -> ExitCode {
             }
             let init_path = format!("{library_dir}/init.lisp");
             if std::path::Path::new(&init_path).exists() {
+                let t_lib = std::time::Instant::now();
                 let load = format!("(load \"{}\")", init_path.replace('\\', "/"));
                 if let Err(e) = session.eval(&load) {
                     eprintln!("ncl: warning: Library/init.lisp failed: {e}");
+                }
+                if startup_timing {
+                    let lib_ms = t_lib.elapsed().as_millis();
+                    eprintln!("[timing] Library/init.lisp: {}ms", lib_ms);
+                    ncl_compiler::Session::drain_startup_timing("Library (top-10 slowest)", lib_ms);
                 }
             }
         }
@@ -213,12 +222,17 @@ fn lisp_main(raw_args: Vec<String>) -> ExitCode {
                     usage();
                     return ExitCode::from(2);
                 };
+                let t_eval = std::time::Instant::now();
                 match session.eval(&src) {
                     Ok(s) => last_output = Some(s),
                     Err(e) => {
                         eprintln!("ncl: {e}");
                         return ExitCode::from(1);
                     }
+                }
+                if startup_timing {
+                    let snippet: String = src.chars().take(40).collect();
+                    eprintln!("[timing] --eval {:?}: {}ms", snippet, t_eval.elapsed().as_millis());
                 }
             }
             "--load" | "-l" => {
@@ -234,12 +248,16 @@ fn lisp_main(raw_args: Vec<String>) -> ExitCode {
                         return ExitCode::from(1);
                     }
                 };
+                let t_load = std::time::Instant::now();
                 match session.eval(&src) {
                     Ok(s) => last_output = Some(s),
                     Err(e) => {
                         eprintln!("ncl: {path}: {e}");
                         return ExitCode::from(1);
                     }
+                }
+                if startup_timing {
+                    eprintln!("[timing] --load {path}: {}ms", t_load.elapsed().as_millis());
                 }
             }
             "--check" | "-c" => {
@@ -289,6 +307,10 @@ fn lisp_main(raw_args: Vec<String>) -> ExitCode {
 
     if let Some(s) = &last_output {
         println!("{s}");
+    }
+
+    if startup_timing {
+        eprintln!("[timing] TOTAL to first prompt: {}ms", t_total.elapsed().as_millis());
     }
 
     if want_repl {

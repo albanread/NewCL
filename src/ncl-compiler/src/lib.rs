@@ -34,6 +34,102 @@ thread_local! {
 pub use lower::{lower, lower_in, CompileError, LocalEnv};
 pub use macroexpand::{macroexpand_all, value_to_word, word_to_value};
 
+// ─── Startup timing ─────────────────────────────────────────────────────────
+//
+// Enabled by setting the environment variable `NCL_STARTUP_TIMING=1` before
+// launching `ncl`. Reports to stderr:
+//
+//   [timing] native-install: Nms
+//   [timing] core.lisp: Nms, M forms, avg X.Xms/form
+//     NNNms  lower=NNms  jit=NNms  SORT
+//     ...  (top-10 slowest)
+//   [timing] clos.lisp: ...
+//   [timing] Library/init.lisp: Nms
+//   [timing] TOTAL: Nms
+//
+// The lower/jit split separates the Lisp→IR lowering cost (our code)
+// from the LLVM IR→machine-code cost (LLVM's code per function).
+mod startup_timing {
+    use std::cell::RefCell;
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+
+    pub fn enabled() -> bool {
+        *ENABLED.get_or_init(|| std::env::var("NCL_STARTUP_TIMING").is_ok())
+    }
+
+    /// Return `Some(Instant::now())` only when timing is enabled,
+    /// so callers pay zero cost on the normal path.
+    #[inline]
+    pub fn now() -> Option<Instant> {
+        if enabled() { Some(Instant::now()) } else { None }
+    }
+
+    #[inline]
+    pub fn elapsed(t: Option<Instant>) -> Duration {
+        t.map(|i| i.elapsed()).unwrap_or_default()
+    }
+
+    pub struct FormRecord {
+        pub name: String,
+        pub lower: Duration,
+        pub jit: Duration,
+    }
+    impl FormRecord {
+        fn total(&self) -> Duration { self.lower + self.jit }
+    }
+
+    thread_local! {
+        static ACCUMULATOR: RefCell<Vec<FormRecord>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Called from `compile_function` with the just-compiled function's
+    /// name and split lower/jit durations.
+    pub fn push_form(name: &str, lower: Duration, jit: Duration) {
+        if !enabled() { return; }
+        ACCUMULATOR.with(|a| {
+            a.borrow_mut().push(FormRecord { name: name.to_string(), lower, jit });
+        });
+    }
+
+    /// Print the top-N slowest forms collected since the last call,
+    /// then clear the accumulator. Call at the end of each load phase.
+    pub fn drain_and_report(label: &str, phase_elapsed: Duration) {
+        if !enabled() { return; }
+        ACCUMULATOR.with(|a| {
+            let mut forms = a.borrow_mut();
+            let n = forms.len();
+            let avg = if n > 0 {
+                phase_elapsed.as_millis() as f64 / n as f64
+            } else { 0.0 };
+            eprintln!(
+                "[timing] {}: {}ms, {} forms, avg {:.1}ms/form",
+                label, phase_elapsed.as_millis(), n, avg
+            );
+            forms.sort_by(|a, b| b.total().cmp(&a.total()));
+            for r in forms.iter().take(10) {
+                eprintln!(
+                    "  {:5}ms  lower={:4}ms  jit={:4}ms  {}",
+                    r.total().as_millis(),
+                    r.lower.as_millis(),
+                    r.jit.as_millis(),
+                    r.name,
+                );
+            }
+            forms.clear();
+        });
+    }
+
+    /// Simple one-liner phase report (for phases without per-form data).
+    pub fn report_phase(label: &str, elapsed: Duration) {
+        if enabled() {
+            eprintln!("[timing] {}: {}ms", label, elapsed.as_millis());
+        }
+    }
+}
+
 /// A NewCormanLisp evaluation session. Owns the GC coordinator and
 /// a single Lisp-thread mutator. defun'd functions persist across
 /// `eval` calls because they live in the coordinator's static area
@@ -362,6 +458,8 @@ impl Session {
         params: &ParamSpec,
         body_forms: &[Value],
     ) -> Result<Word, EvalError> {
+        let t_lower = startup_timing::now();
+
         // First, expand any macros used in the body.
         let mut expanded_body: Vec<Value> = Vec::with_capacity(body_forms.len());
         for form in body_forms {
@@ -410,9 +508,15 @@ impl Session {
         // the caller reads it. See lower::instrument_tail_for_mv.
         let body_expr = lower::instrument_tail_for_mv(body_expr);
 
+        let lower_elapsed = startup_timing::elapsed(t_lower);
+        let t_jit = startup_timing::now();
+
         let arity = params.required.len() as u32;
         let code_ptr = ncl_llvm::jit_compile_function(name, arity, &body_expr)
             .map_err(EvalError::Jit)?;
+
+        startup_timing::push_form(name, lower_elapsed, startup_timing::elapsed(t_jit));
+
         let sym_word = self.coord.intern(name);
         gc_function::alloc_function_in_static(
             self.coord.static_area(),
@@ -1546,8 +1650,20 @@ impl Session {
     /// Function objects are installed in the symbols' function
     /// cells. Idempotent only in the trivial sense — calling twice
     /// re-defines every function.
+    /// Drain the startup-timing accumulator and print a report.
+    /// Called from the driver after the Library/init.lisp load phase
+    /// so that per-form Library timings are visible.
+    pub fn drain_startup_timing(label: &str, elapsed_ms: u128) {
+        startup_timing::drain_and_report(
+            label,
+            std::time::Duration::from_millis(elapsed_ms as u64),
+        );
+    }
+
     pub fn load_core_stdlib(&mut self) -> Result<(), EvalError> {
+        let t = startup_timing::now();
         self.eval(CORE_LISP_SOURCE)?;
+        startup_timing::drain_and_report("core.lisp", startup_timing::elapsed(t));
         Ok(())
     }
 
@@ -1556,13 +1672,18 @@ impl Session {
     /// labels, etc.). Idempotent in the same trivial sense as
     /// `load_core_stdlib`.
     pub fn load_clos(&mut self) -> Result<(), EvalError> {
+        let t = startup_timing::now();
         self.eval(CLOS_LISP_SOURCE)?;
+        startup_timing::drain_and_report("clos.lisp", startup_timing::elapsed(t));
         Ok(())
     }
 
     /// Convenience: a session with the core stdlib + CLOS pre-loaded.
     pub fn with_stdlib() -> Result<Session, EvalError> {
+        let t_init = startup_timing::now();
         let mut s = Session::new();
+        startup_timing::report_phase("native-install", startup_timing::elapsed(t_init));
+
         // Activate the session for the duration of stdlib load so
         // any (compile ...) calls (e.g. CLOS method functions
         // generated during defmethod expansion) can find the
