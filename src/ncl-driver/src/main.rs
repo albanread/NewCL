@@ -641,11 +641,13 @@ fn wrap_for_repl(src: &str) -> String {
 fn run_gui_event_loop(session: &mut ncl_compiler::Session) -> ExitCode {
     #[cfg(windows)]
     {
+        use ncl_runtime::igui::channels::IGuiEvent;
         loop {
-            // Block forever (-1) until the next iGui event.
             match ncl_runtime::igui::channels::next_event(-1) {
+                // Frame closed → let the worker exit so the supervisor
+                // can post WM_QUIT and the message pump unblocks.
+                Some(IGuiEvent::FrameClose) | None => break,
                 Some(ev) => handle_repl_event(session, ev),
-                None => break, // channel closed → clean shutdown
             }
         }
     }
@@ -858,6 +860,38 @@ fn handle_repl_event(
                 }
                 Err(e) => {
                     log_view::append(&format!("[F5] error: {e}"));
+                }
+            }
+        }
+        IGuiEvent::ReplSubmit { child_id } => {
+            use ncl_runtime::igui::repl_child::{self, AppendKind};
+            // Drain the whole input queue for this child (normally one
+            // entry, but drain all to stay in sync).
+            while let Some(src) = repl_child::pop_input(child_id) {
+                // Wrap in handler-case so Lisp conditions come back as
+                // "** message" strings rather than crashing the worker.
+                let wrapped = wrap_for_repl(&src);
+                match session.eval(&wrapped) {
+                    Ok(result) => {
+                        let trimmed = result.trim_end().to_string();
+                        if !trimmed.is_empty() {
+                            // wrap_for_repl prefixes condition messages
+                            // with "** "; display those in error colour.
+                            let kind = if trimmed.starts_with("** ") {
+                                AppendKind::Error
+                            } else {
+                                AppendKind::Output
+                            };
+                            repl_child::append(child_id, trimmed, kind);
+                        }
+                    }
+                    Err(e) => {
+                        repl_child::append(
+                            child_id,
+                            format!("{e}"),
+                            AppendKind::Error,
+                        );
+                    }
                 }
             }
         }
