@@ -86,8 +86,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 const MK_LBUTTON: u32 = 0x0001;
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, DefMDIChildProcW, GetClientRect, GetWindowLongPtrW, IsWindow, LoadCursorW,
-    RegisterClassExW, SendMessageW, SetWindowLongPtrW, CW_USEDEFAULT, GWLP_USERDATA, IDC_IBEAM,
-    MDICREATESTRUCTW, WHEEL_DELTA, WM_CHAR, WM_COMMAND, WM_DPICHANGED_AFTERPARENT, WM_KEYDOWN,
+    PostQuitMessage, RegisterClassExW, SendMessageW, SetWindowLongPtrW, CW_USEDEFAULT,
+    GWLP_USERDATA, IDC_IBEAM, MDICREATESTRUCTW, WHEEL_DELTA, WM_CHAR, WM_COMMAND,
+    WM_DPICHANGED_AFTERPARENT, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MDIACTIVATE, WM_MDICREATE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN,
     WNDCLASSEXW, WNDCLASS_STYLES,
@@ -132,6 +133,17 @@ pub const EDIT_CMD_RUN_BUFFER: u16 = 0x3140;
 /// The canonical CL interactive-development action — Emacs's
 /// `C-M-x`, equivalent of "evaluate the defun under the cursor."
 pub const EDIT_CMD_RUN_FORM: u16 = 0x3141;
+
+/// File-menu command IDs. Dispatched at the frame level; the frame
+/// calls `ledit::do_file_cmd` which delegates to state methods.
+/// Range is intentionally tight so the frame can range-check cheaply.
+pub const FILE_CMD_BASE:    u16 = 0x3200;
+pub const FILE_CMD_END:     u16 = 0x320F;
+pub const FILE_CMD_NEW:     u16 = 0x3200;
+pub const FILE_CMD_OPEN:    u16 = 0x3201;
+pub const FILE_CMD_SAVE:    u16 = 0x3202;
+pub const FILE_CMD_SAVE_AS: u16 = 0x3203;
+pub const FILE_CMD_EXIT:    u16 = 0x3204;
 
 const LEDIT_CLASS: PCWSTR = w!("NewCL.iGui.Ledit");
 const TITLE_NEW: PCWSTR = w!("ledit — untitled");
@@ -259,6 +271,75 @@ pub fn open(frame: HWND, mdi_client: HWND) {
         return;
     }
     let _ = frame; // reserved for future use
+}
+
+/// Load `text` into the ledit buffer as if the user opened a file.
+/// Opens or activates ledit first.  Called on the UI (GUI) thread by
+/// the Demos menu handler in the frame WndProc.
+pub fn load_content(frame: HWND, mdi_client: HWND, text: String, path: Option<PathBuf>) {
+    open(frame, mdi_client); // ensure ledit window exists
+    if let Some(raw) = *LEDIT_HWND.lock().expect("LEDIT_HWND poisoned") {
+        let hwnd = HWND(raw as *mut _);
+        let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut ReditState;
+        if !state_ptr.is_null() {
+            unsafe { &mut *state_ptr }.load_text(text, path);
+        }
+    }
+}
+
+/// Dispatch a File-menu command (FILE_CMD_*) to the ledit state.
+/// Called by the frame WndProc.  Returns `true` if `cmd_id` was
+/// handled (regardless of whether a ledit window exists).
+pub fn do_file_cmd(cmd_id: u16, frame: HWND, mdi_client: HWND) -> bool {
+    match cmd_id {
+        FILE_CMD_NEW => {
+            open(frame, mdi_client);
+            if let Some(raw) = *LEDIT_HWND.lock().expect("LEDIT_HWND poisoned") {
+                let hwnd = HWND(raw as *mut _);
+                let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut ReditState;
+                if !state_ptr.is_null() {
+                    unsafe { &mut *state_ptr }.file_new();
+                }
+            }
+            true
+        }
+        FILE_CMD_OPEN => {
+            open(frame, mdi_client);
+            if let Some(raw) = *LEDIT_HWND.lock().expect("LEDIT_HWND poisoned") {
+                let hwnd = HWND(raw as *mut _);
+                let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut ReditState;
+                if !state_ptr.is_null() {
+                    unsafe { &mut *state_ptr }.file_open();
+                }
+            }
+            true
+        }
+        FILE_CMD_SAVE => {
+            if let Some(raw) = *LEDIT_HWND.lock().expect("LEDIT_HWND poisoned") {
+                let hwnd = HWND(raw as *mut _);
+                let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut ReditState;
+                if !state_ptr.is_null() {
+                    unsafe { &mut *state_ptr }.file_save();
+                }
+            }
+            true
+        }
+        FILE_CMD_SAVE_AS => {
+            if let Some(raw) = *LEDIT_HWND.lock().expect("LEDIT_HWND poisoned") {
+                let hwnd = HWND(raw as *mut _);
+                let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut ReditState;
+                if !state_ptr.is_null() {
+                    unsafe { &mut *state_ptr }.file_save_as();
+                }
+            }
+            true
+        }
+        FILE_CMD_EXIT => {
+            unsafe { PostQuitMessage(0) };
+            true
+        }
+        _ => false,
+    }
 }
 
 // ─── State ───────────────────────────────────────────────────────────
@@ -2176,6 +2257,80 @@ impl ReditState {
                 Some(LPARAM(w.as_ptr() as isize)),
             )
         };
+    }
+
+    // ── File operations (called from do_file_cmd / load_content) ──────
+
+    /// New file: clear the buffer and forget the file path.
+    fn file_new(&mut self) {
+        let len = self.buffer.len();
+        if len > 0 {
+            self.buffer.delete(0, len);
+        }
+        self.cursor = 0;
+        self.anchor = 0;
+        self.scroll_top = 0;
+        self.undo.clear();
+        self.redo.clear();
+        self.coalesce = None;
+        self.file_path = None;
+        self.dirty = false;
+        self.diagnostics.clear();
+        self.diagnostics_stale = false;
+        self.update_title();
+        self.invalidate();
+    }
+
+    /// Open-file dialog then load the chosen file.
+    fn file_open(&mut self) {
+        let Some(path) = open_file_dialog(self.hwnd) else { return };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => self.load_text(text, Some(path)),
+            Err(e) => eprintln!("[ledit] open failed: {e}"),
+        }
+    }
+
+    /// Save to current path, or fall back to Save As if no path yet.
+    fn file_save(&mut self) {
+        if let Some(p) = self.file_path.clone() {
+            self.save_to(p);
+        } else {
+            self.file_save_as();
+        }
+    }
+
+    /// Prompt for a path then save.
+    fn file_save_as(&mut self) {
+        let current = self.file_path.clone();
+        let Some(path) = save_file_dialog(self.hwnd, current.as_deref()) else { return };
+        self.save_to(path);
+    }
+
+    /// Load arbitrary text into the buffer, replacing everything.
+    /// Called by `load_content` (Demos menu) and `file_open`.
+    pub fn load_text(&mut self, text: String, path: Option<PathBuf>) {
+        // Normalize CRLF → LF so the rope stays LF-only internally.
+        let normalized = text.replace("\r\n", "\n");
+        let len = self.buffer.len();
+        if len > 0 {
+            self.buffer.delete(0, len);
+        }
+        let cps: Vec<u32> = normalized.chars().map(|c| c as u32).collect();
+        if !cps.is_empty() {
+            self.buffer.insert(0, &cps);
+        }
+        self.cursor = 0;
+        self.anchor = 0;
+        self.scroll_top = 0;
+        self.undo.clear();
+        self.redo.clear();
+        self.coalesce = None;
+        self.file_path = path;
+        self.dirty = false;
+        self.diagnostics.clear();
+        self.diagnostics_stale = false;
+        self.update_title();
+        self.invalidate();
     }
 }
 

@@ -17,7 +17,7 @@ use std::sync::Mutex;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePatternBrush,
+    CreateBitmap, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePatternBrush,
     CreateSolidBrush, DeleteDC, DeleteObject, FillRect as GdiFillRect, GetDC, ReleaseDC,
     SelectObject, SetBkMode, SetTextColor, TextOutW,
     BACKGROUND_MODE, FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION,
@@ -26,7 +26,6 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
-// (SetWindowSubclass not used — we subclass via SetWindowLongPtrW instead)
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -34,15 +33,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_CAPITAL, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, CreateWindowExW, DefFrameProcW, DispatchMessageW, GetClientRect,
-    GetMessageTime, GetMessageW, GetWindowLongPtrW, LoadCursorW, PostMessageW, PostQuitMessage,
-    RegisterClassExW, SendMessageW, SetWindowLongPtrW, ShowWindow,
-    TranslateAcceleratorW, TranslateMessage, CLIENTCREATESTRUCT, CW_USEDEFAULT, GWLP_WNDPROC,
-    HACCEL, IDC_ARROW, MDICREATESTRUCTW, MSG, SW_SHOW, WHEEL_DELTA, WM_CHAR, WM_CLOSE,
+    CallWindowProcW, CreateIconIndirect, CreateWindowExW, DefFrameProcW, DefWindowProcW,
+    DispatchMessageW, GetClientRect, GetMessageTime, GetMessageW, GetWindowLongPtrW,
+    LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW,
+    SetWindowLongPtrW, ShowWindow, TranslateAcceleratorW, TranslateMessage,
+    CLIENTCREATESTRUCT, CW_USEDEFAULT, GWLP_WNDPROC, HACCEL, ICONINFO, IDC_ARROW,
+    MDICREATESTRUCTW, MSG, SW_SHOW, WHEEL_DELTA, WM_CHAR, WM_CLOSE,
     WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MDICREATE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE, WM_SYSCOLORCHANGE, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_THEMECHANGED, WM_USER, WNDCLASSEXW, WNDCLASS_STYLES, WS_CHILD,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SETICON, WM_SIZE, WM_SYSCOLORCHANGE,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WM_USER, WNDCLASSEXW, WNDCLASS_STYLES, WS_CHILD,
     WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
 };
 
@@ -85,6 +85,11 @@ pub(crate) const WM_IGUI_SET_TIMER: u32 = WM_USER + 6;
 /// render host; reusing the same id replaces the previous one.
 pub(crate) const TICK_TIMER_ID: usize = 0xA1;
 
+/// Base WM_COMMAND id for auto-assigned Demos menu items.
+/// Range 0x4000..=0x4FFF (4096 slots) — well above all other ranges.
+const DEMO_CMD_BASE: u16 = 0x4000;
+const DEMO_CMD_END:  u16 = 0x4FFF;
+
 /// HWND of the MDI client. Set by `run` after `CreateWindowExW`.
 static MDI_CLIENT: Mutex<Option<isize>> = Mutex::new(None);
 static GUI_THREAD_ID: OnceLock<u32> = OnceLock::new();
@@ -94,6 +99,10 @@ static GUI_THREAD_ID: OnceLock<u32> = OnceLock::new();
 static MDICLIENT_ORIG_PROC: OnceLock<isize> = OnceLock::new();
 /// λ brush handle (raw isize) kept alive for the process lifetime.
 static LAMBDA_BRUSH_RAW: OnceLock<isize> = OnceLock::new();
+
+/// Discovered demo files: (menu_id, display_name, file_path).
+/// Populated once in `run()` before the menu bar is built.
+static DEMO_FILES: OnceLock<Vec<(u16, String, std::path::PathBuf)>> = OnceLock::new();
 
 // ── Lambda background brush ────────────────────────────────────────────────
 
@@ -203,13 +212,130 @@ unsafe extern "system" fn mdi_bg_proc(
             CallWindowProcW(Some(f), hwnd, msg, wparam, lparam)
         }
     } else {
-        unsafe { windows::Win32::UI::WindowsAndMessaging::DefWindowProcW(hwnd, msg, wparam, lparam) }
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     }
 }
 
 fn mdi_client_hwnd() -> Option<HWND> {
     let raw = MDI_CLIENT.lock().ok()?;
     raw.map(|r| HWND(r as *mut _))
+}
+
+/// Scan the Lisp/demos/ directory for *.lisp files and return
+/// `(menu_id, display_name, path)` triples sorted by name.
+/// Search order: `<exe>/demos/`  then `<exe>/../../Lisp/demos/` (dev).
+fn discover_demos() -> Vec<(u16, String, std::path::PathBuf)> {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+    let exe_dir = match exe.parent() {
+        Some(d) => d.to_path_buf(),
+        None => return Vec::new(),
+    };
+    let candidates: Vec<std::path::PathBuf> = vec![
+        exe_dir.join("demos"),
+        exe_dir.ancestors()
+            .nth(2)
+            .map(|p| p.join("Lisp").join("demos"))
+            .unwrap_or_default(),
+    ];
+    for dir in &candidates {
+        if !dir.is_dir() { continue; }
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        let mut files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("lisp"))
+            .collect();
+        files.sort();
+        if files.is_empty() { continue; }
+        return files.into_iter()
+            .enumerate()
+            .take((DEMO_CMD_END - DEMO_CMD_BASE + 1) as usize)
+            .map(|(i, path)| {
+                let stem = path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown");
+                // "othello-gui" → "Othello Gui"
+                let pretty: String = stem.split('-')
+                    .map(|w| {
+                        let mut ch = w.chars();
+                        match ch.next() {
+                            Some(f) => f.to_uppercase().collect::<String>() + ch.as_str(),
+                            None => String::new(),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (DEMO_CMD_BASE + i as u16, pretty, path)
+            })
+            .collect();
+    }
+    Vec::new()
+}
+
+/// Build a 32×32 HICON containing the λ glyph on the same dark-slate
+/// background used by the MDI pattern brush.  Sent to the frame via
+/// WM_SETICON so the title bar and taskbar show the λ symbol.
+unsafe fn make_lambda_icon() -> windows::Win32::UI::WindowsAndMessaging::HICON {
+    use windows::Win32::Graphics::Gdi::CreateBitmap;
+    use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, ICONINFO};
+
+    const SZ: i32 = 32;
+    const BG: COLORREF = rgb(28, 40, 52);
+    // Brighter foreground so the icon is legible at 16×16 and 32×32.
+    const FG: COLORREF = rgb(160, 190, 220);
+
+    unsafe {
+        let screen_dc = GetDC(None);
+        let mem_dc = CreateCompatibleDC(Some(screen_dc));
+        let bmp = CreateCompatibleBitmap(screen_dc, SZ, SZ);
+        let old_bmp = SelectObject(mem_dc, HGDIOBJ(bmp.0));
+
+        let bg_brush = CreateSolidBrush(BG);
+        let rect = RECT { left: 0, top: 0, right: SZ, bottom: SZ };
+        GdiFillRect(mem_dc, &rect, bg_brush);
+        DeleteObject(HGDIOBJ(bg_brush.0));
+
+        SetBkMode(mem_dc, BACKGROUND_MODE(TRANSPARENT.0));
+        SetTextColor(mem_dc, FG);
+
+        let font = CreateFontW(
+            22, 0, 0, 0,
+            400,            // FW_NORMAL
+            1, 0, 0,        // italic, no underline, no strikeout
+            FONT_CHARSET(1),
+            FONT_OUTPUT_PRECISION(0),
+            FONT_CLIP_PRECISION(0),
+            FONT_QUALITY(5),
+            32u32,          // FF_SWISS
+            w!("Segoe UI"),
+        );
+        let old_font = SelectObject(mem_dc, HGDIOBJ(font.0));
+        let lambda: &[u16] = &[0x03BB_u16];
+        let _ = TextOutW(mem_dc, 5, 4, lambda);
+        SelectObject(mem_dc, old_font);
+        DeleteObject(HGDIOBJ(font.0));
+        SelectObject(mem_dc, old_bmp);
+
+        // AND mask: all zeros → fully opaque icon.
+        let mask_bmp = CreateBitmap(SZ, SZ, 1, 1, None);
+        let icon_info = ICONINFO {
+            fIcon: windows::core::BOOL(1),
+            xHotspot: 0,
+            yHotspot: 0,
+            hbmMask: mask_bmp,
+            hbmColor: bmp,
+        };
+        let icon = CreateIconIndirect(&icon_info).unwrap_or_default();
+
+        DeleteObject(HGDIOBJ(bmp.0));
+        DeleteObject(HGDIOBJ(mask_bmp.0));
+        let _ = DeleteDC(mem_dc);
+        let _ = ReleaseDC(None, screen_dc);
+        icon
+    }
 }
 
 pub(crate) fn gui_thread_id() -> Option<u32> {
@@ -324,16 +450,34 @@ where
     channels::install();
     super::system_colors::sample();
 
-    // Install a default Tools menu so the built-in editor and log
-    // view are reachable even before any language-thread code runs.
-    // `iGui.SetMenu` from CP will replace this, but
-    // `menu::install_for_frame` always re-appends the tools so they
-    // stay available.
-    if let Some(default_menu) = super::tools_menu::build_default_menu_bar() {
+    // Discover demo files before building the menu so the Demos menu
+    // can list them.  The static owns the Vec for the process lifetime.
+    let demo_files = discover_demos();
+    let demo_name_ids: Vec<(u16, String)> = demo_files
+        .iter()
+        .map(|(id, name, _)| (*id, name.clone()))
+        .collect();
+    let _ = DEMO_FILES.set(demo_files);
+
+    // Default menu bar: File | Edit | Lisp | [Demos] | Tools.
+    // `iGui.SetMenu` from a language-thread call will replace this, but
+    // `menu::install_for_frame` always re-appends Lisp+Tools so they
+    // stay reachable whatever the Lisp menu spec says.
+    if let Some(default_menu) = super::tools_menu::build_default_menu_bar(&demo_name_ids) {
         let _ = unsafe {
             windows::Win32::UI::WindowsAndMessaging::SetMenu(hwnd, Some(default_menu))
         };
         let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::DrawMenuBar(hwnd) };
+    }
+
+    // Set the λ icon on the frame window (both the 16×16 taskbar icon
+    // and the 32×32 Alt+Tab / title-bar icon).
+    unsafe {
+        let icon = make_lambda_icon();
+        if icon.0 as isize != 0 {
+            SendMessageW(hwnd, WM_SETICON, Some(WPARAM(0)), Some(LPARAM(icon.0 as isize)));
+            SendMessageW(hwnd, WM_SETICON, Some(WPARAM(1)), Some(LPARAM(icon.0 as isize)));
+        }
     }
 
     let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
@@ -463,6 +607,42 @@ unsafe extern "system" fn frame_wnd_proc(
         }
         WM_COMMAND => {
             let cmd_id = (wparam.0 & 0xFFFF) as u16;
+
+            // ── File-menu commands ─────────────────────────────────────
+            if cmd_id >= super::ledit::FILE_CMD_BASE && cmd_id <= super::ledit::FILE_CMD_END {
+                if cmd_id == super::ledit::FILE_CMD_EXIT {
+                    unsafe { PostQuitMessage(0) };
+                } else if mdi.0 as isize != 0 {
+                    super::ledit::do_file_cmd(cmd_id, hwnd, mdi);
+                }
+                return LRESULT(0);
+            }
+
+            // ── Demos menu ─────────────────────────────────────────────
+            if cmd_id >= DEMO_CMD_BASE && cmd_id <= DEMO_CMD_END {
+                if mdi.0 as isize != 0 {
+                    if let Some(demos) = DEMO_FILES.get() {
+                        if let Some((_, _, path)) =
+                            demos.iter().find(|(id, _, _)| *id == cmd_id)
+                        {
+                            match std::fs::read_to_string(path) {
+                                Ok(text) => {
+                                    let path_clone = path.clone();
+                                    // Load into ledit so the user can read/edit it.
+                                    super::ledit::load_content(hwnd, mdi, text.clone(), Some(path_clone));
+                                    // Fire EvalBuffer so the demo runs immediately.
+                                    channels::push(IGuiEvent::EvalBuffer { source: text });
+                                }
+                                Err(e) => {
+                                    eprintln!("[demos] cannot read demo file: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+                return LRESULT(0);
+            }
+
             // Built-in tools (ledit, log view) are wired before the
             // user menu so they work even if no language-thread spec
             // has been installed.

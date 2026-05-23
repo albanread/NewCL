@@ -1,162 +1,151 @@
-//! Frame-level "Tools" menu and the keyboard accelerator table for
-//! ledit's built-in tool windows.
+//! Frame-level menus and keyboard accelerator table.
 //!
-//! Both `ledit` and `log_view` are always-available editor tools
-//! that hang off a `Tools` submenu on the frame. Keeping their
-//! menu/accelerator wiring together here means the one-and-only
-//! Tools popup carries every entry, regardless of whether the
-//! language thread has installed a custom menu.
+//! Menu structure (default bar, before any language-thread spec):
+//!
+//!   File  — New, Open, Save, Save As, ─, Exit
+//!   Edit  — Undo, Redo, ─, Cut, Copy, Paste, Select All
+//!   Lisp  — Run Buffer (F5), Run Form at Point (Ctrl+Enter), ─,
+//!            Forward S-expr, Backward S-expr, ─,
+//!            Slurp Forward, Barf Forward, Wrap, Splice, Raise
+//!   Demos — one entry per *.lisp discovered in Lisp/demos/
+//!   Tools — ledit (Ctrl+Shift+E), Log (Ctrl+Shift+L)
+//!
+//! When the language thread installs its own menu bar via
+//! `iGui.SetMenu`, the Lisp and Tools menus are re-appended to
+//! whatever the language spec provided (so Ctrl+Shift+E is always
+//! available regardless of the Lisp code's menu spec).
 
 #![cfg(windows)]
 
 use windows::core::PCWSTR;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateAcceleratorTableW, CreateMenu, CreatePopupMenu, ACCEL, FCONTROL, FSHIFT,
-    FVIRTKEY, HACCEL, HMENU, MF_POPUP, MF_STRING,
+    AppendMenuW, CreateAcceleratorTableW, CreateMenu, CreatePopupMenu, ACCEL,
+    FCONTROL, FSHIFT, FVIRTKEY, HACCEL, HMENU, MF_POPUP, MF_SEPARATOR, MF_STRING,
 };
 
-use super::log_view;
 use super::ledit;
-use windows::Win32::UI::WindowsAndMessaging::MF_SEPARATOR;
+use super::log_view;
 
-/// Append an `Edit` submenu to `bar`. The items are routed to the
-/// active MDI child via WM_COMMAND forwarding from the frame
-/// WndProc; ledit recognises the IDs in its own WM_COMMAND handler
-/// and dispatches to the matching method.
-///
-/// Keeping these on a top-level menu makes the paredit ops
-/// discoverable — most users have not got the muscle memory for
-/// Ctrl-Shift-Right or Alt-W and would never find them otherwise.
+// ── Internal helpers ──────────────────────────────────────────────────
+
+fn append_item(popup: HMENU, id: u16, label: &str) {
+    let mut w: Vec<u16> = label.encode_utf16().collect();
+    w.push(0);
+    let _ = unsafe { AppendMenuW(popup, MF_STRING, id as usize, PCWSTR(w.as_ptr())) };
+}
+
+fn append_sep(popup: HMENU) {
+    let _ = unsafe { AppendMenuW(popup, MF_SEPARATOR, 0, PCWSTR::null()) };
+}
+
+fn attach_popup(bar: HMENU, popup: HMENU, title: &str) {
+    let mut w: Vec<u16> = title.encode_utf16().collect();
+    w.push(0);
+    let _ = unsafe { AppendMenuW(bar, MF_POPUP, popup.0 as usize, PCWSTR(w.as_ptr())) };
+}
+
+// ── Public menu-building functions ────────────────────────────────────
+
+/// File menu: New, Open, Save, Save As, separator, Exit.
+pub fn append_file_menu(bar: HMENU) {
+    let Ok(popup) = (unsafe { CreatePopupMenu() }) else { return };
+    append_item(popup, ledit::FILE_CMD_NEW,     "&New\tCtrl+N");
+    append_item(popup, ledit::FILE_CMD_OPEN,    "&Open…\tCtrl+O");
+    append_item(popup, ledit::FILE_CMD_SAVE,    "&Save\tCtrl+S");
+    append_item(popup, ledit::FILE_CMD_SAVE_AS, "Save &As…\tCtrl+Shift+S");
+    append_sep(popup);
+    append_item(popup, ledit::FILE_CMD_EXIT,    "E&xit\tAlt+F4");
+    attach_popup(bar, popup, "&File");
+}
+
+/// Edit menu: undo/redo and clipboard only.
+/// Structural editing has moved to the Lisp menu so this stays
+/// familiar to users who have never heard of paredit.
 pub fn append_edit_menu(bar: HMENU) {
-    let popup = match unsafe { CreatePopupMenu() } {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("[edit-menu] CreatePopupMenu failed: {e}");
-            return;
-        }
-    };
-
-    let items: &[(u16, &str)] = &[
-        (ledit::EDIT_CMD_UNDO, "&Undo\tCtrl+Z"),
-        (ledit::EDIT_CMD_REDO, "&Redo\tCtrl+Y"),
-        (0, "SEP"),
-        (ledit::EDIT_CMD_CUT, "Cu&t\tCtrl+X"),
-        (ledit::EDIT_CMD_COPY, "&Copy\tCtrl+C"),
-        (ledit::EDIT_CMD_PASTE, "&Paste\tCtrl+V"),
-        (ledit::EDIT_CMD_SELECT_ALL, "Select &All\tCtrl+A"),
-        (0, "SEP"),
-        (ledit::EDIT_CMD_FORWARD_SEXP, "Forward S-expression\tCtrl+\u{2192}"),
-        (ledit::EDIT_CMD_BACKWARD_SEXP, "Backward S-expression\tCtrl+\u{2190}"),
-        (0, "SEP"),
-        (ledit::EDIT_CMD_SLURP_FORWARD, "&Slurp Forward\tCtrl+Shift+\u{2192}"),
-        (ledit::EDIT_CMD_BARF_FORWARD, "&Barf Forward\tCtrl+Shift+\u{2190}"),
-        (ledit::EDIT_CMD_WRAP, "&Wrap with ( )\tAlt+W"),
-        (ledit::EDIT_CMD_SPLICE, "Spli&ce / Unwrap\tAlt+S"),
-        (ledit::EDIT_CMD_RAISE, "&Raise\tAlt+R"),
-        (0, "SEP"),
-        (ledit::EDIT_CMD_RUN_FORM, "Run Form at &Point\tCtrl+Enter"),
-        (ledit::EDIT_CMD_RUN_BUFFER, "R&un Buffer\tF5"),
-    ];
-
-    for &(id, label) in items {
-        if label == "SEP" {
-            let _ = unsafe { AppendMenuW(popup, MF_SEPARATOR, 0, PCWSTR::null()) };
-            continue;
-        }
-        let mut w: Vec<u16> = label.encode_utf16().collect();
-        w.push(0);
-        if let Err(e) = unsafe {
-            AppendMenuW(popup, MF_STRING, id as usize, PCWSTR(w.as_ptr()))
-        } {
-            eprintln!("[edit-menu] append {label:?}: {e}");
-        }
-    }
-
-    let title: Vec<u16> = "&Edit\0".encode_utf16().collect();
-    if let Err(e) = unsafe {
-        AppendMenuW(bar, MF_POPUP, popup.0 as usize, PCWSTR(title.as_ptr()))
-    } {
-        eprintln!("[edit-menu] append popup: {e}");
-    }
+    let Ok(popup) = (unsafe { CreatePopupMenu() }) else { return };
+    append_item(popup, ledit::EDIT_CMD_UNDO,       "&Undo\tCtrl+Z");
+    append_item(popup, ledit::EDIT_CMD_REDO,       "&Redo\tCtrl+Y");
+    append_sep(popup);
+    append_item(popup, ledit::EDIT_CMD_CUT,        "Cu&t\tCtrl+X");
+    append_item(popup, ledit::EDIT_CMD_COPY,       "&Copy\tCtrl+C");
+    append_item(popup, ledit::EDIT_CMD_PASTE,      "&Paste\tCtrl+V");
+    append_item(popup, ledit::EDIT_CMD_SELECT_ALL, "Select &All\tCtrl+A");
+    attach_popup(bar, popup, "&Edit");
 }
 
-/// Append a `Tools` submenu to `bar` containing every built-in tool
-/// (currently ledit and the log view). Called both from
-/// `build_default_menu_bar` and from `menu::install_for_frame` so
-/// the tools stay reachable whatever the language thread does.
+/// Lisp menu: evaluation shortcuts and structural editing ops.
+pub fn append_lisp_menu(bar: HMENU) {
+    let Ok(popup) = (unsafe { CreatePopupMenu() }) else { return };
+    append_item(popup, ledit::EDIT_CMD_RUN_BUFFER, "R&un Buffer\tF5");
+    append_item(popup, ledit::EDIT_CMD_RUN_FORM,   "Run Form at &Point\tCtrl+Enter");
+    append_sep(popup);
+    append_item(popup, ledit::EDIT_CMD_FORWARD_SEXP,  "Forward S-expression\tCtrl+\u{2192}");
+    append_item(popup, ledit::EDIT_CMD_BACKWARD_SEXP, "Backward S-expression\tCtrl+\u{2190}");
+    append_sep(popup);
+    append_item(popup, ledit::EDIT_CMD_SLURP_FORWARD, "&Slurp Forward\tCtrl+Shift+\u{2192}");
+    append_item(popup, ledit::EDIT_CMD_BARF_FORWARD,  "&Barf Forward\tCtrl+Shift+\u{2190}");
+    append_item(popup, ledit::EDIT_CMD_WRAP,          "&Wrap with ( )\tAlt+W");
+    append_item(popup, ledit::EDIT_CMD_SPLICE,        "Spli&ce / Unwrap\tAlt+S");
+    append_item(popup, ledit::EDIT_CMD_RAISE,         "&Raise\tAlt+R");
+    attach_popup(bar, popup, "&Lisp");
+}
+
+/// Demos menu: one entry per discovered demo file.
+/// `demos` is a slice of (menu_id, display_name) pairs.
+/// Silently omitted if the slice is empty.
+pub fn append_demos_menu(bar: HMENU, demos: &[(u16, String)]) {
+    if demos.is_empty() {
+        return;
+    }
+    let Ok(popup) = (unsafe { CreatePopupMenu() }) else { return };
+    for (id, name) in demos {
+        append_item(popup, *id, name);
+    }
+    attach_popup(bar, popup, "&Demos");
+}
+
+/// Tools menu: ledit editor and log overlay.
 pub fn append_tools_menu(bar: HMENU) {
-    let popup = match unsafe { CreatePopupMenu() } {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("[tools-menu] CreatePopupMenu failed: {e}");
-            return;
-        }
-    };
-
-    let ledit_item: Vec<u16> = "ledit\tCtrl+Shift+E\0".encode_utf16().collect();
-    if let Err(e) = unsafe {
-        AppendMenuW(
-            popup,
-            MF_STRING,
-            ledit::MENU_CMD_ID as usize,
-            PCWSTR(ledit_item.as_ptr()),
-        )
-    } {
-        eprintln!("[tools-menu] append ledit: {e}");
-    }
-
-    let log_item: Vec<u16> = "Log\tCtrl+Shift+L\0".encode_utf16().collect();
-    if let Err(e) = unsafe {
-        AppendMenuW(
-            popup,
-            MF_STRING,
-            log_view::MENU_CMD_ID as usize,
-            PCWSTR(log_item.as_ptr()),
-        )
-    } {
-        eprintln!("[tools-menu] append log: {e}");
-    }
-
-    let title: Vec<u16> = "&Tools\0".encode_utf16().collect();
-    if let Err(e) = unsafe {
-        AppendMenuW(
-            bar,
-            MF_POPUP,
-            popup.0 as usize,
-            PCWSTR(title.as_ptr()),
-        )
-    } {
-        eprintln!("[tools-menu] append popup: {e}");
-    }
+    let Ok(popup) = (unsafe { CreatePopupMenu() }) else { return };
+    append_item(popup, ledit::MENU_CMD_ID,    "ledit\tCtrl+Shift+E");
+    append_item(popup, log_view::MENU_CMD_ID, "Log\tCtrl+Shift+L");
+    attach_popup(bar, popup, "&Tools");
 }
 
-/// Build a stand-alone menu bar containing the Edit and Tools
-/// submenus. Used at frame startup when no language-thread menu has
-/// been set.
-pub fn build_default_menu_bar() -> Option<HMENU> {
+/// Build the default menu bar: File | Edit | Lisp | [Demos] | Tools.
+/// `demos` carries (id, display_name) pairs produced by the frame's
+/// demo-discovery pass.
+pub fn build_default_menu_bar(demos: &[(u16, String)]) -> Option<HMENU> {
     let bar = unsafe { CreateMenu() }.ok()?;
+    append_file_menu(bar);
     append_edit_menu(bar);
+    append_lisp_menu(bar);
+    append_demos_menu(bar, demos);
     append_tools_menu(bar);
     Some(bar)
 }
 
-/// Frame-level accelerator table:
-///   Ctrl+Shift+E → ledit
-///   Ctrl+Shift+L → log view
-/// Both dispatch via `WM_COMMAND` to their respective MENU_CMD_IDs,
-/// which the frame WndProc routes to the right `open` function.
+/// Frame-level accelerator table.
+///
+/// | Key              | Command           |
+/// |------------------|-------------------|
+/// | Ctrl+N           | New               |
+/// | Ctrl+O           | Open              |
+/// | Ctrl+S           | Save              |
+/// | Ctrl+Shift+S     | Save As           |
+/// | F5               | Run Buffer        |
+/// | Ctrl+Shift+E     | Open ledit        |
+/// | Ctrl+Shift+L     | Open log view     |
 pub fn build_accelerator_table() -> Option<HACCEL> {
+    // VK_F5 = 0x74
     let entries = [
-        ACCEL {
-            fVirt: FCONTROL | FSHIFT | FVIRTKEY,
-            key: b'E' as u16,
-            cmd: ledit::MENU_CMD_ID,
-        },
-        ACCEL {
-            fVirt: FCONTROL | FSHIFT | FVIRTKEY,
-            key: b'L' as u16,
-            cmd: log_view::MENU_CMD_ID,
-        },
+        ACCEL { fVirt: FCONTROL | FVIRTKEY,        key: b'N' as u16, cmd: ledit::FILE_CMD_NEW },
+        ACCEL { fVirt: FCONTROL | FVIRTKEY,        key: b'O' as u16, cmd: ledit::FILE_CMD_OPEN },
+        ACCEL { fVirt: FCONTROL | FVIRTKEY,        key: b'S' as u16, cmd: ledit::FILE_CMD_SAVE },
+        ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: b'S' as u16, cmd: ledit::FILE_CMD_SAVE_AS },
+        ACCEL { fVirt: FVIRTKEY,                   key: 0x74_u16,    cmd: ledit::EDIT_CMD_RUN_BUFFER },
+        ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: b'E' as u16, cmd: ledit::MENU_CMD_ID },
+        ACCEL { fVirt: FCONTROL | FSHIFT | FVIRTKEY, key: b'L' as u16, cmd: log_view::MENU_CMD_ID },
     ];
     unsafe { CreateAcceleratorTableW(&entries) }
         .ok()

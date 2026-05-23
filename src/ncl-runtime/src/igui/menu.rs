@@ -232,11 +232,11 @@ pub fn install_for_frame(frame: HWND, mdi_client: HWND, spec: &str) -> bool {
             return false;
         }
     };
-    // Always re-append the built-in editor menus (Edit, Tools) so
-    // they stay reachable regardless of what the language thread
-    // set. The Edit menu's items dispatch to whichever editable
-    // child is currently active.
+    // Always re-append the built-in editor menus (Edit, Lisp, Tools)
+    // so they stay reachable regardless of what the language thread
+    // set. Edit/Lisp items dispatch to whichever ledit child is active.
     super::tools_menu::append_edit_menu(menu);
+    super::tools_menu::append_lisp_menu(menu);
     super::tools_menu::append_tools_menu(menu);
     let set_result = unsafe { SetMenu(frame, Some(menu)) };
     let draw_result = unsafe { DrawMenuBar(frame) };
