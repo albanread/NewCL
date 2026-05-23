@@ -637,6 +637,13 @@ impl MutatorState {
         length_cells: u32,
     ) -> Word {
         let total = 1 + length_cells as usize;
+        // Page-heap slabs are capped at PAGE_SIZE_CELLS (one 64 KB page).
+        // Objects that exceed that limit must bypass the TLAB and go
+        // through the large-object allocator (`try_alloc_large`), which
+        // can span an arbitrary number of contiguous pages.
+        if total > crate::page_heap::space::PAGE_SIZE_CELLS {
+            return self.alloc_large_object(ty, length_cells);
+        }
         if self.tlab.top + total > self.tlab.limit {
             self.refill_tlab(total);
         }
@@ -649,12 +656,43 @@ impl MutatorState {
         Word::from_ptr(p as *const u8, Tag::Vector)
     }
 
+    /// Allocate a large object (total cells > PAGE_SIZE_CELLS) directly
+    /// through the page-heap large-object allocator, bypassing the TLAB.
+    /// Cooperates with GC: parks if a stop is requested, triggers a
+    /// minor GC and retries when no contiguous free pages are available.
+    fn alloc_large_object(&mut self, ty: crate::heap::HeapType, length_cells: u32) -> Word {
+        let total = 1 + length_cells as usize;
+        loop {
+            if self.coord.stop_requested.load(Ordering::Acquire) {
+                self.park();
+                continue;
+            }
+            let result = {
+                let mut heap = self.coord.heap.lock().unwrap();
+                heap.try_alloc_young_large(total)
+            };
+            if let Some(ptr) = result {
+                let p = ptr.as_ptr();
+                // `try_alloc_large` zeroed the pages and set the boxed
+                // start bit at cell 0; write the header and return.
+                unsafe { *p = crate::heap::HeapHeader::new(ty, length_cells).raw() };
+                return Word::from_ptr(p as *const u8, Tag::Vector);
+            }
+            // No contiguous free-page run — GC to reclaim G0, then retry.
+            self.trigger_minor_gc();
+        }
+    }
+
     /// Reserve a young-heap object header'd as `String` with the
     /// given payload length. Returns the address of the header
     /// cell — the caller fills char_count and the codepoint cells.
     /// The header is initialised; the payload is uninitialised.
     pub fn alloc_string_buffer(&mut self, payload_cells: u32) -> *mut u64 {
         let total = 1 + payload_cells as usize;
+        // Same large-object guard as alloc_typed_vector.
+        if total > crate::page_heap::space::PAGE_SIZE_CELLS {
+            return self.alloc_large_string_buffer(payload_cells);
+        }
         if self.tlab.top + total > self.tlab.limit {
             self.refill_tlab(total);
         }
@@ -669,6 +707,35 @@ impl MutatorState {
         self.mark_young_start(p);
         self.tlab.top += total;
         p
+    }
+
+    /// Large-object path for string buffers: same loop as
+    /// `alloc_large_object` but returns a raw `*mut u64` for the
+    /// caller to fill (char_count at [0], codepoints at [1..]).
+    fn alloc_large_string_buffer(&mut self, payload_cells: u32) -> *mut u64 {
+        let total = 1 + payload_cells as usize;
+        loop {
+            if self.coord.stop_requested.load(Ordering::Acquire) {
+                self.park();
+                continue;
+            }
+            let result = {
+                let mut heap = self.coord.heap.lock().unwrap();
+                heap.try_alloc_young_large(total)
+            };
+            if let Some(ptr) = result {
+                let p = ptr.as_ptr();
+                unsafe {
+                    *p = crate::heap::HeapHeader::new(
+                        crate::heap::HeapType::String,
+                        payload_cells,
+                    )
+                    .raw();
+                }
+                return p;
+            }
+            self.trigger_minor_gc();
+        }
     }
 
     /// Inline cons write. Caller has confirmed `top + 2 <= limit`.

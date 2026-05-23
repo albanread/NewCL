@@ -406,6 +406,23 @@ impl PageHeap {
         self.last_pin_summary
     }
 
+    // -- Large-object allocation (> one page) ----------------------------
+
+    /// Allocate `n_cells` as a large object in G0 by spanning one or
+    /// more whole pages. Unlike TLAB slabs, large objects are never
+    /// bump-allocated into a shared page — each call claims its own
+    /// contiguous page run.
+    ///
+    /// Returns `None` when no contiguous free-page run is available;
+    /// the caller should trigger a minor GC and retry.
+    ///
+    /// `try_alloc_large` already writes the boxed start bit at cell 0
+    /// and zeros all pages in the run. The caller only needs to write
+    /// the `HeapHeader` at cell 0.
+    pub fn try_alloc_young_large(&mut self, n_cells: usize) -> Option<NonNull<u64>> {
+        self.try_alloc_large(n_cells, Generation::G0)
+    }
+
     // -- Slab allocation primitive used by `young_try_alloc_slab` -------
 
     /// Reserve `cells` contiguous cells on a G0 page for use as
