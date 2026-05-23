@@ -15,9 +15,18 @@ use std::sync::OnceLock;
 use std::sync::Mutex;
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePatternBrush,
+    CreateSolidBrush, DeleteDC, DeleteObject, FillRect as GdiFillRect, GetDC, ReleaseDC,
+    SelectObject, SetBkMode, SetTextColor, TextOutW,
+    BACKGROUND_MODE, FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION,
+    FONT_QUALITY, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ,
+    TRANSPARENT,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
+// (SetWindowSubclass not used — we subclass via SetWindowLongPtrW instead)
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -25,16 +34,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_CAPITAL, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefFrameProcW, DispatchMessageW, GetClientRect, GetMessageTime,
-    GetMessageW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW,
-    ShowWindow,
-    TranslateAcceleratorW, TranslateMessage, CLIENTCREATESTRUCT, CW_USEDEFAULT, HACCEL,
-    IDC_ARROW, MDICREATESTRUCTW, MSG, SW_SHOW, WHEEL_DELTA, WM_CHAR, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MDICREATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE, WM_SYSCOLORCHANGE, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_THEMECHANGED, WM_USER, WNDCLASSEXW, WNDCLASS_STYLES, WS_CHILD, WS_CLIPCHILDREN,
-    WS_EX_APPWINDOW, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
+    CallWindowProcW, CreateWindowExW, DefFrameProcW, DispatchMessageW, GetClientRect,
+    GetMessageTime, GetMessageW, GetWindowLongPtrW, LoadCursorW, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SendMessageW, SetWindowLongPtrW, ShowWindow,
+    TranslateAcceleratorW, TranslateMessage, CLIENTCREATESTRUCT, CW_USEDEFAULT, GWLP_WNDPROC,
+    HACCEL, IDC_ARROW, MDICREATESTRUCTW, MSG, SW_SHOW, WHEEL_DELTA, WM_CHAR, WM_CLOSE,
+    WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MDICREATE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE, WM_SYSCOLORCHANGE, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_THEMECHANGED, WM_USER, WNDCLASSEXW, WNDCLASS_STYLES, WS_CHILD,
+    WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
 };
 
 use super::channels::{self, modifier, mouse_op, IGuiEvent};
@@ -79,6 +88,124 @@ pub(crate) const TICK_TIMER_ID: usize = 0xA1;
 /// HWND of the MDI client. Set by `run` after `CreateWindowExW`.
 static MDI_CLIENT: Mutex<Option<isize>> = Mutex::new(None);
 static GUI_THREAD_ID: OnceLock<u32> = OnceLock::new();
+
+/// Original WNDPROC of the MDICLIENT, saved before we replace it so
+/// our subclass can forward unhandled messages correctly.
+static MDICLIENT_ORIG_PROC: OnceLock<isize> = OnceLock::new();
+/// λ brush handle (raw isize) kept alive for the process lifetime.
+static LAMBDA_BRUSH_RAW: OnceLock<isize> = OnceLock::new();
+
+// ── Lambda background brush ────────────────────────────────────────────────
+
+/// Color helpers: COLORREF = R | (G<<8) | (B<<16).
+const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
+    COLORREF((r as u32) | ((g as u32) << 8) | ((b as u32) << 16))
+}
+
+/// Build an 80×80 GDI pattern brush: dark-slate navy background with a
+/// barely-lighter italic λ (U+03BB) tiled at two diagonal offsets per
+/// cell.  The half-brick offset creates a continuous diagonal lattice.
+///
+/// Called once on the GUI thread immediately after MDICLIENT is created.
+/// The returned HBRUSH lives for the process lifetime.
+unsafe fn make_lambda_brush() -> HBRUSH {
+    const TILE: i32 = 80;
+
+    // Background: deep navy-slate  #1C2834
+    const BG: COLORREF = rgb(28, 40, 52);
+    // Lambda glyph: ~55 units brighter per channel — subtle but legible
+    const FG: COLORREF = rgb(58, 80, 104);
+
+    // All GDI calls are unsafe; group them in one block so Rust 2024's
+    // "unsafe in unsafe fn" lint is satisfied without scattering blocks.
+    unsafe {
+        // Build bitmap on a screen-compatible DC.
+        let screen_dc = GetDC(None);
+        let mem_dc = CreateCompatibleDC(Some(screen_dc));
+        let bmp: HBITMAP = CreateCompatibleBitmap(screen_dc, TILE, TILE);
+        let old_bmp: HGDIOBJ = SelectObject(mem_dc, HGDIOBJ(bmp.0));
+
+        // Fill solid background.
+        let bg_brush: HBRUSH = CreateSolidBrush(BG);
+        let tile_rect = RECT { left: 0, top: 0, right: TILE, bottom: TILE };
+        GdiFillRect(mem_dc, &tile_rect, bg_brush);
+        DeleteObject(HGDIOBJ(bg_brush.0));
+
+        // Draw λ with a thin italic Segoe UI — the slant echoes the
+        // traditional hand-written Greek letter and looks elegant at small
+        // sizes.  Two stamps per tile at (8,6) and (48,46) produce a
+        // half-brick diagonal repeat when the brush is tiled.
+        SetBkMode(mem_dc, BACKGROUND_MODE(TRANSPARENT.0));
+        SetTextColor(mem_dc, FG);
+
+        let font: HFONT = CreateFontW(
+            28, 0,                        // height (cell height), width (auto)
+            0, 0,                         // escapement, orientation
+            100,                          // weight: FW_THIN
+            1, 0, 0,                      // italic, no underline, no strikeout
+            FONT_CHARSET(1),              // DEFAULT_CHARSET
+            FONT_OUTPUT_PRECISION(0),     // OUT_DEFAULT_PRECIS
+            FONT_CLIP_PRECISION(0),       // CLIP_DEFAULT_PRECIS
+            FONT_QUALITY(5),              // CLEARTYPE_QUALITY
+            32u32,                        // FF_SWISS (sans-serif)
+            w!("Segoe UI"),
+        );
+        let old_font: HGDIOBJ = SelectObject(mem_dc, HGDIOBJ(font.0));
+
+        // U+03BB λ — one UTF-16 codepoint (BMP, no surrogate needed).
+        let lambda: &[u16] = &[0x03BB_u16];
+        let _ = TextOutW(mem_dc,  8,  6, lambda); // top-left stamp
+        let _ = TextOutW(mem_dc, 48, 46, lambda); // bottom-right stamp (half-brick)
+
+        SelectObject(mem_dc, old_font);
+        DeleteObject(HGDIOBJ(font.0));
+        SelectObject(mem_dc, old_bmp);
+
+        // Pattern brush tiles the bitmap seamlessly.
+        let brush: HBRUSH = CreatePatternBrush(bmp);
+
+        DeleteObject(HGDIOBJ(bmp.0));
+        let _ = DeleteDC(mem_dc);
+        let _ = ReleaseDC(None, screen_dc);
+
+        brush
+    }
+}
+
+/// Replacement WNDPROC for the MDICLIENT window.  Intercepts WM_ERASEBKGND
+/// to paint the λ-tiled background; all other messages are forwarded to
+/// the original MDICLIENT WndProc saved in MDICLIENT_ORIG_PROC.
+unsafe extern "system" fn mdi_bg_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_ERASEBKGND {
+        if let Some(&raw) = LAMBDA_BRUSH_RAW.get() {
+            let hdc = HDC(wparam.0 as *mut _);
+            let brush = HBRUSH(raw as *mut _);
+            let mut rect = RECT::default();
+            unsafe { let _ = GetClientRect(hwnd, &mut rect); }
+            unsafe { GdiFillRect(hdc, &rect, brush); }
+            return LRESULT(1); // background erased — suppress default erase
+        }
+    }
+    // Forward everything else (and WM_ERASEBKGND if brush not ready) to
+    // the original MDICLIENT WndProc.
+    let orig_raw = MDICLIENT_ORIG_PROC.get().copied().unwrap_or(0);
+    if orig_raw != 0 {
+        // SAFETY: orig_raw was obtained from GetWindowLongPtrW(GWLP_WNDPROC)
+        // immediately before installation and is a valid WNDPROC pointer.
+        unsafe {
+            let f: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT =
+                std::mem::transmute(orig_raw);
+            CallWindowProcW(Some(f), hwnd, msg, wparam, lparam)
+        }
+    } else {
+        unsafe { windows::Win32::UI::WindowsAndMessaging::DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+}
 
 fn mdi_client_hwnd() -> Option<HWND> {
     let raw = MDI_CLIENT.lock().ok()?;
@@ -180,6 +307,18 @@ where
     {
         let mut slot = MDI_CLIENT.lock().expect("MDI_CLIENT mutex poisoned");
         *slot = Some(mdi.0 as isize);
+    }
+
+    // Install the λ-tiled background.  The brush lives for the process
+    // lifetime; no explicit cleanup needed since we exit shortly after
+    // the frame is destroyed.
+    let lambda_brush = unsafe { make_lambda_brush() };
+    let _ = LAMBDA_BRUSH_RAW.set(lambda_brush.0 as isize);
+    unsafe {
+        // Save the original MDICLIENT WndProc then replace it with ours.
+        let orig = GetWindowLongPtrW(mdi, GWLP_WNDPROC);
+        let _ = MDICLIENT_ORIG_PROC.set(orig);
+        SetWindowLongPtrW(mdi, GWLP_WNDPROC, mdi_bg_proc as *const () as isize);
     }
 
     channels::install();
