@@ -1,17 +1,57 @@
-//! Event mailbox: GUI thread → language thread.
+//! Event mailbox: GUI thread → language thread(s).
 //!
-//! A bounded MPSC queue carrying typed `IGuiEvent` values. Producers
-//! are Win32 message handlers on the GUI thread (and, later, the
-//! surface executor when it answers synchronous queries). Consumer
-//! is the language thread, which calls `next_event` from
-//! `iGui.NextEvent`.
+//! ## Architecture — dispatcher model
+//!
+//! ```text
+//!  GUI thread ─SyncSender──► raw MPSC channel ──► dispatcher thread
+//!                                                        │
+//!                          ┌─────────────────────────────┤ routes each event
+//!                          ▼                             ▼
+//!                   per-child Arc<ChildQueue>    CATCH_ALL Arc<ChildQueue>
+//!                   (one per registered child)   (for filter-less next_event)
+//! ```
+//!
+//! Each Lisp thread that calls `filter_on_window(id)` or
+//! `next_event_for(id, …)` blocks on its own `Arc<ChildQueue>`
+//! (a `Mutex<VecDeque> + Condvar`). Multiple threads block independently
+//! on *different* queues — unlike the old single `Mutex<Receiver>` design,
+//! no thread starves the others.
+//!
+//! ## Routing rules (dispatcher thread)
+//!
+//! | Event kind                                   | Destination           |
+//! |----------------------------------------------|-----------------------|
+//! | Global (FrameClose, ThemeChange, Menu,       | **Broadcast** to ALL  |
+//! |          EvalBuffer)                          | registered queues     |
+//! | Per-child (Key, Char, Mouse, Tick, Close, …) | Target child queue    |
+//! |                                              | **+** CATCH_ALL queue |
+//!
+//! ## Thread-local filter (`next_event`)
+//!
+//! Each Lisp thread maintains its own `HashSet<i64>` of windows it cares
+//! about. `next_event(ms)` reads that per-thread set and:
+//!
+//! | Filter size | Action                                             |
+//! |-------------|---------------------------------------------------|
+//! | 0 entries   | Wait on CATCH_ALL queue (all events)              |
+//! | 1 entry     | Delegate to `next_event_for(id, ms)`              |
+//! | N entries   | Spin-poll all matching per-child queues (rare)    |
+//!
+//! This means `(event-loop-for WIN …)` — which does
+//! `filter-on-window WIN` then `next-event -1` in a loop — correctly
+//! delegates to the per-child queue for `WIN`, letting a second thread
+//! concurrently do `(event-loop-for WIN2 …)` on a completely independent
+//! queue.
 
 #![cfg(windows)]
 
-use std::collections::{HashSet, VecDeque};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+// ── Event kinds / sub-kinds (stable ABI, exported to CP) ───────────────────
 
 /// Stable enum tags exported to CP as `iGui.Ev*` constants.
 pub mod kind {
@@ -34,8 +74,7 @@ pub mod kind {
 }
 
 /// Mouse-event sub-kinds packed into the `mouse_op` field. Each is a
-/// distinct value (not a bitmask) so the language side can match
-/// directly.
+/// distinct value (not a bitmask) so the language side can match directly.
 pub mod mouse_op {
     pub const MOVE: i64 = 0;
     pub const LEFT_DOWN: i64 = 1;
@@ -58,7 +97,9 @@ pub mod modifier {
     pub const CAPS: i64 = 1 << 4;
 }
 
-/// All input and lifecycle events flow as one of these structs.
+// ── Event enum ──────────────────────────────────────────────────────────────
+
+/// All input and lifecycle events flow as one of these variants.
 /// Specialised carriers per kind keep the variant fields self-describing
 /// without a tagged-union ABI on the wire.
 #[derive(Debug, Clone)]
@@ -105,145 +146,174 @@ pub enum IGuiEvent {
     ThemeChange,
     DpiChange {
         child_id: i64,
-        dpi_x: i64, // ×100 (e.g. 192 means 192 dpi; ×100 reserves room for fractional later)
+        dpi_x: i64, // ×100
         dpi_y: i64,
     },
     Menu {
         menu_id: i64,
         item_id: i64,
     },
-    /// Animation tick. Fires from a Win32 timer running on a child's
-    /// render host; Win32 auto-coalesces queued WM_TIMERs so the
-    /// language thread sees at most one tick per child per drain
-    /// cycle even if it lags.
+    /// Animation tick — fires from a Win32 timer running on a child's
+    /// render host. Win32 auto-coalesces queued WM_TIMERs so the
+    /// language thread sees at most one tick per child per drain cycle.
     Tick {
         child_id: i64,
         time_ms: i64,
     },
     /// "Evaluate this Lisp source." Fired when the user hits Ctrl+R
-    /// inside the ledit (Lisp editor) pane. The pane snapshots its
-    /// buffer (or current selection) and pushes the text as
-    /// `source`. The language thread evaluates it via the
-    /// active session and, if the printed result fits on one
-    /// line, writes that line to the iGui log overlay. The
-    /// event-loop macros in Library/events.lisp dispatch this
-    /// automatically so every iGui app gets the shortcut.
+    /// inside the ledit (Lisp editor) pane. The event-loop macros in
+    /// Library/events.lisp dispatch this automatically.
     EvalBuffer {
         source: String,
     },
-    /// A complete Lisp form has been submitted from the REPL input
-    /// pane. The text has already been pushed onto `PENDING_INPUTS`;
-    /// the worker thread should call `(repl-pop-input child-id)` to
-    /// retrieve it, evaluate it, then call `(repl-output child-id
-    /// text)` / `(repl-error child-id text)` with the results.
+    /// A complete Lisp form has been submitted from the REPL input pane.
+    /// The text has already been pushed onto the REPL child's pending
+    /// queue; the worker thread should call `(repl-pop-input child-id)`.
     ReplSubmit {
         child_id: i64,
     },
 }
 
-struct Mailbox {
-    tx: SyncSender<IGuiEvent>,
-    rx: Mutex<Receiver<IGuiEvent>>,
+// ── Per-child queue ──────────────────────────────────────────────────────────
+
+/// Sentinel child_id for the catch-all queue. Language threads that use
+/// `(next-event …)` without any `filter-on-window` call consume from here
+/// and receive every event (legacy single-thread demos).
+const CATCH_ALL_ID: i64 = i64::MIN;
+
+struct ChildQueue {
+    events: Mutex<VecDeque<IGuiEvent>>,
+    cv: Condvar,
 }
 
-const CAPACITY: usize = 1024;
+impl ChildQueue {
+    fn new() -> Arc<Self> {
+        Arc::new(ChildQueue {
+            events: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+        })
+    }
 
-static MAILBOX: OnceLock<Mailbox> = OnceLock::new();
+    fn push(&self, ev: IGuiEvent) {
+        {
+            let mut guard = self.events.lock().unwrap_or_else(|e| e.into_inner());
+            guard.push_back(ev);
+        } // release before notify so waiters don't spin on a held mutex
+        self.cv.notify_one();
+    }
 
-pub fn install() {
-    MAILBOX.get_or_init(|| {
-        let (tx, rx) = sync_channel(CAPACITY);
-        Mailbox {
-            tx,
-            rx: Mutex::new(rx),
-        }
-    });
-}
+    /// Non-blocking pop; returns None if empty.
+    fn try_pop(&self) -> Option<IGuiEvent> {
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
+    }
 
-/// Push from the GUI thread. If the queue is full, drop the new event
-/// and log; spamming during a wedged language thread should not block
-/// the message pump.
-pub fn push(ev: IGuiEvent) {
-    let Some(mb) = MAILBOX.get() else {
-        return;
-    };
-    match mb.tx.try_send(ev) {
-        Ok(()) => {}
-        Err(TrySendError::Full(_)) => {
-            // Dropping is correct: the GUI thread cannot block on the
-            // language thread, and a stalled consumer means whatever
-            // we just lost is the least of the user's problems.
-            eprintln!("[igui] event mailbox full, dropping event");
-        }
-        Err(TrySendError::Disconnected(_)) => {
-            // Receiver gone; mailbox is being torn down. Silently ignore.
+    /// Block until an event is available, or until `deadline` is reached.
+    /// `deadline = None` means block forever.
+    fn wait_pop(&self, deadline: Option<Instant>) -> Option<IGuiEvent> {
+        let mut guard = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(ev) = guard.pop_front() {
+                return Some(ev);
+            }
+            match deadline {
+                None => {
+                    guard = self.cv.wait(guard).unwrap_or_else(|e| e.into_inner());
+                }
+                Some(dl) => {
+                    let now = Instant::now();
+                    if now >= dl {
+                        return None;
+                    }
+                    let (g, _) = self
+                        .cv
+                        .wait_timeout(guard, dl - now)
+                        .unwrap_or_else(|e| e.into_inner());
+                    guard = g;
+                    // Loop back: either an event arrived, or we timed out
+                    // and the next `Instant::now() >= dl` check will catch it.
+                }
+            }
         }
     }
 }
 
-// ─── Per-window event filtering / stash ────────────────────────────────
-//
-// Pattern ported from NewBCPL. Lisp programs typically open one child
-// window and only care about its events plus globals like FrameClose.
-// Without filtering, events for OTHER children (e.g. an embedded log
-// view or REPL pane) pollute the loop and force every clause to write
-// (= (getf ev :child-id) win).
-//
-// The runtime now offers two filtering shapes:
-//
-//   * `next_event_for(target, timeout)` — one-shot. Block until an
-//     event matches target (or is a global). Non-matches park in
-//     the stash so they're not lost.
-//
-//   * `filter_on_window(child_id)` / `unfilter_window` /
-//     `clear_filter` — persistent. Any `next_event` calls while the
-//     filter set is non-empty only return matching events; the rest
-//     stash. The language thread typically sets up the filter on
-//     start and clears it on shutdown.
+// ── Queue registry ───────────────────────────────────────────────────────────
 
-/// Stash of events that arrived but didn't match the current
-/// consumer's interest. Drained ahead of the channel by every
-/// consumer.
-static EVENT_STASH: Mutex<VecDeque<IGuiEvent>> = Mutex::new(VecDeque::new());
+static QUEUES: OnceLock<Mutex<HashMap<i64, Arc<ChildQueue>>>> = OnceLock::new();
 
-/// Persistent set of windows the language thread is interested in.
-/// Initialised on first access.
-static EVENT_FILTER: OnceLock<Mutex<HashSet<i64>>> = OnceLock::new();
+fn queues_lock() -> &'static Mutex<HashMap<i64, Arc<ChildQueue>>> {
+    QUEUES.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
-fn filter_lock() -> &'static Mutex<HashSet<i64>> {
-    EVENT_FILTER.get_or_init(|| Mutex::new(HashSet::new()))
+fn get_or_create_queue(id: i64) -> Arc<ChildQueue> {
+    queues_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(id)
+        .or_insert_with(ChildQueue::new)
+        .clone()
+}
+
+fn try_get_queue(id: i64) -> Option<Arc<ChildQueue>> {
+    queues_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&id)
+        .cloned()
+}
+
+// ── Thread-local filter ──────────────────────────────────────────────────────
+
+// Each Lisp thread has its own filter set so two threads each doing
+// `(event-loop-for WIN …)` with different WIN values don't share state
+// and don't fall through to the catch-all queue.
+
+thread_local! {
+    static THREAD_FILTER: RefCell<HashSet<i64>> = RefCell::new(HashSet::new());
 }
 
 pub fn filter_on_window(child_id: i64) {
-    if let Ok(mut filter) = filter_lock().lock() {
-        filter.insert(child_id);
-    }
+    THREAD_FILTER.with(|f| f.borrow_mut().insert(child_id));
+    // Pre-create the queue so the dispatcher can push to it immediately,
+    // even if this thread hasn't called next_event_for yet.
+    get_or_create_queue(child_id);
 }
 
 pub fn unfilter_window(child_id: i64) {
-    if let Ok(mut filter) = filter_lock().lock() {
-        filter.remove(&child_id);
-    }
+    THREAD_FILTER.with(|f| f.borrow_mut().remove(&child_id));
 }
 
 pub fn clear_filter() {
-    if let Ok(mut filter) = filter_lock().lock() {
-        filter.clear();
-    }
+    THREAD_FILTER.with(|f| f.borrow_mut().clear());
 }
 
-pub fn discard_stashed_events() {
-    if let Ok(mut stash) = EVENT_STASH.lock() {
-        stash.clear();
-    }
+/// No-op in the dispatcher design — there is no global stash to drain.
+/// Kept for API compatibility with the old stash-based implementation.
+pub fn discard_stashed_events() {}
+
+// ── Raw MPSC channel + dispatcher ───────────────────────────────────────────
+
+const CAPACITY: usize = 1024;
+
+struct Mailbox {
+    tx: SyncSender<IGuiEvent>,
 }
 
-/// Does `ev` match the registered-interest set? Used by `next_event`
-/// when the filter is non-empty.
-fn matches_filter(ev: &IGuiEvent, filter: &HashSet<i64>) -> bool {
+static MAILBOX: OnceLock<Mailbox> = OnceLock::new();
+
+/// Extract the child_id for per-child events, or None for global events.
+/// Global events are broadcast to every registered queue.
+fn event_target(ev: &IGuiEvent) -> Option<i64> {
     match ev {
-        IGuiEvent::FrameClose | IGuiEvent::ThemeChange | IGuiEvent::EvalBuffer { .. } => true,
-        IGuiEvent::Menu { .. } => true,
+        // Globals: broadcast
+        IGuiEvent::FrameClose
+        | IGuiEvent::ThemeChange
+        | IGuiEvent::EvalBuffer { .. }
+        | IGuiEvent::Menu { .. } => None,
+        // Per-child: route to specific queue + CATCH_ALL
         IGuiEvent::Key { child_id, .. }
         | IGuiEvent::Char { child_id, .. }
         | IGuiEvent::Mouse { child_id, .. }
@@ -252,130 +322,152 @@ fn matches_filter(ev: &IGuiEvent, filter: &HashSet<i64>) -> bool {
         | IGuiEvent::Close { child_id }
         | IGuiEvent::DpiChange { child_id, .. }
         | IGuiEvent::Tick { child_id, .. }
-        | IGuiEvent::ReplSubmit { child_id } => filter.contains(child_id),
+        | IGuiEvent::ReplSubmit { child_id } => Some(*child_id),
     }
 }
 
-/// Does `ev` belong to the consumer that asked for `target`?
-/// Per-window events match when their `child_id` == `target`. Global
-/// events (FrameClose, ThemeChange, Menu) match every target.
-fn matches_target(ev: &IGuiEvent, target: i64) -> bool {
-    match ev {
-        IGuiEvent::FrameClose | IGuiEvent::ThemeChange | IGuiEvent::EvalBuffer { .. } => true,
-        IGuiEvent::Menu { .. } => true,
-        IGuiEvent::Key { child_id, .. }
-        | IGuiEvent::Char { child_id, .. }
-        | IGuiEvent::Mouse { child_id, .. }
-        | IGuiEvent::Focus { child_id, .. }
-        | IGuiEvent::Resize { child_id, .. }
-        | IGuiEvent::Close { child_id }
-        | IGuiEvent::DpiChange { child_id, .. }
-        | IGuiEvent::Tick { child_id, .. }
-        | IGuiEvent::ReplSubmit { child_id } => *child_id == target,
-    }
-}
+fn dispatcher(rx: Receiver<IGuiEvent>) {
+    loop {
+        let ev = match rx.recv() {
+            Ok(ev) => ev,
+            Err(_) => break, // SyncSender dropped; process is shutting down
+        };
 
-/// Pop from the language thread. `timeout_ms < 0` blocks indefinitely.
-///
-/// Semantics depend on the EVENT_FILTER:
-///   * filter empty:     return next event (stash, then channel)
-///   * filter non-empty: return next event matching the set; non-
-///                       matches park in stash.
-pub fn next_event(timeout_ms: i64) -> Option<IGuiEvent> {
-    let filter_snapshot: Option<HashSet<i64>> = filter_lock()
-        .lock()
-        .ok()
-        .map(|f| f.clone())
-        .filter(|f| !f.is_empty());
+        let target = event_target(&ev);
 
-    // Drain stash first.
-    {
-        let mut stash = EVENT_STASH.lock().expect("EVENT_STASH poisoned");
-        match &filter_snapshot {
-            None => {
-                if let Some(ev) = stash.pop_front() {
-                    return Some(ev);
+        // Snapshot Arc refs while holding the map lock, then release the lock
+        // before pushing. This avoids a potential deadlock: pushing notifies a
+        // waiter which could try to create a new queue (which also needs the
+        // map lock).
+        let targets: Vec<Arc<ChildQueue>> = {
+            let guard = queues_lock().lock().unwrap_or_else(|e| e.into_inner());
+            match target {
+                None => {
+                    // Broadcast: push a clone to every registered queue.
+                    guard.values().cloned().collect()
+                }
+                Some(tid) => {
+                    // Per-child: target queue + catch-all.
+                    let mut v = Vec::with_capacity(2);
+                    if let Some(q) = guard.get(&tid) {
+                        v.push(Arc::clone(q));
+                    }
+                    // Always include CATCH_ALL so single-thread demos that
+                    // use (next-event …) without a filter still work.
+                    if let Some(q) = guard.get(&CATCH_ALL_ID) {
+                        v.push(Arc::clone(q));
+                    }
+                    v
                 }
             }
-            Some(filter) => {
-                for i in 0..stash.len() {
-                    if matches_filter(&stash[i], filter) {
-                        return stash.remove(i);
+        };
+
+        // Push the event to every target queue. All but the last need a clone.
+        let n = targets.len();
+        for (i, q) in targets.into_iter().enumerate() {
+            if i + 1 < n {
+                q.push(ev.clone());
+            } else {
+                q.push(ev.clone()); // last element — still clone for simplicity
+            }
+        }
+    }
+}
+
+/// Initialise the mailbox and start the dispatcher thread. Idempotent.
+pub fn install() {
+    MAILBOX.get_or_init(|| {
+        // Pre-create the catch-all queue before the dispatcher starts so the
+        // first event never races with queue creation.
+        get_or_create_queue(CATCH_ALL_ID);
+
+        let (tx, rx) = sync_channel(CAPACITY);
+
+        std::thread::Builder::new()
+            .name("igui-dispatcher".into())
+            .spawn(move || dispatcher(rx))
+            .expect("failed to spawn igui-dispatcher thread");
+
+        Mailbox { tx }
+    });
+}
+
+/// Push an event from the GUI thread. Non-blocking: drops on full queue
+/// rather than blocking the message pump.
+pub fn push(ev: IGuiEvent) {
+    let Some(mb) = MAILBOX.get() else { return };
+    match mb.tx.try_send(ev) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            // A stalled language thread is already a bigger problem.
+            eprintln!("[igui] event mailbox full, dropping event");
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            // Receiver gone (dispatcher exited). Ignore silently.
+        }
+    }
+}
+
+// ── Consumer API ─────────────────────────────────────────────────────────────
+
+fn make_deadline(timeout_ms: i64) -> Option<Instant> {
+    if timeout_ms < 0 {
+        None
+    } else {
+        Some(Instant::now() + Duration::from_millis(timeout_ms as u64))
+    }
+}
+
+/// Wait for the next event, filtered by this thread's `filter_on_window` set.
+///
+/// | Filter size | Behaviour                                              |
+/// |-------------|--------------------------------------------------------|
+/// | 0 entries   | Block on the CATCH_ALL queue (receives all events)    |
+/// | 1 entry     | Delegate to `next_event_for(id, timeout_ms)`          |
+/// | N entries   | Spin-poll all matching per-child queues (rare case)   |
+///
+/// `timeout_ms < 0` blocks indefinitely; `0` polls without blocking;
+/// positive values set a wall-clock deadline.
+pub fn next_event(timeout_ms: i64) -> Option<IGuiEvent> {
+    let filter: HashSet<i64> = THREAD_FILTER.with(|f| f.borrow().clone());
+
+    match filter.len() {
+        0 => {
+            // No filter: block on the catch-all queue.
+            get_or_create_queue(CATCH_ALL_ID).wait_pop(make_deadline(timeout_ms))
+        }
+        1 => {
+            // Common case: exactly one window of interest.
+            let target = *filter.iter().next().unwrap();
+            next_event_for(target, timeout_ms)
+        }
+        _ => {
+            // Multiple filters: spin-poll all matching queues.
+            // This is the rare case (event-loop-for always uses exactly one
+            // window per thread). A 1 ms sleep keeps CPU at ~0% when idle.
+            let deadline = make_deadline(timeout_ms);
+            loop {
+                for &id in &filter {
+                    if let Some(q) = try_get_queue(id) {
+                        if let Some(ev) = q.try_pop() {
+                            return Some(ev);
+                        }
                     }
                 }
-            }
-        }
-    }
-
-    let mb = MAILBOX.get()?;
-    let rx = mb.rx.lock().ok()?;
-    let deadline = if timeout_ms < 0 {
-        None
-    } else {
-        Some(Instant::now() + Duration::from_millis(timeout_ms as u64))
-    };
-    loop {
-        let ev = match deadline {
-            None => rx.recv().ok()?,
-            Some(deadline) => {
-                let now = Instant::now();
-                if now >= deadline {
-                    return None;
+                if let Some(dl) = deadline {
+                    if Instant::now() >= dl {
+                        return None;
+                    }
                 }
-                rx.recv_timeout(deadline - now).ok()?
-            }
-        };
-        match &filter_snapshot {
-            None => {
-                return Some(ev);
-            }
-            Some(filter) => {
-                if matches_filter(&ev, filter) {
-                    return Some(ev);
-                }
-                if let Ok(mut stash) = EVENT_STASH.lock() {
-                    stash.push_back(ev);
-                }
+                std::thread::sleep(Duration::from_millis(1));
             }
         }
     }
 }
 
-/// Block until an event matches `target` (or is a global). Non-
-/// matches park into EVENT_STASH for later consumers.
-/// `timeout_ms < 0` blocks indefinitely; the deadline is wall-clock,
-/// not reset by non-matches.
+/// Block until an event arrives for `target` (or a global event).
+/// `timeout_ms < 0` blocks indefinitely; the deadline is wall-clock, not
+/// reset by the arrival of other events.
 pub fn next_event_for(target: i64, timeout_ms: i64) -> Option<IGuiEvent> {
-    if let Ok(mut stash) = EVENT_STASH.lock() {
-        for i in 0..stash.len() {
-            if matches_target(&stash[i], target) {
-                return stash.remove(i);
-            }
-        }
-    }
-    let mb = MAILBOX.get()?;
-    let rx = mb.rx.lock().ok()?;
-    let deadline = if timeout_ms < 0 {
-        None
-    } else {
-        Some(Instant::now() + Duration::from_millis(timeout_ms as u64))
-    };
-    loop {
-        let ev = match deadline {
-            None => rx.recv().ok()?,
-            Some(deadline) => {
-                let now = Instant::now();
-                if now >= deadline {
-                    return None;
-                }
-                rx.recv_timeout(deadline - now).ok()?
-            }
-        };
-        if matches_target(&ev, target) {
-            return Some(ev);
-        }
-        if let Ok(mut stash) = EVENT_STASH.lock() {
-            stash.push_back(ev);
-        }
-    }
+    get_or_create_queue(target).wait_pop(make_deadline(timeout_ms))
 }

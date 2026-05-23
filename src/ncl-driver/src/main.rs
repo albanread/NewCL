@@ -236,8 +236,14 @@ fn lisp_main(raw_args: Vec<String>) -> ExitCode {
     let t_total = std::time::Instant::now();
 
     // Bare `ncl` invocation drops into the REPL with the stdlib loaded.
+    // `--windows` without any explicit work (--eval/--load/--check) also
+    // implies --repl: the GUI was launched to be interactive, not to run
+    // a script and immediately exit.
+    let has_work = raw_args.iter().any(|a| matches!(a.as_str(),
+        "--eval" | "-e" | "--load" | "-l" | "--check" | "-c"));
     let want_repl = raw_args.is_empty()
-        || raw_args.iter().any(|a| a == "--repl" || a == "-r");
+        || raw_args.iter().any(|a| a == "--repl" || a == "-r")
+        || (raw_args.iter().any(|a| a == "--windows" || a == "-W") && !has_work);
 
     // --lean: skip CLOS, skip Library/init.lisp. User explicitly opted
     // out of the standard auto-loaded surface. Useful for scripts or
