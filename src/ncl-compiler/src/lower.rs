@@ -807,6 +807,24 @@ fn lower_call_in_mut(
             Ok(Expr::values(lowered?))
         }
         "DEFUN" => lower_nested_defun(args, env, coord),
+        // (declare ...) — declaration forms are processed at
+        // let/lambda/defun lowering time, not evaluated. A bare
+        // `declare` that somehow reaches evaluation (e.g. at top
+        // level) is silently ignored per CL spec.
+        "DECLARE" => Ok(Expr::Nil),
+        // (locally (declare (special ...)) body...) — establishes
+        // local special declarations for the enclosed body. The
+        // declares affect only the lexical scope of `body`.
+        "LOCALLY" => lower_locally(args, env, coord),
+        // (proclaim '(special ...)) — globally proclaim variables
+        // as special (dynamically scoped). Affects all future
+        // compilations in this session.
+        "PROCLAIM" => lower_proclaim(args, env, coord),
+        // (unwind-protect protected cleanup...) — ensure cleanup
+        // runs even on non-local exit. Lowers to
+        // (%native-unwind-protect #'(lambda () protected)
+        //                          #'(lambda () cleanup...))
+        "UNWIND-PROTECT" => lower_unwind_protect(args, env, coord),
         // Unknown head: it's a function call. First check the
         // Lisp-2 function namespace — if NAME is bound by an
         // enclosing flet/labels, emit Funcall on the local; else
@@ -1068,14 +1086,32 @@ fn lower_let(
     // Drop the placeholders; the real bindings are pushed below.
     env.restore(placeholder_cp);
 
-    // Determine which of OUR bindings are mutated anywhere reachable
-    // from the body — including from inside nested lambdas. Those
-    // names need boxing; init becomes (cons init nil) and the
-    // binding becomes a LocalCell.
+    // Consume leading (declare ...) forms from the body and collect
+    // locally-declared-special names. These names, together with
+    // globally proclaimed specials, get dynamic binding treatment.
+    let (decl_specs, body_forms) = strip_declares(body_forms);
+    let locally_special = extract_special_names(&decl_specs);
+
+    // Classify each binding as special (dynamic) or lexical.
+    // Special: globally proclaimed via defvar/defparameter/proclaim,
+    //          or locally declared via (declare (special name)).
+    let is_special_binding: Vec<bool> = binding_names
+        .iter()
+        .map(|n| {
+            locally_special.contains(n)
+                || coord.is_special(coord.intern(n))
+        })
+        .collect();
+
+    // For LEXICAL bindings only: determine which need boxing
+    // (mutated in the body, so captured lambdas share the cell).
+    // Special bindings are never boxed — their backing store IS the
+    // symbol's value cell; setq goes through StoreGlobal directly.
     let mutated = mutated_in_body(body_forms, &HashSet::new());
     let needs_box: Vec<bool> = binding_names
         .iter()
-        .map(|n| mutated.contains(n))
+        .zip(is_special_binding.iter())
+        .map(|(n, special)| !special && mutated.contains(n))
         .collect();
     for (i, b) in needs_box.iter().enumerate() {
         if *b {
@@ -1085,17 +1121,28 @@ fn lower_let(
         }
     }
 
-    // Extend env with new locals (cell or plain), lower body, restore env.
+    // Extend env with new LEXICAL locals (cell or plain). Special
+    // bindings are NOT added to the lexical env — symbol reads/writes
+    // for them fall through to LoadGlobal/StoreGlobal as intended.
     let cp = env.checkpoint();
     for (i, name) in binding_names.iter().enumerate() {
-        if needs_box[i] {
+        if is_special_binding[i] {
+            // Reserve a slot in the Let's bindings vector for the
+            // special's pre-computed init value (a temp), but don't
+            // add the name to the lexical env. The temp will be
+            // passed to DynamicBind as Expr::Local(slot_idx).
+            env.push_local(Arc::from("__dyn_temp__"));
+        } else if needs_box[i] {
             env.push_local_cell(Arc::clone(name));
         } else {
             env.push_local(Arc::clone(name));
         }
     }
 
-    let body_expr = if body_forms.is_empty() {
+    // Lower the body. Reads of special names fall through to
+    // LoadGlobal (value cell), writes to StoreGlobal — correct
+    // because we didn't add them to the lexical env.
+    let raw_body = if body_forms.is_empty() {
         Expr::Nil
     } else if body_forms.len() == 1 {
         lower_in_mut(&body_forms[0], env, coord)?
@@ -1108,7 +1155,31 @@ fn lower_let(
     };
 
     env.restore(cp);
-    Ok(Expr::let_(binding_exprs, body_expr))
+
+    // Wrap the body in DynamicBind for each special binding,
+    // innermost-first (so the first binding wraps outermost).
+    // Compute the base local index for this let's bindings:
+    // the locals allocated by the OUTER scope before this let
+    // are not in binding_exprs; this let's slots start at
+    // `saved_local_count` (which is the env's local_count at the
+    // placeholder_cp snapshot). Recover it from placeholder_cp.
+    let base_local_idx = placeholder_cp.1; // local_count before this let
+    let mut body_with_dynbinds = raw_body;
+    // Wrap in reverse order so binding[0] is the outermost DynamicBind.
+    for (i, name) in binding_names.iter().enumerate().rev() {
+        if !is_special_binding[i] { continue; }
+        let sym_word = coord.intern(name);
+        // The pre-computed init is at Local(base_local_idx + i)
+        // inside the Expr::Let that wraps everything.
+        let slot = base_local_idx + i;
+        body_with_dynbinds = Expr::DynamicBind {
+            sym_word: sym_word.raw(),
+            value: Box::new(Expr::Local(slot)),
+            body: Box::new(body_with_dynbinds),
+        };
+    }
+
+    Ok(Expr::let_(binding_exprs, body_with_dynbinds))
 }
 
 /// `(flet ((name (params...) body...) ...) body...)` — establish
@@ -1690,6 +1761,10 @@ fn lower_defparameter(
         }
     };
     let sym_word = coord.intern(&name);
+    // Mark the symbol as globally special so any future `let`
+    // binding of this name uses dynamic rebinding (value cell)
+    // rather than a lexical local slot.
+    coord.proclaim_special(sym_word);
     let value = lower_in_mut(&args[1], env, coord)?;
     // CL spec: (defparameter name ...) returns the symbol, not the
     // new value. Returning the value tripped the REPL printer when
@@ -1700,6 +1775,160 @@ fn lower_defparameter(
         Expr::store_global(sym_word.raw(), value),
         Expr::Word(sym_word.raw()),
     ]))
+}
+
+/// Match a `(declare decl1 decl2 ...)` form. Returns a Vec of
+/// the declspec values (decl1, decl2, …) on a match, or None.
+fn match_declare(form: &Value) -> Option<Vec<Value>> {
+    let items = list_to_vec(form).ok()?;
+    if let Some(Value::Symbol(s)) = items.first() {
+        if &*s.name == "DECLARE" {
+            return Some(items[1..].to_vec());
+        }
+    }
+    None
+}
+
+/// Consume leading `(declare ...)` forms from `body`. Returns the
+/// collected declspecs (each a `Value` — one declspec per form,
+/// flattened) and the rest of the body (non-declare forms).
+pub fn strip_declares(body: &[Value]) -> (Vec<Value>, &[Value]) {
+    let mut specs: Vec<Value> = Vec::new();
+    let mut n = 0;
+    for form in body {
+        if let Some(decl_specs) = match_declare(form) {
+            specs.extend(decl_specs);
+            n += 1;
+        } else {
+            break;
+        }
+    }
+    (specs, &body[n..])
+}
+
+/// Given a slice of declspec Values (the arguments to `declare`
+/// forms), collect the names appearing in `(special name1 name2 …)`
+/// specs and return them as an `Arc<str>` set.
+fn extract_special_names(specs: &[Value]) -> HashSet<Arc<str>> {
+    let mut out = HashSet::new();
+    for spec in specs {
+        let Ok(items) = list_to_vec(spec) else { continue };
+        let [Value::Symbol(head), rest @ ..] = items.as_slice() else { continue };
+        if &*head.name != "SPECIAL" { continue; }
+        for name_val in rest {
+            if let Value::Symbol(s) = name_val {
+                out.insert(Arc::clone(&s.name));
+            }
+        }
+    }
+    out
+}
+
+/// (locally (declare ...) body...) — process local declarations
+/// for the enclosed body; evaluate the body in their scope.
+fn lower_locally(
+    args: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
+    // Strip declare forms, ignore locally-declared specials for now
+    // (they only affect let-lowering inside the body, which handles
+    // its own declare stripping). The body is lowered normally.
+    let (_, body_forms) = strip_declares(args);
+    if body_forms.is_empty() {
+        return Ok(Expr::Nil);
+    }
+    let lowered: Result<Vec<_>, _> = body_forms
+        .iter()
+        .map(|f| lower_in_mut(f, env, coord))
+        .collect();
+    Ok(Expr::progn(lowered?))
+}
+
+/// (proclaim '(special name1 name2 ...)) — globally proclaim
+/// variables as dynamically scoped. `(proclaim '(special *x*))` is
+/// equivalent to wrapping `*x*` with defvar; the symbol's value
+/// cell is not touched, only the special registry.
+fn lower_proclaim(
+    args: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
+    if args.len() != 1 {
+        return Err(CompileError::BadArity {
+            head: "PROCLAIM".into(),
+            expected: "1",
+            got: args.len(),
+        });
+    }
+    // The argument is usually a quoted list: '(special *x* *y*).
+    // After macroexpansion it's a (quote (special ...)) form.
+    // We handle it at compile time: peek inside the quote.
+    let inner = match &args[0] {
+        Value::Cons(_) => {
+            let items = list_to_vec(&args[0])?;
+            if items.len() >= 1 {
+                if let Value::Symbol(s) = &items[0] {
+                    if &*s.name == "QUOTE" && items.len() == 2 {
+                        // (quote (special ...)) — extract the inner list
+                        items.get(1).cloned()
+                    } else { None }
+                } else { None }
+            } else { None }
+        }
+        _ => None,
+    };
+    if let Some(decl) = inner {
+        let specs = vec![decl];
+        let names = extract_special_names(&specs);
+        for name in &names {
+            let sym = coord.intern(name);
+            coord.proclaim_special(sym);
+        }
+    }
+    // proclaim is a side-effect at compile time; at runtime it
+    // evaluates the argument (for conformance) and returns nil.
+    let arg_expr = lower_in_mut(&args[0], env, coord)?;
+    Ok(Expr::progn(vec![arg_expr, Expr::Nil]))
+}
+
+/// Build a 0-arity lambda (thunk) from a slice of body forms.
+/// Used by unwind-protect to wrap the protected and cleanup forms.
+fn lower_thunk(
+    body_forms: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
+    // lower_lambda expects args = [param-list, body-form1, body-form2, ...]
+    // An empty param list is represented as Value::Nil.
+    let mut lambda_args = Vec::with_capacity(1 + body_forms.len());
+    lambda_args.push(Value::Nil); // empty param list
+    lambda_args.extend_from_slice(body_forms);
+    lower_lambda(&lambda_args, env, coord)
+}
+
+/// (unwind-protect protected cleanup...) — ensure cleanup always runs.
+/// Lowers to (%native-unwind-protect #'protected-thunk #'cleanup-thunk).
+fn lower_unwind_protect(
+    args: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
+    if args.is_empty() {
+        return Err(CompileError::BadArity {
+            head: "UNWIND-PROTECT".into(),
+            expected: "at least 1 (protected form)",
+            got: 0,
+        });
+    }
+    let protected_forms = &args[0..1]; // just the first form
+    let cleanup_forms = &args[1..];    // everything after
+
+    let protected_thunk = lower_thunk(protected_forms, env, coord)?;
+    let cleanup_thunk = lower_thunk(cleanup_forms, env, coord)?;
+
+    let sym_word = coord.intern("%NATIVE-UNWIND-PROTECT");
+    Ok(Expr::call(sym_word.raw(), vec![protected_thunk, cleanup_thunk]))
 }
 
 /// Lower a `(lambda (params...) body...)` form. Builds an inner
@@ -1721,7 +1950,12 @@ fn lower_lambda(
     }
     let params = crate::parse_param_list_inner(&args[0])
         .map_err(CompileError::NotImplemented)?;
-    let body_forms = &args[1..];
+    let all_body_forms = &args[1..];
+    // Strip leading (declare ...) forms — they're processed at
+    // lowering time, not evaluated as calls. Locally-declared
+    // specials inside a lambda body are handled by the (let ...)
+    // forms within; we just need to not trip on the bare DECLARE.
+    let (_decl_specs, body_forms) = strip_declares(all_body_forms);
 
     // Inner env starts with required params at Param(0..N) and a
     // capture parent that begins as a clone of `outer_env`. The

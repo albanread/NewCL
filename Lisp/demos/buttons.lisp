@@ -107,3 +107,4 @@
             (unless (equal hovered b)
               (setq hovered b)
               (paint-buttons id last-w last-h hovered pressed)))))))))
+(run-buttons)

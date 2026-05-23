@@ -35,7 +35,7 @@ use ncl_runtime::{
     complex::{ncl_add_complex, ncl_sub_complex, ncl_mul_complex},
     ratio::ncl_cmp_full,
     ncl_abort_pending, ncl_alloc_cons, ncl_apply, ncl_aref_generic, ncl_aset_generic,
-    ncl_build_rest_list, ncl_call, ncl_equal, ncl_funcall,
+    ncl_build_rest_list, ncl_call, ncl_dynamic_bind, ncl_dynamic_unbind, ncl_equal, ncl_funcall,
     ncl_length, ncl_load_function, ncl_load_value, ncl_lookup_keyword,
     ncl_make_closure, ncl_pop_root, ncl_push_root, ncl_set_car,
     ncl_set_cdr, ncl_set_mv_many, ncl_set_mv_single, ncl_store_value,
@@ -630,6 +630,8 @@ fn build_engine_and_get_fn_addr(
             helpers.debug_check_cons,
             ncl_runtime::ncl_debug_check_cons as usize,
         );
+        bind(engine, helpers.dynamic_bind, ncl_dynamic_bind as usize);
+        bind(engine, helpers.dynamic_unbind, ncl_dynamic_unbind as usize);
     }
     // sadd/ssub/smul.with.overflow are LLVM intrinsics — LLVM
     // resolves them itself, no mapping needed.
@@ -706,6 +708,11 @@ struct Helpers<'ctx> {
     /// bugs (Fixnum 0 / stale-pointer) at the exact dereference
     /// point instead of letting them NULL-deref in JIT'd code.
     debug_check_cons: FunctionValue<'ctx>,
+    /// Dynamic variable bind/unbind. Called by `Expr::DynamicBind`
+    /// emit to save/restore a symbol's value cell for the duration
+    /// of the dynamic scope.
+    dynamic_bind: FunctionValue<'ctx>,
+    dynamic_unbind: FunctionValue<'ctx>,
 }
 
 fn declare_runtime_helpers<'ctx>(
@@ -997,6 +1004,25 @@ fn declare_runtime_helpers<'ctx>(
         Some(Linkage::External),
     );
 
+    // ncl_dynamic_bind(mutator, sym_word, new_val) -> u64 (saved old val)
+    let dynamic_bind_type =
+        i64_t.fn_type(&[ptr_t.into(), i64_t.into(), i64_t.into()], false);
+    let dynamic_bind = module.add_function(
+        "ncl_dynamic_bind",
+        dynamic_bind_type,
+        Some(Linkage::External),
+    );
+
+    // ncl_dynamic_unbind(mutator, sym_word, saved_val) -> void
+    let void_t = context.void_type();
+    let dynamic_unbind_type =
+        void_t.fn_type(&[ptr_t.into(), i64_t.into(), i64_t.into()], false);
+    let dynamic_unbind = module.add_function(
+        "ncl_dynamic_unbind",
+        dynamic_unbind_type,
+        Some(Linkage::External),
+    );
+
     Helpers {
         alloc_cons,
         push_root,
@@ -1032,6 +1058,8 @@ fn declare_runtime_helpers<'ctx>(
         ssub_with_overflow,
         smul_with_overflow,
         debug_check_cons,
+        dynamic_bind,
+        dynamic_unbind,
     }
 }
 
@@ -1083,6 +1111,14 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(
         &helpers.debug_check_cons,
         ncl_runtime::ncl_debug_check_cons as *const () as usize,
+    );
+    engine.add_global_mapping(
+        &helpers.dynamic_bind,
+        ncl_runtime::ncl_dynamic_bind as *const () as usize,
+    );
+    engine.add_global_mapping(
+        &helpers.dynamic_unbind,
+        ncl_runtime::ncl_dynamic_unbind as *const () as usize,
     );
     // sadd/ssub/smul.with.overflow are LLVM intrinsics — no
     // global mapping; LLVM resolves them itself.
@@ -2714,6 +2750,40 @@ fn emit_expr<'ctx>(
                 )
                 .map_err(|e| format!("build_call store_value: {e}"))?;
             Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+        }
+        Expr::DynamicBind { sym_word, value, body } => {
+            // 1. Evaluate the new value in the current scope.
+            let new_val = emit_expr(
+                context, builder, function, helpers, arity, params, locals, value,
+            )?;
+            let mutator_arg = function.get_nth_param(0).unwrap();
+            let sym_const = i64_t.const_int(*sym_word, false);
+            // 2. Call ncl_dynamic_bind(mutator, sym, new_val) — saves old,
+            //    stores new, returns old.
+            let bind_call = builder
+                .build_call(
+                    helpers.dynamic_bind,
+                    &[mutator_arg.into(), sym_const.into(), new_val.into()],
+                    "dyn_saved",
+                )
+                .map_err(|e| format!("build_call ncl_dynamic_bind: {e}"))?;
+            let saved_val = bind_call.try_as_basic_value().unwrap_basic().into_int_value();
+            // 3. Evaluate the body. Any abort-checks inside will branch
+            //    to the current function's early-return block without
+            //    running the unbind — this is the known limitation until
+            //    UNWIND-PROTECT lands (see abi.rs ncl_dynamic_bind doc).
+            let result = emit_expr(
+                context, builder, function, helpers, arity, params, locals, body,
+            )?;
+            // 4. Restore unconditionally on normal exit.
+            builder
+                .build_call(
+                    helpers.dynamic_unbind,
+                    &[mutator_arg.into(), sym_const.into(), saved_val.into()],
+                    "",
+                )
+                .map_err(|e| format!("build_call ncl_dynamic_unbind: {e}"))?;
+            Ok(result)
         }
         Expr::Call { sym_word, args } => {
             // Evaluate each argument first.

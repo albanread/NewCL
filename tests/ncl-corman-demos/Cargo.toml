@@ -10,8 +10,7 @@ edition = "2024"
 # first end-to-end pipeline.
 
 [features]
-default = ["gc-semispace"]
-gc-semispace = ["ncl-reader/gc-semispace"]
+default = ["gc-page-heap"]
 gc-page-heap = ["ncl-reader/gc-page-heap"]
 
 [dependencies]

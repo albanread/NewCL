@@ -368,24 +368,31 @@ impl Session {
             expanded_body.push(macroexpand_all(form, &self.coord, &mut self.mutator)?);
         }
 
+        // Strip leading (declare ...) forms — they're processed at
+        // lowering time and must not be evaluated as function calls.
+        let (_, effective_body) = lower::strip_declares(&expanded_body);
+        let effective_body = effective_body.to_vec();
+
         // Build the env. Required params first at Param(0..N); the
         // shared prologue helper then layers optionals/rest/keys on
         // as let-locals (boxed if the body mutates them).
         let mut env = LocalEnv::with_params(&params.required);
         let prologue = lower::build_arglist_prologue(
             params,
-            &expanded_body,
+            &effective_body,
             &mut env,
             &self.coord,
         )
         .map_err(EvalError::Compile)?;
 
         // Implicit progn over body forms.
-        let lowered_body = if expanded_body.len() == 1 {
-            lower_in(&expanded_body[0], &env, &self.coord)
+        let lowered_body = if effective_body.len() == 1 {
+            lower_in(&effective_body[0], &env, &self.coord)
                 .map_err(EvalError::Compile)?
+        } else if effective_body.is_empty() {
+            ncl_ir::Expr::Nil
         } else {
-            let lowered: Result<Vec<_>, _> = expanded_body
+            let lowered: Result<Vec<_>, _> = effective_body
                 .iter()
                 .map(|f| lower_in(f, &env, &self.coord))
                 .collect();
@@ -760,6 +767,8 @@ fn install_native_functions(
                    ncl_runtime::native_block_shim, 2);
     install_native(coord, mutator, "%RETURN-FROM",
                    ncl_runtime::return_from_shim, 2);
+    install_native(coord, mutator, "%NATIVE-UNWIND-PROTECT",
+                   ncl_runtime::unwind_protect_shim, 2);
 
     install_native(coord, mutator, "STRING-SPLIT-NEWLINES",
                    string_split_newlines_shim, 1);

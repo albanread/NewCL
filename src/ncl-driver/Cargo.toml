@@ -8,18 +8,9 @@ name = "ncl"
 path = "src/main.rs"
 
 [features]
-# Forwarded from every dependent crate that pulls in ncl-runtime.
-# Picking `gc-page-heap` here flips the entire workspace's
-# transitively-linked GC backend in one shot.
-default = ["gc-semispace"]
-gc-semispace = [
-    "ncl-runtime/gc-semispace",
-    "ncl-cl/gc-semispace",
-    "ncl-compiler/gc-semispace",
-    "ncl-llvm/gc-semispace",
-    "ncl-loader/gc-semispace",
-    "ncl-reader/gc-semispace",
-]
+# Page-heap is the one and only GC backend. The gc-page-heap feature
+# propagates to every dependent crate in one shot.
+default = ["gc-page-heap"]
 gc-page-heap = [
     "ncl-runtime/gc-page-heap",
     "ncl-cl/gc-page-heap",

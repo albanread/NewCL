@@ -12,8 +12,7 @@ edition = "2024"
 # Forward the GC backend choice to ncl-runtime so a single
 # workspace-level feature flag selects across every dependent
 # crate. See `ncl-runtime/src/gc.rs` for the underlying mechanism.
-default = ["gc-semispace"]
-gc-semispace = ["ncl-runtime/gc-semispace"]
+default = ["gc-page-heap"]
 gc-page-heap = ["ncl-runtime/gc-page-heap"]
 
 [dependencies]

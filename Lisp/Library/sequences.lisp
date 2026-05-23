@@ -649,5 +649,97 @@
        (coerce merged 'string))
       (t (error "merge: unsupported result-type ~S" result-type)))))
 
+;; ── delete-duplicates ────────────────────────────────────────────────────
+;;
+;; CL spec allows destructive modification; for lists this is equivalent
+;; to remove-duplicates. Both names are provided so portable code works.
+
+(defun delete-duplicates (seq &key (test #'eql) (key #'identity))
+  "Like REMOVE-DUPLICATES but may modify SEQ in place.
+   In NCL, this is an alias (same semantics as REMOVE-DUPLICATES)."
+  (remove-duplicates seq :test test :key key))
+
+;; ── nsubstitute / nsubstitute-if / nsubstitute-if-not ────────────────────
+;;
+;; In-place versions of substitute. Walk the sequence and replace matching
+;; elements by mutation; return the (possibly modified) sequence.
+
+(defun %nsubstitute-seq-if (newitem predicate sequence
+                             start end from-end count key)
+  "Internal: in-place substitution via predicate over any sequence."
+  (let* ((len (length sequence))
+         (s   (or start 0))
+         (e   (or end len))
+         (replaced 0))
+    (if from-end
+        ;; Walk backwards
+        (let ((i (- e 1)))
+          (loop
+            (when (or (< i s) (and count (>= replaced count))) (return))
+            (let ((elem (elt sequence i)))
+              (when (funcall predicate (funcall key elem))
+                (setf (elt sequence i) newitem)
+                (setq replaced (+ replaced 1))))
+            (setq i (- i 1))))
+        ;; Walk forwards
+        (let ((i s))
+          (loop
+            (when (or (>= i e) (and count (>= replaced count))) (return))
+            (let ((elem (elt sequence i)))
+              (when (funcall predicate (funcall key elem))
+                (setf (elt sequence i) newitem)
+                (setq replaced (+ replaced 1))))
+            (setq i (+ i 1)))))
+    sequence))
+
+(defun nsubstitute (newitem olditem sequence
+                    &key (test #'eql) (key #'identity)
+                         start end from-end count)
+  "Destructively replace all occurrences of OLDITEM in SEQUENCE
+   with NEWITEM. Returns the modified sequence."
+  (%nsubstitute-seq-if newitem
+                       (lambda (x) (funcall test x olditem))
+                       sequence start end from-end count key))
+
+(defun nsubstitute-if (newitem test sequence
+                       &key (key #'identity) start end from-end count)
+  "Destructively replace every element of SEQUENCE satisfying TEST
+   with NEWITEM. Returns the modified sequence."
+  (%nsubstitute-seq-if newitem test sequence start end from-end count key))
+
+(defun nsubstitute-if-not (newitem test sequence
+                            &key (key #'identity) start end from-end count)
+  "Destructively replace every element of SEQUENCE NOT satisfying TEST
+   with NEWITEM. Returns the modified sequence."
+  (%nsubstitute-seq-if newitem
+                       (lambda (x) (not (funcall test x)))
+                       sequence start end from-end count key))
+
+;; ── (setf subseq) ─────────────────────────────────────────────────────────
+;;
+;; The compiler's generic-setf fallback rewrites
+;;   (setf (subseq seq start end) val)
+;; into
+;;   (%setf-subseq val seq start end)
+;; so we only need (defun %setf-subseq ...).  DO NOT also define
+;; (defun (setf subseq) ...) — that would mangle to the same %SETF-SUBSEQ
+;; symbol and replace this implementation with an infinitely-recursive
+;; wrapper.
+
+(defun %setf-subseq (value sequence start &optional end)
+  "Copy elements from VALUE into SEQUENCE[start…end].
+   VALUE is truncated if shorter than the slice; extra slice positions
+   are left unchanged.  Returns VALUE (CL setf convention)."
+  (let* ((len (length sequence))
+         (s   (or start 0))
+         (e   (if end (min end len) len))
+         (vlen (length value))
+         (n   (min (- e s) vlen))
+         (i   0))
+    (loop
+      (when (>= i n) (return value))
+      (setf (elt sequence (+ s i)) (elt value i))
+      (setq i (+ i 1)))))
+
 (provide 'sequences)
 nil

@@ -213,6 +213,17 @@ pub enum Expr {
         prefix: Vec<Expr>,
         tail: Box<Expr>,
     },
+    /// Dynamic variable binding — CL's `(let ((*x* v)) body)` where `*x*`
+    /// is a special variable. Saves the symbol's value cell, stores the
+    /// new value, evaluates `body`, then restores the old value.  The
+    /// `value` expression is already lowered and lives in a `Local` slot
+    /// (allocated by the enclosing `Let`); `sym_word` is the raw Word of
+    /// the symbol whose value cell is manipulated.
+    DynamicBind {
+        sym_word: u64,
+        value: Box<Expr>,
+        body: Box<Expr>,
+    },
 }
 
 impl Expr {
@@ -306,6 +317,9 @@ impl Expr {
     pub fn progn(forms: Vec<Expr>) -> Expr { Expr::Progn(forms) }
     pub fn let_(bindings: Vec<Expr>, body: Expr) -> Expr {
         Expr::Let { bindings, body: Box::new(body) }
+    }
+    pub fn dynamic_bind(sym_word: u64, value: Expr, body: Expr) -> Expr {
+        Expr::DynamicBind { sym_word, value: Box::new(value), body: Box::new(body) }
     }
 }
 

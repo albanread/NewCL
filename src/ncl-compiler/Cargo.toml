@@ -4,12 +4,7 @@ version = "0.0.0"
 edition = "2024"
 
 [features]
-default = ["gc-semispace"]
-gc-semispace = [
-    "ncl-runtime/gc-semispace",
-    "ncl-reader/gc-semispace",
-    "ncl-llvm/gc-semispace",
-]
+default = ["gc-page-heap"]
 gc-page-heap = [
     "ncl-runtime/gc-page-heap",
     "ncl-reader/gc-page-heap",

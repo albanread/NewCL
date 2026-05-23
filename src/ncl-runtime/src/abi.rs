@@ -180,6 +180,44 @@ pub extern "C-unwind" fn ncl_store_value(
     new_value
 }
 
+/// Dynamic variable bind. Saves the current value of `sym`'s value
+/// cell, sets it to `new_val`, and returns the saved value. The
+/// caller must pass the saved value to `ncl_dynamic_unbind` when the
+/// dynamic scope exits. JIT'd `(let ((*var* expr)) ...)` where `*var*`
+/// is globally special lowers to this pattern.
+///
+/// Note: the save/restore is NOT automatically undone on non-local
+/// exit (condition signals). Full correctness requires UNWIND-PROTECT,
+/// which is the next feature after DECLARE SPECIAL. On normal exit
+/// the binding is always correctly restored.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn ncl_dynamic_bind(
+    _mutator: *mut crate::mutator::MutatorState,
+    sym_word: u64,
+    new_val: u64,
+) -> u64 {
+    let sym = Word::from_raw(sym_word);
+    let saved = crate::gc_symbol::value_acquire(sym);
+    // Store NIL if currently UNBOUND so the saved slot holds a valid
+    // Word (UNBOUND is an internal sentinel, not a Lisp value).
+    let saved_raw = if saved.is_unbound() { Word::NIL.raw() } else { saved.raw() };
+    crate::gc_symbol::set_value_release(sym, Word::from_raw(new_val));
+    saved_raw
+}
+
+/// Dynamic variable unbind. Restores `sym`'s value cell to
+/// `saved_val` (the value returned by a prior `ncl_dynamic_bind`
+/// call for the same symbol).
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn ncl_dynamic_unbind(
+    _mutator: *mut crate::mutator::MutatorState,
+    sym_word: u64,
+    saved_val: u64,
+) {
+    let sym = Word::from_raw(sym_word);
+    crate::gc_symbol::set_value_release(sym, Word::from_raw(saved_val));
+}
+
 /// Length of a String or proper list (in codepoints / cons cells).
 /// JIT'd `(length …)` lowers to a call here. Polymorphic on tag.
 #[unsafe(no_mangle)]
@@ -2250,6 +2288,64 @@ pub extern "C-unwind" fn return_from_shim(
     ABORT_PENDING.with(|p| p.set(true));
     BLOCK_TARGET.with(|t| t.set(name));
     Word::NIL.raw()
+}
+
+/// `(%native-unwind-protect protected-thunk cleanup-thunk)` — the
+/// primitive behind `unwind-protect`. Calls the protected thunk,
+/// saves and clears any pending abort state, calls the cleanup
+/// thunk to completion, then restores the abort state and returns
+/// the value from the protected form.
+///
+/// This ensures cleanup always runs, even when a non-local exit
+/// (return-from, error) was initiated inside the protected form.
+/// The cleanup's own return value is discarded.
+pub extern "C-unwind" fn unwind_protect_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("%native-unwind-protect: expected 2 args (protected cleanup), got {n_args}");
+    }
+    let protected = Word::from_raw(unsafe { *args });
+    let cleanup = Word::from_raw(unsafe { *args.add(1) });
+    if protected.tag() != Tag::Function {
+        panic!("%native-unwind-protect: protected must be a function, got {protected:?}");
+    }
+    if cleanup.tag() != Tag::Function {
+        panic!("%native-unwind-protect: cleanup must be a function, got {cleanup:?}");
+    }
+
+    // 1. Call the protected thunk.
+    let body_result = {
+        let env = crate::gc_function::env(protected);
+        let code = crate::gc_function::code_ptr(protected);
+        let f: crate::gc_function::LispCodeFn = unsafe { std::mem::transmute(code) };
+        unsafe { f(mutator, env.raw(), std::ptr::null(), 0) }
+    };
+
+    // 2. Save and clear any pending abort so cleanup runs fully.
+    let saved_abort = ABORT_PENDING.with(|p| p.get());
+    let saved_target = BLOCK_TARGET.with(|t| t.get());
+    ABORT_PENDING.with(|p| p.set(false));
+    BLOCK_TARGET.with(|t| t.set(0));
+
+    // 3. Call the cleanup thunk (its return value is discarded).
+    {
+        let env = crate::gc_function::env(cleanup);
+        let code = crate::gc_function::code_ptr(cleanup);
+        let f: crate::gc_function::LispCodeFn = unsafe { std::mem::transmute(code) };
+        unsafe { f(mutator, env.raw(), std::ptr::null(), 0) };
+    }
+
+    // 4. Restore abort state so the surrounding block/handler-case
+    //    can observe and handle it.
+    ABORT_PENDING.with(|p| p.set(saved_abort));
+    BLOCK_TARGET.with(|t| t.set(saved_target));
+
+    // 5. Return the protected form's value.
+    body_result
 }
 
 // ───────────────────────────────────────────────────────────────────
