@@ -310,7 +310,7 @@ clean catch.
 
 - `error` / `handler-case` can drop the per-call-site flag
   check. Migration's separate; the SEH path is the prerequisite.
-- `exit-thread` is preemptive, matching Roger Corman's documented
+- `exit-thread` is preemptive, matching Corman Lisp's documented
   contract that it "never returns."
 - `terminate-thread` is cooperative *only* in the sense that the
   target observes the request at its next `(thread-safepoint)`

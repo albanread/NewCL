@@ -24,7 +24,7 @@ Three things existed at the start:
 1. **An empty `E:\CL\` folder** — the workspace.
 2. **`E:\CL\cormanlisp\`** — a clone of
    [sharplispers/cormanlisp](https://github.com/sharplispers/cormanlisp),
-   the maintained fork of Roger Corman's original (Win32 x86 32-bit,
+   the maintained fork of the original Corman Lisp (Win32 x86 32-bit,
    MFC IDE, hand-written assembly kernel). This is the *source* of
    our compatibility commitment, not the *target* of our
    implementation.
@@ -159,7 +159,7 @@ a GC onto a system designed without one means rewriting most of
 the runtime — tagged-value layout, heap shape, root tracking, write
 barriers all need to be GC-aware from day one.
 
-**"Look at the 32-bit GC Roger wrote for inspiration."** Roger's
+**"Look at the Corman Lisp 32-bit GC for inspiration."** The original
 `Gc.cpp` is 4632 lines: generational copying, forwarding pointers,
 per-page dirty tracking, 3-bit pointer tagging, write barriers via
 Win32 page protection (off by default for stability), conservative

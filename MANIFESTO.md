@@ -15,10 +15,10 @@ and feels direct. We replace everything underneath.
 
 ## The original, and why we are leaving it behind
 
-Roger Corman created the Lisp I could afford, and it was in many ways that
-count a better Lisp than the ones that didnt even publish a price list.
+Corman Lisp was the implementation I could afford, and it was in many ways that
+count a better Lisp than the ones that didn't even publish a price list.
 
-Roger Corman's Corman Lisp (1996–2015, now maintained as
+Corman Lisp (1996–2015, now maintained as
 [sharplispers/cormanlisp](https://github.com/sharplispers/cormanlisp))
 is a Win32 x86 Common Lisp implementation. Its compiler emits 32-bit x86
 machine code directly, with no intermediate representation. Substantial
@@ -116,10 +116,10 @@ ahead of code. Headlines:
   `001`, `forward` tag `111` (so a stale slot is one mask-and-compare
   to detect during scanning).
 - **Headerless cons cells.** Everything else carries an 8-byte header.
-- **Forwarding-pointer-based copying**, inherited from Roger's
-  design.
+- **Forwarding-pointer-based copying**, inherited from the original
+  Corman Lisp design.
 - **Software card-marking write barrier.** Hardware-assist via page
-  protection is out of scope for v1 — Roger's `:hardware-gc` was
+  protection is out of scope for v1 — Corman Lisp's `:hardware-gc` was
   off by default for stability and we honour that lesson.
 - **Precise root finding** via LLVM `gc.statepoint`-emitted stack
   maps, with a conservative fallback during bring-up that we

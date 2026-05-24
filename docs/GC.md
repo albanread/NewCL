@@ -24,7 +24,7 @@ documented in `E:\NewGC\README.md`, `E:\NewGC\DESIGN_REVIEW.md`, and
 
 The page heap is informed by four sources:
 
-- Roger Corman's original collector, especially the practical emphasis
+- The original Corman Lisp collector, especially the practical emphasis
   on a generational Common Lisp heap for interactive workloads.
 - SBCL `gencgc.c`, which contributes the page-based, generational,
   mark-evacuate shape and the card-table discipline.

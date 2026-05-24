@@ -404,7 +404,7 @@ GC test in the shape of one. The choices that look gratuitously
 inefficient are the point:
 
 - It represents board state as a **list** of `(x . y)` cons cells, not
-  a 2D array. Roger Corman's original `examples/life.lisp` uses a
+  a 2D array. The original Corman Lisp `examples/life.lisp` uses a
   `make-array` of nil, mutated in place — zero per-tick allocation.
   Ported faithfully, it would not exercise the GC at all.
 - `member-cell` is a linear search through the live list, called from
