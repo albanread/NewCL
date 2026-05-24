@@ -65,7 +65,7 @@ NCL is **Rust-first**, **LLVM-based**, **64-bit-first**, and
    memory; the source lives on disk**, and that is the only direction of
    persistence. There is no image file format. Launching NCL
    means JIT-ing the image into existence from source — and on a 2026
-   machine that is fast enough to be the default.
+   machine that is expected to be fast enough to be the default in practice.
 
    This is a deliberate departure from the classical Lisp/Smalltalk
    image-based model. Persistent images create real source-control
@@ -99,34 +99,41 @@ NCL is **Rust-first**, **LLVM-based**, **64-bit-first**, and
 
 ## The garbage collector
 
-The GC design is pinned in [docs/GC.md](docs/GC.md), committed
-ahead of code. Headlines:
+The current GC design is described in [docs/GC.md](docs/GC.md).
+The design shifted from the original semispace/TLAB sketch to a
+page-heap, mark-evacuate, generational collector — the change is
+documented there. Headlines of the current implementation:
 
-- **Multi-threaded mutator, stop-the-world collector.** Multiple
-  Lisp threads run concurrently; each has its own TLAB
-  (thread-local allocation buffer) so the alloc fast path takes
-  no locks. GCs are cooperative stop-the-world: each mutator polls
-  a flag at safe points and parks voluntarily; the GC runs once
-  all mutators are parked. Modern hardware has 20 cores; this is
-  not optional. Matches Corman's design (verified in upstream
-  Gc.cpp).
-- **Generational copying**, two generations (young + old) plus a
-  pinned static area for compiled code and the loaded image.
-- **3-bit pointer tagging**, 64-bit word, fixnum tag `000`, cons tag
-  `001`, `forward` tag `111` (so a stale slot is one mask-and-compare
-  to detect during scanning).
-- **Headerless cons cells.** Everything else carries an 8-byte header.
-- **Forwarding-pointer-based copying**, inherited from the original
-  Corman Lisp design.
-- **Software card-marking write barrier.** Hardware-assist via page
-  protection is out of scope for v1 — Corman Lisp's `:hardware-gc` was
-  off by default for stability and we honour that lesson.
-- **Precise root finding** via LLVM `gc.statepoint`-emitted stack
-  maps, with a conservative fallback during bring-up that we
-  eliminate by the time `defun` lands.
-- **Symbol's function cell is `AtomicU64`.** The single-store
-  redefinition story we already pinned needs a real atomic to land
-  on.
+- **Page-heap geometry.** One contiguous virtual address reservation,
+  managed in 64 KB pages. Pages carry descriptors tracking generation,
+  kind, mark state, and live count. Commit/decommit is
+  page-granular; Windows uses `VirtualAlloc`, future Unix targets
+  will use `mmap`.
+- **Three generations: G0 (nursery), G1 (promoted), Tenured.**
+  Free pages are recycled from the pool. Collection is minor (G0
+  only) or major (all generations), chosen by the trigger policy.
+- **Mark-and-evacuate, not forwarding-pointer copying.** Live
+  objects are evacuated into destination pages; dead pages are
+  returned to free. The unit of reclamation is the page, not a
+  semispace boundary.
+- **Card-marking write barrier.** Heap-pointer writes into managed
+  objects mark cards. Minor and major cycles both consult dirty
+  cards; cross-generation edges are tracked this way.
+- **Conservative pinning (current), precise roots (planned).** The
+  runtime does not yet have LLVM `gc.statepoint`-emitted stack maps
+  everywhere. Conservative candidates are validated against page
+  ownership and header/tag consistency before being treated as
+  roots; ambiguous live objects are pinned rather than moved. Precise
+  root enumeration via statepoints is planned and is a separate
+  integration sprint.
+- **Stop-the-world, single-mutator for now.** Multi-threaded
+  mutation (TLABs, cooperative parking, per-thread root walks) is
+  planned but not yet implemented. The current model serialises heap
+  access behind a mutex; concurrent mutators are future work.
+- **`try_collect_*` variants for OOM recovery.** Mid-evacuation
+  failures return a `Result` rather than aborting the process. The
+  heap is considered poisoned after an evacuation failure and should
+  be dropped.
 
 The GC lives entirely in `ncl-runtime` in pure Rust. The OS only
 appears via a `PageAllocator` shim. `ncl-runtime` and `ncl-cl`
@@ -249,7 +256,7 @@ decide.
    than a redesign.
 
 3. **Mac is the second target, not a hypothetical.** v1 ships on
-   `x86_64-pc-windows-msvc`. v2 ships on `aarch64-apple-darwin` and
+   `x86_64-pc-windows-msvc`. v2 targets `aarch64-apple-darwin` and
    `x86_64-apple-darwin`. Every architectural decision is made with
    that v2 in mind — if a choice would make the Mac port harder, we
    pick the other choice now. Linux is welcome but not promised.
@@ -327,8 +334,9 @@ We do **not** commit to running:
   IDE internals, or hand-written assembly entry points.
 - Saved images from the original. Ours are a different format.
 
-Compatibility is verified by a regression suite that runs many of the
-ported Corman demos on every CI build.
+Compatibility is tracked by a small regression suite of ported Corman
+demos run manually and, where wired up, as `cargo test` integration
+tests. Automated CI coverage is growing.
 
 ## The GUI
 

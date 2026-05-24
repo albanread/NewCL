@@ -8,12 +8,12 @@ that thinks it's an interpreter.*
 ## FOREWORD
 
 NCL is a Common Lisp. It compiles every form
-through LLVM, runs on a precise generational GC, talks fluently to
-Win32, and answers a `>` prompt within a few hundred milliseconds of
-the icon being clicked. Its language is the Corman Lisp dialect of
-ANSI Common Lisp; its implementation is a from-scratch Rust core.
-The compatibility lives at the source level. Recompile from source
-and your old `.lisp` files run.
+through LLVM, runs on a generational GC, talks to Win32 via a
+metadata-backed FFI surface, and answers a `>` prompt within a
+few hundred milliseconds of the icon being clicked. Its language is
+the Corman Lisp dialect of ANSI Common Lisp; its implementation is a
+from-scratch Rust core. The compatibility lives at the source level.
+Recompile from source and your old `.lisp` files run.
 
 If you know SBCL, CCL, Clozure, or Allegro, nothing in here will
 surprise you for long. If you came up on Corman and miss it, some of the
@@ -32,11 +32,10 @@ with `ncl>`. You leave by typing `(quit)`, `(exit)`, or by striking
 end-of-file (Ctrl+D on Unix, Ctrl+Z+Enter on Windows). Everything
 else is detail.
 
-This manual has eight sections, three appendices, and a glossary's
-worth of functions in Appendix I. Section 1 and 2 are the floor;
-everything else assumes them. Beyond that you can read in any
-order — Section 6 (CLOS) and Section 7 (conditions, I/O, FFI,
-graphics) are written to stand alone.
+> **Note:** This guide is a work in progress. Sections 1 and 2 are
+> complete; later sections are being written as the implementation
+> matures. Features marked *(planned)* exist in the design but are
+> not yet shipped.
 
 ---
 
@@ -57,7 +56,9 @@ readtable to keep case, but: don't. The whole standard library
 expects upper-case interned names and you will spend an afternoon
 debugging if you fight it.
 
-NCL recognises numbers in the full Common Lisp menagerie:
+NCL recognises numbers in the following forms (types marked
+*(planned)* read syntactically but are not yet fully supported at
+runtime):
 
 ```
     42                  fixnum (signed 61-bit on x86-64)
@@ -65,14 +66,15 @@ NCL recognises numbers in the full Common Lisp menagerie:
     100000000000000000000  bignum (arbitrary precision; integer math
                           promotes through fixnum → bignum on overflow,
                           transparently)
-    3/4                 ratio (exact rational; reduces automatically)
+    3/4                 ratio — planned; syntax parses but rational
+                          arithmetic is not yet implemented
     3.14                double float
     1.5e3               float in scientific notation
     #b1011              binary integer = 11
     #o755               octal integer = 493
     #x1A                hexadecimal integer = 26
     #36rZZ              radix-36 integer = 1295
-    #c(1 2)             complex number, real 1 imag 2
+    #c(1 2)             complex — planned; not yet implemented
 ```
 
 A *string* is `"like so"`; a *character* is `#\a`, `#\Space`,
