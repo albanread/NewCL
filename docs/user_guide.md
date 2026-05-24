@@ -7,7 +7,7 @@ that thinks it's an interpreter.*
 
 ## FOREWORD
 
-NCL — NewCormanLisp — is a Common Lisp. It compiles every form
+NCL is a Common Lisp. It compiles every form
 through LLVM, runs on a precise generational GC, talks fluently to
 Win32, and answers a `>` prompt within a few hundred milliseconds of
 the icon being clicked. Its language is the Corman Lisp dialect of
@@ -35,12 +35,12 @@ else is detail.
 This manual has eight sections, three appendices, and a glossary's
 worth of functions in Appendix I. Section 1 and 2 are the floor;
 everything else assumes them. Beyond that you can read in any
-order — Section 6 (CLOS) and Section 7 (conditions, I/O, FFI,
+order Ã¢â‚¬â€ Section 6 (CLOS) and Section 7 (conditions, I/O, FFI,
 graphics) are written to stand alone.
 
 ---
 
-## SECTION 1 — Atoms, Lists, and the Five Primitives
+## SECTION 1 Ã¢â‚¬â€ Atoms, Lists, and the Five Primitives
 
 ### 1.1 Atoms
 
@@ -63,7 +63,7 @@ NCL recognises numbers in the full Common Lisp menagerie:
     42                  fixnum (signed 61-bit on x86-64)
    -17                  ditto, negative
     100000000000000000000  bignum (arbitrary precision; integer math
-                          promotes through fixnum → bignum on overflow,
+                          promotes through fixnum Ã¢â€ â€™ bignum on overflow,
                           transparently)
     3/4                 ratio (exact rational; reduces automatically)
     3.14                double float
@@ -87,7 +87,7 @@ Atoms evaluate as follows:
 > the variable is returned.
 
 `T` and `NIL` are sacred. They cannot be reassigned. `NIL` is both
-boolean falsity and the empty list — those are the same object.
+boolean falsity and the empty list Ã¢â‚¬â€ those are the same object.
 Every other value is true.
 
 ### 1.2 Lists and S-Expressions
@@ -99,7 +99,7 @@ S-expression. This is the whole trick.
     (A B C)
     (1 2 3 4)
     ((A B) (C D) E)
-    ()                                  this is NIL — the empty list
+    ()                                  this is NIL Ã¢â‚¬â€ the empty list
 ```
 
 To evaluate a non-empty list `(F A1 A2 ... AN)`, the system
@@ -113,7 +113,7 @@ to the resulting values:
     16
 ```
 
-A handful of forms — the *special forms* — break this rule and look
+A handful of forms Ã¢â‚¬â€ the *special forms* Ã¢â‚¬â€ break this rule and look
 at their arguments unevaluated. You'll meet them as we go.
 
 ### 1.3 The Five Primitives
@@ -151,7 +151,7 @@ deep, are predefined and expand as you'd expect.
     T
 ```
 
-The leading `'X` is `(quote X)` — a special form that hands its
+The leading `'X` is `(quote X)` Ã¢â‚¬â€ a special form that hands its
 argument back unevaluated. Without it, `(car (A B C))` would try to
 call a function named `A`.
 
@@ -198,7 +198,7 @@ If you find your `COND` tower wanting more visual structure, do
 
 ---
 
-## SECTION 2 — Functions
+## SECTION 2 Ã¢â‚¬â€ Functions
 
 ### 2.1 DEFUN
 
@@ -291,7 +291,7 @@ A default value is given as `(NAME DEFAULT)`:
 
     (LET* ((A 5)                   each binding sees the previous
            (B (+ A 1)))
-      (* A B))                     ⇒ 30
+      (* A B))                     Ã¢â€¡â€™ 30
 ```
 
 Local functions get `FLET` (parallel) or `LABELS` (sequential and
@@ -300,16 +300,16 @@ mutually recursive):
 ```
     (LABELS ((EVEN? (N) (IF (= N 0) T   (ODD?  (- N 1))))
              (ODD?  (N) (IF (= N 0) NIL (EVEN? (- N 1)))))
-      (EVEN? 10))                  ⇒ T
+      (EVEN? 10))                  Ã¢â€¡â€™ T
 ```
 
 ### 2.5 PROGN, SETQ, SETF
 
 `PROGN` evaluates its body in order and returns the last value.
-Most body-bearing forms (`DEFUN`, `LET`, `WHEN`, `UNLESS`, …) are
+Most body-bearing forms (`DEFUN`, `LET`, `WHEN`, `UNLESS`, Ã¢â‚¬Â¦) are
 implicit `PROGN`s.
 
-`SETQ` assigns to a variable. `SETF` assigns to a *place* — any
+`SETQ` assigns to a variable. `SETF` assigns to a *place* Ã¢â‚¬â€ any
 location accessible by an inverted-function syntax:
 
 ```
@@ -339,7 +339,7 @@ already loaded by `init.lisp` in the default setup):
 
 ```
     (LOOP FOR I FROM 1 TO 10
-          WHEN (ODDP I) COLLECT I)        ⇒ (1 3 5 7 9)
+          WHEN (ODDP I) COLLECT I)        Ã¢â€¡â€™ (1 3 5 7 9)
 
     (LOOP FOR X IN '(A B C D E)
           AS I FROM 0
@@ -350,7 +350,7 @@ already loaded by `init.lisp` in the default setup):
           COLLECT LINE)
 ```
 
-The plain unannotated `(LOOP body ...)` is also available — it
+The plain unannotated `(LOOP body ...)` is also available Ã¢â‚¬â€ it
 repeats body until `(RETURN value)` fires.
 
 When recursion is clearer, use it. The compiler handles tail
@@ -358,7 +358,7 @@ calls; a tail-recursive `LEN` does not blow the stack.
 
 ---
 
-## SECTION 3 — Data Is Code
+## SECTION 3 Ã¢â‚¬â€ Data Is Code
 
 Every program is an S-expression. The converse is the punchline:
 every S-expression can be operated on as data, by the same `CAR`,
@@ -369,7 +369,7 @@ makes macros worth writing.
 
 `'X` is shorthand for `(QUOTE X)`, which returns its argument
 unevaluated. Numbers, strings, characters, and keywords don't need
-the quote — they evaluate to themselves anyway.
+the quote Ã¢â‚¬â€ they evaluate to themselves anyway.
 
 ### 3.2 Backquote, Comma, Splice
 
@@ -378,10 +378,10 @@ backquote `` ` ``:
 
 ```
     (LET ((X 10))
-      `(THE VALUE IS ,X))                ⇒ (THE VALUE IS 10)
+      `(THE VALUE IS ,X))                Ã¢â€¡â€™ (THE VALUE IS 10)
 
     (LET ((MIDDLE '(B C D)))
-      `(A ,@MIDDLE E))                   ⇒ (A B C D E)
+      `(A ,@MIDDLE E))                   Ã¢â€¡â€™ (A B C D E)
 ```
 
 `,EXPR` substitutes the value; `,@EXPR` splices a list. This is the
@@ -434,8 +434,8 @@ chooses the destination:
 The directives you'll use 80% of the time:
 
 ```
-    ~A      print, no escapes — humans
-    ~S      print, with escapes — re-readable
+    ~A      print, no escapes Ã¢â‚¬â€ humans
+    ~S      print, with escapes Ã¢â‚¬â€ re-readable
     ~D      decimal integer
     ~X      hexadecimal
     ~B      binary
@@ -445,7 +445,7 @@ The directives you'll use 80% of the time:
     ~%      newline
     ~&      newline if not already at column 0
     ~~      a literal tilde
-    ~{ ~}   loop over a list — body uses ~A, ~D, etc.
+    ~{ ~}   loop over a list Ã¢â‚¬â€ body uses ~A, ~D, etc.
 ```
 
 Loading `(require 'xp)` adds Waters' XP pretty-printer machinery
@@ -453,7 +453,7 @@ Loading `(require 'xp)` adds Waters' XP pretty-printer machinery
 
 ---
 
-## SECTION 4 — Symbols, Cells, and Packages
+## SECTION 4 Ã¢â‚¬â€ Symbols, Cells, and Packages
 
 ### 4.1 The Symbol
 
@@ -462,8 +462,8 @@ A symbol is an atom carrying four cells:
 ```
     NAME            its printable name (a string)
     PACKAGE         its home package
-    VALUE CELL      its variable binding   — SYMBOL-VALUE
-    FUNCTION CELL   its function binding   — SYMBOL-FUNCTION
+    VALUE CELL      its variable binding   Ã¢â‚¬â€ SYMBOL-VALUE
+    FUNCTION CELL   its function binding   Ã¢â‚¬â€ SYMBOL-FUNCTION
 ```
 
 NCL, like all of Common Lisp, is a "Lisp-2": variable and function
@@ -492,8 +492,8 @@ hit DEFUN, call. That is the whole loop.
 A package is a namespace for symbols. Three are created at startup:
 
 ```
-    COMMON-LISP             the language          — nickname CL
-    COMMON-LISP-USER        the default workspace — nickname CL-USER
+    COMMON-LISP             the language          Ã¢â‚¬â€ nickname CL
+    COMMON-LISP-USER        the default workspace Ã¢â‚¬â€ nickname CL-USER
     KEYWORD                 the home of :KEYWORDS
 ```
 
@@ -504,14 +504,14 @@ A symbol from another package is named with a colon-qualifier:
     CCL::QUIT                internal symbol QUIT of CCL
 ```
 
-Single colon ⇒ external (exported); double colon ⇒ any symbol in
-the package. The current package — what the reader interns into
-when no prefix is given — is the value of `*PACKAGE*`. A fresh
+Single colon Ã¢â€¡â€™ external (exported); double colon Ã¢â€¡â€™ any symbol in
+the package. The current package Ã¢â‚¬â€ what the reader interns into
+when no prefix is given Ã¢â‚¬â€ is the value of `*PACKAGE*`. A fresh
 session starts in `COMMON-LISP-USER`.
 
 ---
 
-## SECTION 5 — Macros
+## SECTION 5 Ã¢â‚¬â€ Macros
 
 A macro is a function from program text to program text. NCL
 expands macros at compile time. The expansion is what the compiler
@@ -528,9 +528,9 @@ Now `(WHILE (> N 0) (PRINT N) (SETQ N (1- N)))` expands at compile
 time to a `LOOP` with the obvious shape. The body of `DEFMACRO`
 runs against unevaluated arguments and returns the replacement
 S-expression. If the user wrote `(WHILE ...)`, the compiler never
-sees that — it sees the `LOOP`.
+sees that Ã¢â‚¬â€ it sees the `LOOP`.
 
-A useful starter set lives in `core.lisp` and the Library — `WHEN`,
+A useful starter set lives in `core.lisp` and the Library Ã¢â‚¬â€ `WHEN`,
 `UNLESS`, `LET`, `LET*`, `COND`, `DOLIST`, `DOTIMES`, `LOOP`,
 `CASE`, `TYPECASE`, `HANDLER-CASE`, `RESTART-CASE`,
 `WITH-OPEN-FILE`, `WITH-OUTPUT-TO-STRING`, `MULTIPLE-VALUE-BIND`,
@@ -573,10 +573,10 @@ When debugging a macro you wrote, two utilities will save you:
 
 ---
 
-## SECTION 6 — CLOS
+## SECTION 6 Ã¢â‚¬â€ CLOS
 
 NCL's object system is CLOS, implemented in the manner of Closette
-(Kiczales / des Rivières / Bobrow's *The Art of the Metaobject
+(Kiczales / des RiviÃƒÂ¨res / Bobrow's *The Art of the Metaobject
 Protocol*), seeded from Corman Lisp's port. The four operators you
 need are `DEFCLASS`, `MAKE-INSTANCE`, `DEFGENERIC`, and `DEFMETHOD`.
 
@@ -648,7 +648,7 @@ the whole story end to end.
 
 ---
 
-## SECTION 7 — The Outside World
+## SECTION 7 Ã¢â‚¬â€ The Outside World
 
 ### 7.1 Conditions and Restarts
 
@@ -666,8 +666,8 @@ The first clause whose class matches the condition wins; its value
 becomes the value of the `HANDLER-CASE`. `(ERROR (C) ...)` catches
 everything and binds `C` to the condition.
 
-The full Common Lisp condition system — non-unwinding handlers and
-restarts — lives in the `conditions` module (loaded by default):
+The full Common Lisp condition system Ã¢â‚¬â€ non-unwinding handlers and
+restarts Ã¢â‚¬â€ lives in the `conditions` module (loaded by default):
 
 ```
     (DEFINE-CONDITION my-trouble (error)
@@ -680,17 +680,17 @@ restarts — lives in the `conditions` module (loaded by default):
       (RESTART-CASE
           (ERROR 'my-trouble :thing 42)
         (CONTINUE () :recovered)))
-    ⇒ :RECOVERED
+    Ã¢â€¡â€™ :RECOVERED
 ```
 
-`HANDLER-CASE` unwinds; `HANDLER-BIND` does not — it lets the
+`HANDLER-CASE` unwinds; `HANDLER-BIND` does not Ã¢â‚¬â€ it lets the
 handler decide whether to transfer control via a restart or to
 decline and let the condition propagate. This is the distinguishing
 feature of the Lisp condition system: the *handler* and the *unwind
 target* are different decisions.
 
-Standard restart names — `ABORT`, `CONTINUE`, `USE-VALUE`,
-`STORE-VALUE`, `MUFFLE-WARNING` — are recognised by the helpers.
+Standard restart names Ã¢â‚¬â€ `ABORT`, `CONTINUE`, `USE-VALUE`,
+`STORE-VALUE`, `MUFFLE-WARNING` Ã¢â‚¬â€ are recognised by the helpers.
 
 The REPL itself is wrapped in a top-level handler-case; signalled
 errors print and return you to the prompt instead of taking down
@@ -716,7 +716,7 @@ The streams module gives you `WITH-OUTPUT-TO-STRING`,
 primitives are `OPEN-INPUT-FILE`, `OPEN-OUTPUT-FILE`,
 `OPEN-APPEND-FILE`, `CLOSE-STREAM`, `READ-LINE`, `READ-CHAR-FROM`,
 `WRITE-STRING-TO`, `FILE-POSITION`, `FILE-LENGTH`, `FILE-EXISTS`,
-`DELETE-FILE` — but prefer the `WITH-OPEN-FILE` macro in production
+`DELETE-FILE` Ã¢â‚¬â€ but prefer the `WITH-OPEN-FILE` macro in production
 code. It closes the file on any non-local exit.
 
 ### 7.3 Hot Reload
@@ -739,7 +739,7 @@ that named the old version finish on it; the next call lands on the
 new code. `(CHECK-RELOADS)` runs the drain by hand from inside a
 long computation.
 
-A bad save — half a paren, a typo — is caught by a parse pre-check;
+A bad save Ã¢â‚¬â€ half a paren, a typo Ã¢â‚¬â€ is caught by a parse pre-check;
 the file is skipped, the previous definitions stay in place,
 nothing in the running session is touched. Re-save and the watcher
 retries.
@@ -832,13 +832,13 @@ demos use both interchangeably.
 
 For Win32 specifically, NCL also ships a pre-built metadata pack
 (`packs/windows_api.pack`) holding signatures for the entire Win32
-API — every type, every function, every parameter — derived from
+API Ã¢â‚¬â€ every type, every function, every parameter Ã¢â‚¬â€ derived from
 Microsoft's official `Windows.Win32.winmd`. With that loaded
 (automatic when you start with `--windows`), you can call any
 function by name, no FFI declaration:
 
 ```
-    (WIN32 KERNEL32 GetCurrentProcessId)              ⇒ 12340
+    (WIN32 KERNEL32 GetCurrentProcessId)              Ã¢â€¡â€™ 12340
     (WIN32 USER32   MessageBoxW NULL "hi" "NCL" 0)
 ```
 
@@ -861,18 +861,18 @@ reach; the language itself stays portable.
 
 ### 7.7 Audio
 
-NCL embeds the *NewAudio* sibling crate — a pure-Rust synthesis +
+NCL embeds the *NewAudio* sibling crate Ã¢â‚¬â€ a pure-Rust synthesis +
 ABC playback library backing onto Windows' `waveOut` and `midiOut`.
 Two surfaces, both Lisp-callable from the moment the REPL starts:
 
 ```
     (AUDIO-START)                ; lazy-init the mixer (idempotent)
-    (AUDIO-COIN 0.4)             ; synthesise → returns a SoundId
+    (AUDIO-COIN 0.4)             ; synthesise Ã¢â€ â€™ returns a SoundId
     (AUDIO-PLAY *)               ; play it through waveOut
 ```
 
 The presets are the same game-effect family Roger's `winscheme_sound`
-shipped — `COIN`, `JUMP`, `ZAP`, `HIT`, `CLICK`, `BLIP`, `BEEP`,
+shipped Ã¢â‚¬â€ `COIN`, `JUMP`, `ZAP`, `HIT`, `CLICK`, `BLIP`, `BEEP`,
 plus the lower-level `TONE` for hand-tuned frequencies. Each call
 synthesises a fresh PCM buffer, hands it to the mixer, and returns
 the buffer's `SoundId` as a fixnum:
@@ -884,7 +884,7 @@ the buffer's `SoundId` as a fixnum:
     nil
 ```
 
-`AUDIO-PLAY-VOL` adds volume (0.0–1.0) and pan (-1.0 .. +1.0) for
+`AUDIO-PLAY-VOL` adds volume (0.0Ã¢â‚¬â€œ1.0) and pan (-1.0 .. +1.0) for
 stereo positioning:
 
 ```
@@ -892,7 +892,7 @@ stereo positioning:
 ```
 
 The master volume control is `(AUDIO-MASTER-VOLUME 0.8)`. To stop
-everything in flight — both PCM voices and the MIDI scheduler —
+everything in flight Ã¢â‚¬â€ both PCM voices and the MIDI scheduler Ã¢â‚¬â€
 call `(AUDIO-STOP-ALL)`.
 
 The second surface is ABC notation. NCL ships the ABC parser, the
@@ -913,7 +913,7 @@ and time-signature changes, percussion routing) is documented in
 `E:\NewAudio\NewAudio\USER_GUIDE.md`. `(ABC-STOP)` cuts whatever's
 playing.
 
-Non-Windows builds get NIL-returning stubs for every shim — code
+Non-Windows builds get NIL-returning stubs for every shim Ã¢â‚¬â€ code
 that conditionalises on `(windows-enabled-p)` runs unchanged on a
 silent machine.
 
@@ -924,15 +924,15 @@ the GM synth.
 ### 7.8 Inline Assembly
 
 When the FFI to a C library is too coarse and you want a tight
-inner loop in handwritten x86_64 — a `popcnt`, a `bsr`, a
-SIMD-friendly reduction — NCL gives you the `DEFASM` form:
+inner loop in handwritten x86_64 Ã¢â‚¬â€ a `popcnt`, a `bsr`, a
+SIMD-friendly reduction Ã¢â‚¬â€ NCL gives you the `DEFASM` form:
 
 ```
     (DEFASM NAME (PARAMS...) "line1" "line2" ... "ret")
 ```
 
 Each body line is a string of Intel-syntax x86_64. Parameter names
-appear in the body prefixed with `#` — the assembler substitutes
+appear in the body prefixed with `#` Ã¢â‚¬â€ the assembler substitutes
 each `#NAME` for the Windows x64 register that holds that
 positional integer argument. The first four integer parameters
 travel in `rcx`, `rdx`, `r8`, `r9`; parameters five and above sit
@@ -952,12 +952,12 @@ A first example:
     42
 ```
 
-That worked without a single tag instruction — and it had to,
+That worked without a single tag instruction Ã¢â‚¬â€ and it had to,
 because the body never wrote one. The reason is bookkeeping NCL
 arranges on your behalf: fixnums are stored as the integer shifted
 left by three (the low three bits are the tag, `000` for fixnum).
-Addition is *tag-preserving* — adding two left-shifted integers
-gives you the left-shifted sum — so `add` between two fixnum
+Addition is *tag-preserving* Ã¢â‚¬â€ adding two left-shifted integers
+gives you the left-shifted sum Ã¢â‚¬â€ so `add` between two fixnum
 words drops out a fixnum word with no further work.
 
 Multiplication is not so generous. `(a<<3) * (b<<3) = (a*b)<<6`,
@@ -968,7 +968,7 @@ must shift one operand back down by 3 before multiplying:
     (DEFASM FAST-MUL (A B)
       "mov rax, #a"
       "sar rax, 3"     ; untag A to its raw integer
-      "imul rax, #b"   ; (a) * (b<<3) = (a*b)<<3 — correctly tagged
+      "imul rax, #b"   ; (a) * (b<<3) = (a*b)<<3 Ã¢â‚¬â€ correctly tagged
       "ret")
 
     > (FAST-MUL 17 25)
@@ -987,7 +987,7 @@ will look the way it should.
 
 The reach-down pays off when you want a CPU instruction the language
 does not expose. `popcnt`, `bsr`, `lzcnt`, `bswap`, `pdep`/`pext`,
-the AES-NI family, the AVX gather/scatter ops — every one of them is
+the AES-NI family, the AVX gather/scatter ops Ã¢â‚¬â€ every one of them is
 a `DEFASM` away. A bit-population count:
 
 ```
@@ -998,9 +998,9 @@ a `DEFASM` away. A bit-population count:
       "shl rax, 3"            ; retag as fixnum
       "ret")
 
-    > (POPCOUNT 255)          ; 0xFF — eight bits set
+    > (POPCOUNT 255)          ; 0xFF Ã¢â‚¬â€ eight bits set
     8
-    > (POPCOUNT 1024)         ; 0x400 — one bit set
+    > (POPCOUNT 1024)         ; 0x400 Ã¢â‚¬â€ one bit set
     1
 ```
 
@@ -1010,14 +1010,14 @@ substitutions resolved to registers), and the JIT generates a thin
 shim that adapts NCL's call ABI to the Win64 ABI and back. The shim
 is what NCL's symbol cell points at; you never see it. Calling
 `(POPCOUNT 255)` from compiled Lisp jumps through the shim, into
-your handwritten asm, and back out — three call instructions to
+your handwritten asm, and back out Ã¢â‚¬â€ three call instructions to
 get from a `defun` call site down to a `popcnt`.
 
 The same warnings that apply to handwritten asm anywhere apply
 here. The asm body sees the world as Win64 sees it: `rcx`, `rdx`,
 `r8`, `r9` are the first four parameter registers; `rax`, `rcx`,
-`rdx`, `r8`–`r11`, `xmm0`–`xmm5` are volatile (you may clobber them
-freely); `rbx`, `rbp`, `rsi`, `rdi`, `r12`–`r15`, `xmm6`–`xmm15` are
+`rdx`, `r8`Ã¢â‚¬â€œ`r11`, `xmm0`Ã¢â‚¬â€œ`xmm5` are volatile (you may clobber them
+freely); `rbx`, `rbp`, `rsi`, `rdi`, `r12`Ã¢â‚¬â€œ`r15`, `xmm6`Ã¢â‚¬â€œ`xmm15` are
 non-volatile (save and restore if you touch them). A function
 longer than a handful of lines should `push rbp / mov rbp, rsp` at
 entry and pop on exit; the unwinder thanks you.
@@ -1029,7 +1029,7 @@ not for *yours*; this is where yours lives.
 
 ---
 
-## SECTION 8 — The Driver
+## SECTION 8 Ã¢â‚¬â€ The Driver
 
 The command-line driver is `ncl`. Its principal options:
 
@@ -1047,7 +1047,7 @@ The command-line driver is `ncl`. Its principal options:
                                forms pass through the JIT pipeline (so
                                syntax / macro / lowering errors surface)
                                but never run. Use it as a fast lint.
-    ncl --lean                 load only the bare compiler — no CLOS,
+    ncl --lean                 load only the bare compiler Ã¢â‚¬â€ no CLOS,
                                no Library/init.lisp. Useful for sandboxes
                                and minimal scripts.
     ncl --windows              enable the Windows surface: thread 0 runs
@@ -1068,7 +1068,7 @@ Short forms exist for the common flags: `-e -l -c -r -L -W -V -h`.
 
 ```
     NCL_HEAP_BACKEND    pick the GC implementation:
-                          semispace   (default — production)
+                          semispace   (default Ã¢â‚¬â€ production)
                           page-heap   (under construction; see docs/GC_DESIGN.md)
     NCL_LIBRARY         override the Library/ directory location
     NCL_PACK_DIR        override the packs/ directory (Win32 metadata pack)
@@ -1082,7 +1082,7 @@ to `*LOAD-PATH*` and runs `Library/init.lisp` if present. The
 shipping `init.lisp` `(require)`s the standard layer: `streams`,
 `conditions`, `loop`, `sequences`, `trees`, `characters`, `lists`,
 `places`, `numbers`, `xp`, `describe`, `events`, `hot-reload`, and
-— when `--windows` is on — the win32-* modules.
+Ã¢â‚¬â€ when `--windows` is on Ã¢â‚¬â€ the win32-* modules.
 
 Drop your own `.lisp` files into `Library/` and add `(require
 'name)` to `init.lisp` to load them every session. Each module is
@@ -1121,12 +1121,12 @@ the key matches. Anything stale is recompiled.
 
 The cache is **never canonical**. Delete it whenever you want; it
 will rebuild. It never round-trips through git. Source files are
-the only persistence in this system — the image is what the running
+the only persistence in this system Ã¢â‚¬â€ the image is what the running
 process *is*.
 
 ---
 
-## APPENDIX I — Selected Standard Functions
+## APPENDIX I Ã¢â‚¬â€ Selected Standard Functions
 
 The list is not exhaustive; `Lisp/core.lisp` and the modules under
 `Lisp/Library/` are themselves readable examples of the language.
@@ -1151,7 +1151,7 @@ The list is not exhaustive; `Lisp/core.lisp` and the modules under
 ```
 
 Bignum promotion is transparent on `+`, `-`, `*`, `EXPT`, `ASH`,
-and friends — overflow a fixnum and you get a bignum without
+and friends Ã¢â‚¬â€ overflow a fixnum and you get a bignum without
 asking.
 
 ### Cons and List
@@ -1302,7 +1302,7 @@ asking.
 
 ---
 
-## APPENDIX II — A Worked Example
+## APPENDIX II Ã¢â‚¬â€ A Worked Example
 
 A symbolic differentiator, in the spirit of McCarthy's original
 LISP examples. Reads an algebraic expression and a variable;
@@ -1337,19 +1337,19 @@ returns the symbolic derivative.
     (* 3 (* (EXPT X 2) 1))
 ```
 
-A simplifier — left as an exercise — turns these into `1`, `1`,
+A simplifier Ã¢â‚¬â€ left as an exercise Ã¢â‚¬â€ turns these into `1`, `1`,
 `(* 2 X)`, and `(* 3 (EXPT X 2))`. This is the kind of program LISP
 was made for, and it's the kind of program that is still hard to
 write fluently in anything else. Try it in Python.
 
 ---
 
-## APPENDIX III — What's Under the Hood
+## APPENDIX III Ã¢â‚¬â€ What's Under the Hood
 
 You don't need any of this to use NCL. The author records it
 because the curious always ask.
 
-**Compiler.** Reader → small typed IR → LLVM IR → machine code, JIT
+**Compiler.** Reader Ã¢â€ â€™ small typed IR Ã¢â€ â€™ LLVM IR Ã¢â€ â€™ machine code, JIT
 first. Every form, including the one you just typed at the prompt,
 is compiled. There is no interpreter. The compiler is written in
 Rust, hosted on LLVM, and emits for the host architecture.
@@ -1360,7 +1360,7 @@ generations (young semispace + old two-semispace) plus a pinned
 static area for compiled code and the loaded image. Each mutator
 thread allocates from a thread-local buffer (TLAB) so the fast path
 takes no locks; each polls a safe-point flag and parks
-cooperatively. Pointer tags occupy three bits in a 64-bit word —
+cooperatively. Pointer tags occupy three bits in a 64-bit word Ã¢â‚¬â€
 fixnums tag `000`, conses tag `001`, forwarding pointers tag `111`.
 Roots come from LLVM `gc.statepoint`-emitted stack maps.
 
@@ -1370,7 +1370,7 @@ version, codegen flags)` may be reused or deleted without loss of
 correctness. Source files are the only persistence. The image is
 what the running process *is*.
 
-**Bignums.** Sign-magnitude, base-2³², stored as inline 8-byte
+**Bignums.** Sign-magnitude, base-2Ã‚Â³Ã‚Â², stored as inline 8-byte
 header + variable-length limb tail in the static heap. Overflow
 promotion from fixnum is automatic at `+`, `-`, `*`, `EXPT`. The
 algorithms are textbook (schoolbook multiply, Knuth-D divide); a
@@ -1385,7 +1385,7 @@ split lives behind a thin shim; the rest of `ncl-runtime` has no
 platform awareness.
 
 The simplicity rule applies to the rest of the system. The GC is
-intentionally complex — modern generational, multi-threaded,
+intentionally complex Ã¢â‚¬â€ modern generational, multi-threaded,
 precisely-rooted collectors *are* complex, and that complexity buys
 real throughput and correctness. Everything else is meant to fit in
 a long evening's reading.
@@ -1395,6 +1395,6 @@ a long evening's reading.
 *"LISP is worth learning for the profound enlightenment experience
 you will have when you finally get it. That experience will make
 you a better programmer for the rest of your days, even if you
-never actually use LISP itself a lot."*  — Eric S. Raymond
+never actually use LISP itself a lot."*  Ã¢â‚¬â€ Eric S. Raymond
 
 *The author would prefer you used LISP itself a lot.*

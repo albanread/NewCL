@@ -1,6 +1,6 @@
-# NewCormanLisp
+# NCL
 
-NewCormanLisp (NCL) is a Common Lisp implementation for Windows. It compiles every form through LLVM, runs on a precise generational GC, and answers a `>` prompt within seconds of startup. Its language is the Corman Lisp dialect of ANSI Common Lisp; its core is written in Rust.
+NCL is a Common Lisp implementation for Windows. It compiles every form through LLVM, runs on a precise generational GC, and answers a `>` prompt within seconds of startup. Its language is the Corman Lisp dialect of ANSI Common Lisp; its core is written in Rust.
 
 Start a text session:
 

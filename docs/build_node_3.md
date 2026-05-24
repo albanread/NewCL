@@ -4,7 +4,7 @@
 [build_node_2.md](build_node_2.md).*
 
 Node 2 ([build_node_2.md](build_node_2.md)) ended with
-NewCormanLisp running real Lisp programs — closures, higher-order
+NCL running real Lisp programs — closures, higher-order
 functions, recursive list manipulation, the `compose` /
 `map-list` / `(lambda (x) (* x x))` flavour of code. It was a
 small Lisp but a real one.
@@ -387,7 +387,7 @@ default. The `hello-igui.lisp` demo loads cleanly via
 
 ## Where it leaves us
 
-NewCormanLisp is now a Lisp that paints. Real Direct2D rendering,
+NCL is now a Lisp that paints. Real Direct2D rendering,
 real D3D11 swap chains, real DirectWrite (waiting for `draw-text`
 bindings to surface). 264 ncl-compiler tests, all green. A 23-line
 demo file producing a window with coloured rectangles you can

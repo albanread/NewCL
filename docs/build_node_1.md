@@ -2,7 +2,7 @@
 
 *Written 2026-05-10, after commit `af3582e`. 21 commits on `main`.*
 
-This document captures the path we walked to take NewCormanLisp from
+This document captures the path we walked to take NCL from
 nothing to a Lisp that evaluates real expressions:
 
 ```
@@ -63,7 +63,7 @@ The `ncl` binary from day 0:
 
 ```
 $ ncl --version
-NewCormanLisp 0.0.0
+NCL 0.0.0
 ```
 
 ### Phase 1 — reader (4 commits)

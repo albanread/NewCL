@@ -1,7 +1,7 @@
 # GC Design — Target Architecture for NCL
 
 This document records the target garbage-collector architecture for
-NewCormanLisp and the migration plan to reach it. It was synthesised
+NCL and the migration plan to reach it. It was synthesised
 from a research pass across **Clozure CL** (`E:\ccl`) and
 **SBCL** (`E:\sbcl`) in late session work — those two codebases
 represent the most mature open-source CL collectors and embody

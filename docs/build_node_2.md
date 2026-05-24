@@ -2,7 +2,7 @@
 
 *Written 2026-05-10, after commit `5cebcec`. 29 commits on `main`.*
 
-Node 1 ([build_node_1.md](build_node_1.md)) ended with NewCormanLisp
+Node 1 ([build_node_1.md](build_node_1.md)) ended with NCL
 evaluating recursive arithmetic and conditional list-walking
 programs. It could do `fact`, `length`, `sum-list` — but every
 function had a single-form body, every reference to a name had to
@@ -326,7 +326,7 @@ In addition to the ten from node 1:
 
 ## Where it leaves us
 
-NewCormanLisp is now a Lisp — a small one, but a real one. You
+NCL is now a Lisp — a small one, but a real one. You
 can write `compose`, `map-list`, `filter`, `length`, `member`,
 `reverse` (almost), and have them work. The architecture has
 held: every commit since the GC build has been "add a feature,"
