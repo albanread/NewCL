@@ -16,7 +16,7 @@ The compatibility lives at the source level. Recompile from source
 and your old `.lisp` files run.
 
 If you know SBCL, CCL, Clozure, or Allegro, nothing in here will
-surprise you for long. If you came up on Corman and miss it, the
+surprise you for long. If you came up on Corman and miss it, some of the
 demos still run. If LISP for you means McCarthy 1960, you'll find
 everything from `(car (cdr ...))` up to `defmethod :around` waiting
 for you, and the same `(quote foo)` trick still works.
