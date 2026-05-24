@@ -5,13 +5,13 @@
 ## What this is
 
 NCL is a from-scratch reimplementation of the Corman Lisp
-**language and user-facing experience**, not its codebase. It is a faithful
-tribute that runs Corman Lisp programs and demos, while sharing
-none of the original implementation.
+**language and user-facing experience**, not its codebase. It is a
+Corman Lisp-inspired implementation that runs many Corman Lisp programs
+and demos, while sharing none of the original implementation.
 
-We keep the language. We keep the demos. We keep the spirit — a Lisp that
-is at home on Windows, that talks fluently to native code, that boots fast
-and feels direct. We replace everything underneath.
+We keep the language. We port many of the demos. We keep the spirit — a Lisp
+that is at home on Windows, that talks fluently to native code, that boots
+fast and feels direct. We replace everything underneath.
 
 ## The original, and why we are leaving it behind
 
@@ -307,14 +307,15 @@ decide.
    exceptions. When a NewCP design choice would make any of those
    harder, we deviate.
 
-## Compatibility — what "faithful tribute" means
+## Compatibility — what "Corman Lisp-inspired" means
 
-We commit to running:
+We aim to run:
 
 - Common Lisp as Corman Lisp implements it, including its de-facto
   ANSI-CL surface and the conformance Corman documented.
-- The Corman Lisp **demo programs** in `cormanlisp\examples` and the
-  packaged tutorials, unmodified except for paths.
+- Many of the Corman Lisp **demo programs** in `cormanlisp\examples`
+  and the packaged tutorials. Some demos may require minor porting;
+  not all demos are guaranteed to work without adjustment.
 - The Corman-specific extensions that the demos rely on — notably the
   Win32 FFI conventions, the `ccl:` package surface, and the IDE
   integration points the demos call into.
@@ -326,8 +327,8 @@ We do **not** commit to running:
   IDE internals, or hand-written assembly entry points.
 - Saved images from the original. Ours are a different format.
 
-Compatibility is verified by a regression suite that runs every Corman
-demo end-to-end on every CI build.
+Compatibility is verified by a regression suite that runs many of the
+ported Corman demos on every CI build.
 
 ## The GUI
 
@@ -386,8 +387,9 @@ E:\CL\
 ## The promise
 
 A user who wrote Corman Lisp code in 2005 should be able to open it in
-NCL in 2026, hit compile, and watch it run — faster, on a
-64-bit process, on a modern toolchain, with a debugger that understands
-the source — without changing a line.
+NCL in 2026 and get it running — faster, on a 64-bit process, on a
+modern toolchain, with a debugger that understands the source. Most
+code will run with little or no adjustment; some may need minor porting
+for the 64-bit word size or API differences.
 
-Everything underneath is new. Everything on top is theirs.
+Everything underneath is new. The language and spirit are preserved.
