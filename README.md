@@ -1,10 +1,13 @@
-# NewCormanLisp
+# NCL 
 
-A from-scratch reimplementation of the Corman Lisp **language and
+### !Beware this compiler and GC are all new ###
+
+
+A from-scratch reimplementation of the Common Lisp / Corman Lisp **language and
 user-facing experience** — Rust core, LLVM-based JIT, 64-bit,
 Windows-first with a Mac port planned.
 
-NewCormanLisp runs Corman Lisp source code and demos. It does not run
+NCL ports some Corman Lisp source code and demos. It does not run
 the original implementation's compiled artifacts (`.img`, `.fasl`).
 Recompile from source.
 
