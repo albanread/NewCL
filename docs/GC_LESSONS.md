@@ -10,10 +10,8 @@ Lisp workload we threw at it.** Each subsequent bug was, in retrospect,
 obvious. None of them were obvious in advance. The bugs share a small
 number of root patterns, and naming those patterns is more useful than
 naming the bugs.
-
-This isn't an apology. Roger Corman wrote his original Lisp GC in hand-
-tuned x86 assembly and it had subtle bugs for a decade. SBCL has fixed
-real gencgc correctness issues into the 2020s. Writing a GC is one of
+ 
+SBCL has fixed real gencgc correctness issues into the 2020s. Writing a GC is one of
 the few engineering tasks where decades of public source code, multiple
 textbooks, and a deceptively simple algorithm description still produce
 a bug-per-week debugging schedule for the first month. Memory-safe Rust
