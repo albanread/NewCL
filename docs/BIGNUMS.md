@@ -1,5 +1,12 @@
 # Bignums — Tier 1.D design + staging plan
 
+> ⚠ **Scope note — superseded.** This is the Tier 1.D plan; it
+> deliberately defers floats, ratios, and complex numbers. All three have
+> since been implemented: floats (`src/ncl-runtime/src/float.rs`, ryū
+> printing), exact rationals (`ratio.rs`, Tier 2.B), and complex numbers
+> (`complex.rs`, Tier 2.C). Do not cite this doc's "not in this tier" list
+> as the current state of the numeric tower.
+
 This is the planning doc for Tier 1.D (the last piece of Tier 1).
 Read first; commits implement against this plan.
 

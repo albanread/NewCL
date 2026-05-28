@@ -1,5 +1,15 @@
 # GC Flow — Page-Heap Minor Cycle
 
+> ⚠ **Historical snapshot (2026-05-16).** The Life-OOM diagnosis and the
+> "Path C not yet / Cheney can't reuse source pages mid-cycle" framing
+> below were superseded by the code: block-incremental two-phase
+> evacuation (chunked copy → rewrite → reclaim, reusing source pages
+> mid-cycle) is implemented in `src/ncl-runtime/src/page_heap/evac.rs`,
+> and precise roots are now wired in the JIT. Treat every "not yet" /
+> "stalls" / "blocker" claim here as describing a past state. Verify
+> against the code and `docs/GC.md`'s integration-status block before
+> relying on anything here.
+
 *Companion to `GC_DESIGN.md` and `GC_DESIGN_REVIEW_2.md`. Last updated
 2026-05-16.*
 

@@ -56,9 +56,7 @@ readtable to keep case, but: don't. The whole standard library
 expects upper-case interned names and you will spend an afternoon
 debugging if you fight it.
 
-NCL recognises numbers in the following forms (types marked
-*(planned)* read syntactically but are not yet fully supported at
-runtime):
+NCL recognises numbers in the full Common Lisp menagerie:
 
 ```
     42                  fixnum (signed 61-bit on x86-64)
@@ -66,15 +64,14 @@ runtime):
     100000000000000000000  bignum (arbitrary precision; integer math
                           promotes through fixnum → bignum on overflow,
                           transparently)
-    3/4                 ratio — planned; syntax parses but rational
-                          arithmetic is not yet implemented
+    3/4                 ratio (exact rational; reduces automatically)
     3.14                double float
     1.5e3               float in scientific notation
     #b1011              binary integer = 11
     #o755               octal integer = 493
     #x1A                hexadecimal integer = 26
     #36rZZ              radix-36 integer = 1295
-    #c(1 2)             complex — planned; not yet implemented
+    #c(1 2)             complex number, real 1 imag 2
 ```
 
 A *string* is `"like so"`; a *character* is `#\a`, `#\Space`,

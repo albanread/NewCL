@@ -1,5 +1,15 @@
 # GC Precise Roots — implementation plan
 
+> ⚠ **Largely implemented — historical plan.** This doc's premise
+> ("NCL's JIT doesn't call `push_root` — that's the gap") is no longer
+> true. Option B (explicit push/pop roots) landed: the JIT emits
+> `ncl_push_root`/`ncl_pop_root` via `emit_safepoint_wrap`
+> (`src/ncl-llvm/src/lib.rs`) around every GC-triggering call site, and
+> `ncl_push_root`/`ncl_pop_root` are `extern "C-unwind"` entry points in
+> `src/ncl-runtime/src/abi.rs`. Read this as the design rationale, not as
+> outstanding work. Option A (LLVM `gc.statepoint`) remains a possible
+> future optimisation.
+
 *Written 2026-05-16 after `GC_CHUNKED_INVARIANTS.md` established that
 no amount of guard-adding in `evac.rs` can make invariant I-6 hold
 by construction. The chunked design is correct given precise roots;

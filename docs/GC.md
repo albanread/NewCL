@@ -2,6 +2,54 @@
 
 *Status: synced to the NewGC design on 2026-05-23. This replaces the older semispace/TLAB design sketch that no longer matches the implementation direction.*
 
+> ## NCL integration status — verified against code, 2026-05-28
+>
+> **Read this first.** The rest of this document describes the *extracted*
+> collector (`E:\NewGC` / `newgc-core`). NCL **vendors its own copy** under
+> `src/ncl-runtime/src/page_heap/` and its integration layer
+> (`src/ncl-runtime/src/mutator.rs`, `src/ncl-llvm/src/lib.rs`) has built
+> things the extracted-core sections below say "do not exist yet." Where this
+> document and the code disagree, the code wins. As of this date, verified
+> against the tree:
+>
+> - **Precise roots are wired and primary.** The JIT emits
+>   `ncl_push_root` / `ncl_pop_root` via `emit_safepoint_wrap`
+>   (`ncl-llvm/src/lib.rs`) around every GC-triggering call site —
+>   function calls, cons/closure allocation, global/function loads,
+>   bignum-promote slow paths. Conservative pinning is now a *complement*
+>   (stack-range scan for parked threads + belt-and-suspenders), not the
+>   primary root path. NCL uses explicit push/pop roots, **not**
+>   `gc.statepoint`.
+> - **Cooperative multi-mutator stop-the-world is implemented.**
+>   `mutator.rs` has the `stop_requested` flag + condvar park, per-thread
+>   stack-range publication, per-thread precise-root enumeration, and
+>   per-thread TLABs. Multiple Lisp threads share one heap today.
+> - **Block-incremental two-phase evacuation is implemented**
+>   (`page_heap/evac.rs`): chunked copy → rewrite → reclaim, reusing
+>   source pages mid-cycle.
+> - **`collect_major` / `collect_full` exist** (`page_heap/cycle.rs`) but
+>   are **not wired into NCL's automatic trigger** — a live session runs
+>   only the minor (G0) cycle, so Tenured is not reclaimed.
+>
+> **What NCL genuinely still lacks** (these claims below *are* current):
+> - lock-free TLAB *refill* — refill takes the global heap mutex
+>   (`mutator.rs:789`);
+> - JIT-emitted back-edge safepoint polls — a tight non-allocating loop
+>   cannot be parked, only alloc-slow-path and explicit `safepoint()`
+>   sites observe a stop request;
+> - the recoverable `try_collect_*` + heap-poison path and the
+>   `should_collect_major` / `collect_auto` auto-major trigger policy —
+>   present in `newgc-core` HEAD, **not** synced into NCL's copy
+>   (MidEvacOOM is a fatal `gc-stall` condition, not a `Result`);
+> - the standalone large-object module (NCL inlines `try_alloc_large`
+>   into `alloc.rs`).
+>
+> The "extracted core" framing of the sections below (Conservative
+> pinning, Allocation model, Threading status, Trigger policy, Immediate
+> implications) is accurate *for `newgc-core`* but stale *for NCL's
+> integration*. They are kept as the upstream reference; do not read their
+> "not yet / future work" lines as NCL's status without checking the code.
+
 ## What this is
 
 This document describes the GC shape NCL now targets: a page-based,
@@ -135,8 +183,10 @@ yet have precise roots everywhere.
   not discovered through the precise root walk.
 
 In `E:\NewGC`, conservative pinning is feature-gated so a precise-roots
-client can compile it out. NCL should continue to assume it is required
-until statepoint-driven precise roots replace the conservative fallback.
+client can compile it out. *(NCL update: NCL's JIT now emits precise
+push/pop roots — see the integration-status block at the top. Conservative
+pinning is retained as a complement for parked threads and as
+belt-and-suspenders, no longer the primary root path.)*
 
 ## Allocation model
 
@@ -173,9 +223,13 @@ What does not exist yet:
 - cooperative mutator parking
 - per-thread root enumeration for a stop-the-world cycle
 
-That work is still planned, but it is separate from the current
-page-heap collector. NCL should treat multi-threaded mutators as future
-integration work, not as a property the GC already has.
+That work is still planned *for the extracted core*, but it is separate
+from the current page-heap collector. *(NCL update: NCL's integration
+layer has already built cooperative multi-mutator parking, per-thread
+root enumeration, and per-thread TLABs on top of the core — see the
+status block at the top. The remaining gaps for NCL are lock-free TLAB
+refill and JIT back-edge safepoint polls, not multi-mutator support as a
+whole.)*
 
 ## Trigger policy and OOM handling
 
@@ -218,10 +272,13 @@ behind the current design:
 
 - young/old semispace geometry
 - old-space A/B swaps
-- TLABs as already-implemented infrastructure
-- cooperative multi-mutator stop-the-world as already implemented
 - a collector that can be explained without page descriptors, mark bits,
   start bits, pinned state, and card tables
+
+*(Note: earlier revisions of this list also named "TLABs" and
+"cooperative multi-mutator stop-the-world" as not-yet-implemented. Those
+are now built in NCL's integration layer — see the status block at the
+top. They are removed from this list to stop it misleading NCL readers.)*
 
 The authoritative mental model is:
 
@@ -234,16 +291,19 @@ The authoritative mental model is:
 
 ## Immediate implications for NCL integration
 
-NCL still has integration work ahead before the extracted collector can
-replace every legacy assumption in the runtime.
+NCL still has integration work ahead, but less than this section once
+implied — see the status block at the top for what's already done.
 
-- Safepoint integration is still required for true multi-threaded Lisp.
-- Precise root enumeration still needs to replace conservative fallback
-  paths where possible.
-- Runtime APIs should move toward page-heap-native names and away from
-  semispace compatibility shims.
+- **Done:** precise root enumeration (push/pop roots in the JIT) and
+  cooperative multi-mutator parking. These were the two big items here.
+- **Still open:** lock-free TLAB refill (refill takes the heap mutex);
+  JIT-emitted back-edge safepoint polls (so non-allocating loops can be
+  parked); auto-major / recoverable-OOM sync from `newgc-core`; an
+  explicit FFI object-pin API for after conservative scan is dialed back.
+- Runtime APIs should keep moving toward page-heap-native names and away
+  from semispace compatibility shims.
 - Any documentation that describes the GC as two-generation semispace
-  copying should be treated as obsolete.
+  copying is obsolete.
 
 ## References
 

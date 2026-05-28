@@ -1,5 +1,13 @@
 # GC Design Review #2 — Mid-Evac Recycling and the In-Heap Forwarding Constraint
 
+> ⚠ **Historical snapshot.** "Design 2 (two-phase) is the immediate
+> direction" has since landed as block-incremental two-phase evacuation
+> in `src/ncl-runtime/src/page_heap/evac.rs`, and precise roots are wired
+> in the JIT. The retention numbers here (e.g. "957 live pages",
+> "21 MB live for a 40-cons game") predate precise roots and should be
+> re-measured before being trusted. Verify against the code and
+> `docs/GC.md`'s integration-status block.
+
 *Updated after the pre-BFS sweep histogram landed. This version retires the
 original arithmetic mistake and records the remaining decision clearly.*
 

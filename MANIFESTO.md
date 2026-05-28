@@ -110,34 +110,52 @@ documented there. Headlines of the current implementation:
   page-granular; Windows uses `VirtualAlloc`, future Unix targets
   will use `mmap`.
 - **Three generations: G0 (nursery), G1 (promoted), Tenured.**
-  Free pages are recycled from the pool. Collection is minor (G0
-  only) or major (all generations), chosen by the trigger policy.
-- **Mark-and-evacuate, not forwarding-pointer copying.** Live
-  objects are evacuated into destination pages; dead pages are
-  returned to free. The unit of reclamation is the page, not a
-  semispace boundary.
+  Free pages are recycled from the pool. `collect_major` / `collect_full`
+  (which touch the older generations) exist in the collector, but a
+  live NCL session's automatic trigger only ever runs the **minor**
+  (G0) cycle today — escalation to a full collection is not yet wired,
+  so Tenured is not reclaimed in a running session.
+- **Mark-and-evacuate, block-incremental two-phase.** Evacuation runs
+  in chunks bounded by available free pages: copy a chunk's marked
+  survivors, rewrite references into that chunk, then reclaim the
+  chunk's source pages — so source pages are reused mid-cycle and a
+  high-survival workload doesn't need a free destination for the whole
+  live set at once. The unit of reclamation is the page.
 - **Card-marking write barrier.** Heap-pointer writes into managed
-  objects mark cards. Minor and major cycles both consult dirty
-  cards; cross-generation edges are tracked this way.
-- **Conservative pinning (current), precise roots (planned).** The
-  runtime does not yet have LLVM `gc.statepoint`-emitted stack maps
-  everywhere. Conservative candidates are validated against page
-  ownership and header/tag consistency before being treated as
-  roots; ambiguous live objects are pinned rather than moved. Precise
-  root enumeration via statepoints is planned and is a separate
-  integration sprint.
-- **Stop-the-world, single-mutator for now.** Multi-threaded
-  mutation (TLABs, cooperative parking, per-thread root walks) is
-  planned but not yet implemented. The current model serialises heap
-  access behind a mutex; concurrent mutators are future work.
-- **`try_collect_*` variants for OOM recovery.** Mid-evacuation
-  failures return a `Result` rather than aborting the process. The
-  heap is considered poisoned after an evacuation failure and should
-  be dropped.
+  objects mark cards. Minor cycles consult dirty cards on older-gen
+  pages so cross-generation edges are treated as roots.
+- **Precise roots (primary) + conservative pinning (complement).**
+  NCL's JIT emits `ncl_push_root` / `ncl_pop_root` around every
+  GC-triggering call site (function calls, cons and closure
+  allocation, global/function loads, bignum-promote slow paths) via
+  `emit_safepoint_wrap`, so live Lisp values are precisely rooted. A
+  conservative pin pass over each thread's stack range runs alongside,
+  as belt-and-suspenders and to cover parked threads. We use explicit
+  push/pop roots, not LLVM `gc.statepoint`; statepoints remain a
+  possible later optimisation.
+- **Cooperative multi-mutator stop-the-world.** Multiple Lisp threads
+  run against one shared heap. A GC trigger sets a flag; every other
+  mutator parks at its next allocation safepoint; the collector walks
+  each parked thread's precise roots and stack range, then wakes them.
+  No `SuspendThread`, no signals. Per-thread TLABs make the allocation
+  fast path lock-free. Still missing: lock-free TLAB *refill* (refill
+  takes the heap mutex today) and JIT-emitted back-edge safepoint polls
+  (so a tight non-allocating loop cannot yet be parked).
+- **Mid-evacuation OOM is currently a condition, not a recovery.** A
+  destination-page exhaustion mid-cycle raises a Lisp `gc-stall`
+  condition (via `panic_any`), not a recoverable `Result`. The
+  recoverable `try_collect_*` + heap-poison path exists upstream in
+  `newgc-core` but is not yet synced into NCL's copy.
 
 The GC lives entirely in `ncl-runtime` in pure Rust. The OS only
 appears via a `PageAllocator` shim. `ncl-runtime` and `ncl-cl`
 contain zero FFI imports — including in the GC.
+
+NCL **vendors its own copy** of this collector under
+`src/ncl-runtime/src/page_heap/`; it does not consume `newgc-core` as
+a crate. The two have diverged, so upstream features (recoverable OOM,
+auto-major trigger, the large-object module) land in NCL only via a
+deliberate fork-sync.
 
 ## The loader
 
