@@ -321,11 +321,9 @@ impl Semispace {
         header_cell: u64,
         len: usize,
     ) -> ! {
-        let ty_bits = ((header_cell >> crate::heap_common::TYPE_SHIFT)
-            & crate::heap_common::TYPE_MASK) as u8;
-        let ty = HeapType::from_bits(ty_bits);
-        let gc_bits = ((header_cell >> crate::heap_common::GC_SHIFT)
-            & crate::heap_common::GC_MASK) as u8;
+        let hdr = HeapHeader::from_raw(header_cell);
+        let ty = hdr.ty();
+        let gc_bits = hdr.gc_bits();
         let mut ctx = String::new();
         let lo = idx.saturating_sub(4);
         let hi = (idx + 5).min(self.top);
@@ -340,14 +338,13 @@ impl Semispace {
             "heap walker `{walker}` hit unparseable cell:\n\
              \x20 idx        = {idx}\n\
              \x20 cell       = 0x{header_cell:016x}\n\
-             \x20 type bits  = {ty_bits} ({:?})\n\
+             \x20 type       = {ty:?}\n\
              \x20 length     = {len}\n\
              \x20 gc bits    = 0b{gc_bits:08b}\n\
              \x20 top        = {top}\n\
              \x20 capacity   = {cap}\n\
              \x20 would jump to {jump}, past top by {over} cells\n\
              context:\n{ctx}",
-            ty,
             top = self.top,
             cap = self.cells.len(),
             jump = idx.wrapping_add(1).wrapping_add(len),

@@ -63,7 +63,7 @@ where
 {
     #[cfg(feature = "gc-page-heap")]
     {
-        crate::page_heap::evac::install_quiet_gc_stall_panic_hook();
+        newgc_core::page_heap::evac::install_quiet_gc_stall_panic_hook();
         // Snapshot root depth so a mid-body unwind can't leave
         // half-pushed roots in place. Callees like
         // `ncl_build_rest_list` push roots around their alloc loop;
@@ -74,7 +74,7 @@ where
             Err(payload) => {
                 unsafe { (*mutator).truncate_roots(saved_root_depth) };
                 if let Some(stall) =
-                    payload.downcast_ref::<crate::page_heap::evac::GcStallError>()
+                    payload.downcast_ref::<newgc_core::page_heap::evac::GcStallError>()
                 {
                     let m = unsafe { &mut *mutator };
                     let static_area = m.coord().static_area();

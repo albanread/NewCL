@@ -506,44 +506,43 @@ fn write_heap_state(
     w: &mut BrkWriter,
     coord: &crate::mutator::GcCoordinator,
 ) {
-    use crate::page_heap::Generation;
-    let heap = match coord.heap_mutex().try_lock() {
-        Ok(h) => h,
-        Err(_) => {
-            w.write_str("heap (page-heap): <mutex contended; the GC was \
-                        running when the fault hit>\n");
-            return;
-        }
-    };
-    w.write_str("heap (page-heap):\n");
-    w.write_str("  total-pages = ");
-    w.write_dec_u64(heap.page_count() as u64);
-    w.write_str("\n  free        = ");
-    w.write_dec_u64(heap.count_pages_in_gen(Generation::Free) as u64);
-    w.write_str("\n  g0          = ");
-    w.write_dec_u64(heap.count_pages_in_gen(Generation::G0) as u64);
-    w.write_str("\n  g1          = ");
-    w.write_dec_u64(heap.count_pages_in_gen(Generation::G1) as u64);
-    w.write_str("\n  tenured     = ");
-    w.write_dec_u64(heap.count_pages_in_gen(Generation::Tenured) as u64);
-    w.write_str("\n  last-mark-live-bytes        = ");
-    w.write_dec_u64(heap.last_mark_live_bytes() as u64);
-    w.write_str("\n  last-mark-live-pages        = ");
-    w.write_dec_u64(heap.last_mark_live_pages() as u64);
-    w.write_str("\n  last-zero-live-pages-released = ");
-    w.write_dec_u64(heap.last_zero_live_pages_released() as u64);
-    let (pin_objs, pin_cells) = heap.last_pin_summary();
-    w.write_str("\n  last-pin-objects  = ");
-    w.write_dec_u64(pin_objs as u64);
-    w.write_str("\n  last-pin-cells    = ");
-    w.write_dec_u64(pin_cells as u64);
-    w.write_str("\n  pinned-now        = ");
-    w.write_dec_u64(heap.pinned_count() as u64);
-    w.write_str("\n  minors-since-g0-promote = ");
-    w.write_dec_u64(heap.minors_since_g0_promote() as u64);
-    w.write_str("\n  g0-promotes-since-g1-promote = ");
-    w.write_dec_u64(heap.g0_promotes_since_g1_promote() as u64);
-    w.write_str("\n");
+    use newgc_core::Generation;
+    // newgc-core owns the heap mutex internally; `with_heap` locks it
+    // for the duration of the closure. The process is already dying,
+    // so blocking here is acceptable (a deadlock is preferable to a
+    // silent partial dump — same rationale as the old try_lock path,
+    // minus the contended-skip branch).
+    coord.with_heap(|heap| {
+        w.write_str("heap (page-heap):\n");
+        w.write_str("  total-pages = ");
+        w.write_dec_u64(heap.page_count() as u64);
+        w.write_str("\n  free        = ");
+        w.write_dec_u64(heap.count_pages_in_gen(Generation::Free) as u64);
+        w.write_str("\n  g0          = ");
+        w.write_dec_u64(heap.count_pages_in_gen(Generation::G0) as u64);
+        w.write_str("\n  g1          = ");
+        w.write_dec_u64(heap.count_pages_in_gen(Generation::G1) as u64);
+        w.write_str("\n  tenured     = ");
+        w.write_dec_u64(heap.count_pages_in_gen(Generation::Tenured) as u64);
+        w.write_str("\n  last-mark-live-bytes        = ");
+        w.write_dec_u64(heap.last_mark_live_bytes() as u64);
+        w.write_str("\n  last-mark-live-pages        = ");
+        w.write_dec_u64(heap.last_mark_live_pages() as u64);
+        w.write_str("\n  last-zero-live-pages-released = ");
+        w.write_dec_u64(heap.last_zero_live_pages_released() as u64);
+        let (pin_objs, pin_cells) = heap.last_pin_summary();
+        w.write_str("\n  last-pin-objects  = ");
+        w.write_dec_u64(pin_objs as u64);
+        w.write_str("\n  last-pin-cells    = ");
+        w.write_dec_u64(pin_cells as u64);
+        w.write_str("\n  pinned-now        = ");
+        w.write_dec_u64(heap.pinned_count() as u64);
+        w.write_str("\n  minors-since-g0-promote = ");
+        w.write_dec_u64(heap.minors_since_g0_promote() as u64);
+        w.write_str("\n  g0-promotes-since-g1-promote = ");
+        w.write_dec_u64(heap.g0_promotes_since_g1_promote() as u64);
+        w.write_str("\n");
+    });
 }
 
 #[cfg(all(windows, not(feature = "gc-page-heap")))]
