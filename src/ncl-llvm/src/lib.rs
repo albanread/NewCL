@@ -24,7 +24,7 @@ use inkwell::context::Context;
 use inkwell::execution_engine::{ExecutionEngine, JitFunction};
 use inkwell::module::{Linkage, Module};
 use inkwell::attributes::AttributeLoc;
-use inkwell::values::{AsValueRef, FunctionValue, IntValue};
+use inkwell::values::{AsValueRef, FunctionValue, IntValue, PhiValue};
 
 pub(crate) mod jit_mm;
 
@@ -480,9 +480,20 @@ fn build_lisp_function(
         &mut locals,
         body,
     )?;
-    builder
-        .build_return(Some(&result))
-        .map_err(|e| format!("build_return: {e}"))?;
+    // Only emit the return if the current block isn't already
+    // terminated. A self-tail-call body whose every tail path loops
+    // (e.g. `(if c (f ...) (g ...))` with both arms self-calls) leaves
+    // the final block terminated by an `unreachable`; adding a `ret`
+    // there would be a second terminator.
+    if builder
+        .get_insert_block()
+        .and_then(|b| b.get_terminator())
+        .is_none()
+    {
+        builder
+            .build_return(Some(&result))
+            .map_err(|e| format!("build_return: {e}"))?;
+    }
 
     // Debug aid: `NCL_DUMP_IR=1` writes the LLVM IR for every
     // JIT'd module to ncl-dump.<n>.ll. Lets us audit attributes
@@ -751,6 +762,25 @@ struct Helpers<'ctx> {
     /// of the dynamic scope.
     dynamic_bind: FunctionValue<'ctx>,
     dynamic_unbind: FunctionValue<'ctx>,
+    /// Self-tail-call loop context, set while emitting the body of an
+    /// `Expr::TailLoop`. `SelfTailNext` reads it to find the loop
+    /// header block to branch back to and the per-parameter phi nodes
+    /// to rebind. `None` outside a `TailLoop`. Interior-mutable because
+    /// `Helpers` is threaded by shared ref through every `emit_expr`
+    /// call; this lets `TailLoop`/`SelfTailNext` communicate without
+    /// adding a parameter to that (already large) function's signature
+    /// and all ~40 of its recursive call sites.
+    tail_loop: std::cell::RefCell<Option<TailCtx<'ctx>>>,
+}
+
+/// Loop context published by `Expr::TailLoop` for the `SelfTailNext`
+/// continuations nested inside its body. `SelfTailNext` adds an
+/// incoming edge to each `param_phi` (the new argument values, from
+/// its own latch block) and branches to `loop_header`.
+#[derive(Clone)]
+struct TailCtx<'ctx> {
+    loop_header: inkwell::basic_block::BasicBlock<'ctx>,
+    param_phis: Vec<PhiValue<'ctx>>,
 }
 
 fn declare_runtime_helpers<'ctx>(
@@ -1098,6 +1128,7 @@ fn declare_runtime_helpers<'ctx>(
         debug_check_cons,
         dynamic_bind,
         dynamic_unbind,
+        tail_loop: std::cell::RefCell::new(None),
     }
 }
 
@@ -2576,43 +2607,84 @@ fn emit_expr<'ctx>(
             builder.position_at_end(then_block);
             let then_val = emit_expr(context, builder, function, helpers, arity, params, locals, then_branch)?;
             let then_end = builder.get_insert_block().unwrap();
-            builder
-                .build_unconditional_branch(merge_block)
-                .map_err(|e| format!("br: {e}"))?;
+            // The branch may already be terminated — a `SelfTailNext`
+            // in tail position branches back to the loop header, so this
+            // arm never reaches the merge. Only add the branch-to-merge
+            // (and count it as a phi predecessor) when it falls through.
+            let then_reaches = then_end.get_terminator().is_none();
+            if then_reaches {
+                builder
+                    .build_unconditional_branch(merge_block)
+                    .map_err(|e| format!("br: {e}"))?;
+            }
             let then_locals = std::mem::replace(locals, pre_locals.clone());
             let then_params = std::mem::replace(params, pre_params.clone());
 
             builder.position_at_end(else_block);
             let else_val = emit_expr(context, builder, function, helpers, arity, params, locals, else_branch)?;
             let else_end = builder.get_insert_block().unwrap();
-            builder
-                .build_unconditional_branch(merge_block)
-                .map_err(|e| format!("br: {e}"))?;
+            let else_reaches = else_end.get_terminator().is_none();
+            if else_reaches {
+                builder
+                    .build_unconditional_branch(merge_block)
+                    .map_err(|e| format!("br: {e}"))?;
+            }
             let else_locals = locals.clone();
             let else_params = params.clone();
 
             builder.position_at_end(merge_block);
-            let phi = builder
-                .build_phi(i64_t, "if_result")
-                .map_err(|e| format!("phi: {e}"))?;
-            phi.add_incoming(&[(&then_val, then_end), (&else_val, else_end)]);
-            // Merge any locals/params that diverged between the
-            // branches. The two snapshots have the same length
-            // because Let scoping balances additions in both
-            // branches by the time they reach the merge.
-            merge_locals_params_at_join(
-                context,
-                builder,
-                locals,
-                params,
-                &then_locals,
-                &then_params,
-                then_end,
-                &else_locals,
-                &else_params,
-                else_end,
-            )?;
-            Ok(phi.as_basic_value().into_int_value())
+            match (then_reaches, else_reaches) {
+                (true, true) => {
+                    // Both arms flow to the merge — the ordinary case.
+                    let phi = builder
+                        .build_phi(i64_t, "if_result")
+                        .map_err(|e| format!("phi: {e}"))?;
+                    phi.add_incoming(&[(&then_val, then_end), (&else_val, else_end)]);
+                    // Merge any locals/params that diverged between the
+                    // branches. The two snapshots have the same length
+                    // because Let scoping balances additions in both
+                    // branches by the time they reach the merge.
+                    merge_locals_params_at_join(
+                        context,
+                        builder,
+                        locals,
+                        params,
+                        &then_locals,
+                        &then_params,
+                        then_end,
+                        &else_locals,
+                        &else_params,
+                        else_end,
+                    )?;
+                    Ok(phi.as_basic_value().into_int_value())
+                }
+                (true, false) => {
+                    // Only the THEN arm reaches the merge; the ELSE arm
+                    // self-tail-looped. The merge has a single
+                    // predecessor, so no phi/merge is needed — adopt the
+                    // then-branch's value and local/param state.
+                    *locals = then_locals;
+                    *params = then_params;
+                    Ok(then_val)
+                }
+                (false, true) => {
+                    // Symmetric: only the ELSE arm reaches the merge.
+                    *locals = else_locals;
+                    *params = else_params;
+                    Ok(else_val)
+                }
+                (false, false) => {
+                    // Both arms self-tail-looped (e.g. `(if c (f ...)
+                    // (g ...))` where both are tail self-calls). Nothing
+                    // reaches the merge — terminate it as unreachable so
+                    // the function epilogue's terminator check is
+                    // satisfied. The returned value is dead.
+                    builder
+                        .build_unreachable()
+                        .map_err(|e| format!("if unreachable: {e}"))?;
+                    Ok(i64_t.const_int(Word::NIL.raw(), false))
+                }
+            }
         }
         Expr::LoadGlobal(sym_word) => {
             let mutator_arg = function.get_nth_param(0).unwrap();
@@ -2822,6 +2894,83 @@ fn emit_expr<'ctx>(
                 )
                 .map_err(|e| format!("build_call ncl_dynamic_unbind: {e}"))?;
             Ok(result)
+        }
+        Expr::TailLoop { arity: _, body } => {
+            // Self-tail-call loop. The current block (the function
+            // entry, where params were loaded from args_ptr) becomes
+            // the loop preheader. Create a `loop_header` block carrying
+            // one phi per parameter, seeded from the entry values;
+            // `SelfTailNext` adds the back-edges.
+            let entry_bb = builder.get_insert_block().unwrap();
+            let loop_header = context.append_basic_block(*function, "tail_loop");
+            builder
+                .build_unconditional_branch(loop_header)
+                .map_err(|e| format!("tailloop preheader br: {e}"))?;
+            builder.position_at_end(loop_header);
+
+            // One phi per current param, seeded with the entry value.
+            // Phis must be the first instructions in the block, so build
+            // them all before emitting the body.
+            let mut param_phis: Vec<PhiValue> = Vec::with_capacity(params.len());
+            for (i, p) in params.iter().enumerate() {
+                let phi = builder
+                    .build_phi(i64_t, &format!("tail_p{i}"))
+                    .map_err(|e| format!("tailloop phi: {e}"))?;
+                phi.add_incoming(&[(p, entry_bb)]);
+                param_phis.push(phi);
+            }
+            // The body reads params from the phis now.
+            for (i, phi) in param_phis.iter().enumerate() {
+                params[i] = phi.as_basic_value().into_int_value();
+            }
+
+            // Publish the loop context for nested SelfTailNext, saving
+            // any previous one (there is none in practice — TailLoop is
+            // the outermost body node — but restore defensively).
+            let prev = helpers
+                .tail_loop
+                .replace(Some(TailCtx { loop_header, param_phis }));
+            let result = emit_expr(
+                context, builder, function, helpers, arity, params, locals, body,
+            )?;
+            *helpers.tail_loop.borrow_mut() = prev;
+            Ok(result)
+        }
+        Expr::SelfTailNext { args } => {
+            // Evaluate the new argument values in the current env, then
+            // rebind the loop's param phis and branch back to the loop
+            // header. No call, no new frame — the self-recursion becomes
+            // iteration.
+            let arg_vals: Vec<IntValue> = args
+                .iter()
+                .map(|a| emit_expr(context, builder, function, helpers, arity, params, locals, a))
+                .collect::<Result<_, _>>()?;
+            let cur_bb = builder.get_insert_block().unwrap();
+            {
+                let ctx = helpers.tail_loop.borrow();
+                let tc = ctx.as_ref().ok_or_else(|| {
+                    "SelfTailNext emitted outside a TailLoop".to_string()
+                })?;
+                if arg_vals.len() != tc.param_phis.len() {
+                    return Err(format!(
+                        "SelfTailNext arg count {} != loop param count {}",
+                        arg_vals.len(),
+                        tc.param_phis.len()
+                    ));
+                }
+                for (phi, val) in tc.param_phis.iter().zip(arg_vals.iter()) {
+                    phi.add_incoming(&[(val, cur_bb)]);
+                }
+                builder
+                    .build_unconditional_branch(tc.loop_header)
+                    .map_err(|e| format!("tailloop back-edge br: {e}"))?;
+            }
+            // The block is now terminated by the back-branch. This value
+            // is never used (callers in tail position don't consume it,
+            // and the `If` / function-epilogue logic checks for an
+            // existing terminator before adding their own). NIL is a
+            // harmless placeholder.
+            Ok(i64_t.const_int(Word::NIL.raw(), false))
         }
         Expr::Call { sym_word, args } => {
             // Evaluate each argument first.

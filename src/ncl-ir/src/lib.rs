@@ -224,6 +224,27 @@ pub enum Expr {
         value: Box<Expr>,
         body: Box<Expr>,
     },
+    /// Self-tail-call loop wrapper. Wraps a function body whose tail-
+    /// position self-calls have been rewritten to `SelfTailNext`.
+    /// Codegen lowers it to a loop: it creates a `loop_header` block
+    /// with one phi per parameter (seeded from the entry-block param
+    /// values), runs `body` inside the loop, and a `SelfTailNext`
+    /// rebinds the param phis and branches back instead of calling.
+    /// This turns self-recursion into iteration — the frame is reused,
+    /// so deep self-recursion no longer grows the native stack.
+    ///
+    /// Generated only by the self-tail-call rewrite, only for fixed-
+    /// arity functions (required params only — no &optional/&rest/&key),
+    /// and only ever as the outermost node of a function body. `arity`
+    /// is the number of params (= number of phis to build).
+    TailLoop { arity: u32, body: Box<Expr> },
+    /// Self-tail-call continuation. Evaluate `args` (exactly the
+    /// enclosing `TailLoop`'s arity), rebind the loop's parameter phis
+    /// to the new values, and branch back to the loop header. Appears
+    /// only in tail position, only inside a `TailLoop`. It never
+    /// "returns" — its block ends in the back-branch — so its result
+    /// value is unused (codegen yields NIL as a placeholder).
+    SelfTailNext { args: Vec<Expr> },
 }
 
 impl Expr {
@@ -320,6 +341,12 @@ impl Expr {
     }
     pub fn dynamic_bind(sym_word: u64, value: Expr, body: Expr) -> Expr {
         Expr::DynamicBind { sym_word, value: Box::new(value), body: Box::new(body) }
+    }
+    pub fn tail_loop(arity: u32, body: Expr) -> Expr {
+        Expr::TailLoop { arity, body: Box::new(body) }
+    }
+    pub fn self_tail_next(args: Vec<Expr>) -> Expr {
+        Expr::SelfTailNext { args }
     }
 }
 

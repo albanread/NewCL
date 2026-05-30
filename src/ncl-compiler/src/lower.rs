@@ -2265,6 +2265,16 @@ pub(crate) fn instrument_tail_for_mv(e: Expr) -> Expr {
             Box::new(instrument_tail_for_mv(*t)),
             Box::new(instrument_tail_for_mv(*f)),
         ),
+        // Self-tail-call loop: the loop body still has real value tails
+        // (its base cases), so recurse into it to instrument those.
+        Expr::TailLoop { arity, body } => Expr::TailLoop {
+            arity,
+            body: Box::new(instrument_tail_for_mv(*body)),
+        },
+        // A loop continuation, not a value-returning tail — it rebinds
+        // params and branches back. The loop's eventual base-case tail
+        // carries the MV contract; leave this alone.
+        Expr::SelfTailNext { .. } => e,
         // EnsureSingleMv on top of EnsureSingleMv would be wasted
         // work; keep the inner one.
         Expr::EnsureSingleMv(_) => e,
@@ -2292,6 +2302,75 @@ pub(crate) fn instrument_tail_for_mv(e: Expr) -> Expr {
         // Everything else is a leaf tail that does NOT manage the MV
         // slot — wrap it so the slot is always consistent on return.
         other => Expr::ensure_single_mv(other),
+    }
+}
+
+/// Self-tail-call elimination — rewrite tail-position calls to the
+/// function being compiled into `SelfTailNext` continuations, so
+/// codegen can lower them to a loop branch-back instead of a real
+/// call. Returns the (possibly) rewritten body and whether any
+/// self-tail-call was found.
+///
+/// `self_sym` is the raw Word of the function's own symbol; `arity`
+/// is its required-parameter count. A `Call` qualifies only when it
+/// targets exactly that symbol with exactly that many arguments (a
+/// differing count is an arity error, not a self-call to optimize).
+///
+/// Walks ONLY genuine tail positions — the last form of a `Progn`,
+/// the body of a `Let`, and both arms of an `If`. It deliberately
+/// does NOT descend into:
+///   - `DynamicBind` bodies (the dynamic value is restored AFTER the
+///     body, so a call there is not truly in tail position),
+///   - `%native-block` / `%native-unwind-protect` calls (their
+///     protected forms appear as plain `Call` arguments, never reached
+///     here — and cleanup/return-from targets must outlive the call),
+///   - `EnsureSingleMv` (this pass runs BEFORE `instrument_tail_for_mv`,
+///     so no wrappers exist yet).
+///
+/// Caller contract: only invoke for fixed-arity functions (required
+/// params only) so every parameter maps to a `Param(i)` the loop can
+/// rebind; `&optional`/`&rest`/`&key` functions bind extra params as
+/// let-locals via a prologue and are excluded.
+///
+/// Semantic note: turning a self-call into a loop means a redefinition
+/// of the function *during* its own recursion is not observed by the
+/// in-flight activation (the frame is reused). This matches what "tail
+/// call optimization" means and what every TCO-doing CL does; the
+/// pathological redefine-mid-self-recursion case is the only
+/// observable difference.
+pub(crate) fn rewrite_self_tail_calls(
+    e: Expr,
+    self_sym: u64,
+    arity: u32,
+) -> (Expr, bool) {
+    match e {
+        Expr::Progn(mut es) => {
+            if let Some(last) = es.pop() {
+                let (new_last, found) =
+                    rewrite_self_tail_calls(last, self_sym, arity);
+                es.push(new_last);
+                (Expr::Progn(es), found)
+            } else {
+                (Expr::Progn(es), false)
+            }
+        }
+        Expr::Let { bindings, body } => {
+            let (nb, found) = rewrite_self_tail_calls(*body, self_sym, arity);
+            (Expr::Let { bindings, body: Box::new(nb) }, found)
+        }
+        Expr::If(c, t, f) => {
+            let (nt, ft) = rewrite_self_tail_calls(*t, self_sym, arity);
+            let (nf, ff) = rewrite_self_tail_calls(*f, self_sym, arity);
+            (Expr::If(c, Box::new(nt), Box::new(nf)), ft || ff)
+        }
+        Expr::Call { sym_word, args }
+            if sym_word == self_sym && args.len() == arity as usize =>
+        {
+            (Expr::SelfTailNext { args }, true)
+        }
+        // Not a tail position we descend into, or not a self-call —
+        // leave it untouched.
+        other => (other, false),
     }
 }
 

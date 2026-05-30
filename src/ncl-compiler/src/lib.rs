@@ -502,6 +502,35 @@ impl Session {
         } else {
             ncl_ir::Expr::let_(prologue, lowered_body)
         };
+
+        let arity = params.required.len() as u32;
+
+        // Self-tail-call elimination — turn tail-position calls to THIS
+        // function into a loop so deep self-recursion reuses the frame
+        // instead of overflowing the native stack. Gated to fixed-arity
+        // functions (required params only): with &optional/&rest/&key,
+        // some parameters are bound as let-locals via the prologue, so
+        // a self-call would have to re-run the prologue — out of scope
+        // for this transform. Runs BEFORE instrument_tail_for_mv so the
+        // self-call is matched as a bare `Call`, not wrapped in
+        // EnsureSingleMv; the MV pass then recurses into the resulting
+        // `TailLoop` and leaves the `SelfTailNext` continuations alone.
+        let fixed_arity = params.optionals.is_empty()
+            && params.rest.is_none()
+            && params.keys.is_empty();
+        let body_expr = if fixed_arity {
+            let self_sym = self.coord.intern(name).raw();
+            let (rewritten, found) =
+                lower::rewrite_self_tail_calls(body_expr, self_sym, arity);
+            if found {
+                ncl_ir::Expr::tail_loop(arity, rewritten)
+            } else {
+                rewritten
+            }
+        } else {
+            body_expr
+        };
+
         // Tail-position transform: wrap any non-`(values ...)` tail
         // expression in EnsureSingleMv so the multi-value slot is
         // always exactly the function's actual return values when
@@ -510,8 +539,6 @@ impl Session {
 
         let lower_elapsed = startup_timing::elapsed(t_lower);
         let t_jit = startup_timing::now();
-
-        let arity = params.required.len() as u32;
         let code_ptr = ncl_llvm::jit_compile_function(name, arity, &body_expr)
             .map_err(EvalError::Jit)?;
 
@@ -3837,6 +3864,76 @@ mod end_to_end_tests {
             .unwrap(),
             "55",
         );
+    }
+
+    #[test]
+    fn self_tail_call_does_not_overflow_stack() {
+        // Self-tail-call elimination: a function that tail-calls itself
+        // must iterate (reuse its frame), not grow the native stack.
+        // 5,000,000 deep would overflow any reasonable stack without
+        // TCO; with it, the loop just runs. Guards the TailLoop /
+        // SelfTailNext lowering in ncl-llvm.
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(
+            "(defun %tco-count (n acc)
+               (if (= n 0) acc (%tco-count (- n 1) (+ acc 1))))",
+        )
+        .unwrap();
+        assert_eq!(s.eval("(%tco-count 5000000 0)").unwrap(), "5000000");
+    }
+
+    #[test]
+    fn self_tail_call_preserves_accumulated_heap_data() {
+        // TCO must keep its accumulator rooted across the loop's
+        // back-edge: building a long list by tail recursion triggers
+        // many minor GCs, and the in-progress list (the `acc` param)
+        // must survive every one. A broken root would lose conses and
+        // the length would come back short (or the process would
+        // crash). 200k conses is plenty of GC pressure for the test
+        // heap while staying quick in debug.
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(
+            "(defun %tco-build (n acc)
+               (if (= n 0) acc (%tco-build (- n 1) (cons n acc))))",
+        )
+        .unwrap();
+        assert_eq!(
+            s.eval("(length (%tco-build 200000 nil))").unwrap(),
+            "200000",
+        );
+    }
+
+    #[test]
+    fn self_tail_call_nested_if() {
+        // A self-tail-call in the else arm of a nested `if` exercises
+        // the one-arm-diverts case in the If lowering (the else arm
+        // branches back to the loop header, so only the then arm
+        // reaches the merge). Two base cases, recursion stepping by 2.
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(
+            "(defun %tco-parity (n)
+               (if (= n 0) 'even
+                   (if (= n 1) 'odd
+                       (%tco-parity (- n 2)))))",
+        )
+        .unwrap();
+        assert_eq!(s.eval("(%tco-parity 2000000)").unwrap(), "EVEN");
+        assert_eq!(s.eval("(%tco-parity 2000001)").unwrap(), "ODD");
+    }
+
+    #[test]
+    fn non_tail_self_recursion_still_returns_values() {
+        // A self-call that is NOT in tail position (here, an argument to
+        // `+`) must be left as an ordinary call — TCO must not rewrite
+        // it. Correctness check at a shallow depth that doesn't
+        // overflow.
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(
+            "(defun %sum-to (n)
+               (if (= n 0) 0 (+ n (%sum-to (- n 1)))))",
+        )
+        .unwrap();
+        assert_eq!(s.eval("(%sum-to 100)").unwrap(), "5050");
     }
 
     #[test]
