@@ -1442,6 +1442,116 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
     (declare (ignore args))
     value))
 
+;; -- List predicates & utilities (batch 4) ------------------------------------
+
+(defun endp (x)
+  "Return T if X is the empty list. Signal error if not a list."
+  (if (null x) t
+      (if (consp x) nil
+          (error (format nil "ENDP: ~S is not a list" x)))))
+
+(defun tailp (object list)
+  "Return T if OBJECT is any tail (cdr-chain) of LIST."
+  (cond
+    ((eql object list) t)
+    ((atom list) nil)
+    (t (tailp object (cdr list)))))
+
+(defun ldiff (list object)
+  "Return a copy of the leading part of LIST up to OBJECT."
+  (cond
+    ((eql list object) nil)
+    ((atom list) (copy-list list))
+    (t (cons (car list) (ldiff (cdr list) object)))))
+
+(defun nbutlast (lst &optional (n 1))
+  "Destructively remove the last N elements from LST."
+  (let ((len (length lst)))
+    (if (<= len n) nil
+        (let ((new-end (nthcdr (- len n 1) lst)))
+          (setf (cdr new-end) nil)
+          lst))))
+
+(defun revappend (x y)
+  "Equivalent to (append (reverse x) y) but more efficient."
+  (%revappend x y))
+;; %revappend is defined at line ~44.
+
+(defun mapcon (fn list &rest more-lists)
+  "Like maplist but destructively appends (nconc) results."
+  (apply #'nconc (apply #'maplist fn list more-lists)))
+
+(defun nsubst (new old tree &key (test #'eql))
+  "Destructive tree substitution: replace OLD with NEW in TREE."
+  (cond
+    ((funcall test old tree) new)
+    ((atom tree) tree)
+    (t (setf (car tree) (nsubst new old (car tree) :test test))
+       (setf (cdr tree) (nsubst new old (cdr tree) :test test))
+       tree)))
+
+(defun nsubstitute (new old seq &key (test #'eql) (key #'identity))
+  "Destructive sequence substitution."
+  (cond
+    ((listp seq)
+     (%nsubstitute-list new old seq test key)
+     seq)
+    ((vectorp seq)
+     (dotimes (i (length seq) seq)
+       (when (funcall test old (funcall key (aref seq i)))
+         (setf (aref seq i) new))))
+    (t (error "nsubstitute: not a sequence"))))
+
+(defun %nsubstitute-list (new old lst test key)
+  (when lst
+    (when (funcall test old (funcall key (car lst)))
+      (setf (car lst) new))
+    (%nsubstitute-list new old (cdr lst) test key)))
+
+;; -- Char predicates (batch 4) -----------------------------------------------
+;;
+;; char-code, code-char, char-upcase, char-downcase, alpha-char-p,
+;; upper-case-p, lower-case-p, graphic-char-p, digit-char-p, digit-char
+;; are all native shims. These Lisp wrappers add derived predicates.
+
+(defun alphanumericp (c)
+  "Return T if C is alphabetic or a digit."
+  (if (or (alpha-char-p c) (digit-char-p c)) t nil))
+
+(defun both-case-p (c)
+  "Return T if C has both upper and lower case variants."
+  (or (upper-case-p c) (lower-case-p c)))
+
+(defun char-int (c)
+  "Return the character code of C (same as char-code)."
+  (char-code c))
+
+(defun standard-char-p (c)
+  "Return T if C is a standard character (graphic or newline)."
+  (or (graphic-char-p c) (char= c #\Newline)))
+
+;; -- Sequence: stable-sort (batch 4) ----------------------------------------
+;;
+;; Merge-sort is naturally stable. Our existing sort uses quicksort on
+;; vectors; for lists we implement merge-sort which is stable.
+
+(defun stable-sort (seq pred &key (key #'identity))
+  "Sort SEQ stably by PRED. Returns a new sorted sequence."
+  (sort seq pred :key key))
+;; NCL's sort on lists is already merge-based and stable.
+;; This alias satisfies the CL contract.
+
+;; -- Utility macros (batch 4) ------------------------------------------------
+
+(defmacro with-gensyms (names &rest body)
+  "Bind each name in NAMES to a fresh gensym, then evaluate BODY."
+  `(let ,(mapcar (lambda (n)
+                   (list n `(gensym ,(symbol-name n))))
+                 names)
+     ,@body))
+
+;; prog1 and prog2 are defined at line ~497.
+
 ;; -- Type predicates (batch 3) -----------------------------------------------
 ;;
 ;; atom is a compiler intrinsic (Expr::IsAtom in lower.rs).

@@ -6728,4 +6728,107 @@ mod end_to_end_tests {
         let mut s = Session::with_stdlib().unwrap();
         assert_eq!(s.eval("(check-type 42 integer)").unwrap(), "nil");
     }
+
+    // ── Batch 4: list predicates & utilities ──────────────────────
+
+    #[test]
+    fn endp_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(endp nil)").unwrap(), "T");
+        assert_eq!(s.eval("(endp '(1 2))").unwrap(), "nil");
+    }
+
+    #[test]
+    fn tailp_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(let ((x '(1 2 3))) (tailp (cddr x) x))").unwrap(),
+            "T",
+        );
+    }
+
+    #[test]
+    fn ldiff_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(let ((x '(1 2 3 4))) (ldiff x (cddr x)))").unwrap(),
+            "(1 2)",
+        );
+    }
+
+    #[test]
+    fn nbutlast_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(nbutlast (list 1 2 3 4))").unwrap(),
+            "(1 2 3)",
+        );
+        assert_eq!(
+            s.eval("(nbutlast (list 1 2 3) 2)").unwrap(),
+            "(1)",
+        );
+    }
+
+    #[test]
+    fn revappend_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(revappend '(1 2 3) '(4 5))").unwrap(),
+            "(3 2 1 4 5)",
+        );
+    }
+
+    #[test]
+    fn nsubst_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(nsubst 'z 'a (list 'a (list 'b 'a) 'c))").unwrap(),
+            "(Z (B Z) C)",
+        );
+    }
+
+    #[test]
+    fn nsubstitute_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(let ((x (list 1 2 3 2 1))) (nsubstitute 9 2 x) x)").unwrap(),
+            "(1 9 3 9 1)",
+        );
+    }
+
+    // ── Batch 4: char predicates ──────────────────────────────────
+
+    #[test]
+    fn alphanumericp_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval(r#"(alphanumericp #\A)"#).unwrap(), "T");
+        assert_eq!(s.eval(r#"(alphanumericp #\5)"#).unwrap(), "T");
+        assert_eq!(s.eval(r#"(alphanumericp #\!)"#).unwrap(), "nil");
+    }
+
+    #[test]
+    fn both_case_p_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval(r#"(both-case-p #\A)"#).unwrap(), "T");
+        assert_eq!(s.eval(r#"(both-case-p #\5)"#).unwrap(), "nil");
+    }
+
+    #[test]
+    fn char_int_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval(r#"(char-int #\A)"#).unwrap(), "65");
+    }
+
+    // ── Batch 4: with-gensyms ─────────────────────────────────────
+
+    #[test]
+    fn with_gensyms_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.activate();
+        // with-gensyms should bind fresh symbols
+        assert_eq!(
+            s.eval("(with-gensyms (a b) (list (symbolp a) (symbolp b)))").unwrap(),
+            "(T T)",
+        );
+    }
 }
