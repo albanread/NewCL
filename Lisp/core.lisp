@@ -1550,6 +1550,16 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
                  names)
      ,@body))
 
+;; -- Quantifiers (batch 5) ---------------------------------------------------
+
+(defun notany (pred seq &rest more)
+  "Return T if PRED is false for every element of SEQ."
+  (not (apply #'some pred seq more)))
+
+(defun notevery (pred seq &rest more)
+  "Return T if PRED is false for at least one element of SEQ."
+  (not (apply #'every pred seq more)))
+
 ;; prog1 and prog2 are defined at line ~497.
 
 ;; -- Type predicates (batch 3) -----------------------------------------------

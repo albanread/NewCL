@@ -6831,4 +6831,159 @@ mod end_to_end_tests {
             "(T T)",
         );
     }
+
+    // ── Batch 5: flet ─────────────────────────────────────────────
+
+    #[test]
+    fn flet_basic() {
+        let mut s = Session::with_stdlib().unwrap();
+        // flet creates local function bindings
+        assert_eq!(
+            s.eval("(flet ((double (x) (* x 2))) (double 21))").unwrap(),
+            "42",
+        );
+    }
+
+    #[test]
+    fn flet_shadows_global() {
+        let mut s = Session::with_stdlib().unwrap();
+        // flet can shadow a user-defined global function
+        s.eval("(defun my-op (a b) (+ a b))").unwrap();
+        assert_eq!(
+            s.eval("(flet ((my-op (a b) (* a b))) (my-op 6 7))").unwrap(),
+            "42",
+        );
+        // after flet, the global is restored
+        assert_eq!(s.eval("(my-op 6 7)").unwrap(), "13");
+    }
+
+    #[test]
+    fn flet_multiple_bindings() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(flet ((add1 (x) (+ x 1)) (add2 (x) (+ x 2))) (+ (add1 10) (add2 20)))").unwrap(),
+            "33",
+        );
+    }
+
+    // ── Batch 5: labels (mutual recursion!) ───────────────────────
+
+    #[test]
+    fn labels_self_recursion() {
+        let mut s = Session::with_stdlib().unwrap();
+        // labels allows self-recursion in the binding
+        assert_eq!(
+            s.eval("(labels ((fact (n) (if (<= n 1) 1 (* n (fact (- n 1)))))) (fact 10))").unwrap(),
+            "3628800",
+        );
+    }
+
+    #[test]
+    fn labels_mutual_recursion_even_odd() {
+        let mut s = Session::with_stdlib().unwrap();
+        // The classic mutual recursion test:
+        // my-even? calls my-odd? and vice versa
+        assert_eq!(
+            s.eval("(labels ((my-even (n) (if (= n 0) t (my-odd (- n 1)))) \
+                             (my-odd (n) (if (= n 0) nil (my-even (- n 1))))) \
+                      (list (my-even 10) (my-odd 10) (my-even 7) (my-odd 7)))").unwrap(),
+            "(T nil nil T)",
+        );
+    }
+
+    #[test]
+    fn labels_three_way_mutual() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Three mutually recursive functions: state machine
+        // A→B→C→A cycling, counting down
+        assert_eq!(
+            s.eval("(labels ((state-a (n) (if (= n 0) 'a (state-b (- n 1)))) \
+                             (state-b (n) (if (= n 0) 'b (state-c (- n 1)))) \
+                             (state-c (n) (if (= n 0) 'c (state-a (- n 1))))) \
+                      (list (state-a 0) (state-a 1) (state-a 2) (state-a 6)))").unwrap(),
+            "(A B C A)",
+        );
+    }
+
+    #[test]
+    fn labels_captures_outer() {
+        let mut s = Session::with_stdlib().unwrap();
+        // labels closures can capture outer variables
+        assert_eq!(
+            s.eval("(let ((factor 3)) \
+                      (labels ((scale (x) (* x factor))) \
+                        (scale 14)))").unwrap(),
+            "42",
+        );
+    }
+
+    #[test]
+    fn labels_funcall_sharp_quote() {
+        let mut s = Session::with_stdlib().unwrap();
+        // labels-bound functions work with #' and funcall
+        assert_eq!(
+            s.eval("(labels ((double (x) (* x 2))) \
+                      (funcall #'double 21))").unwrap(),
+            "42",
+        );
+    }
+
+    #[test]
+    fn labels_as_higher_order() {
+        let mut s = Session::with_stdlib().unwrap();
+        // labels function passed to mapcar
+        assert_eq!(
+            s.eval("(labels ((sq (x) (* x x))) \
+                      (mapcar #'sq '(1 2 3 4 5)))").unwrap(),
+            "(1 4 9 16 25)",
+        );
+    }
+
+    // ── Batch 5: more CL coverage ─────────────────────────────────
+
+    #[test]
+    fn notany_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(notany #'oddp '(2 4 6))").unwrap(), "T");
+        assert_eq!(s.eval("(notany #'oddp '(2 3 6))").unwrap(), "nil");
+    }
+
+    #[test]
+    fn notevery_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(notevery #'oddp '(1 2 3))").unwrap(), "T");
+        assert_eq!(s.eval("(notevery #'oddp '(1 3 5))").unwrap(), "nil");
+    }
+
+    #[test]
+    fn string_search_via_search() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.activate();
+        // search works on strings too via %as-list coercion
+        assert_eq!(
+            s.eval(r#"(search '(#\l #\l) (coerce "hello" 'list))"#).unwrap(),
+            "2",
+        );
+    }
+
+    #[test]
+    fn reduce_with_initial_value() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(reduce #'+ '(1 2 3) :initial-value 10)").unwrap(),
+            "16",
+        );
+    }
+
+    #[test]
+    fn copy_tree_is_deep() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Verify copy-tree makes a deep copy (not just top-level)
+        assert_eq!(
+            s.eval("(let* ((orig '((a . 1) (b . 2))) \
+                           (copy (copy-tree orig))) \
+                      (equal orig copy))").unwrap(),
+            "T",
+        );
+    }
 }
