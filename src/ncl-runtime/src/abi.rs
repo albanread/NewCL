@@ -3052,6 +3052,146 @@ pub extern "C-unwind" fn ncl_lookup_keyword(
     Word::UNBOUND.raw()
 }
 
+// ───────────────────────────────────────────────────────────────────
+// String manipulation — string-upcase, string-downcase, concatenate
+// ───────────────────────────────────────────────────────────────────
+
+/// `(string-upcase s)` → fresh upper-cased string.
+pub extern "C-unwind" fn string_upcase_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        return signal_condition_string(mutator, "string-upcase: expected 1 arg");
+    }
+    let s = Word::from_raw(unsafe { *args });
+    if s.tag() != Tag::String {
+        return signal_condition_string(mutator, "string-upcase: argument must be a string");
+    }
+    let upper: String = crate::gc_string::chars_of(s)
+        .flat_map(|c| c.to_uppercase())
+        .collect();
+    let m = unsafe { &mut *mutator };
+    crate::gc_string::alloc_string_in_young(m, &upper).raw()
+}
+
+/// `(string-downcase s)` → fresh lower-cased string.
+pub extern "C-unwind" fn string_downcase_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        return signal_condition_string(mutator, "string-downcase: expected 1 arg");
+    }
+    let s = Word::from_raw(unsafe { *args });
+    if s.tag() != Tag::String {
+        return signal_condition_string(mutator, "string-downcase: argument must be a string");
+    }
+    let lower: String = crate::gc_string::chars_of(s)
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    let m = unsafe { &mut *mutator };
+    crate::gc_string::alloc_string_in_young(m, &lower).raw()
+}
+
+/// `(string-trim chars s)` → fresh string with leading/trailing
+/// characters from CHARS removed. CHARS is a string of characters
+/// to trim.
+pub extern "C-unwind" fn string_trim_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        return signal_condition_string(mutator, "string-trim: expected 2 args (chars, string)");
+    }
+    let chars_w = Word::from_raw(unsafe { *args });
+    let s_w = Word::from_raw(unsafe { *args.add(1) });
+    if chars_w.tag() != Tag::String || s_w.tag() != Tag::String {
+        return signal_condition_string(mutator, "string-trim: arguments must be strings");
+    }
+    let trim_chars: Vec<char> = crate::gc_string::chars_of(chars_w).collect();
+    let s: String = crate::gc_string::chars_of(s_w).collect();
+    let trimmed = s.trim_matches(|c: char| trim_chars.contains(&c));
+    let m = unsafe { &mut *mutator };
+    crate::gc_string::alloc_string_in_young(m, trimmed).raw()
+}
+
+/// `(string-left-trim chars s)` → trim from left only.
+pub extern "C-unwind" fn string_left_trim_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        return signal_condition_string(mutator, "string-left-trim: expected 2 args");
+    }
+    let chars_w = Word::from_raw(unsafe { *args });
+    let s_w = Word::from_raw(unsafe { *args.add(1) });
+    if chars_w.tag() != Tag::String || s_w.tag() != Tag::String {
+        return signal_condition_string(mutator, "string-left-trim: arguments must be strings");
+    }
+    let trim_chars: Vec<char> = crate::gc_string::chars_of(chars_w).collect();
+    let s: String = crate::gc_string::chars_of(s_w).collect();
+    let trimmed = s.trim_start_matches(|c: char| trim_chars.contains(&c));
+    let m = unsafe { &mut *mutator };
+    crate::gc_string::alloc_string_in_young(m, trimmed).raw()
+}
+
+/// `(string-right-trim chars s)` → trim from right only.
+pub extern "C-unwind" fn string_right_trim_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        return signal_condition_string(mutator, "string-right-trim: expected 2 args");
+    }
+    let chars_w = Word::from_raw(unsafe { *args });
+    let s_w = Word::from_raw(unsafe { *args.add(1) });
+    if chars_w.tag() != Tag::String || s_w.tag() != Tag::String {
+        return signal_condition_string(mutator, "string-right-trim: arguments must be strings");
+    }
+    let trim_chars: Vec<char> = crate::gc_string::chars_of(chars_w).collect();
+    let s: String = crate::gc_string::chars_of(s_w).collect();
+    let trimmed = s.trim_end_matches(|c: char| trim_chars.contains(&c));
+    let m = unsafe { &mut *mutator };
+    crate::gc_string::alloc_string_in_young(m, trimmed).raw()
+}
+
+/// `(parse-integer s)` → fixnum parsed from string S. Returns NIL
+/// on invalid input (a real CL would signal an error).
+pub extern "C-unwind" fn parse_integer_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        return signal_condition_string(mutator, "parse-integer: expected 1 arg");
+    }
+    let s = Word::from_raw(unsafe { *args });
+    if s.tag() != Tag::String {
+        return signal_condition_string(mutator, "parse-integer: argument must be a string");
+    }
+    let text: String = crate::gc_string::chars_of(s).collect();
+    let trimmed = text.trim();
+    match trimmed.parse::<i64>() {
+        Ok(n) => Word::fixnum(n).raw(),
+        Err(_) => signal_condition_string(
+            mutator,
+            &format!("parse-integer: not a valid integer: {trimmed:?}"),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

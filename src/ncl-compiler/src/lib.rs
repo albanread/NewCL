@@ -917,6 +917,20 @@ fn install_native_functions(
     install_native(coord, mutator, "STRING-SPLIT-NEWLINES",
                    string_split_newlines_shim, 1);
 
+    // String manipulation.
+    install_native(coord, mutator, "STRING-UPCASE",
+                   ncl_runtime::string_upcase_shim, 1);
+    install_native(coord, mutator, "STRING-DOWNCASE",
+                   ncl_runtime::string_downcase_shim, 1);
+    install_native(coord, mutator, "STRING-TRIM",
+                   ncl_runtime::string_trim_shim, 2);
+    install_native(coord, mutator, "STRING-LEFT-TRIM",
+                   ncl_runtime::string_left_trim_shim, 2);
+    install_native(coord, mutator, "STRING-RIGHT-TRIM",
+                   ncl_runtime::string_right_trim_shim, 2);
+    install_native(coord, mutator, "PARSE-INTEGER",
+                   ncl_runtime::parse_integer_shim, 1);
+
     // THREADS package — Roger Corman's API, cross-platform.
     // Lisp-side wrappers in Library/threads.lisp expose the public
     // names (create-thread, with-synchronization, critical-section
@@ -6331,5 +6345,181 @@ mod end_to_end_tests {
         assert_eq!(s.eval("(equalp 1 1.0)").unwrap(), "T");
         assert_eq!(s.eval("(equalp '(1 2) '(1 2))").unwrap(), "T");
         assert_eq!(s.eval(r#"(equalp "abc" "def")"#).unwrap(), "nil");
+    }
+
+    // ── String functions ────────────────────────────────────────────
+
+    #[test]
+    fn string_eq_and_neq() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval(r#"(string= "abc" "abc")"#).unwrap(), "T");
+        assert_eq!(s.eval(r#"(string= "abc" "ABC")"#).unwrap(), "nil");
+        assert_eq!(s.eval(r#"(string/= "abc" "def")"#).unwrap(), "T");
+    }
+
+    #[test]
+    fn string_order() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval(r#"(string< "abc" "abd")"#).unwrap(), "T");
+        assert_eq!(s.eval(r#"(string> "abd" "abc")"#).unwrap(), "T");
+        assert_eq!(s.eval(r#"(string<= "abc" "abc")"#).unwrap(), "T");
+        assert_eq!(s.eval(r#"(string>= "abc" "abc")"#).unwrap(), "T");
+        assert_eq!(s.eval(r#"(string< "abc" "abc")"#).unwrap(), "nil");
+    }
+
+    #[test]
+    fn string_upcase_downcase() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval(r#"(equal (string-upcase "hello") "HELLO")"#).unwrap(), "T",
+        );
+        assert_eq!(
+            s.eval(r#"(equal (string-downcase "HELLO") "hello")"#).unwrap(), "T",
+        );
+    }
+
+    #[test]
+    fn string_trim_functions() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval(r#"(equal (string-trim " " "  hello  ") "hello")"#).unwrap(), "T",
+        );
+        assert_eq!(
+            s.eval(r#"(equal (string-left-trim " " "  hello  ") "hello  ")"#).unwrap(), "T",
+        );
+        assert_eq!(
+            s.eval(r#"(equal (string-right-trim " " "  hello  ") "  hello")"#).unwrap(), "T",
+        );
+    }
+
+    #[test]
+    fn string_capitalize_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval(r#"(equal (string-capitalize "hello world") "Hello World")"#).unwrap(), "T",
+        );
+    }
+
+    #[test]
+    fn parse_integer_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval(r#"(parse-integer "42")"#).unwrap(), "42");
+        assert_eq!(s.eval(r#"(parse-integer "-7")"#).unwrap(), "-7");
+        assert_eq!(s.eval(r#"(parse-integer "  100  ")"#).unwrap(), "100");
+    }
+
+    // ── Sequence functions ──────────────────────────────────────────
+
+    #[test]
+    fn count_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(count 3 '(1 2 3 3 4))").unwrap(), "2");
+        assert_eq!(s.eval("(count 5 '(1 2 3))").unwrap(), "0");
+    }
+
+    #[test]
+    fn count_if_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(count-if #'oddp '(1 2 3 4 5))").unwrap(), "3");
+    }
+
+    #[test]
+    fn reduce_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(reduce #'+ '(1 2 3 4))").unwrap(), "10");
+        assert_eq!(s.eval("(reduce #'+ '(1 2 3) :initial-value 10)").unwrap(), "16");
+        assert_eq!(s.eval("(reduce #'* '(2 3 4))").unwrap(), "24");
+    }
+
+    #[test]
+    fn concatenate_strings() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval(r#"(equal (concatenate 'string "hello" " " "world") "hello world")"#).unwrap(),
+            "T",
+        );
+    }
+
+    #[test]
+    fn concatenate_lists() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(concatenate 'list '(1 2) '(3 4))").unwrap(),
+            "(1 2 3 4)",
+        );
+    }
+
+    // ── List utilities ──────────────────────────────────────────────
+
+    #[test]
+    fn subst_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(subst 'x 'b '(a b c b))").unwrap(),
+            "(A X C X)",
+        );
+    }
+
+    #[test]
+    fn copy_tree_deep_copies() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(equal (copy-tree '(a (b c) d)) '(a (b c) d))").unwrap(),
+            "T",
+        );
+    }
+
+    #[test]
+    fn tree_equal_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(tree-equal '(a (b c)) '(a (b c)))").unwrap(),
+            "T",
+        );
+        assert_eq!(
+            s.eval("(tree-equal '(a (b c)) '(a (b d)))").unwrap(),
+            "nil",
+        );
+    }
+
+    #[test]
+    fn adjoin_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(adjoin 1 '(1 2 3))").unwrap(), "(1 2 3)");
+        assert_eq!(s.eval("(adjoin 0 '(1 2 3))").unwrap(), "(0 1 2 3)");
+    }
+
+    #[test]
+    fn delete_same_as_remove() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(delete 2 '(1 2 3 2 4))").unwrap(), "(1 3 4)");
+    }
+
+    // ── Control flow extras ─────────────────────────────────────────
+
+    #[test]
+    fn ignore_errors_catches() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Normal case: returns the value.
+        assert_eq!(s.eval("(ignore-errors (+ 1 2))").unwrap(), "3");
+    }
+
+    #[test]
+    fn complement_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(funcall (complement #'plusp) -5)").unwrap(),
+            "T",
+        );
+        assert_eq!(
+            s.eval("(funcall (complement #'plusp) 5)").unwrap(),
+            "nil",
+        );
+    }
+
+    #[test]
+    fn constantly_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(funcall (constantly 42) 1 2 3)").unwrap(), "42");
     }
 }
