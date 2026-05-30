@@ -15,14 +15,35 @@ feed each from Lisp.
 
 ## What's in this manual
 
+**Getting going**
+
 - **[Getting started](getting-started.md)** — install, build, write
   your first NCL program, run it.
+- **[The integrated REPL](repl.md)** — the read/eval/print loop, how
+  the GUI thread and the worker thread talk to each other.
+
+**The Lisp language**
+
+- **[Numbers](numbers.md)** — fixnums, bignums, rationals, floats,
+  complex, and the arithmetic that promotes between them.
+- **[Lists](lists.md)** — cons cells, list operations, mapping,
+  filtering, folding.
+- **[Variables and bindings](variables.md)** — `let`, `defvar`,
+  `setf`, lexical and dynamic scope, closures.
+- **[Control flow](control-flow.md)** — `if`, `cond`, `case`,
+  `loop`, `dotimes`, `dolist`, `block`, `return-from`.
+- **[Functions](functions.md)** — `defun`, `lambda`, lambda lists,
+  closures, `funcall` / `apply`, higher-order functions, multiple
+  values.
+- **[Macros](macros.md)** — `defmacro`, quasiquote, expansion,
+  `gensym` hygiene, when (and when not) to write one.
+
+**Under the hood**
+
 - **[The pipeline](pipeline.md)** — what happens between a `.lisp` file
   and a running expression. Reader, compiler, IR, LLVM JIT, runtime.
 - **[The garbage collector](gc.md)** — a tour of NCL's generational
   page-heap GC, with the cascade and the multi-mutator handshake.
-- **[The integrated REPL](repl.md)** — the read/eval/print loop, how
-  the GUI thread and the worker thread talk to each other.
 
 ## Why it's shaped this way
 
