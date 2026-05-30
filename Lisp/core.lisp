@@ -1442,6 +1442,224 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
     (declare (ignore args))
     value))
 
+;; -- Type predicates (batch 3) -----------------------------------------------
+;;
+;; atom is a compiler intrinsic (Expr::IsAtom in lower.rs).
+;; arrayp — vectorp and stringp already exist as predicates; a
+;; combined arrayp is handy for user code.
+
+(defun arrayp (x)
+  "Return T if X is an array (simple-vector or string)."
+  (or (vectorp x) (stringp x)))
+
+;; -- Number utilities (batch 3) ---------------------------------------------
+
+(defun gcd (&rest args)
+  "Return the greatest common divisor."
+  (cond
+    ((null args) 0)
+    ((null (cdr args)) (abs (car args)))
+    (t (reduce #'%gcd2 (mapcar #'abs args)))))
+
+(defun %gcd2 (a b)
+  "Euclidean GCD of two non-negative integers."
+  (if (zerop b) a (%gcd2 b (rem a b))))
+
+(defun lcm (&rest args)
+  "Return the least common multiple."
+  (cond
+    ((null args) 1)
+    ((null (cdr args)) (abs (car args)))
+    (t (reduce #'%lcm2 (mapcar #'abs args)))))
+
+(defun %lcm2 (a b)
+  (if (or (zerop a) (zerop b))
+      0
+      (* (truncate (abs a) (gcd a b)) (abs b))))
+
+(defun logtest (i1 i2)
+  "Return T if any bit is set in both I1 and I2."
+  (not (zerop (logand i1 i2))))
+
+(defun logcount (n)
+  "Count the 1-bits (positive) or 0-bits (negative) of integer N."
+  (if (minusp n) (logcount (lognot n))
+      (%popcount n 0)))
+
+(defun %popcount (n acc)
+  (if (zerop n) acc
+      (%popcount (logand n (- n 1)) (1+ acc))))
+
+(defun logbitp (index integer)
+  "Return T if bit INDEX of INTEGER is 1."
+  (not (zerop (logand (ash 1 index) integer))))
+
+(defun integer-length (n)
+  "Return the number of bits needed to represent N in two's complement."
+  (if (minusp n) (integer-length (lognot n))
+      (%bit-length n 0)))
+
+(defun %bit-length (n acc)
+  (if (zerop n) acc
+      (%bit-length (ash n -1) (1+ acc))))
+
+;; -- Alist utilities (batch 3) -----------------------------------------------
+
+(defun acons (key datum alist)
+  "Add (KEY . DATUM) to the front of ALIST."
+  (cons (cons key datum) alist))
+
+(defun pairlis (keys data &optional alist)
+  "Pair up KEYS and DATA into an alist prepended to ALIST."
+  (if (null keys)
+      alist
+      (acons (car keys) (car data)
+             (pairlis (cdr keys) (cdr data) alist))))
+
+(defun rassoc (item alist &key (test #'eql) (key #'identity))
+  "Like assoc, but matches against the CDR of each entry."
+  (cond
+    ((null alist) nil)
+    ((funcall test item (funcall key (cdr (car alist)))) (car alist))
+    (t (rassoc item (cdr alist) :test test :key key))))
+
+(defun copy-alist (alist)
+  "Return a copy of ALIST (fresh top-level conses)."
+  (if (null alist)
+      nil
+      (cons (cons (caar alist) (cdar alist))
+            (copy-alist (cdr alist)))))
+
+;; -- More sequence operations (batch 3) --------------------------------------
+
+(defun elt (sequence index)
+  "Return element at INDEX from SEQUENCE."
+  (if (listp sequence)
+      (nth index sequence)
+      (aref sequence index)))
+
+;; (setf elt) — deferred until (defun (setf ...) ...) is
+;; supported in core.lisp loading context.
+
+(defun substitute (new old seq &key (test #'eql) (key #'identity))
+  "Return a copy of SEQ with OLD replaced by NEW."
+  (let ((lst (%as-list seq)))
+    (let ((result (%substitute-list new old lst test key)))
+      (cond
+        ((listp seq) result)
+        ((stringp seq) (coerce result 'string))
+        ((vectorp seq) (coerce result 'vector))
+        (t result)))))
+
+(defun %substitute-list (new old lst test key)
+  (if (null lst) nil
+      (cons (if (funcall test old (funcall key (car lst))) new (car lst))
+            (%substitute-list new old (cdr lst) test key))))
+
+(defun substitute-if (new pred seq &key (key #'identity))
+  "Return copy of SEQ with elements satisfying PRED replaced by NEW."
+  (let ((lst (%as-list seq)))
+    (let ((result (%subst-if-list new pred lst key)))
+      (cond
+        ((listp seq) result)
+        ((stringp seq) (coerce result 'string))
+        ((vectorp seq) (coerce result 'vector))
+        (t result)))))
+
+(defun %subst-if-list (new pred lst key)
+  (if (null lst) nil
+      (cons (if (funcall pred (funcall key (car lst))) new (car lst))
+            (%subst-if-list new pred (cdr lst) key))))
+
+(defun substitute-if-not (new pred seq &key (key #'identity))
+  "Return copy of SEQ with elements NOT satisfying PRED replaced by NEW."
+  (substitute-if new (complement pred) seq :key key))
+
+(defun search (seq1 seq2 &key (test #'eql))
+  "Return position of SEQ1 in SEQ2, or NIL."
+  (let ((lst1 (%as-list seq1))
+        (lst2 (%as-list seq2)))
+    (%search-list lst1 lst2 0 test)))
+
+(defun %search-list (needle haystack pos test)
+  (cond
+    ((null needle) 0)            ; empty pattern matches at 0
+    ((null haystack) nil)
+    ((%prefix-p needle haystack test) pos)
+    (t (%search-list needle (cdr haystack) (1+ pos) test))))
+
+(defun %prefix-p (prefix lst test)
+  (cond
+    ((null prefix) t)
+    ((null lst) nil)
+    ((funcall test (car prefix) (car lst))
+     (%prefix-p (cdr prefix) (cdr lst) test))
+    (t nil)))
+
+(defun mismatch (seq1 seq2 &key (test #'eql))
+  "Return index of first mismatch between SEQ1 and SEQ2, or NIL."
+  (let ((lst1 (%as-list seq1))
+        (lst2 (%as-list seq2)))
+    (%mismatch-list lst1 lst2 0 test)))
+
+(defun %mismatch-list (l1 l2 i test)
+  (cond
+    ((and (null l1) (null l2)) nil)
+    ((or (null l1) (null l2)) i)
+    ((funcall test (car l1) (car l2))
+     (%mismatch-list (cdr l1) (cdr l2) (1+ i) test))
+    (t i)))
+
+(defun mapcan (fn list &rest more-lists)
+  "Like mapcar but destructively appends (nconc) results."
+  (apply #'nconc (apply #'mapcar fn list more-lists)))
+
+(defun maplist (fn list &rest more-lists)
+  "Map FN over successive cdrs of the lists."
+  (cond
+    ((null more-lists) (%maplist-1 fn list))
+    (t (error "maplist: multiple lists not yet supported"))))
+
+(defun %maplist-1 (fn lst)
+  (if (null lst) nil
+      (cons (funcall fn lst) (%maplist-1 fn (cdr lst)))))
+
+(defun make-string (size &key (initial-element #\Space))
+  "Create a string of SIZE characters, each INITIAL-ELEMENT."
+  (let ((s (make-array size :initial-element initial-element)))
+    (coerce s 'string)))
+
+;; -- Control flow (batch 3) --------------------------------------------------
+
+(defmacro nth-value (n form)
+  "Return the Nth value (zero-based) from a multiple-value form."
+  `(nth ,n (multiple-value-list ,form)))
+
+(defmacro multiple-value-setq (vars form)
+  "Set VARS from the multiple values of FORM."
+  (let ((mv (gensym "MV")))
+    `(let ((,mv (multiple-value-list ,form)))
+       ,@(%mvsetq-assigns vars mv 0)
+       (car ,mv))))
+
+(defun %mvsetq-assigns (vars mv-sym i)
+  (if (null vars) nil
+      (cons `(setq ,(car vars) (nth ,i ,mv-sym))
+            (%mvsetq-assigns (cdr vars) mv-sym (1+ i)))))
+
+(defmacro assert (test-form &rest args)
+  "Signal an error if TEST-FORM evaluates to NIL."
+  (declare (ignore args))
+  `(unless ,test-form
+     (error (format nil "Assertion failed: ~S" ',test-form))))
+
+(defmacro check-type (place typespec &rest args)
+  "Signal an error if PLACE is not of type TYPESPEC."
+  (declare (ignore args))
+  `(unless (typep ,place ',typespec)
+     (error (format nil "The value ~S is not of type ~A"
+                    ,place ',typespec))))
+
 ;; -- Hash tables -------------------------------------------------------------
 ;;
 ;; A hash table is a Vector laid out as:

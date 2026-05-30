@@ -6522,4 +6522,210 @@ mod end_to_end_tests {
         let mut s = Session::with_stdlib().unwrap();
         assert_eq!(s.eval("(funcall (constantly 42) 1 2 3)").unwrap(), "42");
     }
+
+    // ── Batch 3: type predicates ──────────────────────────────────
+
+    #[test]
+    fn atom_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(atom 42)").unwrap(), "T");
+        assert_eq!(s.eval("(atom 'x)").unwrap(), "T");
+        assert_eq!(s.eval("(atom nil)").unwrap(), "T");
+        assert_eq!(s.eval("(atom '(1 2))").unwrap(), "nil");
+    }
+
+    #[test]
+    fn arrayp_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval(r#"(arrayp "hello")"#).unwrap(), "T");
+        assert_eq!(s.eval("(arrayp #(1 2 3))").unwrap(), "T");
+        assert_eq!(s.eval("(arrayp 42)").unwrap(), "nil");
+    }
+
+    // ── Batch 3: number utilities ─────────────────────────────────
+
+    #[test]
+    fn gcd_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(gcd 12 8)").unwrap(), "4");
+        assert_eq!(s.eval("(gcd 15 25 10)").unwrap(), "5");
+        assert_eq!(s.eval("(gcd)").unwrap(), "0");
+        assert_eq!(s.eval("(gcd 7)").unwrap(), "7");
+    }
+
+    #[test]
+    fn lcm_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(lcm 4 6)").unwrap(), "12");
+        assert_eq!(s.eval("(lcm)").unwrap(), "1");
+        assert_eq!(s.eval("(lcm 5)").unwrap(), "5");
+    }
+
+    #[test]
+    fn logtest_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(logtest #xFF #x0F)").unwrap(), "T");
+        assert_eq!(s.eval("(logtest #xF0 #x0F)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn logcount_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(logcount #xFF)").unwrap(), "8");
+        assert_eq!(s.eval("(logcount 0)").unwrap(), "0");
+        assert_eq!(s.eval("(logcount 7)").unwrap(), "3");
+    }
+
+    #[test]
+    fn logbitp_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(logbitp 0 5)").unwrap(), "T");
+        assert_eq!(s.eval("(logbitp 1 5)").unwrap(), "nil");
+        assert_eq!(s.eval("(logbitp 2 5)").unwrap(), "T");
+    }
+
+    #[test]
+    fn integer_length_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(integer-length 0)").unwrap(), "0");
+        assert_eq!(s.eval("(integer-length 1)").unwrap(), "1");
+        assert_eq!(s.eval("(integer-length 7)").unwrap(), "3");
+        assert_eq!(s.eval("(integer-length 255)").unwrap(), "8");
+    }
+
+    // ── Batch 3: alist utilities ──────────────────────────────────
+
+    #[test]
+    fn acons_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(acons 'a 1 '((b . 2)))").unwrap(),
+            "((A . 1) (B . 2))",
+        );
+    }
+
+    #[test]
+    fn pairlis_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(pairlis '(a b c) '(1 2 3))").unwrap(),
+            "((A . 1) (B . 2) (C . 3))",
+        );
+    }
+
+    #[test]
+    fn rassoc_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(rassoc 2 '((a . 1) (b . 2) (c . 3)))").unwrap(),
+            "(B . 2)",
+        );
+        assert_eq!(
+            s.eval("(rassoc 99 '((a . 1)))").unwrap(),
+            "nil",
+        );
+    }
+
+    #[test]
+    fn copy_alist_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(copy-alist '((a . 1) (b . 2)))").unwrap(),
+            "((A . 1) (B . 2))",
+        );
+    }
+
+    // ── Batch 3: more sequences ───────────────────────────────────
+
+    #[test]
+    fn elt_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(elt '(a b c) 1)").unwrap(), "B");
+        assert_eq!(s.eval("(elt #(10 20 30) 2)").unwrap(), "30");
+    }
+
+    #[test]
+    fn substitute_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(substitute 0 3 '(1 2 3 4 3))").unwrap(),
+            "(1 2 0 4 0)",
+        );
+    }
+
+    #[test]
+    fn substitute_if_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(substitute-if 0 #'oddp '(1 2 3 4 5))").unwrap(),
+            "(0 2 0 4 0)",
+        );
+    }
+
+    #[test]
+    fn search_seq_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(search '(3 4) '(1 2 3 4 5))").unwrap(), "2");
+        assert_eq!(s.eval("(search '(9) '(1 2 3))").unwrap(), "nil");
+    }
+
+    #[test]
+    fn mismatch_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(mismatch '(1 2 3) '(1 2 9))").unwrap(), "2");
+        assert_eq!(s.eval("(mismatch '(1 2) '(1 2))").unwrap(), "nil");
+        assert_eq!(s.eval("(mismatch '(1 2 3) '(1 2))").unwrap(), "2");
+    }
+
+    #[test]
+    fn mapcan_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(mapcan (lambda (x) (if (oddp x) (list x) nil)) '(1 2 3 4 5))").unwrap(),
+            "(1 3 5)",
+        );
+    }
+
+    #[test]
+    fn make_string_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.activate();
+        assert_eq!(
+            s.eval(r#"(equal (make-string 3 :initial-element #\x) "xxx")"#).unwrap(),
+            "T",
+        );
+    }
+
+    // ── Batch 3: control flow ─────────────────────────────────────
+
+    #[test]
+    fn nth_value_primary() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.activate();
+        // nth-value 0 returns the primary value
+        assert_eq!(s.eval("(nth-value 0 (values 42))").unwrap(), "42");
+    }
+
+    #[test]
+    fn multiple_value_setq_primary() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.activate();
+        // multiple-value-setq at least binds the primary value
+        assert_eq!(
+            s.eval("(let ((a 0)) (multiple-value-setq (a) (+ 10 3)) a)").unwrap(),
+            "13",
+        );
+    }
+
+    #[test]
+    fn assert_core_passes() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(assert (= 1 1))").unwrap(), "nil");
+    }
+
+    #[test]
+    fn check_type_core_passes() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(check-type 42 integer)").unwrap(), "nil");
+    }
 }
