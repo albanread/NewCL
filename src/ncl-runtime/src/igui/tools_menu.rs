@@ -28,7 +28,9 @@ use super::ledit;
 use super::log_view;
 use super::repl_child;
 
-/// Help → Documentation: spawn doc-crate.exe against the bundled docs/.
+/// Help → Documentation: open the bundled `docs/user/index.md` in an
+/// in-window doc-pane MDI child (routed via `window::open_docs` →
+/// `igui::doc_pane::open` + `set_markdown`). No external process.
 pub const HELP_CMD_DOCS: u16 = 0x5000;
 
 // ── Internal helpers ──────────────────────────────────────────────────
@@ -121,7 +123,8 @@ pub fn append_tools_menu(bar: HMENU) {
     attach_popup(bar, popup, "&Tools");
 }
 
-/// Help menu — Documentation (opens doc-crate.exe against docs/).
+/// Help menu — Documentation (opens an in-window doc-pane child
+/// loaded with `docs/user/index.md`; see `window::open_docs`).
 pub fn append_help_menu(bar: HMENU) {
     let Ok(popup) = (unsafe { CreatePopupMenu() }) else { return };
     let mut w: Vec<u16> = "&Documentation\tF1".encode_utf16().collect();
