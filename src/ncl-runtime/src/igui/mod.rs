@@ -41,6 +41,7 @@ mod d2d;
 mod d3d;
 pub mod doc_pane;
 mod dwrite;
+pub mod help_pane;
 mod executor;
 mod font_metrics;
 pub mod lisp_shims;

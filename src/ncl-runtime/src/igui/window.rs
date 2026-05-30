@@ -92,6 +92,12 @@ const WM_IGUI_OPEN_DOC: u32 = WM_USER + 11;
 /// streaming write loop on the language thread doesn't block on the
 /// GUI thread.
 const WM_IGUI_DOC_FLUSH: u32 = WM_USER + 12;
+/// Open a Help-pane MDI child — a read-only documentation browser
+/// over a folder of `.md` files, with sidebar + link navigation.
+/// Distinct from WM_IGUI_OPEN_DOC: that one opens a Lisp-scriptable
+/// single-document pane; this one carries a `path` (folder or .md
+/// file) and never accepts streamed updates.
+const WM_IGUI_OPEN_HELP: u32 = WM_USER + 13;
 /// Sent from the language thread to a render-host HWND to install
 /// or clear a Win32 timer driving `EvTick` events.
 /// `wparam` carries the interval in ms (0 = clear), `lparam` is unused.
@@ -376,31 +382,40 @@ pub(crate) fn gui_thread_id() -> Option<u32> {
 
 // ── Help / documentation launcher ─────────────────────────────────────────
 
-/// Open NCL's user-facing documentation as an in-window doc-pane.
+/// Open NCL's user-facing documentation in a *help-pane* MDI child.
 ///
-/// Finds the bundled docs/ directory (production: next to ncl.exe; dev:
-/// the workspace's docs/), reads `docs/user/index.md` if present (or
-/// falls back to a built-in greeting), then opens a `doc_pane` MDI
-/// child preloaded with the Markdown. The pane renders Markdown + any
-/// fenced ```mermaid blocks via the shared `docpane` Direct2D core, so
-/// no external process is involved.
+/// The help pane is a full read-only docs browser: it scans the
+/// chosen folder for `.md` files, builds a sidebar of pages, follows
+/// in-page Markdown links, and renders Mermaid diagrams through
+/// `docpane`. Distinct from the bare `doc_pane` (which is a single
+/// Lisp-scriptable Markdown surface with no chrome).
 ///
-/// **docs/** search order:
-///   1. `<exe_dir>/docs/`               — production installation
-///   2. `<exe_dir>/../../docs/`         — dev build (exe under target/<profile>/)
-///   3. `CARGO_MANIFEST_DIR/../../docs/` — `cargo run` from anywhere
+/// Folder search order:
+///   1. `<exe_dir>/docs/user/`           — production installation
+///   2. `<exe_dir>/docs/`                — fallback if no `user/`
+///   3. `<exe_dir>/../../docs/user/`     — dev build (exe under target/<profile>/)
+///   4. `<exe_dir>/../../docs/`          — dev fallback
+///   5. `CARGO_MANIFEST_DIR/../../docs/user/` — `cargo run` from anywhere
 pub(crate) fn open_docs() {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
 
-    // ── locate docs/ directory ────────────────────────────────────
-    let docs_dir: Option<std::path::PathBuf> = exe_dir
+    let docs_path: Option<std::path::PathBuf> = exe_dir
         .as_ref()
-        .map(|d| d.join("docs"))
+        .map(|d| d.join("docs").join("user"))
         .filter(|p| p.is_dir())
         .or_else(|| {
-            // dev: exe is in target/debug/ or target/release/
+            exe_dir.as_ref().map(|d| d.join("docs")).filter(|p| p.is_dir())
+        })
+        .or_else(|| {
+            exe_dir
+                .as_ref()
+                .and_then(|d| d.ancestors().nth(2))
+                .map(|root| root.join("docs").join("user"))
+                .filter(|p| p.is_dir())
+        })
+        .or_else(|| {
             exe_dir
                 .as_ref()
                 .and_then(|d| d.ancestors().nth(2))
@@ -408,47 +423,30 @@ pub(crate) fn open_docs() {
                 .filter(|p| p.is_dir())
         })
         .or_else(|| {
-            // cargo run — CARGO_MANIFEST_DIR is ncl-runtime; go up 2
-            // to reach the repo root where docs/ lives.
             let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
             manifest
                 .ancestors()
                 .nth(2)
-                .map(|r| r.join("docs"))
+                .map(|r| r.join("docs").join("user"))
                 .filter(|p| p.is_dir())
         });
 
-    // ── pick an index file ────────────────────────────────────────
-    // Prefer the user-facing manual at docs/user/index.md (Phase 5
-    // writes it). Fall back to docs/index.md, then to an inline
-    // greeting so the pane is never empty if the bundle is missing.
-    const FALLBACK: &str = "\
-# NewCormanLisp Documentation
-
-The bundled documentation could not be located. Expected one of:
-
-- `docs/user/index.md` next to `ncl.exe`
-- `docs/index.md`
-
-Use **Help → Documentation** again once the docs are installed.
-";
-    let markdown: String = docs_dir
-        .as_ref()
-        .and_then(|d| {
-            let candidates = [d.join("user").join("index.md"), d.join("index.md")];
-            candidates
-                .iter()
-                .find(|p| p.is_file())
-                .and_then(|p| std::fs::read_to_string(p).ok())
-        })
-        .unwrap_or_else(|| FALLBACK.to_string());
-
-    let Some(child_id) = super::doc_pane::open("NCL Documentation") else {
-        eprintln!("[docs] failed to open doc pane");
+    let Some(path) = docs_path else {
+        eprintln!(
+            "[docs] docs/ folder not found. Expected `docs/user/` or `docs/` \
+             next to ncl.exe."
+        );
         return;
     };
-    if !super::doc_pane::set_markdown(child_id, &markdown) {
-        eprintln!("[docs] failed to set initial markdown on pane {child_id}");
+    let path_str = match path.to_str() {
+        Some(s) => s.to_owned(),
+        None => {
+            eprintln!("[docs] docs path is not valid UTF-8: {}", path.display());
+            return;
+        }
+    };
+    if super::help_pane::open("NCL Documentation", &path_str).is_none() {
+        eprintln!("[docs] failed to open help pane");
     }
 }
 
@@ -492,6 +490,7 @@ where
     child::register_classes()?;
     super::crash_view::register_class()?;
     super::doc_pane::register_class()?;
+    super::help_pane::register_class()?;
 
     // Renderer comes up before any window so child WM_NCCREATE can build
     // its swap chain immediately.
@@ -682,6 +681,18 @@ unsafe extern "system" fn frame_wnd_proc(
         WM_IGUI_DOC_FLUSH => {
             let child_id = wparam.0 as i64;
             super::doc_pane::flush_on_gui_thread(child_id);
+            LRESULT(0)
+        }
+        WM_IGUI_OPEN_HELP => {
+            let req_ptr = lparam.0 as *mut OpenHelpRequest;
+            if !req_ptr.is_null() {
+                let req = unsafe { &mut *req_ptr };
+                if let Some(mdi_client) = mdi_client_hwnd() {
+                    req.out = super::help_pane::create_on_gui_thread(
+                        mdi_client, &req.title, &req.path,
+                    );
+                }
+            }
             LRESULT(0)
         }
         WM_IGUI_OPEN_REPL => {
@@ -1134,6 +1145,12 @@ pub(crate) struct OpenDocRequest {
     pub out: Option<i64>,
 }
 
+pub(crate) struct OpenHelpRequest {
+    pub title: Vec<u16>,
+    pub path: String,
+    pub out: Option<i64>,
+}
+
 pub(crate) struct CloseChildRequest {
     pub child_id: i64,
     pub ok: bool,
@@ -1328,6 +1345,31 @@ pub(crate) fn post_text_flush(child_id: i64) {
             LPARAM(0),
         )
     };
+}
+
+/// Open a read-only Help-pane MDI child via the GUI thread. `path`
+/// is a docs folder or a `.md` file; the help-pane scans the folder
+/// for sibling docs, builds a sidebar, and follows in-page links.
+/// Used by Help → Documentation; can also be opened from Lisp.
+pub fn open_help_child(title: &str, path: &str) -> Option<i64> {
+    let frame_raw = *FRAME_HWND.get()?;
+    let frame = HWND(frame_raw as *mut _);
+    let mut title_w: Vec<u16> = title.encode_utf16().collect();
+    title_w.push(0);
+    let mut req = OpenHelpRequest {
+        title: title_w,
+        path: path.to_owned(),
+        out: None,
+    };
+    unsafe {
+        SendMessageW(
+            frame,
+            WM_IGUI_OPEN_HELP,
+            Some(WPARAM(0)),
+            Some(LPARAM(&mut req as *mut _ as isize)),
+        )
+    };
+    req.out
 }
 
 /// Open a Markdown doc-pane MDI child via the GUI thread. Returns the
