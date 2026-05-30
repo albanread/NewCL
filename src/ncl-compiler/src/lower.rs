@@ -462,7 +462,10 @@ fn lower_quoted(v: &Value, coord: &Arc<GcCoordinator>) -> Result<Expr, CompileEr
 /// Build a Word for a quoted Value, allocating compound structure
 /// in the coordinator's static area as needed. Recurses into cons
 /// cells.
-fn build_quoted_word(
+///
+/// Also used by `read-from-string` to materialise a reader Value
+/// into a runtime Word.
+pub fn build_quoted_word(
     v: &Value,
     coord: &Arc<GcCoordinator>,
 ) -> Result<Word, CompileError> {

@@ -1176,6 +1176,55 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
      ,@(defstruct-build-setters name slots)
      ',name))
 
+;; -- String comparison helpers -----------------------------------------------
+
+(defun string-equal (s1 s2)
+  "Case-insensitive string comparison. Returns T if S1 and S2 have
+   the same length and matching characters ignoring case."
+  (if (not (and (stringp s1) (stringp s2)))
+      nil
+      (let ((n (length s1)))
+        (if (/= n (length s2))
+            nil
+            (%string-equal-loop s1 s2 n 0)))))
+
+(defun %string-equal-loop (s1 s2 n i)
+  (if (= i n)
+      t
+      (if (char-equal (char s1 i) (char s2 i))
+          (%string-equal-loop s1 s2 n (1+ i))
+          nil)))
+
+(defun char-equal (c1 c2)
+  "Case-insensitive character comparison."
+  (eql (char-upcase c1) (char-upcase c2)))
+
+(defun char= (c1 c2)
+  "Case-sensitive character comparison."
+  (eql c1 c2))
+
+(defun char/= (c1 c2)
+  "True if C1 and C2 are different characters."
+  (not (eql c1 c2)))
+
+(defun char< (c1 c2) (< (char-code c1) (char-code c2)))
+(defun char> (c1 c2) (> (char-code c1) (char-code c2)))
+(defun char<= (c1 c2) (<= (char-code c1) (char-code c2)))
+(defun char>= (c1 c2) (>= (char-code c1) (char-code c2)))
+
+(defun equalp (a b)
+  "Case-insensitive, type-coercing equality. Strings are compared
+   ignoring case; numbers compared by value; conses compared
+   recursively; everything else falls back to EQL."
+  (cond
+    ((eql a b) t)
+    ((and (numberp a) (numberp b)) (= a b))
+    ((and (stringp a) (stringp b)) (string-equal a b))
+    ((and (consp a) (consp b))
+     (and (equalp (car a) (car b))
+          (equalp (cdr a) (cdr b))))
+    (t nil)))
+
 ;; -- Hash tables -------------------------------------------------------------
 ;;
 ;; A hash table is a Vector laid out as:
@@ -1183,11 +1232,10 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
 ;;   slot 1 — current count of entries (fixnum, mutable via setf-svref)
 ;;   slot 2..N+1 — N buckets, each a list of (key . value) cons cells
 ;;
-;; Closette and the GUI demos only need EQ / EQL tables, so we
-;; don't yet content-hash for EQUAL (the bit-mix in %word-hash
-;; gives different strings of equal contents different bucket
-;; indices). EQUAL is tracked as the test for completeness so
-;; callers can opt in once content-hash lands.
+;; EQ / EQL tables use %word-hash (raw-bit hash, fast).
+;; EQUAL / EQUALP tables use %equal-hash (content-aware: strings
+;; are hashed by their character content, so distinct string objects
+;; with the same text hash identically).
 ;;
 ;; The whole structure lives on the GC heap (vector + cons cells),
 ;; so old-to-young pointer marking and the ordinary trace pass take
@@ -1212,17 +1260,32 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
 (defun %ht-set-bucket (ht i v) (setf (svref ht (+ i 2)) v))
 
 (defun %ht-bucket-index (ht key)
-  (mod (%word-hash key) (%ht-nbuckets ht)))
+  (let ((test (%ht-test ht)))
+    (mod (if (or (eq test 'equal) (eq test 'equalp))
+             (%equal-hash key)
+             (%word-hash key))
+         (%ht-nbuckets ht))))
 
 (defun %ht-keys-match (test k1 k2)
   "Compare K1 and K2 under TEST. EQUAL falls back to EQUAL on
-   conses/strings; EQL handles fixnums/chars/symbols/T/NIL same
-   as EQ in our current value set; EQ is identity."
+   conses/strings; EQUALP uses case-insensitive string comparison;
+   EQL handles fixnums/chars/symbols/T/NIL same as EQ in our
+   current value set; EQ is identity."
   (cond
     ((eq test 'eq) (eq k1 k2))
     ((eq test 'eql) (eql k1 k2))
     ((eq test 'equal) (equal k1 k2))
+    ((eq test 'equalp) (equalp k1 k2))
     (t (eql k1 k2))))
+
+(defun hash-table-p (x)
+  "Return T if X is a hash table."
+  ;; A hash table is a vector whose slot 0 is one of the test symbols.
+  (and (vectorp x)
+       (>= (length x) 3)
+       (let ((test (svref x 0)))
+         (or (eq test 'eq) (eq test 'eql)
+             (eq test 'equal) (eq test 'equalp)))))
 
 (defun hash-table-count (ht)
   "Return the number of key/value pairs currently in HT."
@@ -1571,6 +1634,160 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
   (let ((n (length s)))
     (if (zerop n) s (substring s 0 (- n 1)))))
 
+;; -- Standard I/O Streams & CL Printer Names --------------------------------
+;;
+;; The CL standard printer functions: print, prin1, princ, pprint,
+;; write, write-char, write-string, write-line, terpri, fresh-line,
+;; and the -to-string variants.
+;;
+;; Stream destinations:
+;;   NIL or T → *standard-output* (i.e. stdout via native FORMAT)
+;;   fixnum   → file handle (via WRITE-STRING-TO)
+;;
+;; These are thin wrappers around the native FORMAT engine — they'll
+;; be shadowed by Library/xp.lisp if/when the pretty-printer loads.
+
+(defparameter *standard-output* t)
+(defparameter *standard-input* t)
+(defparameter *error-output* t)
+(defparameter *trace-output* t)
+(defparameter *debug-io* t)
+(defparameter *query-io* t)
+(defparameter *terminal-io* t)
+
+;; Print-control variables. Our bootstrap printer ignores them but
+;; defining them here lets library code bind them without error.
+(defparameter *print-escape* t)
+(defparameter *print-readably* nil)
+(defparameter *print-pretty* nil)
+(defparameter *print-circle* nil)
+(defparameter *print-base* 10)
+(defparameter *print-radix* nil)
+(defparameter *print-case* ':upcase)
+(defparameter *print-level* nil)
+(defparameter *print-length* nil)
+(defparameter *print-array* t)
+(defparameter *print-gensym* t)
+
+(defun %resolve-stream (stream)
+  "Resolve a printer stream argument: NIL → *standard-output*."
+  (if stream stream *standard-output*))
+
+(defun %emit-to-stream (stream s)
+  "Write string S to the resolved STREAM. T → stdout, fixnum → file handle."
+  (if (eq stream t)
+      (format t "~A" s)
+      (write-string-to stream s)))
+
+(defun prin1 (object &optional stream)
+  "Print OBJECT readably (~S style) to STREAM. Returns OBJECT."
+  (let ((dest (%resolve-stream stream)))
+    (if (eq dest t)
+        (format t "~S" object)
+        (%emit-to-stream dest (format nil "~S" object))))
+  object)
+
+(defun princ (object &optional stream)
+  "Print OBJECT aesthetically (~A style) to STREAM. Returns OBJECT."
+  (let ((dest (%resolve-stream stream)))
+    (if (eq dest t)
+        (format t "~A" object)
+        (%emit-to-stream dest (format nil "~A" object))))
+  object)
+
+(defun print (object &optional stream)
+  "Output newline, OBJECT readably, then space to STREAM. Returns OBJECT."
+  (let ((dest (%resolve-stream stream)))
+    (if (eq dest t)
+        (format t "~%~S " object)
+        (%emit-to-stream dest (format nil "~%~S " object))))
+  object)
+
+(defun pprint (object &optional stream)
+  "Pretty-print OBJECT to STREAM. Returns (values)."
+  (let ((dest (%resolve-stream stream)))
+    (if (eq dest t)
+        (format t "~%~S" object)
+        (%emit-to-stream dest (format nil "~%~S" object))))
+  (values))
+
+(defun write (object &rest keys)
+  "Output OBJECT to :stream (default *standard-output*). Returns OBJECT.
+   Accepts :escape :readably :pretty :base :radix :case :level
+   :length :circle :array :gensym keywords (ignored in bootstrap)."
+  (let ((stream (%resolve-stream (getf keys ':stream))))
+    (if (eq stream t)
+        (format t "~S" object)
+        (%emit-to-stream stream (format nil "~S" object))))
+  object)
+
+(defun prin1-to-string (object)
+  "Return string with readable printed representation of OBJECT."
+  (format nil "~S" object))
+
+(defun princ-to-string (object)
+  "Return string with aesthetic printed representation of OBJECT."
+  (format nil "~A" object))
+
+(defun write-to-string (object &rest keys)
+  "Return string with printed representation of OBJECT."
+  (declare (ignore keys))
+  (format nil "~S" object))
+
+(defun write-char (character &optional stream)
+  "Write CHARACTER to STREAM. Returns CHARACTER."
+  (let ((dest (%resolve-stream stream)))
+    (if (eq dest t)
+        (format t "~A" character)
+        (%emit-to-stream dest (format nil "~A" character))))
+  character)
+
+(defun write-string (string &optional stream)
+  "Write STRING to STREAM. Returns STRING."
+  (let ((dest (%resolve-stream stream)))
+    (if (eq dest t)
+        (format t "~A" string)
+        (%emit-to-stream dest string)))
+  string)
+
+(defun write-line (string &optional stream)
+  "Write STRING followed by a newline to STREAM. Returns STRING."
+  (let ((dest (%resolve-stream stream)))
+    (if (eq dest t)
+        (format t "~A~%" string)
+        (progn
+          (%emit-to-stream dest string)
+          (%emit-to-stream dest (format nil "~%")))))
+  string)
+
+(defun terpri (&optional stream)
+  "Output a newline to STREAM. Returns NIL."
+  (let ((dest (%resolve-stream stream)))
+    (if (eq dest t)
+        (format t "~%")
+        (%emit-to-stream dest (format nil "~%"))))
+  nil)
+
+(defun fresh-line (&optional stream)
+  "Ensure output begins on a fresh line. Returns T if a newline was output.
+   (Column tracking not yet implemented — always outputs a newline.)"
+  (terpri stream)
+  t)
+
+;; -- eval & read-from-string -------------------------------------------------
+;;
+;; CL's EVAL: evaluate a Lisp form at runtime.
+;; CL's READ-FROM-STRING: parse a string into a Lisp object.
+;;
+;; The native %EVAL-FORM roundtrips through prin1-to-string →
+;; reader → compiler; READ-FROM-STRING is a direct native.
+
+(defun eval (form)
+  "Evaluate FORM and return its value."
+  (%eval-form form))
+
+;; read-from-string is registered as a native directly.
+
 ;; -- File I/O ----------------------------------------------------------------
 ;;
 ;; The native primitives are:
@@ -1589,8 +1806,8 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
 ;; The Lisp wrappers below add ergonomics — line-at-a-time text
 ;; iteration, RAII via with-open-file, file-as-string slurping.
 
-(defun write-line (stream s)
-  "Write S to STREAM followed by a newline. Returns S."
+(defun %file-write-line (stream s)
+  "Write S to file-handle STREAM followed by a newline. Returns S."
   (write-string-to stream s)
   (write-string-to stream (format nil "~%"))
   s)
@@ -1665,7 +1882,7 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
 (defun %write-lines-to (stream lines)
   (cond
     ((null lines) nil)
-    (t (write-line stream (car lines))
+    (t (%file-write-line stream (car lines))
        (%write-lines-to stream (cdr lines)))))
 
 ;; -- Loader: load / require / provide / *load-path* / *modules* --------------

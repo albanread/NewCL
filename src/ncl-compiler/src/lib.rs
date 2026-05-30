@@ -623,6 +623,15 @@ fn install_native_functions(
     // Self-eval bridge: lets Lisp code re-enter the compiler.
     install_native(coord, mutator, "EVAL-STRING",
                    eval_string_shim, 1);
+    // CL eval: takes a runtime form (Word), roundtrips through the
+    // printer/reader, then compiles and evaluates. Returns the
+    // actual result Word (not a printed string).
+    install_native(coord, mutator, "%EVAL-FORM",
+                   eval_form_shim, 1);
+    // CL read-from-string: parse one form from a string and return
+    // the materialised runtime object.
+    install_native(coord, mutator, "READ-FROM-STRING",
+                   read_from_string_shim, 1);
     // Disk-load bridge: read a .lisp file and eval every form.
     // The Lisp `load` in core.lisp wraps this with *load-path*
     // resolution and *modules* recording.
@@ -834,6 +843,8 @@ fn install_native_functions(
                    ncl_runtime::vector_shim, 0);
     install_native(coord, mutator, "%WORD-HASH",
                    ncl_runtime::word_hash_shim, 1);
+    install_native(coord, mutator, "%EQUAL-HASH",
+                   ncl_runtime::equal_hash_shim, 1);
     // Symbol function-cell access. SYMBOL-FUNCTION reads,
     // %SET-SYMBOL-FUNCTION is the target of the
     // (setf (symbol-function ...) ...) lowering, FMAKUNBOUND
@@ -1176,6 +1187,119 @@ extern "C-unwind" fn eval_string_shim(
             ncl_runtime::gc_string::alloc_string_in_young(m, &printed).raw()
         }
         Err(e) => ncl_runtime::abi::signal_condition_string(mutator, &format!("{e}")),
+    }
+}
+
+/// `(%eval-form form)` — evaluate a Lisp form (given as a runtime
+/// Word). Prints the form readably, re-parses it, and runs it
+/// through the compiler pipeline, returning the actual result Word
+/// (not a printed string). This is the bootstrap implementation of
+/// CL's EVAL.
+extern "C-unwind" fn eval_form_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        return ncl_runtime::abi::signal_condition_string(
+            mutator,
+            "eval: expected 1 argument",
+        );
+    }
+    let form_word = Word::from_raw(unsafe { *args });
+
+    // Print the form readably so we can re-parse it.
+    let src = format_word(form_word);
+
+    let session_ptr = ACTIVE_SESSION.with(|c| c.get());
+    if session_ptr.is_null() {
+        return ncl_runtime::abi::signal_condition_string(
+            mutator,
+            "eval: no active session",
+        );
+    }
+    let session = unsafe { &mut *session_ptr };
+
+    // Parse the printed form back into reader Values.
+    let values = match ncl_reader::read_all(&src) {
+        Ok(v) => v,
+        Err(e) => {
+            return ncl_runtime::abi::signal_condition_string(
+                mutator,
+                &format!("eval: read error: {:?}", e.kind),
+            );
+        }
+    };
+
+    // Evaluate each form; return the result of the last.
+    let mut last = Word::NIL;
+    for v in &values {
+        match session.eval_value(v) {
+            Ok(w) => last = w,
+            Err(e) => {
+                return ncl_runtime::abi::signal_condition_string(
+                    mutator,
+                    &format!("eval: {e}"),
+                );
+            }
+        }
+    }
+    last.raw()
+}
+
+/// `(%read-from-string string)` — read one Lisp form from STRING
+/// and return it as a runtime object (cons tree / atom). Returns
+/// NIL on empty input. The second CL return value (position) is
+/// not yet implemented.
+extern "C-unwind" fn read_from_string_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        return ncl_runtime::abi::signal_condition_string(
+            mutator,
+            "read-from-string: expected 1 argument",
+        );
+    }
+    let str_word = Word::from_raw(unsafe { *args });
+    if str_word.tag() != ncl_runtime::Tag::String {
+        return ncl_runtime::abi::signal_condition_string(
+            mutator,
+            "read-from-string: argument must be a string",
+        );
+    }
+    let src: String = ncl_runtime::gc_string::chars_of(str_word).collect();
+
+    let value = match ncl_reader::read_one(&src) {
+        Ok(v) => v,
+        Err(e) => {
+            return ncl_runtime::abi::signal_condition_string(
+                mutator,
+                &format!("read-from-string: {:?}", e.kind),
+            );
+        }
+    };
+
+    // Materialise the reader Value into a runtime Word using the
+    // compiler's build_quoted_word (allocates in the static area).
+    let session_ptr = ACTIVE_SESSION.with(|c| c.get());
+    if session_ptr.is_null() {
+        return ncl_runtime::abi::signal_condition_string(
+            mutator,
+            "read-from-string: no active session",
+        );
+    }
+    let session = unsafe { &mut *session_ptr };
+
+    match lower::build_quoted_word(&value, &session.coord) {
+        Ok(w) => w.raw(),
+        Err(e) => ncl_runtime::abi::signal_condition_string(
+            mutator,
+            &format!("read-from-string: {e:?}"),
+        ),
     }
 }
 
@@ -5986,5 +6110,226 @@ mod end_to_end_tests {
         let v3 = s.eval("(let ((x 0.5)) (- (tanh (atanh x)) x))").unwrap();
         let diff3: f64 = v3.trim().parse().unwrap();
         assert!(diff3.abs() < 1e-10, "tanh(atanh(0.5)) roundtrip error: {diff3}");
+    }
+
+    // ── CL Printer Names ────────────────────────────────────────────
+
+    #[test]
+    fn prin1_to_string_readable() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Returns a string type.
+        assert_eq!(s.eval("(stringp (prin1-to-string 42))").unwrap(), "T");
+        // Content matches readable (~S) form.
+        assert_eq!(s.eval(r#"(equal (prin1-to-string 42) "42")"#).unwrap(), "T");
+        assert_eq!(s.eval(r#"(equal (prin1-to-string 'foo) "FOO")"#).unwrap(), "T");
+        assert_eq!(s.eval(r#"(equal (prin1-to-string '(1 2)) "(1 2)")"#).unwrap(), "T");
+    }
+
+    #[test]
+    fn princ_to_string_aesthetic() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Strings without quotes in princ output.
+        assert_eq!(s.eval(r#"(equal (princ-to-string "hello") "hello")"#).unwrap(), "T");
+        // Characters as raw glyphs.
+        assert_eq!(s.eval(r#"(equal (princ-to-string #\A) "A")"#).unwrap(), "T");
+    }
+
+    #[test]
+    fn write_to_string_default_readable() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval(r#"(equal (write-to-string 42) "42")"#).unwrap(), "T");
+        assert_eq!(s.eval(r#"(equal (write-to-string '(1 2 3)) "(1 2 3)")"#).unwrap(), "T");
+    }
+
+    #[test]
+    fn prin1_returns_object() {
+        let mut s = Session::with_stdlib().unwrap();
+        // prin1 returns its object argument, not the string.
+        assert_eq!(s.eval("(prin1 42)").unwrap(), "42");
+        assert_eq!(s.eval("(prin1 'foo)").unwrap(), "FOO");
+    }
+
+    #[test]
+    fn princ_returns_object() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(princ 42)").unwrap(), "42");
+        assert_eq!(s.eval(r#"(princ "hi")"#).unwrap(), r#""hi""#);
+    }
+
+    #[test]
+    fn print_returns_object() {
+        let mut s = Session::with_stdlib().unwrap();
+        // print outputs newline + readable + space, returns the object.
+        assert_eq!(s.eval("(print 42)").unwrap(), "42");
+    }
+
+    #[test]
+    fn write_returns_object() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(write 99)").unwrap(), "99");
+    }
+
+    #[test]
+    fn write_char_returns_char() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(write-char #\\X)").unwrap(), "#\\X");
+    }
+
+    #[test]
+    fn terpri_returns_nil() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(terpri)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn fresh_line_returns_t() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(fresh-line)").unwrap(), "T");
+    }
+
+    #[test]
+    fn standard_output_is_t() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("*standard-output*").unwrap(), "T");
+        assert_eq!(s.eval("*standard-input*").unwrap(), "T");
+        assert_eq!(s.eval("*error-output*").unwrap(), "T");
+    }
+
+    #[test]
+    fn print_control_vars_exist() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("*print-escape*").unwrap(), "T");
+        assert_eq!(s.eval("*print-base*").unwrap(), "10");
+        assert_eq!(s.eval("*print-pretty*").unwrap(), "nil");
+    }
+
+    #[test]
+    fn write_string_returns_string() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval(r#"(write-string "test")"#).unwrap(),
+            r#""test""#,
+        );
+    }
+
+    #[test]
+    fn write_line_returns_string() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval(r#"(write-line "test")"#).unwrap(),
+            r#""test""#,
+        );
+    }
+
+    // ── eval & read-from-string ─────────────────────────────────────
+
+    #[test]
+    fn eval_simple_expression() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.activate(); // eval needs an active session
+        // eval of a quoted form yields the value.
+        assert_eq!(s.eval("(eval '(+ 1 2))").unwrap(), "3");
+        assert_eq!(s.eval("(eval ''foo)").unwrap(), "FOO");
+    }
+
+    #[test]
+    fn eval_returns_actual_value() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.activate();
+        // eval returns a number, not a string.
+        assert_eq!(s.eval("(numberp (eval '(+ 10 20)))").unwrap(), "T");
+        assert_eq!(s.eval("(+ 1 (eval '(* 3 4)))").unwrap(), "13");
+    }
+
+    #[test]
+    fn eval_list_construction() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.activate();
+        assert_eq!(s.eval("(eval '(list 1 2 3))").unwrap(), "(1 2 3)");
+    }
+
+    #[test]
+    fn read_from_string_atom() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.activate(); // read-from-string also needs active session
+        assert_eq!(s.eval(r#"(read-from-string "42")"#).unwrap(), "42");
+        assert_eq!(s.eval(r#"(read-from-string "FOO")"#).unwrap(), "FOO");
+        assert_eq!(s.eval(r#"(numberp (read-from-string "42"))"#).unwrap(), "T");
+        assert_eq!(s.eval(r#"(symbolp (read-from-string "FOO"))"#).unwrap(), "T");
+    }
+
+    #[test]
+    fn read_from_string_list() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.activate();
+        assert_eq!(
+            s.eval(r#"(read-from-string "(1 2 3)")"#).unwrap(),
+            "(1 2 3)",
+        );
+        assert_eq!(
+            s.eval(r#"(car (read-from-string "(a b c)"))"#).unwrap(),
+            "A",
+        );
+    }
+
+    #[test]
+    fn eval_of_read_from_string() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.activate();
+        // The canonical REPL loop: read → eval.
+        assert_eq!(
+            s.eval(r#"(eval (read-from-string "(+ 10 20)"))"#).unwrap(),
+            "30",
+        );
+    }
+
+    // ── EQUAL hash tables ───────────────────────────────────────────
+
+    #[test]
+    fn equal_hash_table_string_keys() {
+        let mut s = Session::with_stdlib().unwrap();
+        // EQUAL table: two distinct string objects with the same text
+        // should hash to the same bucket and match on lookup.
+        s.eval(r#"(defparameter *ht* (make-hash-table :test 'equal))"#).unwrap();
+        s.eval(r#"(setf (gethash "hello" *ht*) 42)"#).unwrap();
+        // Look up with a fresh string — must still find it.
+        assert_eq!(
+            s.eval(r#"(gethash (format nil "~A" "hello") *ht*)"#).unwrap(),
+            "42",
+        );
+    }
+
+    #[test]
+    fn eql_hash_table_symbol_keys() {
+        let mut s = Session::with_stdlib().unwrap();
+        // EQL table: interned symbols are EQ, so lookup works.
+        s.eval("(defparameter *ht* (make-hash-table :test 'eql))").unwrap();
+        s.eval("(setf (gethash 'foo *ht*) 99)").unwrap();
+        assert_eq!(s.eval("(gethash 'foo *ht*)").unwrap(), "99");
+    }
+
+    #[test]
+    fn hash_table_p_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(hash-table-p (make-hash-table))").unwrap(), "T");
+        assert_eq!(s.eval("(hash-table-p '(1 2 3))").unwrap(), "nil");
+        assert_eq!(s.eval("(hash-table-p 42)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn string_equal_case_insensitive() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval(r#"(string-equal "Hello" "hello")"#).unwrap(), "T");
+        assert_eq!(s.eval(r#"(string-equal "ABC" "abc")"#).unwrap(), "T");
+        assert_eq!(s.eval(r#"(string-equal "abc" "def")"#).unwrap(), "nil");
+    }
+
+    #[test]
+    fn equalp_basics() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval(r#"(equalp "Hello" "hello")"#).unwrap(), "T");
+        assert_eq!(s.eval("(equalp 1 1.0)").unwrap(), "T");
+        assert_eq!(s.eval("(equalp '(1 2) '(1 2))").unwrap(), "T");
+        assert_eq!(s.eval(r#"(equalp "abc" "def")"#).unwrap(), "nil");
     }
 }

@@ -2744,6 +2744,61 @@ pub extern "C-unwind" fn word_hash_shim(
     Word::fixnum(positive).raw()
 }
 
+/// `(%equal-hash w)` — content-aware hash for EQUAL hash tables.
+///
+/// Strings are hashed by their character content (FNV-1a), so two
+/// distinct string objects with identical text hash identically.
+/// Fixnums, symbols, chars — same as `%word-hash` since they are
+/// interned or immediate. Cons cells hash by car (car-only avoids
+/// deep recursion on long lists; collisions are handled by the
+/// comparison walk).
+pub extern "C-unwind" fn equal_hash_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("%equal-hash: expected 1 arg, got {n_args}");
+    }
+    let w = Word::from_raw(unsafe { *args });
+    let h = equal_hash_word(w);
+    let positive = (h & ((1u64 << 60) - 1)) as i64;
+    Word::fixnum(positive).raw()
+}
+
+/// Compute a content-aware hash for a Word.
+fn equal_hash_word(w: Word) -> u64 {
+    match w.tag() {
+        Tag::String => {
+            // FNV-1a over the character codepoints.
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for c in crate::gc_string::chars_of(w) {
+                h ^= c as u64;
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+            h
+        }
+        Tag::Cons => {
+            // Hash by car only — avoids deep recursion.
+            let p = match w.as_ptr::<u64>(Tag::Cons) {
+                Some(p) => p,
+                None => return 0,
+            };
+            let car = Word::from_raw(unsafe { *p });
+            equal_hash_word(car).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        }
+        _ => {
+            // For fixnums, symbols, chars, nil, t — raw-bit hash.
+            let mut h = w.raw().wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            h ^= h >> 30;
+            h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            h ^= h >> 27;
+            h
+        }
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────
 // Vectors — make-array, vector, aref, svref, (setf aref).
 //
