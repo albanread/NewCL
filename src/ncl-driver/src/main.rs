@@ -114,12 +114,45 @@ fn main() -> ExitCode {
     }
 }
 
-/// Today's startup path. Lisp runs on thread 0; no message pump; no
-/// Windows surface. Pulled out of main() unchanged so we can compose
-/// it as either thread-0 work (no `--windows`) or worker work
-/// (`--windows`).
+/// Today's startup path. Lisp runs on a worker thread; no message
+/// pump; no Windows surface. The main thread just waits for the
+/// worker to finish and returns its exit code.
+///
+/// Why a worker thread (not just thread 0): on Windows, the
+/// console-subsystem main thread starts with the PE-header stack
+/// reserve (Rust's default ≈ 1 MB), which isn't enough headroom for
+/// the recursive Lisp stdlib bootstrap — `nclterm.exe` would
+/// stack-overflow on startup. A spawned `std::thread` gets Rust's
+/// default 2 MB stack, matching the `--windows` worker path. (The
+/// gui-app build *also* runs Lisp on a worker thread for the same
+/// reason, plus to keep the UI thread free for the message pump.)
 fn run_without_windows_surface(raw_args: Vec<String>) -> ExitCode {
-    lisp_main(raw_args)
+    // 8 MB — comfortably larger than the deepest recursion the Lisp
+    // bootstrap reaches. The gui-app build's UI-thread worker gets
+    // away with Rust's 2 MB default because some `--load`-driven
+    // paths there don't recurse as deep before yielding to the
+    // message pump; the bare `--eval` / `--check` flows the console
+    // binary uses go through compilation and macroexpansion on the
+    // same thread end-to-end, and 2 MB isn't enough headroom.
+    const LISP_WORKER_STACK: usize = 8 * 1024 * 1024;
+    let worker = match std::thread::Builder::new()
+        .name("ncl-lisp-worker".into())
+        .stack_size(LISP_WORKER_STACK)
+        .spawn(move || lisp_main(raw_args))
+    {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("ncl: cannot spawn worker thread: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    match worker.join() {
+        Ok(code) => code,
+        Err(_) => {
+            eprintln!("ncl: worker thread panicked");
+            ExitCode::from(2)
+        }
+    }
 }
 
 /// `--windows` path. Thread 0 registers itself as the UI thread,

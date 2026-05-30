@@ -308,47 +308,88 @@
 (defun evenp (n) (zerop (rem n 2)))
 (defun oddp (n) (not (evenp n)))
 
-;; (floor a b): largest integer k such that k*b <= a (when b > 0;
-;; flips for b < 0). Differs from truncate only when sign(a) !=
-;; sign(b) and there's a non-zero remainder, in which case floor
-;; rounds further from zero.
-(defun floor (a b)
-  (let ((q (truncate a b))
-        (r (rem a b)))
-    (if (and (not (zerop r))
-             (not (eq (minusp r) (minusp b))))
-        (- q 1)
-        q)))
+;; ── Integer-only rounding family: floor / ceiling / round.
+;;
+;; Each follows the CL spec at the function-contract level — accepts
+;; the divisor as an optional argument that defaults to 1, and
+;; returns TWO values: the quotient and the matching remainder. The
+;; implementations here cover integer arguments; `Library/numbers.lisp`
+;; extends them to floats and ratios in the deployed image. Tests that
+;; load only the core stdlib (Session::with_stdlib) see THIS contract
+;; — see `tests/end_to_end_tests::ffloor_mv_baseline` for the
+;; regression guard.
+;;
+;; MV-propagation constraint: the compiler's `instrument_tail_for_mv`
+;; pass wraps tail-position function CALL expressions with
+;; `EnsureSingleMv`, which collapses the MV slot to a single value. To
+;; return multiple values, a function must have `(values …)` as its
+;; DIRECT tail expression — not tucked inside a helper call at tail
+;; position. Each defun below therefore ends with `(values q r)` at
+;; the bottom of a `let`, never in a helper. (Same constraint, same
+;; workaround, that Library/numbers.lisp documents at length.)
+;;
+;; Note: `truncate` stays as the native shim (single-value, exactly
+;; two args). Wrapping it in core.lisp would conflict with the
+;; deployment's `Library/numbers.lisp`, which snapshots the current
+;; truncate into its `%int-truncate` parameter and would then chain
+;; through the wrapper, recursing infinitely on the native lookup.
+;; The native is exactly what floor/ceiling/round need internally:
+;; `(let ((q (truncate a b))) ...)` binds the let-var to the
+;; quotient, then `(values q r)` at the tail returns both. No
+;; capture, no chain. The cost is that integer-only `truncate` keeps
+;; its strict 2-arg signature in the test session — that's a
+;; separate gap to close later if someone needs it.
+
+;; floor: largest integer k such that k*b <= a (when b > 0; flips
+;; for b < 0). Differs from truncate when sign(a) != sign(b) and
+;; the truncated remainder is non-zero — bump the quotient one
+;; further toward -∞, then recompute the remainder against the
+;; adjusted quotient.
+;;
+;; NB: written with nested `let` rather than `let*` because the
+;; `let*` macro is defined later in this file and isn't visible to
+;; the compiler when this defun is processed.
+(defun floor (a &optional (b 1))
+  "Divide A by B, round toward -∞. Returns (values quotient remainder)."
+  (let ((q0 (truncate a b)))
+    (let ((r0 (- a (* q0 b))))
+      (let ((q (if (and (not (zerop r0))
+                        (not (eq (minusp r0) (minusp b))))
+                   (- q0 1)
+                   q0)))
+        (values q (- a (* q b)))))))
 
 ;; ceiling: smallest integer k such that k*b >= a (when b > 0).
-;; Mirror of floor — if there's a non-zero remainder AND r matches
-;; the sign of b, bump the quotient up by 1.
-(defun ceiling (a b)
-  (let ((q (truncate a b))
-        (r (rem a b)))
-    (if (and (not (zerop r))
-             (eq (minusp r) (minusp b)))
-        (+ q 1)
-        q)))
+;; Mirror of floor — bump UP by 1 when the truncated remainder is
+;; non-zero and shares the divisor's sign.
+(defun ceiling (a &optional (b 1))
+  "Divide A by B, round toward +∞. Returns (values quotient remainder)."
+  (let ((q0 (truncate a b)))
+    (let ((r0 (- a (* q0 b))))
+      (let ((q (if (and (not (zerop r0))
+                        (eq (minusp r0) (minusp b)))
+                   (+ q0 1)
+                   q0)))
+        (values q (- a (* q b)))))))
 
-;; round: round to nearest integer; ties go to even. Equivalent
-;; to (truncate (+ a (/ b 2)) b) for positive, but we don't have
-;; rationals — so handle the tie-to-even case explicitly.
-(defun round (a b)
-  (let ((q (truncate a b))
-        (r (rem a b))
-        (half-b (truncate b 2)))
-    (cond
-      ;; |r| < |half-b| — quotient is closest.
-      ((< (abs r) (abs half-b)) q)
-      ;; |r| > |half-b| — round away from zero by adding sign(r).
-      ((> (abs r) (abs half-b))
-       (if (eq (minusp r) (minusp b)) (+ q 1) (- q 1)))
-      ;; |r| == |half-b| — exact tie. Round to even.
-      ;; Tie can only happen when b is even.
-      (t (if (zerop (rem q 2))
-             q
-             (if (eq (minusp r) (minusp b)) (+ q 1) (- q 1)))))))
+;; round: round to nearest integer; exact ties go to even (banker's
+;; rounding, the CL default).
+(defun round (a &optional (b 1))
+  "Divide A by B, round half-to-even. Returns (values quotient remainder)."
+  (let ((q0 (truncate a b)))
+    (let ((r0 (- a (* q0 b))))
+      (let ((half-b (truncate b 2)))
+        (let ((q (cond
+                   ;; |r| < |half-b| — truncated quotient is the nearest.
+                   ((< (abs r0) (abs half-b)) q0)
+                   ;; |r| > |half-b| — round away from zero.
+                   ((> (abs r0) (abs half-b))
+                    (if (eq (minusp r0) (minusp b)) (+ q0 1) (- q0 1)))
+                   ;; |r| == |half-b| — exact tie; round to even.
+                   (t (if (evenp q0)
+                          q0
+                          (if (eq (minusp r0) (minusp b)) (+ q0 1) (- q0 1)))))))
+          (values q (- a (* q b))))))))
 
 (defun signum (n)
   "CL signum — returns -1, 0, or +1 with the sign of N."
