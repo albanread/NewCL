@@ -122,6 +122,21 @@ enum Directive {
         backward: bool, // `:*`
     },
     Recursive,
+    /// `~( ... ~)` case-conversion block. Renders the inner directives
+    /// into a temporary buffer, then case-transforms it:
+    ///   - `~(`   → lowercase
+    ///   - `~:(`  → Capitalize Each Word
+    ///   - `~@(`  → Capitalize first word (rest lowercased)
+    ///   - `~:@(` → UPPERCASE
+    /// `end_idx` is the matching `~)`, patched in pass 2.
+    CaseConvStart {
+        end_idx: usize,
+        colon: bool,
+        at: bool,
+    },
+    /// Closing `~)`. Never executed directly — the block terminates by
+    /// reaching this index.
+    CaseConvEnd,
     /// Anything not yet supported. The directive char is stored so the
     /// runtime can produce a precise error message.
     Unsupported(char),
@@ -355,6 +370,12 @@ fn directive_for(dc: char, pa: &PrefixArgs) -> Option<Directive> {
         }),
         '{' => Some(Directive::IterStart { end_idx: 0 }), // patched in pass 2
         '}' => Some(Directive::IterEnd),
+        '(' => Some(Directive::CaseConvStart {
+            end_idx: 0, // patched in pass 2
+            colon: pa.colon,
+            at: pa.at_sign,
+        }),
+        ')' => Some(Directive::CaseConvEnd),
         '^' => Some(Directive::IterEscape),
         '[' => Some(Directive::CondStart {
             clauses: Vec::new(),
@@ -421,6 +442,23 @@ fn resolve_brackets(ds: &mut [Directive]) -> Result<(), String> {
     }
     if !stack.is_empty() {
         return Err("~{ with no matching ~}".into());
+    }
+    // Case-conversion block matching: ~( ~). Nesting supported.
+    let mut stack: Vec<usize> = Vec::new();
+    for i in 0..ds.len() {
+        match &ds[i] {
+            Directive::CaseConvStart { .. } => stack.push(i),
+            Directive::CaseConvEnd => {
+                let start = stack.pop().ok_or("~) with no matching ~(")?;
+                if let Directive::CaseConvStart { end_idx, .. } = &mut ds[start] {
+                    *end_idx = i;
+                }
+            }
+            _ => {}
+        }
+    }
+    if !stack.is_empty() {
+        return Err("~( with no matching ~)".into());
     }
     // Second pass: bracket matching.
     let mut stack: Vec<(usize, Vec<usize>)> = Vec::new();
@@ -669,6 +707,17 @@ fn exec(
             Directive::CondSep | Directive::CondEnd => {
                 // Encountered outside their parent — no-op.
             }
+            Directive::CaseConvStart { end_idx, colon, at } => {
+                // Render the inner directives into a temp buffer, then
+                // case-transform the whole thing and append.
+                let mut tmp = String::new();
+                exec(ds, i + 1, *end_idx, cur, &mut tmp, m)?;
+                out.push_str(&apply_case(&tmp, *colon, *at));
+                i = *end_idx; // jump past the ~)
+            }
+            Directive::CaseConvEnd => {
+                // Outside a ~( block, ~) is a no-op.
+            }
             Directive::Skip { n, absolute, backward } => {
                 if *absolute {
                     cur.i = *n;
@@ -697,6 +746,54 @@ fn exec(
         i += 1;
     }
     Ok(())
+}
+
+/// Case-transform a rendered `~( ... ~)` block body.
+///   - neither flag (`~(`)   → lowercase
+///   - colon only  (`~:(`)   → Capitalize Each Word
+///   - at only     (`~@(`)   → Capitalize first word, lowercase the rest
+///   - both        (`~:@(`)  → UPPERCASE
+fn apply_case(s: &str, colon: bool, at: bool) -> String {
+    match (colon, at) {
+        (false, false) => s.to_lowercase(),
+        (true, true) => s.to_uppercase(),
+        (true, false) => {
+            // Capitalize each word: first alphanumeric of each run
+            // uppercased, the rest of the run lowercased. A "word" is a
+            // maximal run of alphanumerics (CL's string-capitalize).
+            let mut out = String::with_capacity(s.len());
+            let mut in_word = false;
+            for ch in s.chars() {
+                if ch.is_alphanumeric() {
+                    if in_word {
+                        out.extend(ch.to_lowercase());
+                    } else {
+                        out.extend(ch.to_uppercase());
+                        in_word = true;
+                    }
+                } else {
+                    out.push(ch);
+                    in_word = false;
+                }
+            }
+            out
+        }
+        (false, true) => {
+            // Capitalize the first word only: uppercase the first
+            // alphabetic character, lowercase everything else.
+            let mut out = String::with_capacity(s.len());
+            let mut done_first = false;
+            for ch in s.chars() {
+                if !done_first && ch.is_alphabetic() {
+                    out.extend(ch.to_uppercase());
+                    done_first = true;
+                } else {
+                    out.extend(ch.to_lowercase());
+                }
+            }
+            out
+        }
+    }
 }
 
 fn run_iter(

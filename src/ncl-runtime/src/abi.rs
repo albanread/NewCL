@@ -2755,12 +2755,79 @@ pub extern "C-unwind" fn word_hash_shim(
 // vector heap object.
 // ───────────────────────────────────────────────────────────────────
 
+/// Decode `make-array`'s dimension argument to a 1-D length.
+///
+/// Accepts a non-negative fixnum (`(make-array 3)`) or a *singleton*
+/// dimension list (`(make-array '(3))` — CL's 1-D list form). A
+/// multi-element dimension list is a multidimensional array, which
+/// isn't supported yet; rather than panic the worker thread, this
+/// returns `Err(msg)` so the caller can signal a catchable Lisp
+/// condition. Same for malformed specifiers.
+///
+/// SAFETY: walks `dim_w` as a cons list when it is Cons-tagged; the
+/// `Tag::Cons` check gates every dereference.
+fn make_array_dimension(dim_w: Word) -> Result<u32, String> {
+    if let Some(n) = dim_w.as_fixnum() {
+        return if n >= 0 {
+            Ok(n as u32)
+        } else {
+            Err(format!("make-array: dimension must be non-negative, got {n}"))
+        };
+    }
+    if dim_w.is_nil() {
+        return Err(
+            "make-array: zero-dimensional arrays are not supported".to_string(),
+        );
+    }
+    if dim_w.tag() == Tag::Cons {
+        let mut dims: u32 = 0;
+        let mut only: u32 = 0;
+        let mut cur = dim_w;
+        while !cur.is_nil() {
+            if cur.tag() != Tag::Cons {
+                return Err(
+                    "make-array: dimension list must be a proper list".to_string(),
+                );
+            }
+            let p = cur.as_ptr::<u64>(Tag::Cons).unwrap();
+            let car = Word::from_raw(unsafe { *p });
+            match car.as_fixnum() {
+                Some(d) if d >= 0 => {
+                    if dims == 0 {
+                        only = d as u32;
+                    }
+                    dims += 1;
+                }
+                _ => {
+                    return Err(format!(
+                        "make-array: array dimension must be a non-negative \
+                         fixnum, got {car:?}"
+                    ));
+                }
+            }
+            cur = Word::from_raw(unsafe { *p.add(1) });
+        }
+        return match dims {
+            1 => Ok(only),
+            0 => Err(
+                "make-array: zero-dimensional arrays are not supported".to_string(),
+            ),
+            _ => Err(format!(
+                "make-array: multidimensional arrays ({dims} dimensions) are \
+                 not yet supported — only 1-D arrays are available"
+            )),
+        };
+    }
+    Err(format!("make-array: invalid dimension specifier {dim_w:?}"))
+}
+
 /// `(make-array dim &key initial-element initial-contents)`.
-/// `dim` is a fixnum length (multidimensional shapes deferred —
-/// reject lists for now). `initial-element` fills every cell;
-/// without it, cells are NIL. `initial-contents` (a list) copies
-/// list elements into positions; if shorter than `dim`, trailing
-/// positions stay NIL (or the initial-element).
+/// `dim` is a fixnum length or a singleton list `(N)` (CL's 1-D
+/// form). Multidimensional shapes signal a catchable condition (not
+/// yet supported). `initial-element` fills every cell; without it,
+/// cells are NIL. `initial-contents` (a list) copies list elements
+/// into positions; if shorter than `dim`, trailing positions stay
+/// NIL (or the initial-element).
 pub extern "C-unwind" fn make_array_shim(
     mutator: *mut crate::mutator::MutatorState,
     _env: u64,
@@ -2768,14 +2835,15 @@ pub extern "C-unwind" fn make_array_shim(
     n_args: u64,
 ) -> u64 {
     if n_args == 0 {
-        panic!("make-array: expected at least 1 arg (dimension)");
+        return signal_condition_string(
+            mutator,
+            "make-array: expected at least 1 arg (dimension)",
+        );
     }
     let dim_w = Word::from_raw(unsafe { *args });
-    let n = match dim_w.as_fixnum() {
-        Some(n) if n >= 0 => n as u32,
-        _ => panic!(
-            "make-array: dimension must be a non-negative fixnum, got {dim_w:?}"
-        ),
+    let n = match make_array_dimension(dim_w) {
+        Ok(n) => n,
+        Err(msg) => return signal_condition_string(mutator, &msg),
     };
     // Scan keyword args. Only :initial-element and :initial-contents
     // recognised. Unknown keywords are silently ignored, matching

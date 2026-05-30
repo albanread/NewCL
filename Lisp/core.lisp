@@ -47,8 +47,25 @@
       acc
       (%revappend (cdr lst) (cons (car lst) acc))))
 
-(defun reverse (lst)
-  (%revappend lst nil))
+;; Coerce any sequence to a fresh list of its elements. Lists pass
+;; through; vectors and strings are converted via `coerce`. The
+;; list-walking sequence operators below funnel non-list arguments
+;; through this so they never dereference vector/string storage as
+;; cons cells — which segfaults. (`coerce` is defined in
+;; Library/sequences.lisp; it's referenced here only at call time, by
+;; which point the full library is loaded, so the forward reference is
+;; fine. Bootstrap-time callers all pass real lists.)
+(defun %as-list (seq)
+  (if (listp seq) seq (coerce seq 'list)))
+
+(defun reverse (seq)
+  "Reverse a sequence, returning a NEW sequence of the same type.
+   Lists, vectors, and strings are all supported."
+  (cond
+    ((listp seq) (%revappend seq nil))
+    ((stringp seq) (coerce (%revappend (coerce seq 'list) nil) 'string))
+    ((vectorp seq) (coerce (%revappend (coerce seq 'list) nil) 'vector))
+    (t (error "REVERSE: argument is not a sequence: ~S" seq))))
 
 (defun append (a b)
   ;; Binary append. Variadic CL append lands when &rest does.
@@ -151,10 +168,12 @@
 (defun every (pred list &rest more-lists)
   "T iff PRED returns non-NIL for every parallel tuple of elements
    from LIST and MORE-LISTS. Stops at the shortest input. Early-
-   exits on the first NIL."
+   exits on the first NIL. Accepts lists, vectors, and strings —
+   non-list sequences are coerced to lists first so the walk never
+   dereferences vector/string storage as cons cells."
   (cond
-    ((null more-lists) (%every-1 pred list))
-    (t (%every-n pred (cons list more-lists)))))
+    ((null more-lists) (%every-1 pred (%as-list list)))
+    (t (%every-n pred (mapcar #'%as-list (cons list more-lists))))))
 
 ;; ── some ───────────────────────────────────────────────────────
 
@@ -175,10 +194,12 @@
 (defun some (pred list &rest more-lists)
   "Returns the first non-NIL value of PRED applied to parallel
    tuples from LIST and MORE-LISTS, or NIL if all yielded NIL.
-   Stops at the shortest input or at the first hit."
+   Stops at the shortest input or at the first hit. Accepts lists,
+   vectors, and strings — non-list sequences are coerced to lists
+   first so the walk never dereferences their storage as cons cells."
   (cond
-    ((null more-lists) (%some-1 pred list))
-    (t (%some-n pred (cons list more-lists)))))
+    ((null more-lists) (%some-1 pred (%as-list list)))
+    (t (%some-n pred (mapcar #'%as-list (cons list more-lists))))))
 
 ;; -- member, position, find, assoc -------------------------------------------
 
