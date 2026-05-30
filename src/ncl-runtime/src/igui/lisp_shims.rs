@@ -1564,3 +1564,85 @@ pub extern "C-unwind" fn repl_pop_input_shim(
         None => Word::NIL.raw(),
     }
 }
+
+// ───────────────────────────────────────────────────────────────────
+// Doc-pane shims — Markdown + Mermaid pane (docpane crate).
+//
+// `(open-doc-window TITLE)` opens a new MDI child whose body renders
+// the Markdown source supplied later via `(doc-set-markdown ...)`
+// and `(doc-append-markdown ...)`. Diagrams in fenced ```mermaid
+// blocks render natively through `docpane`'s Direct2D path. All
+// three shims return T / a fixnum on success and NIL on failure.
+// ───────────────────────────────────────────────────────────────────
+
+use super::doc_pane;
+
+/// `(open-doc-window title)` — open a new MDI doc-pane child. The
+/// pane starts empty; supply Markdown via `doc-set-markdown`. Returns
+/// the child-id as a fixnum, or NIL on failure.
+pub extern "C-unwind" fn open_doc_window_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("open-doc-window: expected 1 arg (title), got {n_args}");
+    }
+    let Some(title) = arg_string(args, 0) else {
+        panic!("open-doc-window: title must be a string");
+    };
+    match doc_pane::open(&title) {
+        Some(id) => Word::fixnum(id).raw(),
+        None => Word::NIL.raw(),
+    }
+}
+
+/// `(doc-set-markdown child-id markdown)` — replace the pane's
+/// Markdown source. Returns T, or NIL if the child id is unknown.
+pub extern "C-unwind" fn doc_set_markdown_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("doc-set-markdown: expected 2 args (child-id markdown), got {n_args}");
+    }
+    let Some(id) = arg_fixnum(args, 0) else {
+        panic!("doc-set-markdown: child-id must be a fixnum");
+    };
+    let Some(md) = arg_string(args, 1) else {
+        panic!("doc-set-markdown: markdown must be a string");
+    };
+    if doc_pane::set_markdown(id, &md) {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}
+
+/// `(doc-append-markdown child-id markdown)` — append to the pane's
+/// existing Markdown source. Returns T, or NIL if the child id is
+/// unknown.
+pub extern "C-unwind" fn doc_append_markdown_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("doc-append-markdown: expected 2 args (child-id markdown), got {n_args}");
+    }
+    let Some(id) = arg_fixnum(args, 0) else {
+        panic!("doc-append-markdown: child-id must be a fixnum");
+    };
+    let Some(md) = arg_string(args, 1) else {
+        panic!("doc-append-markdown: markdown must be a string");
+    };
+    if doc_pane::append_markdown(id, &md) {
+        Word::T.raw()
+    } else {
+        Word::NIL.raw()
+    }
+}

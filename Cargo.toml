@@ -1,5 +1,8 @@
 [workspace]
 members = [
+    "crates/doc-crate",
+    "crates/docpane",
+    "crates/selkie",
     "src/ncl-cl",
     "src/ncl-compiler",
     "src/ncl-driver",

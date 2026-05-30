@@ -1630,6 +1630,14 @@ fn install_igui(coord: &Arc<GcCoordinator>, mutator: &mut MutatorState) {
                    ncl_runtime::repl_error_shim, 2);
     install_native(coord, mutator, "REPL-POP-INPUT",
                    ncl_runtime::repl_pop_input_shim, 1);
+
+    // Doc pane — Markdown + Mermaid renderer.
+    install_native(coord, mutator, "OPEN-DOC-WINDOW",
+                   ncl_runtime::open_doc_window_shim, 1);
+    install_native(coord, mutator, "DOC-SET-MARKDOWN",
+                   ncl_runtime::doc_set_markdown_shim, 2);
+    install_native(coord, mutator, "DOC-APPEND-MARKDOWN",
+                   ncl_runtime::doc_append_markdown_shim, 2);
 }
 
 fn install_native(

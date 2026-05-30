@@ -51,6 +51,11 @@ windows-numerics = "0.3"
 # is the only crate that brings the live mixer; the pure-Rust
 # newaudio-core / newaudio-abc come along under the umbrella.
 newaudio = { path = "../../../../NewAudio/NewAudio/crates/newaudio" }
+# docpane — Direct2D markdown + Mermaid render core, vendored from
+# NewFactor's `crates/docpane`. Powers `igui::doc_pane` (in-window
+# pane type) and the headless `doc-crate` snapshot tool. Windows-only
+# because the renderer targets Direct2D / DirectWrite.
+docpane = { path = "../../crates/docpane" }
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"

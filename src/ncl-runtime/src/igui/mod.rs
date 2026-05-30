@@ -39,6 +39,7 @@ mod cursor;
 pub mod splash;
 mod d2d;
 mod d3d;
+pub mod doc_pane;
 mod dwrite;
 mod executor;
 mod font_metrics;

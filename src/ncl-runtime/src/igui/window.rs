@@ -83,6 +83,15 @@ const WM_IGUI_OPEN_REPL: u32 = WM_USER + 9;
 /// Posted (from any thread) when a new crash dump is available.
 /// Frame WndProc opens/invalidates the crash_view MDI child.
 pub(super) const WM_IGUI_CRASH_FLUSH: u32 = WM_USER + 10;
+/// Open a Markdown doc-pane MDI child. Like WM_IGUI_OPEN_TEXT but
+/// the child class is `doc_pane`'s, with the docpane (Direct2D
+/// Markdown + Mermaid) renderer.
+const WM_IGUI_OPEN_DOC: u32 = WM_USER + 11;
+/// Invalidate a doc-pane child so WM_PAINT re-reads its Markdown
+/// source. wparam carries the child_id. Posted (not sent) so a
+/// streaming write loop on the language thread doesn't block on the
+/// GUI thread.
+const WM_IGUI_DOC_FLUSH: u32 = WM_USER + 12;
 /// Sent from the language thread to a render-host HWND to install
 /// or clear a Win32 timer driving `EvTick` events.
 /// `wparam` carries the interval in ms (0 = clear), `lparam` is unused.
@@ -367,43 +376,23 @@ pub(crate) fn gui_thread_id() -> Option<u32> {
 
 // ── Help / documentation launcher ─────────────────────────────────────────
 
-/// Locate `doc-crate.exe` and the bundled `docs/` directory, then
-/// spawn the documentation browser.
+/// Open NCL's user-facing documentation as an in-window doc-pane.
 ///
-/// Search order for each asset:
+/// Finds the bundled docs/ directory (production: next to ncl.exe; dev:
+/// the workspace's docs/), reads `docs/user/index.md` if present (or
+/// falls back to a built-in greeting), then opens a `doc_pane` MDI
+/// child preloaded with the Markdown. The pane renders Markdown + any
+/// fenced ```mermaid blocks via the shared `docpane` Direct2D core, so
+/// no external process is involved.
 ///
-/// **doc-crate.exe**
-///   1. `<exe_dir>/doc-crate.exe`  — production installation
-///   2. `DOC_CRATE_EXE` env var   — developer override
-///
-/// **docs/**
-///   1. `<exe_dir>/docs/`         — production installation
-///   2. `<exe_dir>/../../docs/`   — dev build (exe is under target/debug/)
+/// **docs/** search order:
+///   1. `<exe_dir>/docs/`               — production installation
+///   2. `<exe_dir>/../../docs/`         — dev build (exe under target/<profile>/)
 ///   3. `CARGO_MANIFEST_DIR/../../docs/` — `cargo run` from anywhere
 pub(crate) fn open_docs() {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-
-    // ── locate doc-crate.exe ──────────────────────────────────────
-    let doc_exe: Option<std::path::PathBuf> = exe_dir
-        .as_ref()
-        .map(|d| d.join("doc-crate.exe"))
-        .filter(|p| p.is_file())
-        .or_else(|| {
-            std::env::var("DOC_CRATE_EXE")
-                .ok()
-                .map(std::path::PathBuf::from)
-                .filter(|p| p.is_file())
-        });
-
-    let Some(doc_exe) = doc_exe else {
-        eprintln!(
-            "[docs] doc-crate.exe not found next to this executable.\n\
-             Copy doc-crate.exe alongside ncl.exe, or set DOC_CRATE_EXE."
-        );
-        return;
-    };
 
     // ── locate docs/ directory ────────────────────────────────────
     let docs_dir: Option<std::path::PathBuf> = exe_dir
@@ -412,7 +401,8 @@ pub(crate) fn open_docs() {
         .filter(|p| p.is_dir())
         .or_else(|| {
             // dev: exe is in target/debug/ or target/release/
-            exe_dir.as_ref()
+            exe_dir
+                .as_ref()
                 .and_then(|d| d.ancestors().nth(2))
                 .map(|root| root.join("docs"))
                 .filter(|p| p.is_dir())
@@ -421,23 +411,44 @@ pub(crate) fn open_docs() {
             // cargo run — CARGO_MANIFEST_DIR is ncl-runtime; go up 2
             // to reach the repo root where docs/ lives.
             let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            manifest.ancestors().nth(2).map(|r| r.join("docs")).filter(|p| p.is_dir())
+            manifest
+                .ancestors()
+                .nth(2)
+                .map(|r| r.join("docs"))
+                .filter(|p| p.is_dir())
         });
 
-    let Some(docs_dir) = docs_dir else {
-        eprintln!(
-            "[docs] docs/ directory not found next to this executable.\n\
-             Expected a docs/ folder alongside ncl.exe."
-        );
+    // ── pick an index file ────────────────────────────────────────
+    // Prefer the user-facing manual at docs/user/index.md (Phase 5
+    // writes it). Fall back to docs/index.md, then to an inline
+    // greeting so the pane is never empty if the bundle is missing.
+    const FALLBACK: &str = "\
+# NewCormanLisp Documentation
+
+The bundled documentation could not be located. Expected one of:
+
+- `docs/user/index.md` next to `ncl.exe`
+- `docs/index.md`
+
+Use **Help → Documentation** again once the docs are installed.
+";
+    let markdown: String = docs_dir
+        .as_ref()
+        .and_then(|d| {
+            let candidates = [d.join("user").join("index.md"), d.join("index.md")];
+            candidates
+                .iter()
+                .find(|p| p.is_file())
+                .and_then(|p| std::fs::read_to_string(p).ok())
+        })
+        .unwrap_or_else(|| FALLBACK.to_string());
+
+    let Some(child_id) = super::doc_pane::open("NCL Documentation") else {
+        eprintln!("[docs] failed to open doc pane");
         return;
     };
-
-    // ── spawn ─────────────────────────────────────────────────────
-    if let Err(e) = std::process::Command::new(&doc_exe)
-        .arg(&docs_dir)
-        .spawn()
-    {
-        eprintln!("[docs] failed to launch {}: {e}", doc_exe.display());
+    if !super::doc_pane::set_markdown(child_id, &markdown) {
+        eprintln!("[docs] failed to set initial markdown on pane {child_id}");
     }
 }
 
@@ -480,6 +491,7 @@ where
     }
     child::register_classes()?;
     super::crash_view::register_class()?;
+    super::doc_pane::register_class()?;
 
     // Renderer comes up before any window so child WM_NCCREATE can build
     // its swap chain immediately.
@@ -655,6 +667,21 @@ unsafe extern "system" fn frame_wnd_proc(
         WM_IGUI_TEXT_FLUSH => {
             let child_id = wparam.0 as i64;
             super::text_view::flush_on_gui_thread(child_id);
+            LRESULT(0)
+        }
+        WM_IGUI_OPEN_DOC => {
+            let req_ptr = lparam.0 as *mut OpenDocRequest;
+            if !req_ptr.is_null() {
+                let req = unsafe { &mut *req_ptr };
+                if let Some(mdi_client) = mdi_client_hwnd() {
+                    req.out = super::doc_pane::create_on_gui_thread(mdi_client, &req.title);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_IGUI_DOC_FLUSH => {
+            let child_id = wparam.0 as i64;
+            super::doc_pane::flush_on_gui_thread(child_id);
             LRESULT(0)
         }
         WM_IGUI_OPEN_REPL => {
@@ -1102,6 +1129,11 @@ pub(crate) struct OpenReplRequest {
     pub out: Option<i64>,
 }
 
+pub(crate) struct OpenDocRequest {
+    pub title: Vec<u16>,
+    pub out: Option<i64>,
+}
+
 pub(crate) struct CloseChildRequest {
     pub child_id: i64,
     pub ok: bool,
@@ -1292,6 +1324,48 @@ pub(crate) fn post_text_flush(child_id: i64) {
         PostMessageW(
             Some(frame),
             WM_IGUI_TEXT_FLUSH,
+            WPARAM(child_id as usize),
+            LPARAM(0),
+        )
+    };
+}
+
+/// Open a Markdown doc-pane MDI child via the GUI thread. Returns the
+/// child id Lisp uses with `doc_pane::set_markdown` etc. Blocks until
+/// the GUI thread has run `WM_MDICREATE`, mirroring `open_text_child`.
+pub fn open_doc_child(title: &str) -> Option<i64> {
+    let frame_raw = *FRAME_HWND.get()?;
+    let frame = HWND(frame_raw as *mut _);
+    let mut title_w: Vec<u16> = title.encode_utf16().collect();
+    title_w.push(0);
+    let mut req = OpenDocRequest {
+        title: title_w,
+        out: None,
+    };
+    unsafe {
+        SendMessageW(
+            frame,
+            WM_IGUI_OPEN_DOC,
+            Some(WPARAM(0)),
+            Some(LPARAM(&mut req as *mut _ as isize)),
+        )
+    };
+    req.out
+}
+
+/// Post a "the doc-pane source changed; repaint" at the frame. The
+/// frame dispatches to `doc_pane::flush_on_gui_thread`, which just
+/// invalidates the child so WM_PAINT re-reads the source. Posted so
+/// a streaming `append_markdown` loop doesn't block.
+pub(crate) fn post_doc_flush(child_id: i64) {
+    let Some(frame_raw) = FRAME_HWND.get() else {
+        return;
+    };
+    let frame = HWND(*frame_raw as *mut _);
+    let _ = unsafe {
+        PostMessageW(
+            Some(frame),
+            WM_IGUI_DOC_FLUSH,
             WPARAM(child_id as usize),
             LPARAM(0),
         )
