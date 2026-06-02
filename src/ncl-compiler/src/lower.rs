@@ -315,6 +315,11 @@ pub enum CompileError {
     ImproperList(String),
     /// `(defun)` form at non-top-level, or malformed.
     BadDefun(String),
+    /// A condition was signaled while a macro's expander function ran
+    /// (e.g. it called an undefined function, or did `(error …)`).
+    /// Caught by the macroexpansion guard so it surfaces as a clean
+    /// compile error instead of aborting the process.
+    MacroError(String),
 }
 
 /// Lower a top-level Value to an Expr (no parameter scope).

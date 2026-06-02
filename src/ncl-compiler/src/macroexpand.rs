@@ -299,6 +299,12 @@ pub fn macroexpand_all(
             let code = gc_function::code_ptr(macro_fn);
             let f: gc_function::LispCodeFn =
                 unsafe { std::mem::transmute(code) };
+            // Guard the expander call: bump HANDLER_DEPTH so any
+            // condition it signals (undefined function, type error,
+            // explicit `error`) defers and is reported as a clean
+            // compile error instead of calling std::process::abort()
+            // — which on Windows looks exactly like a stack overflow.
+            let guard = ncl_runtime::abi::macro_guard_enter();
             let result_word_raw = unsafe {
                 f(
                     mutator as *mut _,
@@ -307,6 +313,12 @@ pub fn macroexpand_all(
                     arg_words.len() as u64,
                 )
             };
+            if let Some(cond_raw) = ncl_runtime::abi::macro_guard_exit(guard) {
+                let msg = ncl_runtime::format_word_aesthetic(Word::from_raw(cond_raw));
+                return Err(EvalError::Compile(crate::CompileError::MacroError(
+                    format!("while expanding macro ({head_name} …): {msg}"),
+                )));
+            }
             let result_value = word_to_value(Word::from_raw(result_word_raw))?;
             return macroexpand_all(&result_value, coord, mutator);
         }

@@ -792,6 +792,46 @@ pub fn signal_condition_string(
     record_pending_condition(cond.raw())
 }
 
+/// Macroexpansion guard — enter a region in which signaled
+/// conditions DEFER instead of aborting the process.
+///
+/// The macroexpander invokes a macro's compiled expander function
+/// directly, not through `handler-case`. Without a guard, any
+/// condition the expander signals (an undefined function, a type
+/// error, an explicit `(error …)`) hits `HANDLER_DEPTH == 0` inside
+/// `signal_condition_string` and calls `std::process::abort()` —
+/// which on Windows surfaces as exit code 0xC0000409, visually
+/// identical to a stack overflow, with no recoverable error. That
+/// turned a trivial "typo'd function name in a macro" into a
+/// process-killing mystery crash.
+///
+/// `macro_guard_enter` bumps `HANDLER_DEPTH` so signals defer (record
+/// a pending condition and return NIL) and snapshots the current
+/// pending state to restore on exit. Pair with `macro_guard_exit`.
+pub fn macro_guard_enter() -> (bool, u64) {
+    let saved_pending = CONDITION_PENDING.with(|p| p.replace(false));
+    let saved_slot = CONDITION_SLOT.with(|s| s.get());
+    HANDLER_DEPTH.with(|d| d.set(d.get() + 1));
+    (saved_pending, saved_slot)
+}
+
+/// Macroexpansion guard — exit. Restores `HANDLER_DEPTH` and the
+/// saved pending state. If a condition was signaled during the
+/// guarded region, returns `Some(cond_raw)` (the condition Word) and
+/// clears `ABORT_PENDING` so subsequent compilation isn't poisoned by
+/// a stale flag; otherwise returns `None`.
+pub fn macro_guard_exit(saved: (bool, u64)) -> Option<u64> {
+    HANDLER_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    let was_pending = CONDITION_PENDING.with(|p| p.replace(saved.0));
+    let cond = CONDITION_SLOT.with(|s| s.replace(saved.1));
+    if was_pending {
+        ABORT_PENDING.with(|p| p.set(false));
+        Some(cond)
+    } else {
+        None
+    }
+}
+
 /// `(error condition-or-message)` — signal a condition. With a
 /// matching `handler-case` on the stack, returns NIL after stashing
 /// the condition; the unwind happens through normal stack returns.

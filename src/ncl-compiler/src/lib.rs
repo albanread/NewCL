@@ -7750,4 +7750,60 @@ mod end_to_end_tests {
             "36",
         );
     }
+
+    // ── Probes: undefined-function failure mode ───────────────────
+
+    #[test]
+    fn probe_undefined_fn_runtime() {
+        // Calling an undefined function at runtime should signal a
+        // catchable condition, NOT crash the process.
+        let mut s = Session::with_stdlib().unwrap();
+        let r = s.eval("(handler-case (this-fn-does-not-exist 1 2) (error (e) e 'caught))");
+        // We only care that it returns (catchable) rather than crashing.
+        assert_eq!(r.unwrap(), "CAUGHT");
+    }
+
+    #[test]
+    fn probe_undefined_fn_in_macroexpand() {
+        // A macro whose expander calls an undefined helper. This used
+        // to surface as STATUS_STACK_BUFFER_OVERRUN (really a Windows
+        // process abort, code 0xC0000409) with no diagnostic. The
+        // macroexpansion guard now turns it into a clean compile error
+        // that names the offending function.
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval("(defmacro probe-bad-macro (x) (probe-undefined-helper x))").unwrap();
+        let r = s.eval("(probe-bad-macro 5)");
+        let err = format!("{r:?}");
+        assert!(r.is_err(), "expected a clean error, got {r:?}");
+        // The diagnostic should name the undefined helper and flag it
+        // as a macroexpansion-time failure.
+        assert!(
+            err.contains("PROBE-UNDEFINED-HELPER") || err.contains("probe-undefined-helper"),
+            "error should name the undefined function; got: {err}"
+        );
+        assert!(
+            err.to_lowercase().contains("undefined function"),
+            "error should say 'undefined function'; got: {err}"
+        );
+    }
+
+    #[test]
+    fn probe_macro_explicit_error_is_clean() {
+        // A macro expander that explicitly (error ...)s should also
+        // produce a clean compile error, not abort the process.
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval(r#"(defmacro probe-erroring-macro (x) (error "boom from expander"))"#).unwrap();
+        let r = s.eval("(probe-erroring-macro 1)");
+        let err = format!("{r:?}");
+        assert!(r.is_err(), "expected a clean error, got {r:?}");
+        assert!(err.contains("boom from expander"), "got: {err}");
+    }
+
+    #[test]
+    fn probe_good_macro_still_works_after_guard() {
+        // Regression: the guard must not disturb normal macroexpansion.
+        let mut s = Session::with_stdlib().unwrap();
+        s.eval("(defmacro probe-good-macro (a b) (list '+ a b))").unwrap();
+        assert_eq!(s.eval("(probe-good-macro 19 23)").unwrap(), "42");
+    }
 }
