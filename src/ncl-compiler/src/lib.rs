@@ -937,6 +937,13 @@ fn install_native_functions(
                    ncl_runtime::return_from_shim, 2);
     install_native(coord, mutator, "%NATIVE-UNWIND-PROTECT",
                    ncl_runtime::unwind_protect_shim, 2);
+    // catch / throw — dynamic (runtime-tagged) non-local exit. The
+    // Lisp macros in core.lisp wrap the body in a thunk and pass the
+    // evaluated tag to %native-catch / %throw.
+    install_native(coord, mutator, "%NATIVE-CATCH",
+                   ncl_runtime::catch_shim, 2);
+    install_native(coord, mutator, "%THROW",
+                   ncl_runtime::throw_shim, 2);
 
     install_native(coord, mutator, "STRING-SPLIT-NEWLINES",
                    string_split_newlines_shim, 1);
@@ -7369,5 +7376,88 @@ mod end_to_end_tests {
         assert_eq!(s.eval("(>= 3 2 1)").unwrap(), "T");
         assert_eq!(s.eval("(>= 3 2 2)").unwrap(), "T");
         assert_eq!(s.eval("(>= 3 2 3)").unwrap(), "nil");
+    }
+
+    // ── catch / throw ─────────────────────────────────────────────
+
+    #[test]
+    fn catch_no_throw() {
+        let mut s = Session::with_stdlib().unwrap();
+        // catch without a throw returns the body value
+        assert_eq!(s.eval("(catch 'foo 1 2 3)").unwrap(), "3");
+    }
+
+    #[test]
+    fn catch_throw_basic() {
+        let mut s = Session::with_stdlib().unwrap();
+        // throw exits the catch with the thrown value
+        assert_eq!(s.eval("(catch 'foo (throw 'foo 42) 99)").unwrap(), "42");
+    }
+
+    #[test]
+    fn catch_throw_aborts_rest() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Code after a throw must not run (verify via side effect)
+        s.eval("(defvar *ct-marker* 0)").unwrap();
+        s.eval("(catch 'tag (throw 'tag 1) (setq *ct-marker* 999))").unwrap();
+        assert_eq!(s.eval("*ct-marker*").unwrap(), "0");
+    }
+
+    #[test]
+    fn catch_throw_through_function() {
+        let mut s = Session::with_stdlib().unwrap();
+        // throw crosses a function-call boundary to reach the catch
+        s.eval("(defun ct-thrower () (throw 'escape 77))").unwrap();
+        assert_eq!(s.eval("(catch 'escape (ct-thrower) 5)").unwrap(), "77");
+    }
+
+    #[test]
+    fn catch_nested_distinct_tags() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Inner throw to outer tag skips the inner catch
+        assert_eq!(
+            s.eval("(catch 'outer (catch 'inner (throw 'outer 100)) 1)").unwrap(),
+            "100",
+        );
+    }
+
+    #[test]
+    fn catch_nested_inner_tag() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Inner throw to inner tag; outer returns its own last form
+        assert_eq!(
+            s.eval("(catch 'outer (catch 'inner (throw 'inner 50)) 7)").unwrap(),
+            "7",
+        );
+    }
+
+    #[test]
+    fn catch_dynamic_tag() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Tags are compared by EQ at runtime, not by lexical name
+        assert_eq!(
+            s.eval("(let ((tg 'dynamic)) (catch tg (throw tg 21)))").unwrap(),
+            "21",
+        );
+    }
+
+    #[test]
+    fn catch_throw_computed_value() {
+        let mut s = Session::with_stdlib().unwrap();
+        // The thrown value is an arbitrary expression
+        assert_eq!(
+            s.eval("(catch 'c (throw 'c (+ 20 22)))").unwrap(),
+            "42",
+        );
+    }
+
+    #[test]
+    fn unmatched_throw_is_catchable() {
+        let mut s = Session::with_stdlib().unwrap();
+        // A throw with no matching catch signals a catchable condition
+        assert_eq!(
+            s.eval("(handler-case (throw 'nope 1) (error (e) e 'caught))").unwrap(),
+            "CAUGHT",
+        );
     }
 }

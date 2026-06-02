@@ -652,6 +652,23 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
    enclosing (block NAME …) with VAL."
   `(%return-from ',name ,value))
 
+(defmacro catch (tag &rest body)
+  "(catch TAG body…) — establish a dynamic exit point keyed by the
+   *value* of TAG (compared with EQ). A matching (throw TAG val)
+   anywhere in the dynamic extent of BODY transfers control here and
+   returns VAL. Without a throw, returns the last body form's value.
+
+   Unlike BLOCK (whose name is lexical and compile-time), CATCH's tag
+   is evaluated at run time — so the tag form is passed through to
+   %native-catch, and the body is wrapped in a thunk."
+  `(%native-catch ,tag (lambda () ,@body)))
+
+(defmacro throw (tag value)
+  "(throw TAG val) — transfer control to the nearest enclosing
+   (catch TAG …) whose tag is EQ to TAG, carrying VAL out. Signals a
+   control error if no matching catch is active."
+  `(%throw ,tag ,value))
+
 (defmacro dotimes (binding &rest body)
   "(dotimes (var count [result-form]) body…) — bind VAR to
    0, 1, …, COUNT-1; evaluate BODY each time. Returns RESULT-FORM."

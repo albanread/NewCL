@@ -2326,10 +2326,17 @@ pub extern "C-unwind" fn unwind_protect_shim(
     };
 
     // 2. Save and clear any pending abort so cleanup runs fully.
+    //    Covers all three exit kinds: block-return (BLOCK_TARGET),
+    //    catch-throw (THROW_PENDING/THROW_TAG), and conditions (the
+    //    ABORT_PENDING flag alone).
     let saved_abort = ABORT_PENDING.with(|p| p.get());
     let saved_target = BLOCK_TARGET.with(|t| t.get());
+    let saved_throw = THROW_PENDING.with(|p| p.get());
+    let saved_throw_tag = THROW_TAG.with(|t| t.get());
     ABORT_PENDING.with(|p| p.set(false));
     BLOCK_TARGET.with(|t| t.set(0));
+    THROW_PENDING.with(|p| p.set(false));
+    THROW_TAG.with(|t| t.set(0));
 
     // 3. Call the cleanup thunk (its return value is discarded).
     {
@@ -2339,13 +2346,143 @@ pub extern "C-unwind" fn unwind_protect_shim(
         unsafe { f(mutator, env.raw(), std::ptr::null(), 0) };
     }
 
-    // 4. Restore abort state so the surrounding block/handler-case
-    //    can observe and handle it.
+    // 4. Restore abort state so the surrounding block / catch /
+    //    handler-case can observe and handle it.
     ABORT_PENDING.with(|p| p.set(saved_abort));
     BLOCK_TARGET.with(|t| t.set(saved_target));
+    THROW_PENDING.with(|p| p.set(saved_throw));
+    THROW_TAG.with(|t| t.set(saved_throw_tag));
 
     // 5. Return the protected form's value.
     body_result
+}
+
+// ---- catch / throw ---------------------------------------------------------
+//
+// CATCH/THROW are the dynamic (run-time-tagged) cousins of BLOCK/
+// RETURN-FROM. A `(catch TAG body…)` establishes a dynamic exit point
+// keyed by the *value* of TAG (compared with EQ — raw Word identity);
+// `(throw TAG value)` transfers control to the nearest enclosing catch
+// whose tag is EQ to TAG, carrying VALUE out.
+//
+// Mechanism mirrors BLOCK exactly: a thread-local CATCH_STACK of
+// frames, the shared ABORT_PENDING flag for call-site instrumentation,
+// plus a dedicated THROW_PENDING boolean that discriminates a throw
+// abort from a block-return / condition / loop-break abort. We need an
+// explicit boolean (rather than "tag != 0" the way BLOCK keys off
+// BLOCK_TARGET) because a catch tag can legitimately be any value,
+// including NIL whose raw bits may be 0.
+
+struct CatchFrame {
+    tag: u64,
+    value: u64,
+}
+
+thread_local! {
+    /// Active catch frames in dynamic-extent order; innermost at the
+    /// back. `(catch TAG …)` pushes on entry, pops on exit.
+    static CATCH_STACK: RefCell<Vec<CatchFrame>> = const { RefCell::new(Vec::new()) };
+
+    /// True while a `throw` is propagating. Distinguishes a throw
+    /// abort from block / condition / loop aborts (which leave this
+    /// false). Cleared by the catch that consumes the throw.
+    static THROW_PENDING: Cell<bool> = const { Cell::new(false) };
+
+    /// Raw Word of the tag the in-flight throw is seeking. Only
+    /// meaningful while THROW_PENDING is true.
+    static THROW_TAG: Cell<u64> = const { Cell::new(0) };
+}
+
+/// `(%native-catch TAG THUNK)` — the primitive behind the `catch`
+/// macro. TAG is pre-evaluated (catch tags are dynamic). Pushes a
+/// frame, runs the body thunk, then consumes the abort iff a matching
+/// throw is pending.
+pub extern "C-unwind" fn catch_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("%native-catch: expected 2 args (tag thunk), got {n_args}");
+    }
+    let tag = unsafe { *args };
+    let thunk = Word::from_raw(unsafe { *args.add(1) });
+    if thunk.tag() != Tag::Function {
+        panic!("%native-catch: thunk must be a function, got {thunk:?}");
+    }
+
+    CATCH_STACK.with(|s| {
+        s.borrow_mut().push(CatchFrame {
+            tag,
+            value: Word::NIL.raw(),
+        });
+    });
+
+    let body_result = {
+        let env = crate::gc_function::env(thunk);
+        let code = crate::gc_function::code_ptr(thunk);
+        let f: crate::gc_function::LispCodeFn =
+            unsafe { std::mem::transmute(code) };
+        unsafe { f(mutator, env.raw(), std::ptr::null(), 0) }
+    };
+
+    let frame_value = CATCH_STACK.with(|s| {
+        s.borrow_mut()
+            .pop()
+            .expect("CATCH_STACK underflow at catch exit")
+            .value
+    });
+
+    // Consume the abort iff it's a throw targeting our tag.
+    if ABORT_PENDING.with(|p| p.get()) && THROW_PENDING.with(|p| p.get()) {
+        let target = THROW_TAG.with(|t| t.get());
+        if target == tag {
+            ABORT_PENDING.with(|p| p.set(false));
+            THROW_PENDING.with(|p| p.set(false));
+            THROW_TAG.with(|t| t.set(0));
+            return frame_value;
+        }
+    }
+    body_result
+}
+
+/// `(%throw TAG VALUE)` — find the nearest enclosing catch whose tag
+/// is EQ to TAG, stash VALUE on its frame, and raise the abort. If no
+/// matching catch is active, signal a (catchable) control error.
+pub extern "C-unwind" fn throw_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 2 {
+        panic!("%throw: expected 2 args (tag value), got {n_args}");
+    }
+    let tag = unsafe { *args };
+    let val = unsafe { *args.add(1) };
+
+    let found = CATCH_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        match stack.iter().rposition(|f| f.tag == tag) {
+            Some(i) => {
+                stack[i].value = val;
+                true
+            }
+            None => false,
+        }
+    });
+    if !found {
+        let tag_str = crate::printer::format_word_aesthetic(Word::from_raw(tag));
+        return signal_condition_string(
+            mutator,
+            &format!("throw: no enclosing catch for tag {tag_str}"),
+        );
+    }
+    ABORT_PENDING.with(|p| p.set(true));
+    THROW_PENDING.with(|p| p.set(true));
+    THROW_TAG.with(|t| t.set(tag));
+    Word::NIL.raw()
 }
 
 // ───────────────────────────────────────────────────────────────────

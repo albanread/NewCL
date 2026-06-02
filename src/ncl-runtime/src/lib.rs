@@ -61,6 +61,7 @@ pub use abi::{
     values_shim, values_list_shim,
     native_block_shim, native_loop_shim,
     return_from_shim, unwind_protect_shim,
+    catch_shim, throw_shim,
     ncl_abort_pending, ncl_alloc_cons, ncl_apply, ncl_aref_generic, ncl_aset_generic,
     ncl_build_rest_list, ncl_call, ncl_car, ncl_cdr, ncl_equal, ncl_funcall,
     ncl_length, ncl_load_function, ncl_load_value, ncl_lookup_keyword,
