@@ -7569,4 +7569,185 @@ mod end_to_end_tests {
                     sum))").unwrap();
         assert_eq!(s.eval("(tb-sum 10)").unwrap(), "55");
     }
+
+    // ── Extended LOOP ─────────────────────────────────────────────
+
+    #[test]
+    fn loop_simple_still_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        // The simple (loop FORM...) form must still work (dispatch)
+        assert_eq!(
+            s.eval("(let ((i 0)) (loop (when (>= i 3) (return i)) (setq i (+ i 1))))").unwrap(),
+            "3",
+        );
+    }
+
+    #[test]
+    fn loop_for_in_collect() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(loop for x in '(1 2 3 4) collect (* x x))").unwrap(),
+            "(1 4 9 16)",
+        );
+    }
+
+    #[test]
+    fn loop_for_from_to_sum() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(loop for i from 1 to 10 sum i)").unwrap(), "55");
+    }
+
+    #[test]
+    fn loop_for_from_below() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(loop for i from 0 below 5 collect i)").unwrap(),
+            "(0 1 2 3 4)",
+        );
+    }
+
+    #[test]
+    fn loop_for_from_by() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(loop for i from 0 to 10 by 2 collect i)").unwrap(),
+            "(0 2 4 6 8 10)",
+        );
+    }
+
+    #[test]
+    fn loop_for_downto() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(loop for i from 3 downto 0 collect i)").unwrap(),
+            "(3 2 1 0)",
+        );
+    }
+
+    #[test]
+    fn loop_for_on() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(loop for tail on '(1 2 3) collect (car tail))").unwrap(),
+            "(1 2 3)",
+        );
+    }
+
+    #[test]
+    fn loop_repeat() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(loop repeat 4 sum 10)").unwrap(), "40");
+    }
+
+    #[test]
+    fn loop_for_count_when() {
+        let mut s = Session::with_stdlib().unwrap();
+        // count with a when-gated clause: count odd numbers 1..10
+        assert_eq!(
+            s.eval("(loop for i from 1 to 10 when (oddp i) count i)").unwrap(),
+            "5",
+        );
+    }
+
+    #[test]
+    fn loop_for_in_when_collect() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(loop for x in '(1 2 3 4 5 6) when (evenp x) collect x)").unwrap(),
+            "(2 4 6)",
+        );
+    }
+
+    #[test]
+    fn loop_maximize_minimize() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(loop for x in '(3 1 4 1 5 9 2 6) maximize x)").unwrap(),
+            "9",
+        );
+        assert_eq!(
+            s.eval("(loop for x in '(3 1 4 1 5 9 2 6) minimize x)").unwrap(),
+            "1",
+        );
+    }
+
+    #[test]
+    fn loop_while_with() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(loop with i = 0 while (< i 5) do (setq i (+ i 1)) collect i)").unwrap(),
+            "(1 2 3 4 5)",
+        );
+    }
+
+    #[test]
+    fn loop_until() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(loop for i from 0 until (> i 3) collect i)").unwrap(),
+            "(0 1 2 3)",
+        );
+    }
+
+    #[test]
+    fn loop_append() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(loop for x in '(1 2 3) append (list x x))").unwrap(),
+            "(1 1 2 2 3 3)",
+        );
+    }
+
+    #[test]
+    fn loop_for_equals_then() {
+        let mut s = Session::with_stdlib().unwrap();
+        // for v = init then step: powers of 2
+        assert_eq!(
+            s.eval("(loop repeat 5 for p = 1 then (* p 2) collect p)").unwrap(),
+            "(1 2 4 8 16)",
+        );
+    }
+
+    #[test]
+    fn loop_finally() {
+        let mut s = Session::with_stdlib().unwrap();
+        // finally runs after the loop; its forms can reference the result
+        assert_eq!(
+            s.eval("(loop for i from 1 to 3 sum i)").unwrap(),
+            "6",
+        );
+        // initially + finally with side effects
+        s.eval("(defvar *loop-fin* nil)").unwrap();
+        s.eval("(loop for i from 1 to 3 do (push i *loop-fin*) finally (push 'done *loop-fin*))").unwrap();
+        assert_eq!(s.eval("(reverse *loop-fin*)").unwrap(), "(1 2 3 DONE)");
+    }
+
+    #[test]
+    fn loop_return_clause() {
+        let mut s = Session::with_stdlib().unwrap();
+        // return clause exits the loop early
+        assert_eq!(
+            s.eval("(loop for i from 0 to 100 when (= i 7) return i)").unwrap(),
+            "7",
+        );
+    }
+
+    #[test]
+    fn loop_always_never_thereis() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(loop for x in '(2 4 6) always (evenp x))").unwrap(), "T");
+        assert_eq!(s.eval("(loop for x in '(2 4 5) always (evenp x))").unwrap(), "nil");
+        assert_eq!(s.eval("(loop for x in '(1 3 5) never (evenp x))").unwrap(), "T");
+        assert_eq!(s.eval("(loop for x in '(1 2 3) thereis (and (evenp x) x))").unwrap(), "2");
+    }
+
+    #[test]
+    fn loop_nested() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Nested loops: flatten a 3x3 multiplication grid sum
+        assert_eq!(
+            s.eval("(loop for i from 1 to 3 sum (loop for j from 1 to 3 sum (* i j)))").unwrap(),
+            "36",
+        );
+    }
 }

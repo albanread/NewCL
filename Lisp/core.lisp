@@ -463,7 +463,33 @@
 ;; runs once the when's expansion has stashed the return value.
 
 (defmacro loop (&rest body)
-  `(%native-loop (lambda () ,@body)))
+  "CL LOOP. Two forms:
+   * Simple: (loop FORM...) repeats FORMs forever; (return v) exits.
+   * Extended: (loop KEYWORD ...) — for/while/collect/sum/etc, parsed
+     by %loop-expand into a block + let* + tagbody. Dispatch is by
+     whether the first element is a recognised loop keyword symbol."
+  (if (%loop-extended-p body)
+      (%loop-expand body)
+      `(%native-loop (lambda () ,@body))))
+
+;; Defined here (before the first internal use of `loop` in dotimes/
+;; do below) so the dispatch works during the rest of stdlib load.
+;; The full %loop-expand machinery lives after `tagbody`, since the
+;; expansion targets tagbody/go — it's only invoked lazily when a
+;; user actually writes an extended loop, well after load completes.
+(defun %loop-extended-p (body)
+  "True if BODY is an extended-LOOP clause list (starts with a known
+   loop keyword symbol). Uses only MEMBER (defined far above) — NOT
+   symbolp, which is defined much later in this file and would be
+   unbound when the simple (loop …) forms inside the parser helpers
+   below are macroexpanded during stdlib load. A cons or number as
+   the first element simply fails the eql-based MEMBER test."
+  (and body
+       (member (car body)
+               '(for repeat while until do collect append nconc
+                 sum count maximize minimize when unless
+                 with initially finally return
+                 thereis always never named))))
 
 (defmacro return (&rest args)
   ;; (return)   → exit with nil
@@ -773,6 +799,323 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
              (block ,block-name
                ,@(%tagbody-build-dispatch segments tag-alist block-name pc-var 0)
                -1))))))
+
+;; ── Extended LOOP ─────────────────────────────────────────────────
+;;
+;; A useful subset of CL's LOOP facility, expanding to block + let* +
+;; tagbody/go (the same shape real implementations use). Supported:
+;;
+;;   for V in LIST | on LIST | from N [to|below|downto|above M] [by S]
+;;                | = INIT [then STEP]
+;;   repeat N        while TEST       until TEST
+;;   with V [= INIT] named NAME
+;;   do FORMS...      initially FORMS...   finally FORMS...
+;;   collect E   append E   sum E   count E   maximize E   minimize E
+;;   when TEST <clause>     unless TEST <clause>
+;;   return E    thereis E    always E    never E
+;;
+;; Parser state is a 12-slot vector, mutated in place by small clause
+;; handlers — this sidesteps NCL's "no mutable parameters" rule (the
+;; vector is a shared heap object; we mutate its slots, not a param)
+;; and keeps each handler tiny so codegen never blows the stack.
+;;
+;;   0 cl   1 vars   2 pre   3 ends   4 body   5 steps   6 post
+;;   7 result   8 name   9 acc   10 acc-tail   11 acc-kind
+;; Slots 1-6 hold REVERSED accumulators; %loop-build reverses them.
+
+(defun %lsg (st i) (svref st i))
+(defun %lss (st i v) (setf (svref st i) v))
+(defun %lsp (st i v) (setf (svref st i) (cons v (svref st i))))
+
+(defun %loop-keyword-p (sym)
+  (member sym '(for repeat while until do collect append nconc
+                sum count maximize minimize when unless
+                with initially finally return
+                thereis always never named)))
+
+;; -- accumulator setup --
+
+(defun %loop-need-list-acc (st)
+  (when (null (%lsg st 9))
+    (let ((h (gensym "ACC")) (tl (gensym "TL")))
+      (%lsp st 1 (list h (list 'cons nil nil)))
+      (%lsp st 1 (list tl h))
+      (%lss st 9 h)
+      (%lss st 10 tl)
+      (%lss st 11 'collect))))
+
+(defun %loop-need-num-acc (st init kind)
+  (when (null (%lsg st 9))
+    (let ((a (gensym "NUM")))
+      (%lsp st 1 (list a init))
+      (%lss st 9 a)
+      (%lss st 11 kind))))
+
+;; -- accumulator emitters (each appends one body form, optionally
+;;    guarded by a when-TEST from a surrounding when/unless clause) --
+
+(defun %loop-guard (form test)
+  (if test (list 'when test form) form))
+
+(defun %loop-emit-collect (st expr test)
+  (%loop-need-list-acc st)
+  (let ((tl (%lsg st 10)) (c (gensym "C")))
+    (%lsp st 4 (%loop-guard
+                (list 'let (list (list c (list 'cons expr nil)))
+                      (list 'setf (list 'cdr tl) c)
+                      (list 'setq tl c))
+                test))))
+
+(defun %loop-emit-append (st expr test)
+  (%loop-need-list-acc st)
+  (%lss st 11 'append)
+  (let ((tl (%lsg st 10)) (tmp (gensym "AP")))
+    (%lsp st 4 (%loop-guard
+                (list 'let (list (list tmp expr))
+                      (list 'when tmp
+                            (list 'setf (list 'cdr tl) (list 'copy-list tmp))
+                            (list 'setq tl (list 'last (list 'cdr tl)))))
+                test))))
+
+(defun %loop-emit-sum (st expr test)
+  (%loop-need-num-acc st 0 'sum)
+  (let ((a (%lsg st 9)))
+    (%lsp st 4 (%loop-guard (list 'setq a (list '+ a expr)) test))))
+
+(defun %loop-emit-count (st expr test)
+  (%loop-need-num-acc st 0 'count)
+  (let ((a (%lsg st 9)))
+    (%lsp st 4 (%loop-guard (list 'when expr (list 'setq a (list '+ a 1))) test))))
+
+(defun %loop-emit-max (st expr test)
+  (%loop-need-num-acc st nil 'maximize)
+  (let ((a (%lsg st 9)) (tmp (gensym "MX")))
+    (%lsp st 4 (%loop-guard
+                (list 'let (list (list tmp expr))
+                      (list 'when (list 'or (list 'null a) (list '> tmp a))
+                            (list 'setq a tmp)))
+                test))))
+
+(defun %loop-emit-min (st expr test)
+  (%loop-need-num-acc st nil 'minimize)
+  (let ((a (%lsg st 9)) (tmp (gensym "MN")))
+    (%lsp st 4 (%loop-guard
+                (list 'let (list (list tmp expr))
+                      (list 'when (list 'or (list 'null a) (list '< tmp a))
+                            (list 'setq a tmp)))
+                test))))
+
+(defun %loop-emit-acc (st kind expr test)
+  (cond
+    ((eq kind 'collect) (%loop-emit-collect st expr test))
+    ((eq kind 'append)  (%loop-emit-append st expr test))
+    ((eq kind 'nconc)   (%loop-emit-append st expr test))
+    ((eq kind 'sum)     (%loop-emit-sum st expr test))
+    ((eq kind 'count)   (%loop-emit-count st expr test))
+    ((eq kind 'maximize)(%loop-emit-max st expr test))
+    ((eq kind 'minimize)(%loop-emit-min st expr test))
+    (t (error (format nil "LOOP: bad accumulator ~S" kind)))))
+
+;; -- FOR clause --
+
+(defun %loop-for-arith (st var start rest)
+  "Parse FOR V FROM start [to|below|downto|above LIM] [by S]."
+  (let ((limit nil) (test-op nil) (step 1) (dir 'up) (rem rest))
+    (loop
+      (cond
+        ((null rem) (return))
+        ((eq (car rem) 'to)     (setq limit (cadr rem)) (setq test-op '>)  (setq rem (cddr rem)))
+        ((eq (car rem) 'below)  (setq limit (cadr rem)) (setq test-op '>=) (setq rem (cddr rem)))
+        ((eq (car rem) 'downto) (setq limit (cadr rem)) (setq test-op '<)  (setq dir 'down) (setq rem (cddr rem)))
+        ((eq (car rem) 'above)  (setq limit (cadr rem)) (setq test-op '<=) (setq dir 'down) (setq rem (cddr rem)))
+        ((eq (car rem) 'by)     (setq step (cadr rem)) (setq rem (cddr rem)))
+        (t (return))))
+    (%lsp st 1 (list var start))
+    (when limit
+      (let ((lv (gensym "LIM")))
+        (%lsp st 1 (list lv limit))
+        (%lsp st 3 (list test-op var lv))))
+    (if (eq dir 'down)
+        (%lsp st 5 (list 'setq var (list '- var step)))
+        (%lsp st 5 (list 'setq var (list '+ var step))))
+    (%lss st 0 rem)))
+
+(defun %loop-clause-for (st)
+  (let* ((cl (%lsg st 0))
+         (var (cadr cl))
+         (prep (caddr cl))
+         (rest (cdddr cl)))
+    (cond
+      ((eq prep 'in)
+       (let ((lv (gensym "IN")))
+         (%lsp st 1 (list lv (car rest)))
+         (%lsp st 1 (list var nil))
+         (%lsp st 3 (list 'null lv))
+         (%lsp st 4 (list 'setq var (list 'car lv)))
+         (%lsp st 5 (list 'setq lv (list 'cdr lv)))
+         (%lss st 0 (cdr rest))))
+      ((eq prep 'on)
+       (let ((lv (gensym "ON")))
+         (%lsp st 1 (list lv (car rest)))
+         (%lsp st 1 (list var nil))
+         (%lsp st 3 (list 'null lv))
+         (%lsp st 4 (list 'setq var lv))
+         (%lsp st 5 (list 'setq lv (list 'cdr lv)))
+         (%lss st 0 (cdr rest))))
+      ((eq prep 'from)
+       (%loop-for-arith st var (car rest) (cdr rest)))
+      ((eq prep '=)
+       (let ((init (car rest)) (r2 (cdr rest)))
+         (if (and r2 (eq (car r2) 'then))
+             (progn (%lsp st 1 (list var init))
+                    (%lsp st 5 (list 'setq var (cadr r2)))
+                    (%lss st 0 (cddr r2)))
+             (progn (%lsp st 1 (list var init))
+                    (%lsp st 5 (list 'setq var init))
+                    (%lss st 0 r2)))))
+      (t (error (format nil "LOOP FOR: unknown preposition ~S" prep))))))
+
+;; -- multi-form clauses (do / initially / finally) --
+
+(defun %loop-grab-forms (st)
+  "Consume forms after the current keyword until the next loop keyword
+   or end. Returns the forms in source order; advances slot 0."
+  (let ((rem (cdr (%lsg st 0))) (forms nil))
+    (loop
+      (if (or (null rem) (%loop-keyword-p (car rem)))
+          (return)
+          (progn (setq forms (cons (car rem) forms)) (setq rem (cdr rem)))))
+    (%lss st 0 rem)
+    (reverse forms)))
+
+(defun %loop-prepend (st slot forms)
+  "Prepend FORMS (source order) to a reversed accumulator slot."
+  (%lss st slot (append (reverse forms) (%lsg st slot))))
+
+;; -- when / unless --
+
+(defun %loop-clause-cond (st negate)
+  (let* ((cl (%lsg st 0))
+         (test0 (cadr cl))
+         (test (if negate (list 'not test0) test0))
+         (inner-kw (caddr cl))
+         (inner-expr (cadddr cl)))
+    (%lss st 0 (cddddr cl))
+    (cond
+      ((eq inner-kw 'do)
+       (%lsp st 4 (list 'when test inner-expr)))
+      ((eq inner-kw 'return)
+       (%lsp st 4 (list 'when test
+                        (list 'return-from (%lsg st 8) inner-expr))))
+      (t (%loop-emit-acc st inner-kw inner-expr test)))))
+
+;; -- per-clause dispatch (split in two to keep each cond small) --
+
+(defun %loop-step (st)
+  (let ((kw (car (%lsg st 0))))
+    (cond
+      ((eq kw 'named)   (%lss st 8 (cadr (%lsg st 0))) (%lss st 0 (cddr (%lsg st 0))))
+      ((eq kw 'for)     (%loop-clause-for st))
+      ((eq kw 'with)    (%loop-clause-with st))
+      ((eq kw 'repeat)  (%loop-clause-repeat st))
+      ((eq kw 'while)   (%lsp st 3 (list 'not (cadr (%lsg st 0)))) (%lss st 0 (cddr (%lsg st 0))))
+      ((eq kw 'until)   (%lsp st 3 (cadr (%lsg st 0))) (%lss st 0 (cddr (%lsg st 0))))
+      ((eq kw 'when)    (%loop-clause-cond st nil))
+      ((eq kw 'unless)  (%loop-clause-cond st t))
+      ((eq kw 'do)      (%loop-prepend st 4 (%loop-grab-forms st)))
+      ((eq kw 'initially)(%loop-prepend st 2 (%loop-grab-forms st)))
+      ((eq kw 'finally) (%loop-prepend st 6 (%loop-grab-forms st)))
+      ((eq kw 'return)  (%loop-clause-return st))
+      (t (%loop-step2 st kw)))))
+
+(defun %loop-step2 (st kw)
+  (cond
+    ((member kw '(collect append nconc sum count maximize minimize))
+     (let ((expr (cadr (%lsg st 0))))
+       (%lss st 0 (cddr (%lsg st 0)))
+       (%loop-emit-acc st kw expr nil)))
+    ((eq kw 'thereis)  (%loop-clause-thereis st))
+    ((eq kw 'always)   (%loop-clause-always st))
+    ((eq kw 'never)    (%loop-clause-never st))
+    (t (error (format nil "LOOP: unknown clause ~S" kw)))))
+
+(defun %loop-clause-with (st)
+  (let* ((cl (%lsg st 0)) (var (cadr cl)) (r (cddr cl)))
+    (if (and r (eq (car r) '=))
+        (progn (%lsp st 1 (list var (cadr r))) (%lss st 0 (cddr r)))
+        (progn (%lsp st 1 (list var nil)) (%lss st 0 r)))))
+
+(defun %loop-clause-repeat (st)
+  (let ((cv (gensym "REP")) (n (cadr (%lsg st 0))))
+    (%lsp st 1 (list cv n))
+    (%lsp st 3 (list '<= cv 0))
+    (%lsp st 5 (list 'setq cv (list '- cv 1)))
+    (%lss st 0 (cddr (%lsg st 0)))))
+
+(defun %loop-clause-return (st)
+  (%lsp st 4 (list 'return-from (%lsg st 8) (cadr (%lsg st 0))))
+  (%lss st 0 (cddr (%lsg st 0))))
+
+(defun %loop-clause-thereis (st)
+  (let ((tv (gensym "TH")) (expr (cadr (%lsg st 0))))
+    (%lsp st 4 (list 'let (list (list tv expr))
+                     (list 'when tv (list 'return-from (%lsg st 8) tv))))
+    (%lss st 0 (cddr (%lsg st 0)))))
+
+(defun %loop-clause-always (st)
+  (%lsp st 4 (list 'unless (cadr (%lsg st 0)) (list 'return-from (%lsg st 8) nil)))
+  (%lss st 7 t)
+  (%lss st 0 (cddr (%lsg st 0))))
+
+(defun %loop-clause-never (st)
+  (%lsp st 4 (list 'when (cadr (%lsg st 0)) (list 'return-from (%lsg st 8) nil)))
+  (%lss st 7 t)
+  (%lss st 0 (cddr (%lsg st 0))))
+
+;; -- result + output assembly --
+
+(defun %loop-result (st)
+  (let ((kind (%lsg st 11)) (acc (%lsg st 9)) (result (%lsg st 7)))
+    (cond
+      ((member kind '(collect append)) (if acc (list 'cdr acc) nil))
+      ((member kind '(sum count maximize minimize)) acc)
+      (t result))))
+
+(defun %loop-end-gos (ends lend)
+  (mapcar (lambda (test) (list 'when test (list 'go lend))) ends))
+
+(defun %loop-build (st)
+  (let* ((start (gensym "LS"))
+         (lend (gensym "LE"))
+         (name (%lsg st 8))
+         (vars (reverse (%lsg st 1)))
+         (pre (reverse (%lsg st 2)))
+         (ends (reverse (%lsg st 3)))
+         (body (reverse (%lsg st 4)))
+         (steps (reverse (%lsg st 5)))
+         (post (reverse (%lsg st 6)))
+         (result (%loop-result st)))
+    `(block ,name
+       (let* ,vars
+         ,@pre
+         (tagbody
+           ,start
+           ,@(%loop-end-gos ends lend)
+           ,@body
+           ,@steps
+           (go ,start)
+           ,lend)
+         ,@post
+         ,result))))
+
+(defun %loop-expand (clauses)
+  "Parse extended-LOOP CLAUSES into a block/let*/tagbody form."
+  (let ((st (make-array 12 :initial-element nil)))
+    (%lss st 0 clauses)
+    (loop
+      (when (null (%lsg st 0)) (return nil))
+      (%loop-step st))
+    (%loop-build st)))
 
 (defmacro dotimes (binding &rest body)
   "(dotimes (var count [result-form]) body…) — bind VAR to
