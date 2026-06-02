@@ -475,13 +475,37 @@ impl Session {
         // shared prologue helper then layers optionals/rest/keys on
         // as let-locals (boxed if the body mutates them).
         let mut env = LocalEnv::with_params(&params.required);
-        let prologue = lower::build_arglist_prologue(
+
+        // Mutable-parameter promotion: if a required param is
+        // mutated in the body, promote it to a boxed local cell.
+        let body_mutations = lower::mutated_in_body(
+            &effective_body,
+            &std::collections::HashSet::new(),
+        );
+        let mut req_box_prologue: Vec<ncl_ir::Expr> = Vec::new();
+        for (i, pname) in params.required.iter().enumerate() {
+            if body_mutations.contains(pname) {
+                let cell_init = ncl_ir::Expr::cons(
+                    ncl_ir::Expr::Param(i),
+                    ncl_ir::Expr::Nil,
+                );
+                env.rebind_as_local_cell(pname);
+                req_box_prologue.push(cell_init);
+            }
+        }
+
+        let mut prologue = lower::build_arglist_prologue(
             params,
             &effective_body,
             &mut env,
             &self.coord,
         )
         .map_err(EvalError::Compile)?;
+        if !req_box_prologue.is_empty() {
+            let mut combined = req_box_prologue;
+            combined.append(&mut prologue);
+            prologue = combined;
+        }
 
         // Implicit progn over body forms.
         let lowered_body = if effective_body.len() == 1 {
@@ -7192,6 +7216,81 @@ mod end_to_end_tests {
         assert_eq!(
             s.eval("(nreconc (list 3 2 1) '(4 5))").unwrap(),
             "(1 2 3 4 5)",
+        );
+    }
+
+    // ── Mutable parameters ────────────────────────────────────────
+
+    #[test]
+    fn setq_required_param() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Basic setq on a required parameter
+        assert_eq!(
+            s.eval("(funcall (lambda (x) (setq x 99) x) 1)").unwrap(),
+            "99",
+        );
+    }
+
+    #[test]
+    fn setq_accumulate_param() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Multiple setq on a required parameter (accumulator pattern)
+        assert_eq!(
+            s.eval("(funcall (lambda (n) (setq n (+ n 1)) (setq n (+ n 1)) n) 10)").unwrap(),
+            "12",
+        );
+    }
+
+    #[test]
+    fn push_on_required_param() {
+        let mut s = Session::with_stdlib().unwrap();
+        // push on a required list parameter
+        assert_eq!(
+            s.eval("(funcall (lambda (lst) (push 0 lst) lst) '(1 2 3))").unwrap(),
+            "(0 1 2 3)",
+        );
+    }
+
+    #[test]
+    fn mutable_param_with_closure_capture() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Mutated param captured by an inner lambda
+        assert_eq!(
+            s.eval("(funcall (lambda (x) \
+                      (setq x 42) \
+                      (funcall (lambda () x))) 0)").unwrap(),
+            "42",
+        );
+    }
+
+    #[test]
+    fn mutable_param_accumulator_pattern() {
+        let mut s = Session::with_stdlib().unwrap();
+        // The pattern that blocked the LOOP macro: accumulate via push on param
+        assert_eq!(
+            s.eval("(funcall (lambda (acc items) \
+                      (dolist (x items) (push (* x x) acc)) \
+                      (reverse acc)) \
+                    nil '(1 2 3 4))").unwrap(),
+            "(1 4 9 16)",
+        );
+    }
+
+    #[test]
+    fn defun_with_mutable_param() {
+        let mut s = Session::with_stdlib().unwrap();
+        // defun (not just lambda) should also handle mutable params
+        s.eval("(defun test-mut-param (n) (setq n (* n 2)) n)").unwrap();
+        assert_eq!(s.eval("(test-mut-param 21)").unwrap(), "42");
+    }
+
+    #[test]
+    fn non_mutated_param_unchanged() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Params that AREN'T mutated should still work as before
+        assert_eq!(
+            s.eval("(funcall (lambda (a b) (+ a b)) 20 22)").unwrap(),
+            "42",
         );
     }
 }

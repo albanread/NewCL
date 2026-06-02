@@ -256,6 +256,24 @@ impl LocalEnv {
         idx
     }
 
+    /// Promote an existing required-parameter binding `Param(i)` to a
+    /// `LocalCell`.  The caller is responsible for inserting a
+    /// `(cons Param(i) nil)` init expression into the prologue at the
+    /// matching local slot index.
+    pub fn rebind_as_local_cell(&mut self, name: &str) -> usize {
+        let cell_idx = self.local_count;
+        // Walk bindings in reverse so the most-recent (innermost)
+        // occurrence wins — mirrors `find_local` resolution order.
+        for (n, b) in self.bindings.iter_mut().rev() {
+            if &**n == name {
+                *b = Binding::LocalCell(cell_idx);
+                break;
+            }
+        }
+        self.local_count += 1;
+        cell_idx
+    }
+
     pub fn checkpoint(&self) -> (usize, usize, usize) {
         (self.bindings.len(), self.local_count, self.fn_bindings.len())
     }
@@ -931,6 +949,36 @@ fn collect_mutations(
                 }
                 collect_mutations(&args[i + 1], shadowed, into);
                 i += 2;
+            }
+        }
+        // Macros that expand to (setf place ...).  The first argument
+        // is the place being mutated; if it's a bare symbol, record it.
+        "INCF" | "DECF" => {
+            if let Some(Value::Symbol(s)) = args.first() {
+                if !shadowed.contains(&s.name) {
+                    into.insert(Arc::clone(&s.name));
+                }
+            }
+            for it in args {
+                collect_mutations(it, shadowed, into);
+            }
+        }
+        "PUSH" if args.len() >= 2 => {
+            // (push item place) — place is the second arg
+            if let Value::Symbol(s) = &args[1] {
+                if !shadowed.contains(&s.name) {
+                    into.insert(Arc::clone(&s.name));
+                }
+            }
+            for it in args {
+                collect_mutations(it, shadowed, into);
+            }
+        }
+        "POP" if !args.is_empty() => {
+            if let Value::Symbol(s) = &args[0] {
+                if !shadowed.contains(&s.name) {
+                    into.insert(Arc::clone(&s.name));
+                }
             }
         }
         "LET" if !args.is_empty() => {
@@ -1971,7 +2019,38 @@ fn lower_lambda(
     let outer_captures_before = outer_env.captures.len();
     let outer_bindings_before = outer_env.bindings.len();
     let mut inner_env = LocalEnv::for_lambda(&params.required, outer_env.clone());
-    let prologue = build_arglist_prologue(&params, body_forms, &mut inner_env, coord)?;
+
+    // ── Mutable-parameter promotion ──────────────────────────────
+    //
+    // Required parameters start as Binding::Param(i) — direct reads
+    // from the argument array.  If the body mutates a required param
+    // (setq / push / incf / …), we promote it to a let-bound
+    // LocalCell so the mutation has somewhere to write.
+    //
+    // Implementation: for each mutated required param at Param(i),
+    // push a new local cell seeded with `(cons Param(i) nil)` and
+    // rebind the name to point at that cell.  This is exactly how
+    // `push_param_local` handles &optional/&key/&rest params in
+    // `build_arglist_prologue`.
+    let body_mutations = mutated_in_body(body_forms, &HashSet::new());
+    let mut req_box_prologue: Vec<Expr> = Vec::new();
+    for (i, name) in params.required.iter().enumerate() {
+        if body_mutations.contains(name) {
+            // Replace the Param binding with a LocalCell.
+            let cell_init = Expr::cons(Expr::Param(i), Expr::Nil);
+            inner_env.rebind_as_local_cell(name);
+            req_box_prologue.push(cell_init);
+        }
+    }
+
+    let mut prologue = build_arglist_prologue(&params, body_forms, &mut inner_env, coord)?;
+    // Prepend required-param cells BEFORE optional/key/rest locals
+    // so cell indices line up with the push order in inner_env.
+    if !req_box_prologue.is_empty() {
+        let mut combined = req_box_prologue;
+        combined.append(&mut prologue);
+        prologue = combined;
+    }
 
     let lowered_body = if body_forms.is_empty() {
         Expr::Nil
