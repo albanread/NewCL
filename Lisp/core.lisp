@@ -669,6 +669,111 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
    control error if no matching catch is active."
   `(%throw ,tag ,value))
 
+;; ── TAGBODY / GO ──────────────────────────────────────────────────
+;;
+;; TAGBODY is CL's primitive iteration/goto construct. The body is a
+;; sequence of statements (conses) and tags (symbols or integers).
+;; Execution runs top to bottom; (go TAG) transfers control to just
+;; after TAG. The tagbody returns NIL.
+;;
+;; Implementation strategy — a PC-driven state machine, built entirely
+;; from existing primitives (block / return-from / a simple loop):
+;;
+;;   * Split the body at tags into SEGMENTS. Segment 0 is the code
+;;     before the first tag; each tag opens the next segment. A tag
+;;     maps to the PC (index) of the segment it opens.
+;;   * Compile the body to a function (lambda (pc) ...) that, given a
+;;     starting PC, runs every segment whose index is >= pc (natural
+;;     fall-through), wrapped in a (block B ...). The function returns
+;;     -1 when it falls off the end.
+;;   * (go TAG) rewrites to (return-from B <pc-of-TAG>) — a non-local
+;;     exit that aborts the rest of the current segment and hands the
+;;     target PC back to the driver.
+;;   * The driver %native-tagbody calls the function repeatedly,
+;;     feeding back each returned PC, until it sees -1 (completion).
+;;
+;; (go X) is only rewritten for tags X belonging to THIS tagbody; a
+;; (go Y) for an outer tag is left untouched so the enclosing
+;; tagbody's expansion handles it (correct lexical tag scoping).
+
+(defun %tagbody-tag-p (form)
+  "A tagbody tag is an atom (symbol or integer) at top level."
+  (or (symbolp form) (integerp form)))
+
+(defun %tagbody-parse (body)
+  "Split BODY into segments at tags. Returns (tag-alist . segments)
+   where tag-alist maps each tag to its segment PC, and segments is a
+   list of statement-lists indexed by PC (segment 0 first)."
+  (let ((tag-alist nil)
+        (segments nil)     ; reversed list of (reversed) statement lists
+        (current nil)      ; reversed statements of the current segment
+        (pc 0))
+    (dolist (form body)
+      (if (%tagbody-tag-p form)
+          (progn
+            (push (reverse current) segments)
+            (setq current nil)
+            (setq pc (1+ pc))
+            (push (cons form pc) tag-alist))
+          (push form current)))
+    (push (reverse current) segments)
+    (cons (reverse tag-alist) (reverse segments))))
+
+(defun %tagbody-rewrite (form tag-alist block-name)
+  "Recursively rewrite (go TAG) → (return-from BLOCK-NAME pc) for tags
+   in TAG-ALIST. Leaves other gos and quoted data untouched."
+  (cond
+    ((not (consp form)) form)
+    ((eq (car form) 'go)
+     (let ((entry (assoc (car (cdr form)) tag-alist)))
+       (if entry
+           (list 'return-from block-name (cdr entry))
+           form)))
+    ((eq (car form) 'quote) form)
+    (t (mapcar (lambda (sub) (%tagbody-rewrite sub tag-alist block-name)) form))))
+
+(defun %tagbody-build-dispatch (segments tag-alist block-name pc-var i)
+  "Build the (when (<= pc-var i) stmts...) dispatch clauses, with gos
+   rewritten. Recurses over SEGMENTS with running index I."
+  (if (null segments)
+      nil
+      (cons (list* 'when (list '<= pc-var i)
+                   (%tagbody-rewrite-list (car segments) tag-alist block-name))
+            (%tagbody-build-dispatch (cdr segments) tag-alist block-name
+                                     pc-var (1+ i)))))
+
+(defun %tagbody-rewrite-list (stmts tag-alist block-name)
+  "Rewrite gos in each statement of STMTS; append a trailing NIL so an
+   empty segment still forms a valid WHEN body."
+  (append (mapcar (lambda (s) (%tagbody-rewrite s tag-alist block-name)) stmts)
+          (list nil)))
+
+(defun %native-tagbody (body-fn)
+  "Driver: run BODY-FN starting at PC 0, feeding back each returned PC
+   until it returns a negative value (normal completion). Returns NIL."
+  (let ((pc 0))
+    (loop
+      (setq pc (funcall body-fn pc))
+      (when (< pc 0) (return nil)))))
+
+(defmacro tagbody (&rest body)
+  "(tagbody {tag | statement}*) — CL's goto-based iteration construct.
+   Runs statements top to bottom; (go TAG) jumps to just after TAG.
+   Returns NIL."
+  (let* ((block-name (gensym "TAGBODY"))
+         (pc-var (gensym "PC"))
+         (parsed (%tagbody-parse body))
+         (tag-alist (car parsed))
+         (segments (cdr parsed)))
+    (if (null tag-alist)
+        ;; No tags — body is just a progn returning nil.
+        `(progn ,@body nil)
+        `(%native-tagbody
+           (lambda (,pc-var)
+             (block ,block-name
+               ,@(%tagbody-build-dispatch segments tag-alist block-name pc-var 0)
+               -1))))))
+
 (defmacro dotimes (binding &rest body)
   "(dotimes (var count [result-form]) body…) — bind VAR to
    0, 1, …, COUNT-1; evaluate BODY each time. Returns RESULT-FORM."

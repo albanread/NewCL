@@ -7460,4 +7460,113 @@ mod end_to_end_tests {
             "CAUGHT",
         );
     }
+
+    // ── tagbody / go ──────────────────────────────────────────────
+
+    #[test]
+    fn tagbody_returns_nil() {
+        let mut s = Session::with_stdlib().unwrap();
+        // tagbody always returns NIL
+        assert_eq!(s.eval("(tagbody)").unwrap(), "nil");
+        s.eval("(defvar *tb-x* 0)").unwrap();
+        assert_eq!(s.eval("(tagbody (setq *tb-x* 5))").unwrap(), "nil");
+        assert_eq!(s.eval("*tb-x*").unwrap(), "5");
+    }
+
+    #[test]
+    fn tagbody_sequential() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Statements run top to bottom
+        s.eval("(defvar *tb-acc* nil)").unwrap();
+        s.eval("(tagbody (push 1 *tb-acc*) (push 2 *tb-acc*) (push 3 *tb-acc*))").unwrap();
+        assert_eq!(s.eval("(reverse *tb-acc*)").unwrap(), "(1 2 3)");
+    }
+
+    #[test]
+    fn tagbody_go_backward_loop() {
+        let mut s = Session::with_stdlib().unwrap();
+        // The classic counting loop via go
+        s.eval("(defun tb-count (n) \
+                  (let ((i 0) (acc nil)) \
+                    (tagbody \
+                      top \
+                      (when (>= i n) (go done)) \
+                      (push i acc) \
+                      (setq i (+ i 1)) \
+                      (go top) \
+                      done) \
+                    (reverse acc)))").unwrap();
+        assert_eq!(s.eval("(tb-count 5)").unwrap(), "(0 1 2 3 4)");
+    }
+
+    #[test]
+    fn tagbody_go_forward() {
+        let mut s = Session::with_stdlib().unwrap();
+        // go can skip forward over statements
+        s.eval("(defvar *tb-fwd* nil)").unwrap();
+        s.eval("(tagbody \
+                  (push 'a *tb-fwd*) \
+                  (go skip) \
+                  (push 'b *tb-fwd*) \
+                  skip \
+                  (push 'c *tb-fwd*))").unwrap();
+        // 'b is skipped
+        assert_eq!(s.eval("(reverse *tb-fwd*)").unwrap(), "(A C)");
+    }
+
+    #[test]
+    fn tagbody_go_aborts_rest_of_segment() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Code after (go X) in the same segment must not run
+        s.eval("(defvar *tb-abort* nil)").unwrap();
+        s.eval("(tagbody \
+                  (go target) \
+                  (push 'should-not-run *tb-abort*) \
+                  target \
+                  (push 'ran *tb-abort*))").unwrap();
+        assert_eq!(s.eval("*tb-abort*").unwrap(), "(RAN)");
+    }
+
+    #[test]
+    fn tagbody_integer_tags() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Tags can be integers, not just symbols
+        s.eval("(defvar *tb-int* 0)").unwrap();
+        s.eval("(tagbody (setq *tb-int* 1) (go 10) (setq *tb-int* 99) 10 (setq *tb-int* (+ *tb-int* 1)))").unwrap();
+        assert_eq!(s.eval("*tb-int*").unwrap(), "2");
+    }
+
+    #[test]
+    fn tagbody_nested() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Nested tagbodies with distinct tags
+        s.eval("(defvar *tb-nest* nil)").unwrap();
+        s.eval("(tagbody \
+                  outer \
+                  (push 'o *tb-nest*) \
+                  (tagbody \
+                    inner \
+                    (push 'i *tb-nest*)) \
+                  (go fin) \
+                  (push 'x *tb-nest*) \
+                  fin)").unwrap();
+        assert_eq!(s.eval("(reverse *tb-nest*)").unwrap(), "(O I)");
+    }
+
+    #[test]
+    fn tagbody_do_style_sum() {
+        let mut s = Session::with_stdlib().unwrap();
+        // A realistic sum loop, like DO would expand to
+        s.eval("(defun tb-sum (n) \
+                  (let ((i 1) (sum 0)) \
+                    (tagbody \
+                      loop \
+                      (when (> i n) (go end)) \
+                      (setq sum (+ sum i)) \
+                      (setq i (+ i 1)) \
+                      (go loop) \
+                      end) \
+                    sum))").unwrap();
+        assert_eq!(s.eval("(tb-sum 10)").unwrap(), "55");
+    }
 }
