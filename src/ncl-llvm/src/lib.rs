@@ -2069,6 +2069,35 @@ fn emit_expr<'ctx>(
             )?;
             Ok(phi.as_basic_value().into_int_value())
         }
+        Expr::OptSuppliedP(idx) => {
+            // T if n_args > idx, NIL otherwise
+            let n_args = function.get_nth_param(3).unwrap().into_int_value();
+            let idx_const = i64_t.const_int(*idx as u64, false);
+            let cond = builder
+                .build_int_compare(IntPredicate::UGT, n_args, idx_const, "opt_sp_cmp")
+                .map_err(|e| format!("opt supplied-p cmp: {e}"))?;
+            emit_bool_select(builder, cond, i64_t)
+        }
+        Expr::KeySuppliedP { keyword_word, key_start } => {
+            // Call ncl_lookup_keyword, then: T if result != UNBOUND, NIL otherwise
+            let args_ptr = function.get_nth_param(2).unwrap();
+            let n_args = function.get_nth_param(3).unwrap();
+            let key_start_const = i64_t.const_int(*key_start as u64, false);
+            let kw_const = i64_t.const_int(*keyword_word, false);
+            let call = builder
+                .build_call(
+                    helpers.lookup_keyword,
+                    &[args_ptr.into(), key_start_const.into(), n_args.into(), kw_const.into()],
+                    "ksp_lookup",
+                )
+                .map_err(|e| format!("key supplied-p lookup: {e}"))?;
+            let found = call.try_as_basic_value().unwrap_basic().into_int_value();
+            let unbound = i64_t.const_int(Word::UNBOUND.raw(), false);
+            let cond = builder
+                .build_int_compare(IntPredicate::NE, found, unbound, "key_sp_cmp")
+                .map_err(|e| format!("key supplied-p cmp: {e}"))?;
+            emit_bool_select(builder, cond, i64_t)
+        }
         Expr::KeyArg { keyword_word, key_start, default } => {
             // v = ncl_lookup_keyword(args, key_start, n_args, keyword)
             // if (v == UNBOUND) <default> else v

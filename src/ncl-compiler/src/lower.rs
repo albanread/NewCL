@@ -785,11 +785,11 @@ fn lower_call_in_mut(
         // Numeric comparisons. Binary only for now; CL allows
         // variadic with chained semantics ((< 1 2 3) = (and …))
         // — that lands when `and` does.
-        "<" => binary_op(&head_name, args, env, coord, Expr::lt),
-        ">" => binary_op(&head_name, args, env, coord, Expr::gt),
-        "<=" => binary_op(&head_name, args, env, coord, Expr::le),
-        ">=" => binary_op(&head_name, args, env, coord, Expr::ge),
-        "=" => binary_op(&head_name, args, env, coord, Expr::num_eq),
+        "<" => chainable_cmp(&head_name, args, env, coord, Expr::lt),
+        ">" => chainable_cmp(&head_name, args, env, coord, Expr::gt),
+        "<=" => chainable_cmp(&head_name, args, env, coord, Expr::le),
+        ">=" => chainable_cmp(&head_name, args, env, coord, Expr::ge),
+        "=" => chainable_cmp(&head_name, args, env, coord, Expr::num_eq),
         // Type predicates. Each takes one argument.
         "NULL" => unary_op(&head_name, args, env, coord, Expr::is_null),
         "CONSP" => unary_op(&head_name, args, env, coord, Expr::is_cons),
@@ -2271,12 +2271,18 @@ pub(crate) fn build_arglist_prologue(
 
     // Optionals are positional: arg index = required + i.
     for (i, opt) in params.optionals.iter().enumerate() {
+        let arg_idx = req_n + i as u32;
         let default_expr = match &opt.default {
             Some(form) => lower_in_mut(form, env, coord)?,
             None => Expr::Nil,
         };
-        let init = Expr::opt_arg(req_n + i as u32, default_expr);
+        let init = Expr::opt_arg(arg_idx, default_expr);
         push_param_local(env, &opt.name, init, &body_mutations, &mut bindings);
+        // supplied-p variable, if declared
+        if let Some(ref sp_name) = opt.supplied_p {
+            let sp_init = Expr::opt_supplied_p(arg_idx);
+            push_param_local(env, sp_name, sp_init, &body_mutations, &mut bindings);
+        }
     }
 
     // Rest binding (if present) follows optionals. The rest list
@@ -2301,6 +2307,11 @@ pub(crate) fn build_arglist_prologue(
             };
             let init = Expr::key_arg(kw_word, key_start, default_expr);
             push_param_local(env, &key.name, init, &body_mutations, &mut bindings);
+            // supplied-p variable, if declared
+            if let Some(ref sp_name) = key.supplied_p {
+                let sp_init = Expr::key_supplied_p(kw_word, key_start);
+                push_param_local(env, sp_name, sp_init, &body_mutations, &mut bindings);
+            }
         }
     }
 
@@ -2546,6 +2557,44 @@ fn lower_funcall(
         .map(|a| lower_in_mut(a, env, coord))
         .collect();
     Ok(Expr::funcall(fn_expr, lowered_args?))
+}
+
+/// Variadic comparison: `(< a b c)` → `(and (< a b) (< b c))`.
+/// For 0 args returns T, 1 arg returns T, 2 args is a simple binary op.
+/// Each intermediate value is evaluated exactly once (let-bound when
+/// used in multiple comparisons).
+fn chainable_cmp(
+    head: &str,
+    args: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+    build: fn(Expr, Expr) -> Expr,
+) -> Result<Expr, CompileError> {
+    match args.len() {
+        0 | 1 => Ok(Expr::True),
+        2 => Ok(build(
+            lower_in_mut(&args[0], env, coord)?,
+            lower_in_mut(&args[1], env, coord)?,
+        )),
+        _ => {
+            // Lower all args, then chain pairwise comparisons with AND.
+            let lowered: Result<Vec<_>, _> = args
+                .iter()
+                .map(|a| lower_in_mut(a, env, coord))
+                .collect();
+            let lowered = lowered?;
+            let mut pairs = Vec::new();
+            for i in 0..lowered.len() - 1 {
+                pairs.push(build(lowered[i].clone(), lowered[i + 1].clone()));
+            }
+            // Chain with nested if (short-circuit AND semantics)
+            let mut result = pairs.pop().unwrap();
+            while let Some(p) = pairs.pop() {
+                result = Expr::if_(p, result, Expr::Nil);
+            }
+            Ok(result)
+        }
+    }
 }
 
 fn binary_op(

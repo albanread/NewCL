@@ -2199,6 +2199,9 @@ pub struct ParamSpec {
 pub struct OptParam {
     pub name: Arc<str>,
     pub default: Option<Value>,
+    /// If present, a variable bound to T when the caller supplied
+    /// this argument, NIL otherwise. CL `(name default supplied-p)`.
+    pub supplied_p: Option<Arc<str>>,
 }
 
 /// One `&key` parameter. `keyword` is the colon-prefixed name used
@@ -2212,6 +2215,7 @@ pub struct KeyParam {
     pub name: Arc<str>,
     pub keyword: Arc<str>,
     pub default: Option<Value>,
+    pub supplied_p: Option<Arc<str>>,
 }
 
 /// Parsing state machine for an arglist. Steps strictly through
@@ -2315,8 +2319,8 @@ pub(crate) fn parse_param_list_inner(v: &Value) -> Result<ParamSpec, String> {
                         required.push(Arc::clone(&s.name));
                     }
                     ArglistMode::Optional => {
-                        let (name, default) = parse_init_form(&head)?;
-                        optionals.push(OptParam { name, default });
+                        let (name, default, supplied_p) = parse_init_form(&head)?;
+                        optionals.push(OptParam { name, default, supplied_p });
                     }
                     ArglistMode::Rest => {
                         return Err(format!(
@@ -2324,13 +2328,14 @@ pub(crate) fn parse_param_list_inner(v: &Value) -> Result<ParamSpec, String> {
                         ));
                     }
                     ArglistMode::Key => {
-                        let (name, default) = parse_init_form(&head)?;
+                        let (name, default, supplied_p) = parse_init_form(&head)?;
                         // Convention: the matching keyword is `:NAME`.
                         let kw_name = format!(":{}", name);
                         keys.push(KeyParam {
                             name,
                             keyword: Arc::from(kw_name.as_str()),
                             default,
+                            supplied_p,
                         });
                     }
                 }
@@ -2345,34 +2350,42 @@ pub(crate) fn parse_param_list_inner(v: &Value) -> Result<ParamSpec, String> {
     Ok(ParamSpec { required, optionals, rest, keys })
 }
 
-/// Parse one entry of the form `name`, `(name)`, or `(name
-/// default)`. Returns the name and the optional default form. The
-/// 3-element `(name default supplied-p)` shape is rejected for now
-/// — Closette doesn't use it widely; can grow later.
-fn parse_init_form(v: &Value) -> Result<(Arc<str>, Option<Value>), String> {
+/// Parse one entry of the form `name`, `(name)`, `(name default)`,
+/// or `(name default supplied-p)`. Returns the name, optional default
+/// form, and optional supplied-p variable name.
+fn parse_init_form(v: &Value) -> Result<(Arc<str>, Option<Value>, Option<Arc<str>>), String> {
     match v {
-        Value::Symbol(s) => Ok((Arc::clone(&s.name), None)),
-        Value::Cons(c) => {
-            let Value::Symbol(s) = &c.car else {
+        Value::Symbol(s) => Ok((Arc::clone(&s.name), None, None)),
+        Value::Cons(_) => {
+            let elems = list_to_vec_of_value(v)?;
+            if elems.is_empty() || elems.len() > 3 {
                 return Err(format!(
-                    "init-form name must be a symbol, got {:?}", c.car
+                    "init-form must be (name [default [supplied-p]]), got {} elements",
+                    elems.len()
                 ));
-            };
-            let name = Arc::clone(&s.name);
-            match &c.cdr {
-                Value::Nil => Ok((name, None)),
-                Value::Cons(c2) => {
-                    if !matches!(c2.cdr, Value::Nil) {
-                        return Err(
-                            "init-form may have at most (name default); supplied-p flag not yet supported".into(),
-                        );
-                    }
-                    Ok((name, Some(c2.car.clone())))
-                }
-                other => Err(format!(
-                    "init-form tail must be a list, got {other:?}"
-                )),
             }
+            let name = match &elems[0] {
+                Value::Symbol(s) => Arc::clone(&s.name),
+                other => return Err(format!(
+                    "init-form name must be a symbol, got {other:?}"
+                )),
+            };
+            let default = if elems.len() >= 2 {
+                Some(elems[1].clone())
+            } else {
+                None
+            };
+            let supplied_p = if elems.len() == 3 {
+                match &elems[2] {
+                    Value::Symbol(s) => Some(Arc::clone(&s.name)),
+                    other => return Err(format!(
+                        "supplied-p must be a symbol, got {other:?}"
+                    )),
+                }
+            } else {
+                None
+            };
+            Ok((name, default, supplied_p))
         }
         other => Err(format!(
             "init-form must be a symbol or a list, got {other:?}"
@@ -7292,5 +7305,69 @@ mod end_to_end_tests {
             s.eval("(funcall (lambda (a b) (+ a b)) 20 22)").unwrap(),
             "42",
         );
+    }
+
+    // ── Supplied-p ────────────────────────────────────────────────
+
+    #[test]
+    fn optional_supplied_p() {
+        let mut s = Session::with_stdlib().unwrap();
+        // With supplied-p flag on &optional
+        assert_eq!(
+            s.eval("(funcall (lambda (&optional (x 10 x-p)) (list x x-p)) 42)").unwrap(),
+            "(42 T)",
+        );
+        assert_eq!(
+            s.eval("(funcall (lambda (&optional (x 10 x-p)) (list x x-p)))").unwrap(),
+            "(10 nil)",
+        );
+    }
+
+    #[test]
+    fn key_supplied_p() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(funcall (lambda (&key (x 10 x-p)) (list x x-p)) :x 42)").unwrap(),
+            "(42 T)",
+        );
+        assert_eq!(
+            s.eval("(funcall (lambda (&key (x 10 x-p)) (list x x-p)))").unwrap(),
+            "(10 nil)",
+        );
+    }
+
+    #[test]
+    fn defun_supplied_p() {
+        let mut s = Session::with_stdlib().unwrap();
+        // defun also supports supplied-p
+        s.eval("(defun sp-test (&key (value nil value-p)) (if value-p value 'default))").unwrap();
+        assert_eq!(s.eval("(sp-test :value 42)").unwrap(), "42");
+        assert_eq!(s.eval("(sp-test)").unwrap(), "DEFAULT");
+    }
+
+    // ── Variadic comparisons ──────────────────────────────────────
+
+    #[test]
+    fn variadic_less_than() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(< 1 2 3)").unwrap(), "T");
+        assert_eq!(s.eval("(< 1 3 2)").unwrap(), "nil");
+        assert_eq!(s.eval("(< 1)").unwrap(), "T");
+        assert_eq!(s.eval("(<)").unwrap(), "T");
+    }
+
+    #[test]
+    fn variadic_equals() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(= 5 5 5)").unwrap(), "T");
+        assert_eq!(s.eval("(= 5 5 6)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn variadic_greater_equal() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(>= 3 2 1)").unwrap(), "T");
+        assert_eq!(s.eval("(>= 3 2 2)").unwrap(), "T");
+        assert_eq!(s.eval("(>= 3 2 3)").unwrap(), "nil");
     }
 }

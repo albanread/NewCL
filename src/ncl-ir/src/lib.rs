@@ -38,6 +38,10 @@ pub enum Expr {
     /// and optional params already bound, so CL's
     /// `(defun foo (a &optional (b (* a 2))))` semantics work.
     OptArg { idx: u32, default: Box<Expr> },
+    /// `supplied-p` test for optional args: T if `n_args > idx`, NIL otherwise.
+    OptSuppliedP(u32),
+    /// `supplied-p` test for keyword args: T if the keyword was found, NIL otherwise.
+    KeySuppliedP { keyword_word: u64, key_start: u32 },
     /// `(values v1 v2 ... vN)` — write all `vals` into the
     /// thread-local multi-value slot, return `vals[0]` (or NIL if
     /// empty). The caller (typically multiple-value-bind) reads the
@@ -326,6 +330,12 @@ impl Expr {
     }
     pub fn opt_arg(idx: u32, default: Expr) -> Expr {
         Expr::OptArg { idx, default: Box::new(default) }
+    }
+    pub fn opt_supplied_p(idx: u32) -> Expr {
+        Expr::OptSuppliedP(idx)
+    }
+    pub fn key_supplied_p(keyword_word: u64, key_start: u32) -> Expr {
+        Expr::KeySuppliedP { keyword_word, key_start }
     }
     pub fn key_arg(keyword_word: u64, key_start: u32, default: Expr) -> Expr {
         Expr::KeyArg {

@@ -6,6 +6,10 @@
 # same install as our sibling project NewCP.
 [env]
 LLVM_SYS_221_PREFIX = "C:\\projects\\LLVM\\install"
+# Test threads need large stacks: each test loads the full stdlib
+# (macroexpansion + LLVM codegen recurse deeply in debug mode).
+# 8 MiB matches the ncl-driver worker thread.
+RUST_MIN_STACK = "8388608"
 
 # Windows debug builds need a fatter main-thread stack. The default
 # 1 MiB is fine for release (optimized frames are tight), but debug
