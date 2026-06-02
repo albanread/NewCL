@@ -1067,6 +1067,11 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
 (defun fixnump (x) (typep x 'fixnum))
 (defun characterp (x) (typep x 'character))
 (defun functionp (x) (typep x 'function))
+(defun floatp (x) (typep x 'float))
+(defun rationalp (x) (typep x 'rational))
+(defun realp (x) (typep x 'real))
+(defun complexp (x) (typep x 'complex))
+(defun packagep (x) (typep x 'package))
 
 ;; -- defstruct ---------------------------------------------------------------
 ;;
@@ -1779,6 +1784,219 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
   `(unless (typep ,place ',typespec)
      (error (format nil "The value ~S is not of type ~A"
                     ,place ',typespec))))
+
+;; -- Sweep II: missing CL standard functions ---------------------------------
+
+;; -- assoc-if / rassoc-if / member-if ----------------------------------------
+
+(defun assoc-if (pred alist &key (key #'identity))
+  "Return first entry in ALIST whose KEY of car satisfies PRED."
+  (cond
+    ((null alist) nil)
+    ((funcall pred (funcall key (car (car alist)))) (car alist))
+    (t (assoc-if pred (cdr alist) :key key))))
+
+(defun rassoc-if (pred alist &key (key #'identity))
+  "Return first entry in ALIST whose KEY of cdr satisfies PRED."
+  (cond
+    ((null alist) nil)
+    ((funcall pred (funcall key (cdr (car alist)))) (car alist))
+    (t (rassoc-if pred (cdr alist) :key key))))
+
+(defun member-if (pred lst &key (key #'identity))
+  "Return tail of LST starting at first element satisfying PRED."
+  (cond
+    ((null lst) nil)
+    ((funcall pred (funcall key (car lst))) lst)
+    (t (member-if pred (cdr lst) :key key))))
+
+(defun member-if-not (pred lst &key (key #'identity))
+  "Return tail of LST starting at first element NOT satisfying PRED."
+  (member-if (complement pred) lst :key key))
+
+;; -- position-if / find-if-not -----------------------------------------------
+
+(defun position-if (pred seq &key (key #'identity))
+  "Return index of first element in SEQ satisfying PRED, or NIL."
+  (%position-if-from pred (%as-list seq) 0 key))
+
+(defun %position-if-from (pred lst i key)
+  (cond
+    ((null lst) nil)
+    ((funcall pred (funcall key (car lst))) i)
+    (t (%position-if-from pred (cdr lst) (1+ i) key))))
+
+(defun position-if-not (pred seq &key (key #'identity))
+  "Return index of first element NOT satisfying PRED."
+  (position-if (complement pred) seq :key key))
+
+(defun find-if-not (pred seq &key (key #'identity))
+  "Return first element in SEQ NOT satisfying PRED."
+  (find-if (complement pred) seq :key key))
+
+;; -- char case-insensitive comparisons (sweep II) ----------------------------
+
+(defun char-lessp (c1 c2)
+  "Case-insensitive char<."
+  (char< (char-upcase c1) (char-upcase c2)))
+
+(defun char-greaterp (c1 c2)
+  "Case-insensitive char>."
+  (char> (char-upcase c1) (char-upcase c2)))
+
+(defun char-not-greaterp (c1 c2)
+  "Case-insensitive char<=."
+  (char<= (char-upcase c1) (char-upcase c2)))
+
+(defun char-not-lessp (c1 c2)
+  "Case-insensitive char>=."
+  (char>= (char-upcase c1) (char-upcase c2)))
+
+;; -- nstring destructives (sweep II) -----------------------------------------
+
+(defun nstring-upcase (string)
+  "Destructively upcase STRING in place."
+  (dotimes (i (length string))
+    (setf (char string i) (char-upcase (char string i))))
+  string)
+
+(defun nstring-downcase (string)
+  "Destructively downcase STRING in place."
+  (dotimes (i (length string))
+    (setf (char string i) (char-downcase (char string i))))
+  string)
+
+(defun nstring-capitalize (string)
+  "Destructively capitalize STRING: first char of each word up, rest down."
+  (let ((start t))
+    (dotimes (i (length string))
+      (let ((ch (char string i)))
+        (cond
+          ((alpha-char-p ch)
+           (if start
+               (setf (char string i) (char-upcase ch))
+               (setf (char string i) (char-downcase ch)))
+           (setq start nil))
+          (t (setq start t))))))
+  string)
+
+;; -- copy-seq / replace (sweep II) -------------------------------------------
+
+(defun copy-seq (seq)
+  "Return a fresh copy of SEQ."
+  (cond
+    ((listp seq)   (copy-list seq))
+    ((stringp seq) (subseq seq 0))
+    ((vectorp seq) (subseq seq 0))
+    (t (error (format nil "copy-seq: not a sequence: ~S" seq)))))
+
+(defun replace (seq1 seq2 &key (start1 0) end1 (start2 0) end2)
+  "Copy elements from SEQ2 into SEQ1 destructively. Returns SEQ1."
+  (let* ((src (%as-list (subseq seq2 start2 end2)))
+         (e1 (or end1 (length seq1)))
+         (pos start1))
+    (dolist (elem src)
+      (when (>= pos e1) (return))
+      (if (listp seq1)
+          (setf (nth pos seq1) elem)
+          (setf (aref seq1 pos) elem))
+      (setq pos (1+ pos))))
+  seq1)
+
+;; -- set-exclusive-or / subsetp (sweep II) -----------------------------------
+
+(defun set-exclusive-or (xs ys &key (test #'eql) (key #'identity))
+  "Elements in either XS or YS but not both."
+  (append (set-difference xs ys :test test :key key)
+          (set-difference ys xs :test test :key key)))
+
+(defun nset-exclusive-or (xs ys &key (test #'eql) (key #'identity))
+  "Destructive version of set-exclusive-or."
+  (nconc (set-difference xs ys :test test :key key)
+         (set-difference ys xs :test test :key key)))
+
+(defun subsetp (xs ys &key (test #'eql) (key #'identity))
+  "Return T if every element of XS is in YS."
+  (every (lambda (x)
+           (member (funcall key x) ys :test test :key key))
+         xs))
+
+;; -- mapl / mapcon (sweep II) ------------------------------------------------
+
+(defun mapl (fn list &rest more-lists)
+  "Like mapc but passes successive cdrs to FN."
+  (cond
+    ((null more-lists) (%mapl-1 fn list))
+    (t (error "mapl: multiple lists not yet supported")))
+  list)
+
+(defun %mapl-1 (fn lst)
+  (when lst
+    (funcall fn lst)
+    (%mapl-1 fn (cdr lst))))
+
+(defun mapcon (fn list &rest more-lists)
+  "Like mapcan but passes successive cdrs to FN."
+  (apply #'nconc (apply #'maplist fn list more-lists)))
+
+;; -- map (generic CL map) (sweep II) ----------------------------------------
+
+(defun map (result-type fn &rest seqs)
+  "Apply FN to successive elements of SEQS, collecting into RESULT-TYPE."
+  (let ((results (apply #'mapcar fn (mapcar #'%as-list seqs))))
+    (cond
+      ((null result-type) nil)
+      ((eq result-type 'list) results)
+      ((eq result-type 'string) (coerce results 'string))
+      ((eq result-type 'vector) (coerce results 'vector))
+      (t (error (format nil "map: unsupported result-type ~S" result-type))))))
+
+;; -- nsubstitute / nsubstitute-if (sweep II) ---------------------------------
+
+(defun nsubstitute (new old seq &key (test #'eql) (key #'identity))
+  "Destructively substitute NEW for OLD in SEQ."
+  (let ((lst (%as-list seq)))
+    (%nsubst-list new old lst test key))
+  seq)
+
+(defun %nsubst-list (new old lst test key)
+  (when lst
+    (when (funcall test old (funcall key (car lst)))
+      (setf (car lst) new))
+    (%nsubst-list new old (cdr lst) test key)))
+
+(defun nsubstitute-if (new pred seq &key (key #'identity))
+  "Destructively substitute NEW where PRED holds in SEQ."
+  (let ((lst (%as-list seq)))
+    (%nsubst-if-list new pred lst key))
+  seq)
+
+(defun %nsubst-if-list (new pred lst key)
+  (when lst
+    (when (funcall pred (funcall key (car lst)))
+      (setf (car lst) new))
+    (%nsubst-if-list new pred (cdr lst) key)))
+
+;; -- multiple-value-prog1 (sweep II) ----------------------------------------
+
+(defmacro multiple-value-prog1 (first-form &rest more-forms)
+  "Evaluate FIRST-FORM, save all its values, evaluate MORE-FORMS,
+   then return all saved values from FIRST-FORM."
+  (let ((vals (gensym "MVPROG1")))
+    `(let ((,vals (multiple-value-list ,first-form)))
+       ,@more-forms
+       (values-list ,vals))))
+
+;; -- nreconc (sweep II) ------------------------------------------------------
+
+(defun nreconc (list tail)
+  "Destructive version of (revappend list tail).
+   Equivalent to (nconc (nreverse list) tail) but more efficient."
+  (if (null list)
+      tail
+      (let ((rest (cdr list)))
+        (setf (cdr list) tail)
+        (nreconc rest list))))
 
 ;; -- Hash tables -------------------------------------------------------------
 ;;

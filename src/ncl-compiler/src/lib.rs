@@ -6986,4 +6986,212 @@ mod end_to_end_tests {
             "T",
         );
     }
+
+    // ── Sweep II: type predicates ─────────────────────────────────
+
+    #[test]
+    fn floatp_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(floatp 3.14)").unwrap(), "T");
+        assert_eq!(s.eval("(floatp 42)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn rationalp_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(rationalp 1/3)").unwrap(), "T");
+        assert_eq!(s.eval("(rationalp 42)").unwrap(), "T");
+        assert_eq!(s.eval("(rationalp 3.14)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn realp_and_complexp_work() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(realp 42)").unwrap(), "T");
+        assert_eq!(s.eval("(realp 3.14)").unwrap(), "T");
+        assert_eq!(s.eval("(complexp #C(1 2))").unwrap(), "T");
+        assert_eq!(s.eval("(complexp 42)").unwrap(), "nil");
+    }
+
+    // ── Sweep II: assoc-if / rassoc-if / member-if ────────────────
+
+    #[test]
+    fn assoc_if_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(assoc-if #'oddp '((2 . a) (3 . b) (4 . c)))").unwrap(),
+            "(3 . B)",
+        );
+    }
+
+    #[test]
+    fn rassoc_if_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(rassoc-if #'symbolp '((1 . 10) (2 . hello)))").unwrap(),
+            "(2 . HELLO)",
+        );
+    }
+
+    #[test]
+    fn member_if_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(member-if #'evenp '(1 3 5 6 7))").unwrap(),
+            "(6 7)",
+        );
+    }
+
+    // ── Sweep II: position-if / find-if-not ───────────────────────
+
+    #[test]
+    fn position_if_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(position-if #'evenp '(1 3 4 5))").unwrap(), "2");
+        assert_eq!(s.eval("(position-if #'evenp '(1 3 5))").unwrap(), "nil");
+    }
+
+    #[test]
+    fn find_if_not_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(find-if-not #'oddp '(1 3 4 5))").unwrap(), "4");
+    }
+
+    // ── Sweep II: char case-insensitive ───────────────────────────
+
+    #[test]
+    fn char_lessp_greaterp() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval(r#"(char-lessp #\a #\B)"#).unwrap(), "T");
+        assert_eq!(s.eval(r#"(char-greaterp #\b #\A)"#).unwrap(), "T");
+        assert_eq!(s.eval(r#"(char-not-greaterp #\A #\a)"#).unwrap(), "T");
+        assert_eq!(s.eval(r#"(char-not-lessp #\a #\A)"#).unwrap(), "T");
+    }
+
+    // ── Sweep II: nstring destructives ────────────────────────────
+
+    #[test]
+    fn nstring_upcase_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.activate();
+        assert_eq!(
+            s.eval(r#"(equal (nstring-upcase (copy-seq "hello")) "HELLO")"#).unwrap(),
+            "T",
+        );
+    }
+
+    #[test]
+    fn nstring_downcase_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.activate();
+        assert_eq!(
+            s.eval(r#"(equal (nstring-downcase (copy-seq "HELLO")) "hello")"#).unwrap(),
+            "T",
+        );
+    }
+
+    #[test]
+    fn nstring_capitalize_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.activate();
+        assert_eq!(
+            s.eval(r#"(equal (nstring-capitalize (copy-seq "hello world")) "Hello World")"#).unwrap(),
+            "T",
+        );
+    }
+
+    // ── Sweep II: copy-seq / replace ──────────────────────────────
+
+    #[test]
+    fn copy_seq_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(copy-seq '(1 2 3))").unwrap(), "(1 2 3)");
+    }
+
+    #[test]
+    fn replace_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(let ((v (vector 1 2 3 4 5))) \
+                      (replace v '(9 8) :start1 1) \
+                      v)").unwrap(),
+            "#(1 9 8 4 5)",
+        );
+    }
+
+    // ── Sweep II: set operations ──────────────────────────────────
+
+    #[test]
+    fn set_exclusive_or_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        // Elements in either but not both: {1,2,3} XOR {2,3,4} = {1,4}
+        assert_eq!(
+            s.eval("(sort (set-exclusive-or '(1 2 3) '(2 3 4)) #'<)").unwrap(),
+            "(1 4)",
+        );
+    }
+
+    #[test]
+    fn subsetp_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(s.eval("(subsetp '(1 2) '(1 2 3))").unwrap(), "T");
+        assert_eq!(s.eval("(subsetp '(1 4) '(1 2 3))").unwrap(), "nil");
+    }
+
+    // ── Sweep II: mapl / mapcon / map ─────────────────────────────
+
+    #[test]
+    fn mapcon_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(mapcon (lambda (l) (list (length l))) '(a b c d))").unwrap(),
+            "(4 3 2 1)",
+        );
+    }
+
+    #[test]
+    fn map_generic_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(map 'list #'+ '(1 2 3) '(10 20 30))").unwrap(),
+            "(11 22 33)",
+        );
+    }
+
+    // ── Sweep II: nsubstitute ─────────────────────────────────────
+
+    #[test]
+    fn nsubstitute_destructive() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(let ((lst (list 1 2 3 2 1))) \
+                      (nsubstitute 9 2 lst) \
+                      lst)").unwrap(),
+            "(1 9 3 9 1)",
+        );
+    }
+
+    // ── Sweep II: multiple-value-prog1 ────────────────────────────
+
+    #[test]
+    fn multiple_value_prog1_primary() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.activate();
+        // Primary value preserved across side-effecting forms
+        assert_eq!(
+            s.eval("(multiple-value-prog1 42 (+ 1 2) (+ 3 4))").unwrap(),
+            "42",
+        );
+    }
+
+    // ── Sweep II: nreconc ─────────────────────────────────────────
+
+    #[test]
+    fn nreconc_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(nreconc (list 3 2 1) '(4 5))").unwrap(),
+            "(1 2 3 4 5)",
+        );
+    }
 }
