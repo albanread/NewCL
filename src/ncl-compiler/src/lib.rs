@@ -235,7 +235,21 @@ impl Session {
         }
         let expr = lower(&expanded, &self.coord).map_err(EvalError::Compile)?;
         let mutator_ptr = &mut *self.mutator as *mut _;
-        ncl_llvm::jit_eval(&expr, mutator_ptr).map_err(EvalError::Jit)
+        // Guard the JIT execution: establish a backstop handler frame so
+        // a condition that escapes this top-level form (undefined
+        // function, error, type error with no enclosing handler-case)
+        // defers and surfaces as a recoverable EvalError::Runtime —
+        // instead of hitting HANDLER_DEPTH == 0 and exiting the process.
+        // This is what lets the REPL keep going after an error, and lets
+        // stdlib load report the actual failing form rather than dying
+        // with a bare 0xC0000409.
+        let guard = ncl_runtime::abi::condition_guard_enter();
+        let jit_result = ncl_llvm::jit_eval(&expr, mutator_ptr);
+        if let Some(cond_raw) = ncl_runtime::abi::condition_guard_exit(guard) {
+            let msg = ncl_runtime::format_word_aesthetic(Word::from_raw(cond_raw));
+            return Err(EvalError::Runtime(msg));
+        }
+        jit_result.map_err(EvalError::Jit)
     }
 
     /// Dry-run check of a single Value: do parse + macroexpand + lower
@@ -2428,6 +2442,11 @@ pub enum EvalError {
     Read(String),
     Compile(CompileError),
     Jit(String),
+    /// A Lisp condition escaped to the top level with no handler.
+    /// Captured by the top-level eval guard so it surfaces as a
+    /// recoverable error (REPL keeps going, embedders get an Err)
+    /// instead of terminating the process.
+    Runtime(String),
 }
 
 impl std::fmt::Display for EvalError {
@@ -2436,6 +2455,7 @@ impl std::fmt::Display for EvalError {
             EvalError::Read(s) => write!(f, "read error: {s}"),
             EvalError::Compile(e) => write!(f, "compile error: {e:?}"),
             EvalError::Jit(s) => write!(f, "jit error: {s}"),
+            EvalError::Runtime(s) => write!(f, "unhandled condition: {s}"),
         }
     }
 }
@@ -7805,5 +7825,49 @@ mod end_to_end_tests {
         let mut s = Session::with_stdlib().unwrap();
         s.eval("(defmacro probe-good-macro (a b) (list '+ a b))").unwrap();
         assert_eq!(s.eval("(probe-good-macro 19 23)").unwrap(), "42");
+    }
+
+    // ── Unhandled-condition recovery (top-level eval guard) ───────
+
+    #[test]
+    fn unhandled_condition_at_toplevel_is_recoverable() {
+        // An undefined function at top level (no handler-case) used to
+        // abort the process (0xC0000409). It must now return an Err.
+        let mut s = Session::with_stdlib().unwrap();
+        let r = s.eval("(no-such-function-xyz 1 2 3)");
+        assert!(r.is_err(), "expected Err, got {r:?}");
+        let msg = format!("{r:?}").to_lowercase();
+        assert!(msg.contains("undefined function"), "got: {msg}");
+    }
+
+    #[test]
+    fn toplevel_explicit_error_is_recoverable() {
+        let mut s = Session::with_stdlib().unwrap();
+        let r = s.eval(r#"(error "boom at top level")"#);
+        assert!(r.is_err(), "expected Err, got {r:?}");
+        assert!(format!("{r:?}").contains("boom at top level"), "got: {r:?}");
+    }
+
+    #[test]
+    fn session_survives_unhandled_condition() {
+        // The REPL/session must remain usable after an unhandled error —
+        // the guard cleared the abort flag so the next form runs clean.
+        let mut s = Session::with_stdlib().unwrap();
+        s.activate();
+        let _ = s.eval("(no-such-function-xyz)");
+        assert_eq!(s.eval("(+ 1 2)").unwrap(), "3");
+        let _ = s.eval(r#"(error "second boom")"#);
+        assert_eq!(s.eval("(* 6 7)").unwrap(), "42");
+    }
+
+    #[test]
+    fn handler_case_unaffected_by_toplevel_guard() {
+        // The top-level guard is only a backstop: a handler-case inside
+        // the form must still catch its own condition normally.
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(handler-case (error \"x\") (error (e) e 'handled))").unwrap(),
+            "HANDLED",
+        );
     }
 }

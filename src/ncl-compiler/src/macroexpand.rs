@@ -304,7 +304,7 @@ pub fn macroexpand_all(
             // explicit `error`) defers and is reported as a clean
             // compile error instead of calling std::process::abort()
             // — which on Windows looks exactly like a stack overflow.
-            let guard = ncl_runtime::abi::macro_guard_enter();
+            let guard = ncl_runtime::abi::condition_guard_enter();
             let result_word_raw = unsafe {
                 f(
                     mutator as *mut _,
@@ -313,7 +313,7 @@ pub fn macroexpand_all(
                     arg_words.len() as u64,
                 )
             };
-            if let Some(cond_raw) = ncl_runtime::abi::macro_guard_exit(guard) {
+            if let Some(cond_raw) = ncl_runtime::abi::condition_guard_exit(guard) {
                 let msg = ncl_runtime::format_word_aesthetic(Word::from_raw(cond_raw));
                 return Err(EvalError::Compile(crate::CompileError::MacroError(
                     format!("while expanding macro ({head_name} …): {msg}"),

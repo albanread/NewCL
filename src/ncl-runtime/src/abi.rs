@@ -29,11 +29,38 @@ fn record_pending_condition(cond_raw: u64) -> u64 {
     Word::NIL.raw()
 }
 
+/// Distinct process exit code for an unhandled Lisp condition.
+/// Chosen so it is NOT a crash signature: `std::process::abort()` on
+/// Windows raises __fastfail and exits 0xC0000409, byte-identical to
+/// a stack overflow or buffer overrun, and a Rust panic exits 101.
+/// 70 (BSD sysexits EX_SOFTWARE, "internal software error") is stable
+/// and unambiguously "your program signaled an error nobody caught,"
+/// not "the runtime crashed."
+pub const EXIT_UNHANDLED_CONDITION: i32 = 70;
+
+/// Terminate the process on an unhandled Lisp condition: print a
+/// clear, flushed diagnostic and exit with EXIT_UNHANDLED_CONDITION.
+///
+/// Used by every signal path when no `handler-case` is active. We
+/// deliberately use `exit`, not `abort`, so the failure is legible:
+/// a controlled "unhandled condition" is a normal (if terminal)
+/// outcome of running Lisp, not a runtime bug, and should not look
+/// like one in logs, CI, or a debugger.
+pub(crate) fn die_unhandled_condition(msg: &str) -> ! {
+    use std::io::Write;
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(err, "\nUnhandled Lisp condition: {msg}");
+    let _ = writeln!(
+        err,
+        "No active handler-case to catch it; exiting (code {EXIT_UNHANDLED_CONDITION})."
+    );
+    let _ = err.flush();
+    std::process::exit(EXIT_UNHANDLED_CONDITION);
+}
+
 fn signal_condition_word_and_abort(cond: Word) -> u64 {
     if HANDLER_DEPTH.with(|d| d.get()) == 0 {
-        let msg = crate::printer::format_word_aesthetic(cond);
-        eprintln!("unhandled condition: {msg}");
-        std::process::abort();
+        die_unhandled_condition(&crate::printer::format_word_aesthetic(cond));
     }
     record_pending_condition(cond.raw())
 }
@@ -784,43 +811,43 @@ pub fn signal_condition_string(
     msg: &str,
 ) -> u64 {
     if HANDLER_DEPTH.with(|d| d.get()) == 0 {
-        eprintln!("unhandled condition: {msg}");
-        std::process::abort();
+        die_unhandled_condition(msg);
     }
     let m = unsafe { &mut *mutator };
     let cond = crate::gc_string::alloc_string_in_young(m, msg);
     record_pending_condition(cond.raw())
 }
 
-/// Macroexpansion guard — enter a region in which signaled
-/// conditions DEFER instead of aborting the process.
+/// Condition guard — enter a region in which signaled conditions
+/// DEFER instead of terminating the process.
 ///
-/// The macroexpander invokes a macro's compiled expander function
-/// directly, not through `handler-case`. Without a guard, any
-/// condition the expander signals (an undefined function, a type
-/// error, an explicit `(error …)`) hits `HANDLER_DEPTH == 0` inside
-/// `signal_condition_string` and calls `std::process::abort()` —
-/// which on Windows surfaces as exit code 0xC0000409, visually
-/// identical to a stack overflow, with no recoverable error. That
-/// turned a trivial "typo'd function name in a macro" into a
-/// process-killing mystery crash.
+/// Used in two places that run Lisp code outside any `handler-case`:
+///   1. The macroexpander, which invokes a macro's compiled expander
+///      function directly. A condition the expander signals (undefined
+///      function, type error, explicit `(error …)`) would otherwise
+///      hit `HANDLER_DEPTH == 0` and exit the process — on Windows
+///      with code 0xC0000409, visually identical to a stack overflow.
+///   2. Top-level eval (the REPL, file loading, stdlib bootstrap),
+///      so a condition that escapes the form becomes a recoverable
+///      error instead of killing the whole session.
 ///
-/// `macro_guard_enter` bumps `HANDLER_DEPTH` so signals defer (record
-/// a pending condition and return NIL) and snapshots the current
-/// pending state to restore on exit. Pair with `macro_guard_exit`.
-pub fn macro_guard_enter() -> (bool, u64) {
+/// `condition_guard_enter` bumps `HANDLER_DEPTH` so signals defer
+/// (record a pending condition and return NIL) and snapshots the
+/// current pending state to restore on exit. Pair with
+/// `condition_guard_exit`.
+pub fn condition_guard_enter() -> (bool, u64) {
     let saved_pending = CONDITION_PENDING.with(|p| p.replace(false));
     let saved_slot = CONDITION_SLOT.with(|s| s.get());
     HANDLER_DEPTH.with(|d| d.set(d.get() + 1));
     (saved_pending, saved_slot)
 }
 
-/// Macroexpansion guard — exit. Restores `HANDLER_DEPTH` and the
-/// saved pending state. If a condition was signaled during the
-/// guarded region, returns `Some(cond_raw)` (the condition Word) and
-/// clears `ABORT_PENDING` so subsequent compilation isn't poisoned by
-/// a stale flag; otherwise returns `None`.
-pub fn macro_guard_exit(saved: (bool, u64)) -> Option<u64> {
+/// Condition guard — exit. Restores `HANDLER_DEPTH` and the saved
+/// pending state. If a condition was signaled during the guarded
+/// region, returns `Some(cond_raw)` (the condition Word) and clears
+/// `ABORT_PENDING` so subsequent work isn't poisoned by a stale flag;
+/// otherwise returns `None`.
+pub fn condition_guard_exit(saved: (bool, u64)) -> Option<u64> {
     HANDLER_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
     let was_pending = CONDITION_PENDING.with(|p| p.replace(saved.0));
     let cond = CONDITION_SLOT.with(|s| s.replace(saved.1));
@@ -850,11 +877,8 @@ pub extern "C-unwind" fn error_shim(
         unsafe { *args }
     };
     if HANDLER_DEPTH.with(|d| d.get()) == 0 {
-        // No handler — render the condition and abort.
-        let w = Word::from_raw(cond);
-        let msg = crate::printer::format_word_aesthetic(w);
-        eprintln!("unhandled condition: {msg}");
-        std::process::abort();
+        // No handler — render the condition and exit cleanly.
+        die_unhandled_condition(&crate::printer::format_word_aesthetic(Word::from_raw(cond)));
     }
     record_pending_condition(cond)
 }
