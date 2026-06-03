@@ -2880,8 +2880,42 @@ pub extern "C-unwind" fn fmakunbound_shim(
 
 /// `(fboundp sym)` — return T if SYM has a function cell bound,
 /// NIL otherwise.
+/// The ANSI Common Lisp special operators (CLHS Figure 3-2). Used by
+/// SPECIAL-OPERATOR-P and FBOUNDP. Names are upper-case to match the
+/// reader's case-folding and the symbol-name registry.
+const ANSI_SPECIAL_OPERATORS: &[&str] = &[
+    "BLOCK", "CATCH", "EVAL-WHEN", "FLET", "FUNCTION", "GO", "IF",
+    "LABELS", "LET", "LET*", "LOAD-TIME-VALUE", "LOCALLY", "MACROLET",
+    "MULTIPLE-VALUE-CALL", "MULTIPLE-VALUE-PROG1", "PROGN", "PROGV",
+    "QUOTE", "RETURN-FROM", "SETQ", "SYMBOL-MACROLET", "TAGBODY", "THE",
+    "THROW", "UNWIND-PROTECT",
+];
+
+fn is_ansi_special_operator(name: &str) -> bool {
+    ANSI_SPECIAL_OPERATORS.contains(&name)
+}
+
+/// Standard CL macros that NCL bakes into the compiler (lowered directly
+/// in ncl-compiler's `lower.rs`) rather than registering in the macro
+/// table. They have no function cell and aren't ANSI special operators,
+/// so FBOUNDP would otherwise miss them even though they are fbound. Used
+/// by FBOUNDP only — they are macros, not special operators, so
+/// SPECIAL-OPERATOR-P must still answer NIL for them. Keep in sync with
+/// the corresponding `"NAME" =>` arms in lower.rs.
+const NCL_COMPILER_MACROS: &[&str] = &[
+    "AND", "OR", "WHEN", "UNLESS", "COND", "SETF", "DECF", "DEFVAR",
+];
+
+fn is_ncl_compiler_macro(name: &str) -> bool {
+    NCL_COMPILER_MACROS.contains(&name)
+}
+
+/// `(fboundp symbol)` — true if SYMBOL is fbound: it names a function, a
+/// macro, OR a special operator. Previously this checked only the
+/// function cell, so (fboundp 'when) [macro] and (fboundp 'if) [special
+/// operator] wrongly returned NIL.
 pub extern "C-unwind" fn fboundp_shim(
-    _mutator: *mut crate::mutator::MutatorState,
+    mutator: *mut crate::mutator::MutatorState,
     _env: u64,
     args: *const u64,
     n_args: u64,
@@ -2893,12 +2927,77 @@ pub extern "C-unwind" fn fboundp_shim(
     if sym.tag() != Tag::Symbol {
         return Word::NIL.raw();
     }
-    let f = crate::gc_symbol::function_acquire(sym);
-    if f.is_unbound() {
-        Word::NIL.raw()
-    } else {
-        Word::T.raw()
+    if !crate::gc_symbol::function_acquire(sym).is_unbound() {
+        return Word::T.raw();
     }
+    // Not a plain function — is it a macro or a special operator?
+    let m = unsafe { &mut *mutator };
+    if let Some(name) = crate::sym_names::lookup(sym.raw()) {
+        if m.coord().macro_for(&name).is_some()
+            || is_ansi_special_operator(&name)
+            || is_ncl_compiler_macro(&name)
+        {
+            return Word::T.raw();
+        }
+    }
+    Word::NIL.raw()
+}
+
+/// `(macro-function symbol)` — the macro expander Function for SYMBOL,
+/// or NIL if SYMBOL does not name a macro. NCL macro expanders take the
+/// macro call's *arguments* (the cdr of the form) positionally, matching
+/// how the compiler invokes them; the Lisp-level MACROEXPAND-1 bridges
+/// that to the CL (form env) contract via APPLY.
+pub extern "C-unwind" fn macro_function_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    // (macro-function symbol &optional environment) — environment ignored.
+    if n_args < 1 {
+        panic!("macro-function: expected at least 1 arg (symbol), got {n_args}");
+    }
+    let sym = Word::from_raw(unsafe { *args });
+    if sym.tag() != Tag::Symbol {
+        return Word::NIL.raw();
+    }
+    let m = unsafe { &mut *mutator };
+    match crate::sym_names::lookup(sym.raw())
+        .and_then(|name| m.coord().macro_for(&name))
+    {
+        Some(w) => w.raw(),
+        None => Word::NIL.raw(),
+    }
+}
+
+/// `(special-operator-p symbol)` — true if SYMBOL is one of the ANSI
+/// special operators AND is not currently shadowed by a macro. (NCL
+/// implements some standardized operators, e.g. LET*, as macros; CLHS
+/// allows that, and such a symbol is then a macro, not a special
+/// operator, so it answers NIL here.)
+pub extern "C-unwind" fn special_operator_p_shim(
+    mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        panic!("special-operator-p: expected 1 arg (symbol), got {n_args}");
+    }
+    let sym = Word::from_raw(unsafe { *args });
+    if sym.tag() != Tag::Symbol {
+        return Word::NIL.raw();
+    }
+    let m = unsafe { &mut *mutator };
+    if let Some(name) = crate::sym_names::lookup(sym.raw()) {
+        if m.coord().macro_for(&name).is_none()
+            && is_ansi_special_operator(&name)
+        {
+            return Word::T.raw();
+        }
+    }
+    Word::NIL.raw()
 }
 
 // ───────────────────────────────────────────────────────────────────

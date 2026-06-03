@@ -427,5 +427,36 @@ UNWIND-PROTECT yet), but the common case of normal return is correct."
              (let ,(mapcar (lambda (n g) (list n g)) names gensyms)
                (progn ,@body))))))
 
+;; ── Macro introspection (CL §3.8) ─────────────────────────────────────────
+;;
+;; MACRO-FUNCTION and SPECIAL-OPERATOR-P are native shims (they consult the
+;; compiler's macro registry / the ANSI special-operator set). NCL macro
+;; expanders take the macro call's *arguments* positionally — the same way
+;; the compiler invokes them — so MACROEXPAND-1 bridges to the CL contract
+;; by APPLYing the expander to (cdr form).
+
+(defun macroexpand-1 (form &optional environment)
+  "If FORM is a macro call, expand it once. Returns two values: the
+   expansion and a generalized boolean true iff expansion occurred. A
+   non-macro FORM is returned unchanged with a NIL second value. Special
+   operators are not macros, so they are left alone."
+  (declare (ignore environment))
+  (if (and (consp form) (symbolp (car form)))
+      (let ((expander (macro-function (car form))))
+        (if expander
+            (values (apply expander (cdr form)) t)
+            (values form nil)))
+      (values form nil)))
+
+(defun macroexpand (form &optional environment)
+  "Repeatedly MACROEXPAND-1 FORM until its head no longer names a macro.
+   Returns the fully-expanded form and a second value true iff any
+   expansion happened."
+  (declare (ignore environment))
+  (let ((expansion (macroexpand-1 form)))
+    (if (eq expansion form)
+        (values form nil)
+        (values (macroexpand expansion) t))))
+
 (provide 'symbols)
 nil

@@ -940,6 +940,10 @@ fn install_native_functions(
                    ncl_runtime::fmakunbound_shim, 1);
     install_native(coord, mutator, "FBOUNDP",
                    ncl_runtime::fboundp_shim, 1);
+    install_native(coord, mutator, "MACRO-FUNCTION",
+                   ncl_runtime::macro_function_shim, 1);
+    install_native(coord, mutator, "SPECIAL-OPERATOR-P",
+                   ncl_runtime::special_operator_p_shim, 1);
     install_native(coord, mutator, "INTERN",
                    ncl_runtime::intern_shim, 1);
     // block / return-from — non-local exit via setjmp/longjmp

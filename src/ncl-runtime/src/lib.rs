@@ -53,6 +53,7 @@ pub use abi::{
     fboundp_shim, file_exists_shim, file_length_shim, file_position_shim,
     fmakunbound_shim, format_shim,
     gensym_shim, handler_case_shim, intern_shim,
+    macro_function_shim, special_operator_p_shim,
     set_symbol_function_shim, symbol_function_shim, symbol_name_shim, symbol_package_shim,
     length_shim, lt_shim, gt_shim, le_shim, ge_shim, num_eq_shim, num_ne_shim,
     add_shim, sub_shim, mul_shim,
