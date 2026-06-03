@@ -547,6 +547,16 @@ fn build_lisp_function(
         }
     }
 
+    // NOTE on IR-level optimization: running the LLVM middle-end
+    // pipeline (default<O2>) here MISCOMPILES our IR — GC roots aren't
+    // expressed as gc.statepoints and the runtime helpers carry no
+    // attributes, so gvn/instcombine break GC/ABI invariants (verified:
+    // ACCESS_VIOLATION at stdlib load). The only safe subset
+    // (simplifycfg) duplicates what the MCJIT backend's -O2 codegen
+    // already does, for zero measurable gain. So we rely on the
+    // backend's -O2 and skip an IR pass manager until the IR is made
+    // GC-safe. See optimize_module (kept, gated off) for the harness.
+
     // Build the MCJIT engine ourselves via llvm-sys so we can pass
     // a custom memory manager that captures .pdata/.xdata/.text and
     // registers Windows SEH unwind tables on finalize. inkwell 0.9
@@ -560,6 +570,58 @@ fn build_lisp_function(
 
     let _ = keep_forever(module);
     Ok(addr)
+}
+
+/// Run the LLVM new-pass-manager middle-end pipeline over `module`.
+/// Currently UNUSED: the full pipeline miscompiles our GC-unaware IR
+/// and the safe subset is redundant with the backend's -O2 (see the
+/// note in build_lisp_function). Kept as a harness for when the IR
+/// grows gc.statepoints / helper attributes.
+#[allow(dead_code)]
+fn optimize_module(module: &Module<'_>) {
+    use inkwell::passes::PassBuilderOptions;
+    use inkwell::targets::{
+        CodeModel, InitializationConfig, RelocMode, Target, TargetMachine,
+    };
+    use std::sync::atomic::Ordering;
+
+    let level = JIT_OPT_LEVEL.load(Ordering::Relaxed);
+    if level == 0 {
+        return;
+    }
+    Target::initialize_native(&InitializationConfig::default()).ok();
+    let triple = TargetMachine::get_default_triple();
+    let target = match Target::from_triple(&triple) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let opt = match level {
+        1 => OptimizationLevel::Less,
+        2 => OptimizationLevel::Default,
+        _ => OptimizationLevel::Aggressive,
+    };
+    let tm = match target.create_target_machine(
+        &triple,
+        "generic",
+        "",
+        opt,
+        RelocMode::PIC,
+        CodeModel::Default,
+    ) {
+        Some(tm) => tm,
+        None => return,
+    };
+    // Conservative pipeline: control-flow cleanup only. The full
+    // default<O> pipeline miscompiles our IR (GC roots aren't
+    // expressed as statepoints and the runtime helpers carry no
+    // attributes, so memory-reasoning passes like gvn/instcombine
+    // break GC/ABI invariants). simplifycfg just merges blocks and
+    // deletes provably-dead ones (e.g. the never-taken overflow
+    // slow-path) without touching memory ops or call ordering.
+    let pipeline = "simplifycfg";
+    if let Err(e) = module.run_passes(pipeline, &tm, PassBuilderOptions::create()) {
+        eprintln!("[ncl-llvm] run_passes({pipeline}) failed: {e}");
+    }
 }
 
 /// Construct an MCJIT engine over `module` with our JIT memory
@@ -1711,6 +1773,14 @@ fn emit_safepoint_wrap<'ctx, T>(
     extra_roots: &[IntValue<'ctx>],
     emit_call: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
+    // DIAGNOSTIC ONLY (NCL_NO_ROOTS=1): skip the GC root push/pop
+    // entirely to measure how much of the per-call cost is the root
+    // traffic. UNSAFE in general (a GC during the call would not see
+    // these roots), but correct to measure on allocation-free
+    // benchmarks like fib/tak/ack that never trigger a collection.
+    if no_roots_enabled() {
+        return emit_call();
+    }
     let mutator_arg = function.get_nth_param(0).unwrap();
 
     for param in params.iter().copied() {
@@ -1772,6 +1842,22 @@ fn emit_safepoint_wrap<'ctx, T>(
     }
 
     Ok(result)
+}
+
+/// Diagnostic flag: NCL_NO_ROOTS=1 disables GC-root push/pop in the
+/// safepoint wrap. Read once, cached.
+fn no_roots_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHE: AtomicU8 = AtomicU8::new(2); // 2 = uninit
+    match CACHE.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("NCL_NO_ROOTS").is_some();
+            CACHE.store(v as u8, Ordering::Relaxed);
+            v
+        }
+    }
 }
 
 /// Convert an i1 comparison result to a tagged Word (T or NIL).
@@ -3035,10 +3121,42 @@ fn emit_expr<'ctx>(
                     .map_err(|e| format!("store: {e}"))?;
             }
 
-            // Call ncl_call(mutator, sym_word, args_ptr, n_args).
+            // Lever 2a: inline the call dispatch. Instead of always
+            // calling into ncl_call (a Rust function that loads the
+            // symbol's function cell, tag-checks, extracts code+env,
+            // and indirect-calls), emit that fast path directly in IR:
+            //
+            //   fn_word = load [untag(sym) + FUNCTION_OFFSET]
+            //   if (fn_word & 7) == Tag::Function:           ; bound fn
+            //     code = load [untag(fn_word) + CODE_PTR_OFFSET]
+            //     env  = load [untag(fn_word) + ENV_OFFSET]
+            //     result = code(mutator, env, args_ptr, n)
+            //   else:                                         ; unbound / not-a-fn
+            //     result = ncl_call(mutator, sym, args_ptr, n)   ; signals
+            //
+            // This removes one Rust call/return per Lisp call (the
+            // bound-function common case never enters ncl_call). The
+            // root push/pop safepoint wrap is unchanged around it.
+            let ptr_t = context.ptr_type(AddressSpace::default());
             let mutator_arg = function.get_nth_param(0).unwrap();
             let sym_const = i64_t.const_int(*sym_word, false);
             let n_const = i64_t.const_int(n as u64, false);
+            let payload_mask = i64_t.const_int(!0b111u64, false);
+            let tag_mask = i64_t.const_int(0b111, false);
+            let func_tag =
+                i64_t.const_int(ncl_runtime::Tag::Function as u64, false);
+            // The JIT'd-function ABI: i64 (mutator*, env, args*, n).
+            let entry_fn_type = i64_t.fn_type(
+                &[ptr_t.into(), i64_t.into(), ptr_t.into(), i64_t.into()],
+                false,
+            );
+            const SYM_FUNCTION_OFFSET: u64 =
+                ncl_runtime::gc_symbol::FUNCTION_OFFSET as u64;
+            const FN_CODE_OFFSET: u64 =
+                ncl_runtime::gc_function::CODE_PTR_OFFSET as u64;
+            const FN_ENV_OFFSET: u64 =
+                ncl_runtime::gc_function::ENV_OFFSET as u64;
+
             let result = emit_safepoint_wrap(
                 builder,
                 function,
@@ -3047,7 +3165,104 @@ fn emit_expr<'ctx>(
                 locals,
                 &arg_vals,
                 || {
-                    let call = builder
+                    // Load the symbol's function cell.
+                    let sym_ptr_int = builder
+                        .build_and(sym_const, payload_mask, "untag_sym")
+                        .map_err(|e| format!("and sym: {e}"))?;
+                    let sym_ptr = builder
+                        .build_int_to_ptr(sym_ptr_int, ptr_t, "sym_ptr")
+                        .map_err(|e| format!("itp sym: {e}"))?;
+                    let fn_cell_ptr = unsafe {
+                        builder
+                            .build_gep(
+                                i64_t,
+                                sym_ptr,
+                                &[i64_t.const_int(SYM_FUNCTION_OFFSET, false)],
+                                "fn_cell_ptr",
+                            )
+                            .map_err(|e| format!("gep fn cell: {e}"))?
+                    };
+                    let fn_word = builder
+                        .build_load(i64_t, fn_cell_ptr, "fn_word")
+                        .map_err(|e| format!("load fn cell: {e}"))?
+                        .into_int_value();
+                    // is (fn_word & 7) == Tag::Function ?
+                    let fn_tag = builder
+                        .build_and(fn_word, tag_mask, "fn_tag")
+                        .map_err(|e| format!("and tag: {e}"))?;
+                    let is_fn = builder
+                        .build_int_compare(IntPredicate::EQ, fn_tag, func_tag, "is_fn")
+                        .map_err(|e| format!("cmp tag: {e}"))?;
+                    let fast_bb = context.append_basic_block(*function, "call_fast");
+                    let slow_bb = context.append_basic_block(*function, "call_slow");
+                    let cont_bb = context.append_basic_block(*function, "call_cont");
+                    builder
+                        .build_conditional_branch(is_fn, fast_bb, slow_bb)
+                        .map_err(|e| format!("br call: {e}"))?;
+
+                    // Fast: extract code+env, indirect-call.
+                    builder.position_at_end(fast_bb);
+                    let fn_ptr_int = builder
+                        .build_and(fn_word, payload_mask, "untag_fn")
+                        .map_err(|e| format!("and fn: {e}"))?;
+                    let fn_obj_ptr = builder
+                        .build_int_to_ptr(fn_ptr_int, ptr_t, "fn_obj_ptr")
+                        .map_err(|e| format!("itp fn: {e}"))?;
+                    let code_ptr_addr = unsafe {
+                        builder
+                            .build_gep(
+                                i64_t,
+                                fn_obj_ptr,
+                                &[i64_t.const_int(FN_CODE_OFFSET, false)],
+                                "code_addr",
+                            )
+                            .map_err(|e| format!("gep code: {e}"))?
+                    };
+                    let code_int = builder
+                        .build_load(i64_t, code_ptr_addr, "code")
+                        .map_err(|e| format!("load code: {e}"))?
+                        .into_int_value();
+                    let env_addr = unsafe {
+                        builder
+                            .build_gep(
+                                i64_t,
+                                fn_obj_ptr,
+                                &[i64_t.const_int(FN_ENV_OFFSET, false)],
+                                "env_addr",
+                            )
+                            .map_err(|e| format!("gep env: {e}"))?
+                    };
+                    let env_val = builder
+                        .build_load(i64_t, env_addr, "fn_env")
+                        .map_err(|e| format!("load env: {e}"))?
+                        .into_int_value();
+                    let code_fnptr = builder
+                        .build_int_to_ptr(code_int, ptr_t, "code_fnptr")
+                        .map_err(|e| format!("itp code: {e}"))?;
+                    let fast_call = builder
+                        .build_indirect_call(
+                            entry_fn_type,
+                            code_fnptr,
+                            &[
+                                mutator_arg.into(),
+                                env_val.into(),
+                                arr_alloca.into(),
+                                n_const.into(),
+                            ],
+                            "fast_call",
+                        )
+                        .map_err(|e| format!("indirect call: {e}"))?;
+                    let fast_val =
+                        fast_call.try_as_basic_value().unwrap_basic().into_int_value();
+                    let fast_end = builder.get_insert_block().unwrap();
+                    builder
+                        .build_unconditional_branch(cont_bb)
+                        .map_err(|e| format!("br fast→cont: {e}"))?;
+
+                    // Slow: ncl_call handles unbound / not-a-function
+                    // (signals a condition) and the redefinition race.
+                    builder.position_at_end(slow_bb);
+                    let slow_call = builder
                         .build_call(
                             helpers.call_fn,
                             &[
@@ -3056,10 +3271,22 @@ fn emit_expr<'ctx>(
                                 arr_alloca.into(),
                                 n_const.into(),
                             ],
-                            "call_result",
+                            "slow_call",
                         )
                         .map_err(|e| format!("build_call ncl_call: {e}"))?;
-                    Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+                    let slow_val =
+                        slow_call.try_as_basic_value().unwrap_basic().into_int_value();
+                    let slow_end = builder.get_insert_block().unwrap();
+                    builder
+                        .build_unconditional_branch(cont_bb)
+                        .map_err(|e| format!("br slow→cont: {e}"))?;
+
+                    builder.position_at_end(cont_bb);
+                    let phi = builder
+                        .build_phi(i64_t, "call_result")
+                        .map_err(|e| format!("phi call: {e}"))?;
+                    phi.add_incoming(&[(&fast_val, fast_end), (&slow_val, slow_end)]);
+                    Ok(phi.as_basic_value().into_int_value())
                 },
             )?;
             emit_post_call_abort_check(context, builder, function, helpers)?;

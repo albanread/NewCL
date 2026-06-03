@@ -139,6 +139,40 @@ Speedup (this machine, release):
 The push/pop happens once per live variable around *every* call, so the
 ~25 ns mutex lock dominated; the ~1 ns non-atomic borrow erases it.
 
-(The second half of the WIP — inline call dispatch in the LLVM backend —
-is evaluated separately next; kept stashed for now.)
+### Perf: inline call dispatch ("Lever 2a") — kept, ~11%
+
+The second half of the stashed WIP inlines the symbol-call dispatch into
+the JIT'd IR: load the function cell, tag-check, and indirect-call the
+bound-function fast path directly, falling back to `ncl_call` only for
+unbound / not-a-function. Saves one Rust call per Lisp call.
+
+**Correct and GC-safe** — stdlib + CLOS + conditions + Prolog all right,
+and the full GC suite passed on this exact binary (alloc-test exact
+32000000, stress 16-thread clean, gc-watch 0 pin leaks, all four
+seh-unwind tests exit 0). GC-safety reasoning: no safepoint between the
+code/env loads and the indirect call, and the callee roots its env param
+exactly as the `ncl_call` path does.
+
+**Methodology note — I almost rejected this on bad data.** A first pass
+compared "RefCell" numbers from early in the session (fib 30 ≈ 0.049 s)
+against "inline" numbers measured ~15 min and several heavy LLVM builds
+later (≈ 0.085 s) and concluded it was 1.7× *slower*. That was a
+**machine-state drift confound** — re-measuring the *identical* committed
+RefCell binary at the later time also gave ≈ 0.093 s, i.e. the machine had
+slowed ~1.9× (CPU freq/thermal), not the code. Lesson: never compare
+benchmark numbers taken at different points in a build-heavy session.
+
+Redid it as an **interleaved A/B** — saved both binaries, ran them
+alternately (R,I,R,I…) so drift hits both equally, 7 rounds of fib 30:
+
+| stat        | refcell | inline |
+|-------------|---------|--------|
+| mean (s)    | 0.094   | 0.084  |
+| rounds won  | 1       | 6      |
+
+~11 % faster, reproducible (one noisy outlier round). Modest next to the
+RefCell 3.9×, but real and on the core dispatch path. Kept.
+
+(Microbench caveat: fib/tak are pure-call, no allocation; allocation-heavy
+real code spends a smaller fraction in call dispatch, so expect <11 % there.)
 
