@@ -184,6 +184,15 @@
     (t (error "loop: bad destructuring pattern ~A" pattern))))
 
 (defun %parse-for (plan cur)
+  "Parse one or more parallel for-bindings joined by `and`:
+     (for i from 1 to 3 and j in list ...)
+   All bindings step together; the loop ends when ANY iterator
+   terminates (NCL treats sequential for-clauses as parallel too)."
+  (%parse-one-for plan cur)
+  (when (%cur-eat-keyword? cur 'and)
+    (%parse-for plan cur)))
+
+(defun %parse-one-for (plan cur)
   "(for VAR <spec>). spec is one of:
      in LIST                          → walk list
      on LIST                          → walk cons cells
@@ -345,6 +354,13 @@
       (t                  (%plan-add-step plan `(setq ,var (- ,var ,step)))))))
 
 (defun %parse-with (plan cur)
+  "(with VAR [= INIT] [and VAR2 [= INIT2]] ...) — one or more parallel
+   outer bindings joined by `and`."
+  (%parse-one-with plan cur)
+  (when (%cur-eat-keyword? cur 'and)
+    (%parse-with plan cur)))
+
+(defun %parse-one-with (plan cur)
   "(with VAR [= INIT])."
   (let ((var (%cur-eat! cur)))
     (cond
