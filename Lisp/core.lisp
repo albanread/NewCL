@@ -2531,12 +2531,26 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
 (defun %ht-bucket (ht i) (svref ht (+ i 2)))
 (defun %ht-set-bucket (ht i v) (setf (svref ht (+ i 2)) v))
 
+;; Capture the native integer REM *now*, before any later module
+;; (Library/numbers.lisp) redefines REM/MOD into polymorphic wrappers.
+;; The bucket index is always (non-negative-fixnum-hash) REM
+;; (positive-fixnum-nbuckets), so the raw integer primitive is exactly
+;; correct here — and using it is mandatory, not just an optimisation:
+;; the polymorphic MOD calls FLOATP, and FLOATP -> TYPEP -> %NEW-TYPEP
+;; -> GETHASH -> %HT-BUCKET-INDEX -> MOD closes a recursion cycle that
+;; stack-overflows the entire stdlib load the moment numbers.lisp is on
+;; top of types.lisp. Going straight to the native REM breaks the cycle
+;; at its only closure point and keeps every GETHASH off the polymorphic
+;; dispatch path.
+(defparameter %ht-native-rem (symbol-function 'rem))
+
 (defun %ht-bucket-index (ht key)
   (let ((test (%ht-test ht)))
-    (mod (if (or (eq test 'equal) (eq test 'equalp))
-             (%equal-hash key)
-             (%word-hash key))
-         (%ht-nbuckets ht))))
+    (funcall %ht-native-rem
+             (if (or (eq test 'equal) (eq test 'equalp))
+                 (%equal-hash key)
+                 (%word-hash key))
+             (%ht-nbuckets ht))))
 
 (defun %ht-keys-match (test k1 k2)
   "Compare K1 and K2 under TEST. EQUAL falls back to EQUAL on
