@@ -309,9 +309,17 @@
                        (= (length object) (car args)))))
              ;; Unknown compound — try just the head as a symbol.
              (t (funcall *%original-typep%* object head))))))
-    ;; ── Symbol / nil type names — catch-all ──────────────────────────
-    ;; Anything reaching here is a symbol (or nil, which CL treats as a
-    ;; symbol too).  We do NOT use (symbolp type) — see note above.
+    ;; ── The universal / empty type names ─────────────────────────────
+    ;; (typep x t)   is always true  — T is the type of every object.
+    ;; (typep x nil) is always false — NIL is the empty type.
+    ;; The native shim doesn't special-case these, so handle them here.
+    ;; (Note: the NULL *type* is the symbol NULL, distinct from NIL, and
+    ;; falls through to the native shim below.)
+    ((eq type t) t)
+    ((eq type 'nil) nil)
+    ;; ── Symbol type names — catch-all ────────────────────────────────
+    ;; Anything reaching here is a symbol.  We do NOT use (symbolp type)
+    ;; — see note above.
     (t
      (let ((expander (gethash type *type-expanders*)))
        (if expander
@@ -319,6 +327,13 @@
            (%new-typep object (funcall expander type))
            ;; Built-in named type: delegate to the Rust shim.
            (funcall *%original-typep%* object type))))))
+
+;; CL: a compiled function. NCL JIT-compiles every function at
+;; definition, so every function is a compiled function.
+(defun compiled-function-p (object)
+  "Return T if OBJECT is a compiled function. In NCL every function is
+   JIT-compiled, so this is equivalent to FUNCTIONP."
+  (functionp object))
 
 ;; Wrap with optional environment parameter for CL compliance.
 (defun typep (object type &optional environment)

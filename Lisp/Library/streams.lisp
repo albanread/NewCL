@@ -97,6 +97,26 @@
      t)
     (t nil)))
 
+;; ── Output flushing ───────────────────────────────────────────────────────
+;; NCL's standard output and string-output streams are not user-buffered:
+;; FORMAT / PRINC / TERPRI write through immediately, and string streams
+;; accumulate in place. So FORCE-OUTPUT / FINISH-OUTPUT have nothing to
+;; drain and are no-ops that return NIL, per the CL contract (it is always
+;; legal for these to be no-ops on an unbuffered stream). They exist so
+;; portable code that calls them runs unchanged. CLEAR-OUTPUT likewise has
+;; no buffered output to abort.
+(defun force-output (&optional stream)
+  (declare (ignore stream))
+  nil)
+
+(defun finish-output (&optional stream)
+  (declare (ignore stream))
+  nil)
+
+(defun clear-output (&optional stream)
+  (declare (ignore stream))
+  nil)
+
 ;; ── Write dispatchers ─────────────────────────────────────────────────────
 
 (defun stream-write-string (stream s)
