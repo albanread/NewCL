@@ -258,5 +258,36 @@ X must be >= 1."
 X must be in (-1, 1)."
   (/ (log (/ (+ 1.0 x) (- 1.0 x))) 2.0))
 
+;;; ── Standard numeric constants ───────────────────────────────────────────
+;;
+;; PI and the implementation-limit constants every CL program expects.
+;; FIXNUM bounds match NCL's tagged-word layout: a Word is 64 bits with a
+;; 3-bit tag, leaving 61 signed value bits, so the range is
+;;   [-2^60, 2^60-1] = [-1152921504606846976, 1152921504606846975].
+;; (Confirmed empirically: (+ most-positive-fixnum 1) promotes to bignum.)
+;; Floats are IEEE-754 binary64 (Rust f64); SINGLE-FLOAT is the same
+;; representation as DOUBLE-FLOAT here, so the *-single-float limits alias
+;; the double ones.
+
+(defconstant pi 3.141592653589793d0)
+
+(defconstant most-positive-fixnum 1152921504606846975)
+(defconstant most-negative-fixnum -1152921504606846976)
+
+(defconstant most-positive-double-float 1.7976931348623157d308)
+(defconstant most-negative-double-float -1.7976931348623157d308)
+(defconstant least-positive-double-float 2.2250738585072014d-308)
+(defconstant least-negative-double-float -2.2250738585072014d-308)
+(defconstant double-float-epsilon 1.1102230246251568d-16)
+(defconstant double-float-negative-epsilon 1.1102230246251568d-16)
+
+;; SINGLE-FLOAT == DOUBLE-FLOAT in NCL (both f64).
+(defconstant most-positive-single-float most-positive-double-float)
+(defconstant most-negative-single-float most-negative-double-float)
+(defconstant least-positive-single-float least-positive-double-float)
+(defconstant least-negative-single-float least-negative-double-float)
+(defconstant single-float-epsilon double-float-epsilon)
+(defconstant single-float-negative-epsilon double-float-negative-epsilon)
+
 (provide 'numbers)
 nil
