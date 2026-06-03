@@ -245,6 +245,9 @@
          (%plan-add-step plan `(setq ,i-var (+ ,i-var 1)))
          (%plan-add-step plan `(when (< ,i-var ,n-var)
                                  (setq ,var (svref ,vec-var ,i-var))))))
+      ;; for VAR being [the|each] {hash-key[s]|hash-value[s]} {of|in} HT
+      ((%cur-eat-keyword? cur 'being)
+       (%parse-being-clause plan cur var))
       ;; for VAR = EXPR [then EXPR]
       ((%cur-eat-keyword? cur '=)
        (let ((init (%cur-eat! cur)))
@@ -267,6 +270,49 @@
               (member k '(to upto below downto above))))
        (%parse-from-clause plan cur var 0))
       (t (error "loop: unknown for-spec after ~A" var)))))
+
+(defun %parse-being-clause (plan cur var)
+  "(for VAR being [the|each] {hash-key[s]|hash-value[s]} {of|in} HT
+        [using ({hash-value|hash-key} OTHER-VAR)]).
+   Implemented by snapshotting the table's (key . value) pairs with
+   MAPHASH once, then iterating that list. Package iteration
+   (being the symbols of …) is not supported — NCL has no packages."
+  (or (%cur-eat-keyword? cur 'the) (%cur-eat-keyword? cur 'each))
+  (let ((kind (%cur-eat! cur)))
+    (or (%cur-eat-keyword? cur 'of) (%cur-eat-keyword? cur 'in))
+    (let ((ht-form (%cur-eat! cur))
+          (tail-var (gensym "HTTAIL-"))
+          (acc-g (gensym "HTACC-"))
+          (k-g (gensym "HTK-"))
+          (v-g (gensym "HTV-"))
+          (using-kind nil)
+          (using-var nil))
+      (when (%cur-eat-keyword? cur 'using)
+        (let ((spec (%cur-eat! cur)))      ; (hash-value v) / (hash-key k)
+          (setq using-kind (car spec))
+          (setq using-var (cadr spec))))
+      ;; Snapshot the pairs: maphash builds a list of (key . value).
+      (%plan-add-iter-binding plan tail-var
+        `(let ((,acc-g nil))
+           (maphash (lambda (,k-g ,v-g)
+                      (setq ,acc-g (cons (cons ,k-g ,v-g) ,acc-g)))
+                    ,ht-form)
+           ,acc-g))
+      (%plan-add-test plan `(null ,tail-var))
+      (%plan-add-step plan `(setq ,tail-var (cdr ,tail-var)))
+      ;; The iteration variable takes the key (default) or value.
+      (let ((var-acc (if (member kind '(hash-value hash-values))
+                         `(cdr (car ,tail-var))
+                         `(car (car ,tail-var)))))
+        (%plan-add-iter-binding plan var var-acc)
+        (%plan-add-step plan `(setq ,var ,var-acc)))
+      ;; Optional paired `using` variable takes the other half.
+      (when using-var
+        (let ((u-acc (if (member using-kind '(hash-value hash-values))
+                         `(cdr (car ,tail-var))
+                         `(car (car ,tail-var)))))
+          (%plan-add-iter-binding plan using-var u-acc)
+          (%plan-add-step plan `(setq ,using-var ,u-acc)))))))
 
 (defun %parse-from-clause (plan cur var start)
   "Parse the range tail [to|upto|below|downto|above M] [by STEP] for a
