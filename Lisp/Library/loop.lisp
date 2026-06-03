@@ -168,6 +168,21 @@
 
 ;; ── Clause parsers ────────────────────────────────────────────────────────
 
+(defun %loop-pattern-bindings (pattern source)
+  "Given a loop iteration variable PATTERN — a symbol, NIL, or a
+   possibly-dotted list of symbols — and an accessor form SOURCE that
+   yields the value to destructure, return a list of (VAR ACCESSOR-FORM)
+   pairs binding each symbol in PATTERN to the matching part of SOURCE.
+   NIL in a pattern position ignores that slot (no binding). This is the
+   `(for (a b) in pairs)` destructuring used by LOOP."
+  (cond
+    ((null pattern) nil)
+    ((symbolp pattern) (list (list pattern source)))
+    ((consp pattern)
+     (append (%loop-pattern-bindings (car pattern) (list 'car source))
+             (%loop-pattern-bindings (cdr pattern) (list 'cdr source))))
+    (t (error "loop: bad destructuring pattern ~A" pattern))))
+
 (defun %parse-for (plan cur)
   "(for VAR <spec>). spec is one of:
      in LIST                          → walk list
@@ -187,21 +202,35 @@
     (when (%cur-eat-keyword? cur 'of-type)
       (%cur-eat! cur))
     (cond
-      ;; for VAR in LIST
+      ;; for VAR in LIST  (VAR may be a destructuring pattern)
       ((%cur-eat-keyword? cur 'in)
        (let* ((list-form (%cur-eat! cur))
               (tail-var (gensym "TAIL-")))
          (%plan-add-iter-binding plan tail-var list-form)
-         (%plan-add-iter-binding plan var `(car ,tail-var))
          (%plan-add-test plan `(null ,tail-var))
          (%plan-add-step plan `(setq ,tail-var (cdr ,tail-var)))
-         (%plan-add-step plan `(setq ,var (car ,tail-var)))))
-      ;; for VAR on LIST
+         ;; Bind the element — a plain symbol, or each var of a
+         ;; destructuring pattern — to (car tail-var), recomputed each step.
+         (dolist (b (%loop-pattern-bindings var `(car ,tail-var)))
+           (%plan-add-iter-binding plan (car b) (cadr b))
+           (%plan-add-step plan `(setq ,(car b) ,(cadr b))))))
+      ;; for VAR on LIST  (VAR may be a destructuring pattern; it
+      ;; destructures the successive tails)
       ((%cur-eat-keyword? cur 'on)
        (let ((list-form (%cur-eat! cur)))
-         (%plan-add-iter-binding plan var list-form)
-         (%plan-add-test plan `(null ,var))
-         (%plan-add-step plan `(setq ,var (cdr ,var)))))
+         (cond
+           ((symbolp var)
+            (%plan-add-iter-binding plan var list-form)
+            (%plan-add-test plan `(null ,var))
+            (%plan-add-step plan `(setq ,var (cdr ,var))))
+           (t
+            (let ((tail-var (gensym "TAIL-")))
+              (%plan-add-iter-binding plan tail-var list-form)
+              (%plan-add-test plan `(null ,tail-var))
+              (%plan-add-step plan `(setq ,tail-var (cdr ,tail-var)))
+              (dolist (b (%loop-pattern-bindings var tail-var))
+                (%plan-add-iter-binding plan (car b) (cadr b))
+                (%plan-add-step plan `(setq ,(car b) ,(cadr b)))))))))
       ;; for VAR across VECTOR
       ((%cur-eat-keyword? cur 'across)
        (let* ((vec-form (%cur-eat! cur))
