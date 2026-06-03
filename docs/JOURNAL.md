@@ -5,6 +5,83 @@ NewCormanLisp. Newest entries at the top.
 
 ---
 
+## Session 2 — CL compliance sweep (2026-06-03)
+
+### Method
+
+Ran the **Corman ANSI hyperspec-examples suite** (`E:/CL/cormanlisp/test/
+ansi-chapter-{2..8}.lisp`, ~225 CLHS-example assertions) via
+`demos/ansi-runner.lisp` for a baseline, then cross-checked every
+suspected failure with a **direct probe** of the live binary — the suite
+has false failures (harness/`test-equalp` artifacts: e.g. it reported
+`(typep 12 'integer)` and `(coerce '(a b c) 'vector)` failing, but both
+are correct when run directly) and the runner aborts a whole chapter on
+the first compile error, so its raw tally undercounts.
+
+Baseline: **174 pass / 25 fail / 26 err**, with chapters 3, 5, 6, 8
+aborting mid-load. Direct probes were the source of truth throughout.
+
+### Fixes landed (7 commits, each verified; no GC regressions)
+
+| commit | area | what |
+|--------|------|------|
+| `9fa9025` | types/io | `(typep x t)`→T, `(typep x nil)`→NIL; `compiled-function-p`; `force-output`/`finish-output`/`clear-output` (the last unblocked the ANSI runner) |
+| `0f159f3` | loop | leading numeric bound w/o FROM (`for i below n`), `upto`, `accumulate … into VAR` |
+| `b5eae37` | numbers | `pi`, `most-positive/negative-fixnum`, double/single-float limit + epsilon constants (none existed) |
+| `f819338` | macros | `macro-function`, `macroexpand`/`-1`, `special-operator-p` (all were undefined); `fboundp` fixed to see macros, special operators, and compiler-baked macros |
+| `e095ddb` | loop | destructuring `for (a b) in/on` (nested + dotted) |
+| `cbab7b8` | loop | `for VAR being the hash-keys/hash-values of HT [using …]` |
+| `85a78d7` | loop | parallel `and` in for-/with-clauses |
+
+Only one (`f819338`) touched Rust (abi.rs shims) and needed a rebuild; it
+was gated on 208 runtime+GC tests + alloc-test. The rest are Library-only
+(`.lisp`, disk-loaded — no rebuild), each verified by direct probe + a
+regression sweep + the full smoke test.
+
+Suite after fixes: **180 pass / 23 fail / 22 err** — but this *undercounts*
+the real gain: chapters 3 and 6 (the LOOP chapter) still abort on
+not-yet-implemented LOOP clauses, so the ~5 LOOP features added only show
+up via direct probes, not the chapter tally.
+
+### Remaining gaps — prioritized backlog (verified, with a plan)
+
+Tractable, no Rust (Library `.lisp`):
+- **LOOP `if/else` conditional accumulation** and **`loop-finish`** — the
+  two clauses still blocking ANSI ch6. Both need accumulator-model rework
+  (shared accumulator across then/else branches; a finally-aware
+  non-local exit that isn't rewritten to `return-from`). Medium risk.
+- **`(setf (getf place ind) val)`** — needs a real setf-expander that can
+  update the place (insert at front when absent). Common.
+
+Needs Rust:
+- **`read` / `read-char` / `peek-char` from a stream**, and
+  **`read-from-string` second value (end position)** — currently returns
+  NIL. Fixing the position also enables a *resilient* ANSI runner
+  (form-by-form load) for a true, uncapped compliance number.
+- **`coerce`** to `character` / float types / `complex` (several targets
+  signal errors).
+- **`multiple-value-call`** (special form / compiler support).
+- reader: **`#S`** struct literals (blocks ANSI ch8); large-integer
+  literal overflow (reader tags `2^60` as fixnum though arithmetic
+  correctly promotes).
+
+Larger features:
+- **`define-modify-macro`** (blocks ANSI ch5 — "non-symbol head BABBIT")
+  and **nested backquote**.
+- `defmethod` lambda-lists with explicit keyword-var forms `((:k v) d)`.
+- `subtypep` on `integer` ranges; `change-class`; fill-pointers /
+  `vector-push-extend` / adjustable arrays; `~R` number spelling.
+
+### Now confirmed WORKING (was flagged missing in the May review)
+
+`typep` on all the common types, `eval`, `read-from-string`,
+`equal`/`equalp` hash tables honoring `:test`, vector sequences,
+`macroexpand`, `fboundp` on macros/special-ops, `(expt _ -n)` → ratio,
+`pi` & numeric limits, and a much larger LOOP subset (below/to/upto,
+into, destructuring, hash-keys, parallel `and`).
+
+---
+
 ## Session 1 summary (2026-06-03)
 
 Five commits, each verified before landing; GC reliability re-checked
