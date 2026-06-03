@@ -539,25 +539,39 @@ pub extern "C-unwind" fn expt_shim(
             mutator, "expt: base must be an integer",
         ),
     };
-    // Exponent must be a fixnum that fits in u32 (BigInt::pow takes
-    // u32). 2^32 is more headroom than any reasonable Lisp program
-    // will use — a million-digit result happens at exponent ~17000.
+    // Exponent must be a fixnum whose magnitude fits in u32
+    // (BigInt::pow takes u32). 2^32 is more headroom than any
+    // reasonable Lisp program will use — a million-digit result
+    // happens at exponent ~17000.
     let exp = match exp_w.as_fixnum() {
-        Some(n) if n >= 0 => n,
-        Some(_) => return crate::abi::signal_condition_string(
-            mutator, "expt: negative exponent not yet supported (needs ratios)",
-        ),
+        Some(n) => n,
         None => return crate::abi::signal_condition_string(
             mutator, "expt: exponent must be a fixnum",
         ),
     };
-    if exp > u32::MAX as i64 {
+    let abs_exp = exp.unsigned_abs();
+    if abs_exp > u32::MAX as u64 {
         return crate::abi::signal_condition_string(
             mutator, "expt: exponent too large",
         );
     }
-    let result = base.pow(exp as u32);
-    bigint_to_word(m, &result).raw()
+    let pow = base.pow(abs_exp as u32);
+    if exp >= 0 {
+        return bigint_to_word(m, &pow).raw();
+    }
+    // Negative exponent on an integer base: (expt b n) for n<0 is the
+    // exact rational 1 / b^|n|. b^|n| == 0 only when b == 0, which is a
+    // division by zero. BigRational::new reduces to lowest terms and
+    // normalises the sign onto the numerator, and bigrational_to_word
+    // collapses a unit denominator back to an integer — so (expt -2 -3)
+    // => -1/8, (expt 1 -5) => 1, (expt 2 -3) => 1/8 all fall out.
+    if pow.is_zero() {
+        return crate::abi::signal_condition_string(
+            mutator, "expt: zero to a negative power (division by zero)",
+        );
+    }
+    let q = num_rational::BigRational::new(BigInt::from(1), pow);
+    crate::ratio::bigrational_to_word(m, &q).raw()
 }
 
 /// `(abs n)` — magnitude. Integer-only for now.

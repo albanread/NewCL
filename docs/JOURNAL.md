@@ -209,3 +209,22 @@ Lots now works that the May review flagged: vector sequences
 `eval`, `equal`/`equalp` hash tables honoring `:test`, `~(~A~)` case
 conversion, complex arithmetic.
 
+### Compat: (expt <int> <neg-int>) now returns an exact rational
+
+`expt_shim` (bignum.rs) signalled "negative exponent not yet supported"
+for any negative integer exponent. Implemented it: for `n < 0`,
+`(expt b n)` = `1 / b^|n|`, built with `BigRational::new(1, b^|n|)` and
+collapsed through `ratio::bigrational_to_word` (which reduces a unit
+denominator back to an integer). `BigRational::new` reduces to lowest
+terms and normalises the sign onto the numerator, so every case is exact:
+
+  (expt 2 -3) => 1/8     (expt -2 -3) => -1/8   (expt 10 -2) => 1/100
+  (expt 1 -5) => 1       (expt 4 -1)  => 1/4    (expt 0 -2)  => clean error
+  (expt 2 10) => 1024 (positive path unchanged)
+
+Touches the numeric tower and allocates a ratio on the GC heap (same
+allocation API the `/` operator already uses), so re-verified: 208/208
+runtime tests, alloc-test exact 32000000, and a 50 000-iteration ratio
+allocation loop runs clean under GC pressure. (Float-base `expt` —
+`EXPT-FLOAT` exists but isn't wired into `EXPT` — remains a separate gap.)
+
