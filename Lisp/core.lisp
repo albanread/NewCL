@@ -2015,12 +2015,17 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
 ;; -- Char predicates (batch 4) -----------------------------------------------
 ;;
 ;; char-code, code-char, char-upcase, char-downcase, alpha-char-p,
-;; upper-case-p, lower-case-p, graphic-char-p, digit-char-p, digit-char
-;; are all native shims. These Lisp wrappers add derived predicates.
+;; upper-case-p, lower-case-p, graphic-char-p, digit-char-p, digit-char,
+;; alphanumericp are all native shims. These Lisp wrappers add derived
+;; predicates.
 
-(defun alphanumericp (c)
-  "Return T if C is alphabetic or a digit."
-  (if (or (alpha-char-p c) (digit-char-p c)) t nil))
+;; NOTE: ALPHANUMERICP is intentionally NOT redefined here. It is already
+;; a native shim backed by Rust's char::is_alphanumeric, which is Unicode-
+;; aware (a Devanagari digit, a CJK letter, etc. all answer T). A previous
+;; Lisp wrapper `(or (alpha-char-p c) (digit-char-p c))` *shadowed* that
+;; shim and narrowed it: DIGIT-CHAR-P is radix-based (ASCII 0-9/A-Z only),
+;; so `(alphanumericp (code-char #x0969))` (Devanagari 3) wrongly returned
+;; NIL. Deleting the wrapper restores the Unicode-aware native behaviour.
 
 (defun both-case-p (c)
   "Return T if C has both upper and lower case variants."

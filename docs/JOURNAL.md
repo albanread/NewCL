@@ -176,3 +176,36 @@ RefCell 3.9×, but real and on the core dispatch path. Kept.
 (Microbench caveat: fib/tak are pure-call, no allocation; allocation-heavy
 real code spends a smaller fraction in call dispatch, so expect <11 % there.)
 
+Committed as `1374340`.
+
+### Compat: ALPHANUMERICP made Unicode-aware
+
+Fixed the pre-existing red test from above. `core.lisp` was redefining
+`alphanumericp` as `(or (alpha-char-p c) (digit-char-p c))`, *shadowing*
+the registered native shim (Rust `char::is_alphanumeric`). Because
+`digit-char-p` is radix-based (ASCII 0-9 / A-Z), the wrapper narrowed the
+predicate so non-ASCII decimal digits answered NIL. Deleted the wrapper
+(left a comment so it isn't re-added); the Unicode-aware native shim now
+serves. `(alphanumericp (code-char #x0969))` (Devanagari ३) → T, while
+`#\A`/`#\5` → T and `#\!` → NIL still hold.
+
+### CL gap inventory (probed, current binary) — for future rounds
+
+Still missing / wrong (none crash the process — all signal Lisp errors):
+- `(expt <int> <neg>)` → "negative exponent not yet supported"; should be
+  a ratio (`(expt 2 -3)` = 1/8). Native shim, needs ratio construction.
+- `multiple-value-call` — undefined (needs compiler/special-form support).
+- `(coerce 1 'double-float)` / `'single-float` → SIMPLE-ERROR.
+- `parse-integer` ignores `:junk-allowed` / `:start` / `:end` / `:radix`
+  (native, fixed-arity-1).
+- `vector-push-extend` / fill pointers / adjustable arrays — undefined.
+- multidimensional arrays — `(make-array '(2 3))` signals cleanly now (was
+  a panic in the May review); `aref` is hard-wired to arity 2 (compile
+  error on `(aref a i j)`).
+- `~R` doesn't spell numbers (`(format nil "~R" 4)` → "4").
+
+Lots now works that the May review flagged: vector sequences
+(reverse/nreverse/some/every/count/reduce/sort), `read-from-string`,
+`eval`, `equal`/`equalp` hash tables honoring `:test`, `~(~A~)` case
+conversion, complex arithmetic.
+
