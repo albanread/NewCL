@@ -7870,4 +7870,81 @@ mod end_to_end_tests {
             "HANDLED",
         );
     }
+
+    // ── Symbol plists + sublis (Prolog scouting) ──────────────────
+
+    #[test]
+    fn symbol_get_put() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.activate();
+        s.eval("(setf (get 'pkim 'color) 'red)").unwrap();
+        s.eval("(setf (get 'pkim 'size) 'large)").unwrap();
+        assert_eq!(s.eval("(get 'pkim 'color)").unwrap(), "RED");
+        assert_eq!(s.eval("(get 'pkim 'size)").unwrap(), "LARGE");
+        // Missing property returns the default.
+        assert_eq!(s.eval("(get 'pkim 'weight 'unknown)").unwrap(), "UNKNOWN");
+    }
+
+    #[test]
+    fn symbol_get_overwrite() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.activate();
+        s.eval("(setf (get 'pnode 'next) 'a)").unwrap();
+        s.eval("(setf (get 'pnode 'next) 'b)").unwrap();
+        assert_eq!(s.eval("(get 'pnode 'next)").unwrap(), "B");
+    }
+
+    #[test]
+    fn symbol_plist_and_remprop() {
+        let mut s = Session::with_stdlib().unwrap();
+        s.activate();
+        s.eval("(setf (get 'pr 'a) 1)").unwrap();
+        s.eval("(setf (get 'pr 'b) 2)").unwrap();
+        assert_eq!(s.eval("(remprop 'pr 'a)").unwrap(), "T");
+        assert_eq!(s.eval("(get 'pr 'a 'gone)").unwrap(), "GONE");
+        assert_eq!(s.eval("(get 'pr 'b)").unwrap(), "2");
+        assert_eq!(s.eval("(remprop 'pr 'missing)").unwrap(), "nil");
+    }
+
+    #[test]
+    fn sublis_works() {
+        let mut s = Session::with_stdlib().unwrap();
+        assert_eq!(
+            s.eval("(sublis '((a . 1) (b . 2)) '(a (b c) a))").unwrap(),
+            "(1 (2 C) 1)",
+        );
+    }
+
+    #[test]
+    fn prolog_unify_integration() {
+        // A self-contained slice of the Prolog scout: the unifier must
+        // produce a correct binding list. Permanent regression for the
+        // plist/sublis/recursion combination real CL code leans on.
+        let mut s = Session::with_stdlib().unwrap();
+        s.activate();
+        s.eval(r#"
+          (defun pvar-p (x) (and (symbolp x) (not (null x))
+                                 (eql (char (symbol-name x) 0) #\?)))
+          (defun uv (var x b)
+            (let ((vb (assoc var b)))
+              (cond (vb (u (cdr vb) x b))
+                    ((and (pvar-p x) (assoc x b)) (u var (cdr (assoc x b)) b))
+                    (t (cons (cons var x) b)))))
+          (defun u (x y b)
+            (cond ((eq b 'fail) 'fail)
+                  ((eql x y) b)
+                  ((pvar-p x) (uv x y b))
+                  ((pvar-p y) (uv y x b))
+                  ((and (consp x) (consp y))
+                   (u (cdr x) (cdr y) (u (car x) (car y) b)))
+                  (t 'fail)))
+        "#).unwrap();
+        // (?x + 1) unify (2 + ?y) -> ?x=2, ?y=1
+        assert_eq!(
+            s.eval("(u '(?x + 1) '(2 + ?y) nil)").unwrap(),
+            "((?Y . 1) (?X . 2))",
+        );
+        // occurs mismatch fails
+        assert_eq!(s.eval("(u '(?x ?x) '(1 2) nil)").unwrap(), "FAIL");
+    }
 }

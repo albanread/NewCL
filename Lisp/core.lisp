@@ -1268,6 +1268,40 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
     ((eq (car plist) key) (car (cdr plist)))
     (t (getf (cdr (cdr plist)) key default))))
 
+(defun %putf (plist key value)
+  "Return a plist like PLIST but with KEY mapped to VALUE — updating
+   the existing pair if present, else prepending a new one."
+  (cond
+    ((null plist) (list key value))
+    ((eq (car plist) key) (cons key (cons value (cdr (cdr plist)))))
+    (t (cons (car plist)
+             (cons (car (cdr plist))
+                   (%putf (cdr (cdr plist)) key value))))))
+
+;; Symbol property lists (get / symbol-plist) need make-hash-table, so
+;; they're defined after the hash-table section further down.
+
+(defun %plist-remove (plist key)
+  (cond
+    ((null plist) nil)
+    ((eq (car plist) key) (cdr (cdr plist)))
+    (t (cons (car plist)
+             (cons (car (cdr plist))
+                   (%plist-remove (cdr (cdr plist)) key))))))
+
+;; -- sublis / nsublis --------------------------------------------------------
+
+(defun sublis (alist tree &key (test #'eql) (key #'identity))
+  "Substitute in TREE using ALIST: any subtree whose KEY matches a
+   key in ALIST (under TEST) is replaced by that entry's value."
+  (let ((pair (assoc (funcall key tree) alist :test test)))
+    (cond
+      (pair (cdr pair))
+      ((consp tree)
+       (cons (sublis alist (car tree) :test test :key key)
+             (sublis alist (cdr tree) :test test :key key)))
+      (t tree))))
+
 ;; -- Conditions --------------------------------------------------------------
 ;;
 ;; (error condition-or-message) signals; (handler-case body
@@ -2638,6 +2672,45 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
                (t (funcall fn (car (car bucket)) (cdr (car bucket)))
                   (setq bucket (cdr bucket))))))
          (setq i (+ i 1)))))))
+
+;; -- Symbol property lists ---------------------------------------------------
+;;
+;; NCL symbols don't carry a dedicated plist slot yet, so each symbol's
+;; plist is stored in a global EQ hash table. get / symbol-plist and
+;; their setf forms layer on top. (setf (get s i) v) lowers via the
+;; generic %SETF-NAME convention to (%setf-get v s i); same for
+;; symbol-plist. Defined here (after make-hash-table) because the
+;; backing store is a hash table.
+
+(defvar *symbol-plists* (make-hash-table :test 'eq))
+
+(defun symbol-plist (sym)
+  "Return SYM's property list (NIL if it has none)."
+  (gethash sym *symbol-plists*))
+
+(defun %setf-symbol-plist (new-plist sym)
+  (if (null new-plist)
+      (remhash sym *symbol-plists*)
+      (setf (gethash sym *symbol-plists*) new-plist))
+  new-plist)
+
+(defun get (sym indicator &optional default)
+  "Return the value of SYM's INDICATOR property, or DEFAULT."
+  (getf (symbol-plist sym) indicator default))
+
+(defun %setf-get (value sym indicator &optional default)
+  (declare (ignore default))
+  (setf (symbol-plist sym) (%putf (symbol-plist sym) indicator value))
+  value)
+
+(defun remprop (sym indicator)
+  "Remove SYM's INDICATOR property. Returns T if it was present."
+  (let ((plist (symbol-plist sym)))
+    (if (eq (getf plist indicator '%plist-absent) '%plist-absent)
+        nil
+        (progn
+          (setf (symbol-plist sym) (%plist-remove plist indicator))
+          t))))
 
 (defmacro multiple-value-list (form)
   "Evaluate FORM and return a fresh list of all the values it
