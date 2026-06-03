@@ -228,21 +228,29 @@
             ;; No `then` → re-evaluate INIT every iteration.
             (%plan-add-iter-binding plan var init)
             (%plan-add-step plan `(setq ,var ,init))))))
-      ;; for VAR from N [to|below|downto|above M] [by STEP]
+      ;; for VAR from N [to|upto|below|downto|above M] [by STEP]
       ((%cur-eat-keyword? cur 'from)
-       (%parse-from-clause plan cur var))
+       (%parse-from-clause plan cur var (%cur-eat! cur)))
+      ;; for VAR to|upto|below|downto|above M  — no `from`; the start
+      ;; defaults to 0  (CL: `for i below n` ≡ `for i from 0 below n`).
+      ((let ((k (%cur-peek cur)))
+         (and (symbolp k)
+              (member k '(to upto below downto above))))
+       (%parse-from-clause plan cur var 0))
       (t (error "loop: unknown for-spec after ~A" var)))))
 
-(defun %parse-from-clause (plan cur var)
-  "Parse (for VAR from N [bound-keyword M] [by STEP])."
-  (let* ((start (%cur-eat! cur))
-         (cmp nil)
+(defun %parse-from-clause (plan cur var start)
+  "Parse the range tail [to|upto|below|downto|above M] [by STEP] for a
+   numeric for-clause whose START value is already determined — either
+   the token after `from`, or 0 for a `for i below n`-style clause."
+  (let* ((cmp nil)
          (limit nil)
          (step 1)
          (direction 1))
-    ;; Optional bound keyword.
+    ;; Optional bound keyword. `upto` is a synonym for `to`.
     (cond
       ((%cur-eat-keyword? cur 'to)     (setq cmp '<=) (setq limit (%cur-eat! cur)))
+      ((%cur-eat-keyword? cur 'upto)   (setq cmp '<=) (setq limit (%cur-eat! cur)))
       ((%cur-eat-keyword? cur 'below)  (setq cmp '<)  (setq limit (%cur-eat! cur)))
       ((%cur-eat-keyword? cur 'downto)
        (setq cmp '>=) (setq direction -1) (setq limit (%cur-eat! cur)))
@@ -285,55 +293,68 @@
     (%plan-add-test plan `(<= ,counter 0))
     (%plan-add-step plan `(setq ,counter (- ,counter 1)))))
 
+;; Optional `into VAR` tail on an accumulation clause. Returns the
+;; user's accumulator variable if present (and NIL otherwise), having
+;; eaten the `into` keyword and the variable name.
+(defun %parse-into? (cur)
+  (when (%cur-eat-keyword? cur 'into)
+    (%cur-eat! cur)))
+
 (defun %parse-collect (plan cur)
-  (let ((expr (%cur-eat! cur))
-        (acc (gensym "COLLECT-")))
+  (let* ((expr (%cur-eat! cur))
+         (into (%parse-into? cur))
+         (acc (or into (gensym "COLLECT-"))))
     (%plan-add-with plan acc nil)
     (%plan-add-body plan `(setq ,acc (cons ,expr ,acc)))
-    (%plan-add-accumulator plan 'collect acc nil)))
+    (%plan-add-accumulator plan 'collect acc into)))
 
 (defun %parse-append (plan cur)
-  (let ((expr (%cur-eat! cur))
-        (acc (gensym "APPEND-")))
+  (let* ((expr (%cur-eat! cur))
+         (into (%parse-into? cur))
+         (acc (or into (gensym "APPEND-"))))
     (%plan-add-with plan acc nil)
     (%plan-add-body plan `(setq ,acc (append* ,acc ,expr)))
-    (%plan-add-accumulator plan 'append acc nil)))
+    (%plan-add-accumulator plan 'append acc into)))
 
 (defun %parse-sum (plan cur)
-  (let ((expr (%cur-eat! cur))
-        (acc (gensym "SUM-")))
+  (let* ((expr (%cur-eat! cur))
+         (into (%parse-into? cur))
+         (acc (or into (gensym "SUM-"))))
     (%plan-add-with plan acc 0)
     (%plan-add-body plan `(setq ,acc (+ ,acc ,expr)))
-    (%plan-add-accumulator plan 'sum acc nil)))
+    (%plan-add-accumulator plan 'sum acc into)))
 
 (defun %parse-count (plan cur)
-  (let ((expr (%cur-eat! cur))
-        (acc (gensym "COUNT-")))
+  (let* ((expr (%cur-eat! cur))
+         (into (%parse-into? cur))
+         (acc (or into (gensym "COUNT-"))))
     (%plan-add-with plan acc 0)
     (%plan-add-body plan `(when ,expr (setq ,acc (+ ,acc 1))))
-    (%plan-add-accumulator plan 'count acc nil)))
+    (%plan-add-accumulator plan 'count acc into)))
 
 (defun %parse-minimize (plan cur)
-  (let ((expr (%cur-eat! cur))
-        (acc (gensym "MIN-"))
-        (val (gensym "V-")))
+  (let* ((expr (%cur-eat! cur))
+         (into (%parse-into? cur))
+         (acc (or into (gensym "MIN-")))
+         (val (gensym "V-")))
     (%plan-add-with plan acc nil)
     (%plan-add-body plan
                     `(let ((,val ,expr))
                        (when (or (null ,acc) (< ,val ,acc))
                          (setq ,acc ,val))))
-    (%plan-add-accumulator plan 'min acc nil)))
+    (%plan-add-accumulator plan 'min acc into)))
 
 (defun %parse-maximize (plan cur)
-  (let ((expr (%cur-eat! cur))
-        (acc (gensym "MAX-"))
-        (val (gensym "V-")))
+  (let* ((expr (%cur-eat! cur))
+         (into (%parse-into? cur))
+         (acc (or into (gensym "MAX-")))
+         (val (gensym "V-")))
     (%plan-add-with plan acc nil)
     (%plan-add-body plan
                     `(let ((,val ,expr))
                        (when (or (null ,acc) (> ,val ,acc))
                          (setq ,acc ,val))))
-    (%plan-add-accumulator plan 'max acc nil)))
+    (%plan-add-accumulator plan 'max acc into)))
 
 ;; (do FORM ...) — run forms each iteration, no accumulation.
 ;; Reads forms until the next clause keyword or end of body.
@@ -466,17 +487,33 @@
 (defun %loop-result-form (plan)
   "Pick the final-value form. CL says the value of the last
    accumulator clause; collect's accumulator was built with cons-
-   prepend so we reverse it back."
-  (let ((accs (loop-plan-accumulators plan)))
+   prepend so we reverse it back. Accumulators with an `into` variable
+   bind that variable instead and contribute NOTHING to the loop value
+   — the user retrieves them via `finally`."
+  (let ((anon (remove-if (lambda (a) (cddr a))   ; cddr = the into-var, if any
+                         (loop-plan-accumulators plan))))
     (cond
-      ((null accs) nil)
+      ((null anon) nil)
       (t
-       (let ((last (car (last accs))))
-         (let ((kind (car last))
-               (var (cadr last)))
-           (cond
-             ((eq kind 'collect) `(reverse ,var))
-             (t var))))))))
+       (let* ((last (car (last anon)))
+              (kind (car last))
+              (var (cadr last)))
+         (cond
+           ((eq kind 'collect) `(reverse ,var))
+           (t var)))))))
+
+(defun %loop-collect-into-reversals (plan)
+  "For each distinct `collect ... into VAR`, emit a form that reverses
+   VAR in place after the loop and before `finally`, so finally (and any
+   later reader) sees the items in collection order. APPEND-into already
+   builds in order, and numeric accumulators need no fixup."
+  (let ((seen nil) (forms nil))
+    (dolist (a (loop-plan-accumulators plan))
+      (let ((kind (car a)) (var (cadr a)) (into (cddr a)))
+        (when (and into (eq kind 'collect) (not (member var seen)))
+          (setq seen (cons var seen))
+          (setq forms (cons `(setq ,var (nreverse ,var)) forms)))))
+    (reverse forms)))
 
 (defun %loop-emit (plan)
   "Walk PLAN, emit the full expansion. Shape:
@@ -558,6 +595,7 @@
                (,test-form (return nil))
                (t ,@body
                   ,post-test-cond)))
+           ,@(%loop-collect-into-reversals plan)
            ,@finally
            ,result)))))
 
