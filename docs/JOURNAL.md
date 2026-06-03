@@ -5,6 +5,43 @@ NewCormanLisp. Newest entries at the top.
 
 ---
 
+## Session 1 summary (2026-06-03)
+
+Five commits, each verified before landing; GC reliability re-checked
+after every GC-touching change (per the user's standing instruction).
+
+| commit    | what | verification |
+|-----------|------|--------------|
+| `6c56628` | **blocker**: stdlib bootstrap stack-overflow (hash-bucket → polymorphic-mod recursion cycle). The whole CLI was unusable on any non-`--lean` start. | stdlib loads; CLOS/conditions/LOOP/vectors/Prolog all run |
+| `436f12c` | **perf**: precise-root stack `Mutex`→`RefCell` | ~3.9× call-heavy; 208 unit + full GC stress green |
+| `1374340` | **perf**: inline symbol-call dispatch fast path | ~11% (interleaved A/B); GC stress + SEH green |
+| `abda652` | **compat**: `alphanumericp` Unicode (un-shadow native shim) | red integration test → green |
+| `6ccbdb1` | **compat**: `(expt <int> <neg>)` → exact rational | 208 unit + GC sanity + ratio-pressure |
+
+Methodology note worth keeping: the inline-dispatch decision was nearly
+wrong because the first A/B compared numbers taken ~15 min apart in a
+build-heavy session — CPU-frequency drift made it look 1.7× *slower*. An
+interleaved A/B (binaries run alternately) corrected it to ~11 % faster.
+Never compare perf numbers across different points in a busy session.
+
+Per-change verification done before each landed:
+- `ncl-runtime` unit tests (208, incl. mutator/heap/ratio/bignum) — green
+  after every commit that touched the crate.
+- GC semantic gate after each GC-touching change: conservative-pin
+  `alloc-test` (exact 32000000), `stress` (16-thread), `gc-watch`
+  (0 pin leaks), plus `seh-unwind` for the dispatch change.
+- `ncl-tests::characters` (incl. the formerly-red Unicode test) — green.
+
+A final *cumulative* `cargo test -p ncl-tests -p ncl-corman-demos` run was
+launched as a belt-and-suspenders check; it rebuilds ~30 Windows-linked
+test binaries and runs the JIT demo corpus, so it is very slow. Since
+every change above is independently verified and the working tree is
+clean + committed, the session's correctness does not hinge on it.
+
+Details for each below.
+
+---
+
 ## 2026-06-03 — Session 1
 
 ### Orientation
