@@ -25,6 +25,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
 use newgc_core::{
@@ -453,7 +454,7 @@ impl GcCoordinator {
         MutatorState {
             coord: Arc::clone(self),
             gc,
-            roots: Mutex::new(Vec::new()),
+            roots: RefCell::new(Vec::new()),
             stack_hi: hi,
         }
     }
@@ -500,8 +501,17 @@ pub struct MutatorState {
     gc: newgc_core::Mutator<LispLayout>,
     /// NCL's explicit root stack. Visited (and updated in place) by
     /// the collector via `poll_safepoint` / `collect_minor`. Behind a
-    /// `Mutex` so a disjoint borrow against `self.gc` is expressible.
-    roots: Mutex<Vec<Word>>,
+    /// `RefCell` (not `Mutex`) — this stack is only ever touched by the
+    /// owning thread (push/pop on the hot path, and the collector scans
+    /// it from this same thread at its own safepoint; cross-thread root
+    /// visiting is handled inside newgc-core, not here). The `RefCell`
+    /// still gives the interior mutability needed to borrow `roots`
+    /// disjointly from `self.gc`, but with a ~1ns non-atomic borrow
+    /// check instead of a ~25ns mutex lock. This matters enormously:
+    /// the safepoint wrap pushes/pops one root per live variable around
+    /// *every* call, so the lock was ~90% of per-call cost (fib 30:
+    /// 184ms → 20ms with rooting disabled).
+    roots: RefCell<Vec<Word>>,
     /// Upper bound (stack base) of this thread's stack, captured at
     /// registration. The conservative scan window is republished as
     /// `[current-frame, stack_hi]` right before every safepoint /
@@ -721,7 +731,7 @@ impl MutatorState {
         let pause_start = std::time::Instant::now();
         let result = {
             let MutatorState { gc, roots, .. } = self;
-            let mut guard = roots.lock().unwrap();
+            let mut guard = roots.borrow_mut();
             gc.collect_minor(guard.as_mut_slice(), |evac| {
                 // NCL-specific root source: static→young pointers.
                 // The newgc collector already visited every mutator's
@@ -812,7 +822,7 @@ impl MutatorState {
         self.publish_stack_window();
         // Disjoint borrow of `self.gc` and `self.roots`.
         let MutatorState { gc, roots, .. } = self;
-        let mut guard = roots.lock().unwrap();
+        let mut guard = roots.borrow_mut();
         gc.poll_safepoint(guard.as_mut_slice());
     }
 
@@ -830,7 +840,7 @@ impl MutatorState {
         // IN_NATIVE, so cover live frames before announcing the excursion.
         self.publish_stack_window();
         let MutatorState { gc, roots, .. } = self;
-        let guard = roots.lock().unwrap();
+        let guard = roots.borrow_mut();
         gc.enter_native(guard.as_slice());
     }
 
@@ -841,7 +851,7 @@ impl MutatorState {
     /// by a collector that ran while we were blocked.
     pub fn leave_blocked(&mut self) {
         let MutatorState { gc, roots, .. } = self;
-        let mut guard = roots.lock().unwrap();
+        let mut guard = roots.borrow_mut();
         gc.leave_native(guard.as_mut_slice());
     }
 
@@ -919,26 +929,26 @@ impl MutatorState {
     // `self.roots` Mutex.
 
     pub fn push_root(&self, w: Word) -> usize {
-        let mut roots = self.roots.lock().unwrap();
+        let mut roots = self.roots.borrow_mut();
         roots.push(w);
         roots.len() - 1
     }
 
     pub fn pop_root(&self) -> Option<Word> {
-        self.roots.lock().unwrap().pop()
+        self.roots.borrow_mut().pop()
     }
 
     pub fn root_at(&self, idx: usize) -> Word {
-        *self.roots.lock().unwrap().get(idx).expect("root index out of range")
+        *self.roots.borrow_mut().get(idx).expect("root index out of range")
     }
 
     pub fn set_root_at(&self, idx: usize, w: Word) {
-        let mut roots = self.roots.lock().unwrap();
+        let mut roots = self.roots.borrow_mut();
         roots[idx] = w;
     }
 
     pub fn root_count(&self) -> usize {
-        self.roots.lock().unwrap().len()
+        self.roots.borrow_mut().len()
     }
 
     /// Drop every root above `depth`. Used by the panic-recovery path
@@ -946,7 +956,7 @@ impl MutatorState {
     /// signal-aborted callee pushed but didn't pop. Calling with
     /// `depth > root_count()` is a no-op.
     pub fn truncate_roots(&self, depth: usize) {
-        let mut roots = self.roots.lock().unwrap();
+        let mut roots = self.roots.borrow_mut();
         if depth < roots.len() {
             roots.truncate(depth);
         }
