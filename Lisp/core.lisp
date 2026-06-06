@@ -542,14 +542,21 @@
     ((null rest) `(defparameter ,name nil))
     (t `(defparameter ,name ,(car rest)))))
 
+;; Registry of symbols declared constant via DEFCONSTANT, consulted
+;; by CONSTANTP. A plain list with eq membership — the set of user
+;; constants is small in practice.
+(defparameter *constants* nil)
+
 (defmacro defconstant (name value &rest rest)
-  "Declare NAME as a constant with VALUE. CL semantics say a
-   defconstant'd symbol must not be reassigned; NCL doesn't yet
-   enforce that, so this is documentation-only and aliases to
-   defparameter. The optional docstring argument is accepted and
+  "Declare NAME as a constant with VALUE. NCL does not yet ENFORCE
+   non-reassignment, but the symbol is recorded so CONSTANTP reports
+   it as constant. The optional docstring argument is accepted and
    discarded for source-compat with portable libraries."
   (declare (ignore rest))
-  `(defparameter ,name ,value))
+  `(progn
+     (defparameter ,name ,value)
+     (setq *constants* (cons ',name *constants*))
+     ',name))
 
 (defmacro push (value place)
   "Prepend VALUE to the list stored at PLACE. PLACE is evaluated
@@ -2137,6 +2144,25 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
   (lambda (&rest args)
     (declare (ignore args))
     value))
+
+(defun constantp (form &optional environment)
+  "True if FORM is a constant form — its value is fixed and known:
+   a self-evaluating object (number, string, character, vector, …),
+   NIL or T, a (quote …) form, or a symbol declared with DEFCONSTANT.
+   Symbols bound by defvar/defparameter (or unbound) are NOT constant.
+   The optional ENVIRONMENT is accepted (per CL) and ignored — we do
+   not yet recognise lexically constant forms. May return NIL for
+   forms that are in fact constant; CL permits this."
+  (declare (ignore environment))
+  (cond
+    ((consp form) (eq (car form) 'quote))
+    ((symbolp form)
+     ;; NIL and T self-evaluate; otherwise only DEFCONSTANT names.
+     (if (or (null form) (eq form t) (and (member form *constants*) t))
+         t
+         nil))
+    ;; Everything else is a self-evaluating literal.
+    (t t)))
 
 ;; -- List predicates & utilities (batch 4) ------------------------------------
 
