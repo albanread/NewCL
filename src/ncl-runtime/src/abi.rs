@@ -434,6 +434,9 @@ pub extern "C-unwind" fn ncl_call(
             &format!("not a function: {fn_value:?}"),
         );
     }
+    if let Some(cond) = under_supplied_arity(mutator, fn_value, n_args) {
+        return cond;
+    }
     let env = crate::gc_function::env(fn_value);
     // Diagnostic: an env that isn't NIL and isn't a Vector pointer
     // means the Function's env field has been corrupted (typically
@@ -522,6 +525,48 @@ fn resolve_function_designator(
     }
 }
 
+/// Guard against calling a Lisp-compiled function with fewer
+/// arguments than its required-parameter count.
+///
+/// A Lisp callee's prologue loads each required parameter straight
+/// from `args[i]`; under-supplying makes it read PAST the end of the
+/// argument array into uninitialised memory — a stale stack slot or
+/// a code pointer — and crash with an access violation. That is the
+/// whole "too few arguments" crash family: `(funcall (complement
+/// #'member) …)`, a stray `(some-fn)`, a predicate passed to
+/// `mapcar`/`sort`/`reduce` that's called with the wrong arity, etc.
+///
+/// Native Rust shims are exempt: they manage their own (frequently
+/// variadic) argument lists and validate `n_args` themselves, so a
+/// fixed `arity` field would wrongly reject e.g. `(+)` or `(list)`.
+///
+/// Returns `Some(_)` — a value that flows through the condition
+/// machinery (a recorded condition under a handler, else a clean
+/// process exit) — when the call must be rejected; `None` to proceed.
+#[inline]
+fn under_supplied_arity(
+    mutator: *mut crate::mutator::MutatorState,
+    f_word: Word,
+    n_args: u64,
+) -> Option<u64> {
+    if !crate::gc_function::is_lisp_compiled(f_word) {
+        return None;
+    }
+    let required = crate::gc_function::arity(f_word) as u64;
+    if n_args >= required {
+        return None;
+    }
+    let fname = crate::sym_names::lookup(crate::gc_function::name(f_word).raw())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "anonymous function".to_string());
+    Some(signal_condition_string(
+        mutator,
+        &format!(
+            "{fname}: too few arguments — got {n_args}, requires at least {required}"
+        ),
+    ))
+}
+
 /// Call a Function value directly. Accepts a function designator —
 /// either a Function Word or a symbol whose function cell is bound
 /// to a Function. The latter case is what makes `(funcall '+ 1 2)`
@@ -539,6 +584,9 @@ pub extern "C-unwind" fn ncl_funcall(
             Ok(w) => w,
             Err(nil) => return nil,
         };
+        if let Some(cond) = under_supplied_arity(mutator, f_word, n_args) {
+            return cond;
+        }
         let env = crate::gc_function::env(f_word);
         debug_assert_closure_env_valid("ncl_funcall", 0, f_word, env);
         let code = crate::gc_function::code_ptr(f_word);
@@ -1362,6 +1410,9 @@ pub extern "C-unwind" fn ncl_apply(
         cur = Word::from_raw(unsafe { *p.add(1) });
     }
 
+    if let Some(cond) = under_supplied_arity(mutator, f_word, total as u64) {
+        return cond;
+    }
     let env = crate::gc_function::env(f_word);
     debug_assert_closure_env_valid("ncl_apply", 0, f_word, env);
     let code = crate::gc_function::code_ptr(f_word);
