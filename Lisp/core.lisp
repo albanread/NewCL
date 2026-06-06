@@ -1726,13 +1726,31 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
        ((stringp object)
         (apply #'vector (coerce-string-to-list object 0 (length object))))
        (t (error "coerce: cannot coerce ~S to VECTOR" object))))
+    ;; ── → CHARACTER ─────────────────────────────────────────────────
+    ;; A character designator: a character, a one-element string, or a
+    ;; symbol whose name is exactly one character long.
+    ((eq result-type 'character)
+     (cond
+       ((characterp object) object)
+       ((and (stringp object) (= (length object) 1)) (char object 0))
+       ((and (symbolp object) object (= (length (symbol-name object)) 1))
+        (char (symbol-name object) 0))
+       (t (error "coerce: cannot coerce ~S to CHARACTER" object))))
     ;; ── numeric widenings ───────────────────────────────────────────
-    ((eq result-type 'float)
+    ;; All float subtypes collapse to NCL's single float type.
+    ((member result-type '(float short-float single-float double-float long-float))
      (if (numberp object) (* 1.0 object)
          (error "coerce: cannot coerce ~S to FLOAT" object)))
     ((eq result-type 'integer)
      (if (integerp object) object
          (error "coerce: cannot coerce ~S to INTEGER" object)))
+    ;; ── → COMPLEX ───────────────────────────────────────────────────
+    ;; (complex x 0): a float realpart stays as #C(x 0.0); a rational
+    ;; realpart canonicalizes back to the real (CL). An already-complex
+    ;; object was handled by the identity branch above.
+    ((eq result-type 'complex)
+     (if (numberp object) (complex object 0)
+         (error "coerce: cannot coerce ~S to COMPLEX" object)))
     (t (error "coerce: unsupported result-type ~S" result-type))))
 
 (defun coerce-string-to-list (s i n)
