@@ -533,6 +533,15 @@ pub extern "C-unwind" fn expt_shim(
     let m = unsafe { &mut *mutator };
     let base_w = Word::from_raw(unsafe { *args });
     let exp_w = Word::from_raw(unsafe { *args.add(1) });
+    // Float contagion: if either operand is a float, the result is a
+    // float (CL: expt of a float, or to a float power, yields a
+    // float). Delegate to the float path, which uses powf and also
+    // handles non-integer powers — e.g. (expt 2.0 3), (expt 1.5 2),
+    // (expt 2.0 0.5). The integer/ratio exact path below is reserved
+    // for rational base AND integer power.
+    if crate::float::is_float(base_w) || crate::float::is_float(exp_w) {
+        return crate::float::expt_float_shim(mutator, _env, args, n_args);
+    }
     let base = match integer_to_bigint(base_w) {
         Some(n) => n,
         None => return crate::abi::signal_condition_string(
