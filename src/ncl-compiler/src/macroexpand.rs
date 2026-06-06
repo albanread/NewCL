@@ -228,14 +228,126 @@ pub fn word_to_value(w: Word) -> Result<Value, EvalError> {
 /// Every other cons form is treated uniformly: if its head names a
 /// registered macro, call it and recurse on the result; otherwise
 /// walk all subforms.
+// ---- lexical macro environment (macrolet / symbol-macrolet) ---------------
+//
+// A stack of frames threaded as a thread-local rather than a parameter, so
+// the existing recursive macroexpand_all signature stays intact. Each
+// macrolet / symbol-macrolet pushes a frame around the expansion of its
+// body and pops it after. Lookups walk innermost-first.
+//
+// Scoping caveat: inner LET/LAMBDA bindings that shadow a symbol-macro name
+// are not removed from the env (no per-binding shadow frames yet), so a
+// lexical rebinding of a symbol-macro'd name inside the body would still see
+// the macro. Rare in practice; the common (and ANSI-tested) uses don't rely
+// on it.
+
+struct MacroFrame {
+    /// local macros: name -> compiled expander Function word.
+    macros: Vec<(Arc<str>, Word)>,
+    /// symbol macros: name -> expansion form.
+    symbol_macros: Vec<(Arc<str>, Value)>,
+}
+
+thread_local! {
+    static MACRO_ENV: std::cell::RefCell<Vec<MacroFrame>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn macro_env_push(frame: MacroFrame) {
+    MACRO_ENV.with(|e| e.borrow_mut().push(frame));
+}
+fn macro_env_pop() {
+    MACRO_ENV.with(|e| { e.borrow_mut().pop(); });
+}
+
+/// RAII guard: pushes a `MacroFrame` and pops it when dropped. Using a
+/// guard (instead of a manual push/pop pair) makes the thread-local
+/// `MACRO_ENV` leak-proof — the frame is removed on EVERY exit path,
+/// including early `?` returns and panics. A leaked frame would make
+/// `any_symbol_macros()` / `lookup_*_macro` see stale bindings in
+/// later top-level forms, which previously caused ordinary `setq`s to
+/// be misrewritten.
+struct FrameGuard;
+impl Drop for FrameGuard {
+    fn drop(&mut self) {
+        macro_env_pop();
+    }
+}
+#[must_use]
+fn macro_env_push_guard(frame: MacroFrame) -> FrameGuard {
+    macro_env_push(frame);
+    FrameGuard
+}
+fn lookup_local_macro(name: &str) -> Option<Word> {
+    MACRO_ENV.with(|e| {
+        for frame in e.borrow().iter().rev() {
+            for (n, w) in frame.macros.iter().rev() {
+                if &**n == name {
+                    return Some(*w);
+                }
+            }
+        }
+        None
+    })
+}
+fn lookup_symbol_macro(name: &str) -> Option<Value> {
+    MACRO_ENV.with(|e| {
+        for frame in e.borrow().iter().rev() {
+            for (n, expansion) in frame.symbol_macros.iter().rev() {
+                if &**n == name {
+                    return Some(expansion.clone());
+                }
+            }
+        }
+        None
+    })
+}
+/// True if `v` is `(SETQ var val ...)` where at least one assigned
+/// *variable* (an even-indexed argument) is currently a symbol macro.
+/// Only such a SETQ needs the SETQ→SETF rewrite; an ordinary SETQ must
+/// be left alone so it doesn't bounce SETQ→SETF→SETQ forever (SETF of a
+/// plain symbol expands straight back to SETQ).
+fn setq_has_symbol_macro_target(v: &Value) -> bool {
+    let mut cur = cdr_of(v);
+    let mut idx = 0usize;
+    while let Value::Cons(c) = &cur {
+        if idx % 2 == 0 {
+            if let Value::Symbol(s) = &c.car {
+                if lookup_symbol_macro(&s.name).is_some() {
+                    return true;
+                }
+            }
+        }
+        let next = c.cdr.clone();
+        cur = next;
+        idx += 1;
+    }
+    false
+}
+
+/// Intern NAME and return it as a `Value::Symbol` (for synthesising forms
+/// like `(setf …)` / `(progn …)` during expansion).
+fn sym_value(coord: &Arc<GcCoordinator>, name: &str) -> Value {
+    let w = coord.intern(name).raw();
+    word_to_value(Word::from_raw(w)).unwrap_or(Value::Nil)
+}
+
 pub fn macroexpand_all(
     v: &Value,
     coord: &Arc<GcCoordinator>,
     mutator: &mut MutatorState,
 ) -> Result<Value, EvalError> {
-    let Value::Cons(_) = v else {
-        return Ok(v.clone());
-    };
+    match v {
+        // A bare symbol in a value position may be a symbol-macro.
+        Value::Symbol(s) => {
+            if let Some(expansion) = lookup_symbol_macro(&s.name) {
+                return macroexpand_all(&expansion, coord, mutator);
+            }
+            return Ok(v.clone());
+        }
+        Value::Cons(_) => {}
+        _ => return Ok(v.clone()),
+    }
     if let Some(head_name) = head_symbol_name(v) {
         match &*head_name {
             "QUOTE" => return Ok(v.clone()),
@@ -285,15 +397,154 @@ pub fn macroexpand_all(
                 let items = list_to_vec(v)?;
                 return rebuild_let(&items, coord, mutator);
             }
+            "SYMBOL-MACROLET" => {
+                // (symbol-macrolet ((name expansion) ...) body...)
+                let items = list_to_vec(v)?;
+                if items.len() < 2 {
+                    return Ok(v.clone());
+                }
+                let bindings = list_to_vec(&items[1])?;
+                let mut sym_macros = Vec::new();
+                for b in &bindings {
+                    let pair = list_to_vec(b)?;
+                    if pair.len() >= 2 {
+                        if let Value::Symbol(s) = &pair[0] {
+                            sym_macros.push((Arc::clone(&s.name), pair[1].clone()));
+                        }
+                    }
+                }
+                let _frame = macro_env_push_guard(MacroFrame {
+                    macros: Vec::new(),
+                    symbol_macros: sym_macros,
+                });
+                let mut progn = vec![sym_value(coord, "PROGN")];
+                for body in &items[2..] {
+                    progn.push(macroexpand_all(body, coord, mutator)?);
+                }
+                return Ok(Value::list(progn));
+            }
+            "MACROLET" => {
+                // (macrolet ((name lambda-list body...) ...) body...)
+                // Compile each local macro's expander into a Function
+                // word, then macroexpand the body with those expanders
+                // in scope. Per CLHS the expander bodies see the
+                // surrounding macro environment (outer macrolet /
+                // symbol-macrolet) but NOT each other, so we compile
+                // them BEFORE pushing the new frame — exactly like the
+                // parallel scoping of `flet`.
+                let items = list_to_vec(v)?;
+                if items.len() < 2 {
+                    return Ok(v.clone());
+                }
+                let defs = list_to_vec(&items[1])?;
+                let mut macros: Vec<(Arc<str>, Word)> = Vec::new();
+                for def in &defs {
+                    let parts = list_to_vec(def)?;
+                    if parts.len() < 2 {
+                        return Err(EvalError::Compile(
+                            crate::CompileError::NotImplemented(
+                                "malformed macrolet binding".into(),
+                            ),
+                        ));
+                    }
+                    let name = match &parts[0] {
+                        Value::Symbol(s) => Arc::clone(&s.name),
+                        _ => {
+                            return Err(EvalError::Compile(
+                                crate::CompileError::NotImplemented(
+                                    "macrolet macro name must be a symbol".into(),
+                                ),
+                            ))
+                        }
+                    };
+                    let params = crate::parse_param_list_inner(&parts[1])
+                        .map_err(|e| {
+                            EvalError::Compile(crate::CompileError::BadDefun(e))
+                        })?;
+                    let body = &parts[2..];
+                    let expander = crate::compile_function_raw(
+                        coord, mutator, &name, &params, body,
+                    )?;
+                    macros.push((name, expander));
+                }
+                let _frame = macro_env_push_guard(MacroFrame {
+                    macros,
+                    symbol_macros: Vec::new(),
+                });
+                let mut progn = vec![sym_value(coord, "PROGN")];
+                for body in &items[2..] {
+                    progn.push(macroexpand_all(body, coord, mutator)?);
+                }
+                return Ok(Value::list(progn));
+            }
+            // SETQ where at least one target is a symbol macro: rewrite
+            // each such pair to `(setf <expansion> val)` and leave the
+            // ordinary pairs as `(setq var val)`. Gating on *this* SETQ
+            // having a symbol-macro target (not merely any symbol macro
+            // being in scope) is essential: an ordinary SETQ left as
+            // SETQ would otherwise re-enter this arm, expand to SETF,
+            // and SETF of a plain symbol expands straight back to SETQ —
+            // an infinite SETQ→SETF→SETQ loop. The emitted plain SETQs
+            // have no symbol-macro target, so they fall through to the
+            // ordinary subform walk on re-expansion.
+            "SETQ" if setq_has_symbol_macro_target(v) => {
+                let items = list_to_vec(v)?;
+                let pairs = &items[1..];
+                let mut forms = vec![sym_value(coord, "PROGN")];
+                let mut i = 0;
+                while i + 1 < pairs.len() {
+                    let val = macroexpand_all(&pairs[i + 1], coord, mutator)?;
+                    match &pairs[i] {
+                        Value::Symbol(s) if lookup_symbol_macro(&s.name).is_some() => {
+                            let place = lookup_symbol_macro(&s.name).unwrap();
+                            forms.push(Value::list(vec![
+                                sym_value(coord, "SETF"),
+                                place,
+                                val,
+                            ]));
+                        }
+                        other => {
+                            forms.push(Value::list(vec![
+                                sym_value(coord, "SETQ"),
+                                other.clone(),
+                                val,
+                            ]));
+                        }
+                    }
+                    i += 2;
+                }
+                return macroexpand_all(&Value::list(forms), coord, mutator);
+            }
             _ => {}
         }
-        // Macro head? Expand, then recurse on the result.
-        if let Some(macro_fn) = coord.macro_for(&head_name) {
+        // Macro head? Local macros (macrolet) shadow global ones.
+        if let Some(macro_fn) =
+            lookup_local_macro(&head_name).or_else(|| coord.macro_for(&head_name))
+        {
             let args_value = cdr_of(v);
             let args_vec = list_to_vec(&args_value)?;
             let mut arg_words: Vec<u64> = Vec::with_capacity(args_vec.len());
             for a in &args_vec {
                 arg_words.push(value_to_word(a, mutator, coord)?.raw());
+            }
+            // Defensive arity check. A macro expander's prologue reads
+            // its required positional parameters straight out of the
+            // args array; calling it with fewer would read PAST the end
+            // into uninitialised memory, whose bytes can carry any tag —
+            // a forwarding pointer, a bogus symbol — and then crash deep
+            // in `word_to_value` or at runtime. Report a clean compile
+            // error instead. (`arity` is the required-param count set by
+            // `compile_function_raw`.)
+            let required = gc_function::arity(macro_fn) as usize;
+            if arg_words.len() < required {
+                return Err(EvalError::Compile(crate::CompileError::MacroError(
+                    format!(
+                        "macro ({head_name} …) called with {} argument(s) \
+                         but requires at least {}",
+                        arg_words.len(),
+                        required
+                    ),
+                )));
             }
             let env = gc_function::env(macro_fn);
             let code = gc_function::code_ptr(macro_fn);

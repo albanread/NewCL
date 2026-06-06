@@ -2308,6 +2308,20 @@ pub extern "C-unwind" fn native_block_shim(
             BLOCK_TARGET.with(|t| t.set(0));
             return our_frame_value;
         }
+        // CL `(return v)` ≡ `(return-from nil v)`. NCL's `return`
+        // lowers to the loop-break primitive (`%loop-return`), which
+        // an enclosing `%native-loop` consumes. When the nearest
+        // enclosing exit point is a `(block nil …)` instead of a loop,
+        // THIS block must consume the loop-break: it gives `return` its
+        // block semantics and stops a stray break from propagating to
+        // the top level and aborting the load. Only a block actually
+        // named NIL qualifies; loops, being innermost, still consume
+        // their own breaks first.
+        if name == Word::NIL.raw() && LOOP_BREAK_PENDING.with(|p| p.get()) {
+            LOOP_BREAK_PENDING.with(|p| p.set(false));
+            ABORT_PENDING.with(|p| p.set(false));
+            return LOOP_BREAK_VALUE.with(|v| v.get());
+        }
         // Not our abort — leave the flag pending so a surrounding
         // block (or handler-case for a condition) catches it.
         // Drop body_result.
@@ -2321,7 +2335,7 @@ pub extern "C-unwind" fn native_block_shim(
 /// see module docstring for the trade-off). Panics if no
 /// matching block is currently active.
 pub extern "C-unwind" fn return_from_shim(
-    _mutator: *mut crate::mutator::MutatorState,
+    mutator: *mut crate::mutator::MutatorState,
     _env: u64,
     args: *const u64,
     n_args: u64,
@@ -2344,10 +2358,20 @@ pub extern "C-unwind" fn return_from_shim(
         }
     });
     if !found {
+        // No matching block on the stack. This is a CONTROL-ERROR in
+        // CL, not an internal invariant — e.g. `(return-from foo)`
+        // where the enclosing `(defun foo …)` didn't establish an
+        // implicit block, or a stale closure outliving its block.
+        // Signal a catchable condition (handler-case sees it; with no
+        // handler the process exits cleanly) rather than panicking,
+        // which would unwind through JIT frames and abort the worker.
         let sym_name = crate::sym_names::lookup(name)
             .map(|s| s.to_string())
             .unwrap_or_else(|| "<unknown>".to_string());
-        panic!("return-from: no enclosing block named {sym_name}");
+        return signal_condition_string(
+            mutator,
+            &format!("return-from: no enclosing block named {sym_name}"),
+        );
     }
     ABORT_PENDING.with(|p| p.set(true));
     BLOCK_TARGET.with(|t| t.set(name));

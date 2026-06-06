@@ -2274,6 +2274,17 @@ pub(crate) fn build_arglist_prologue(
     let body_mutations = mutated_in_body(body_forms, &HashSet::new());
     let req_n = params.required.len() as u32;
 
+    // `&whole` / `&environment` (macro lambda lists): non-positional
+    // locals bound to NIL. Bound first so they're in scope for any
+    // later default forms. A real binding (the whole call form / the
+    // lexical macro environment) is a future enhancement.
+    if let Some(whole_name) = &params.whole {
+        push_param_local(env, whole_name, Expr::Nil, &body_mutations, &mut bindings);
+    }
+    if let Some(env_name) = &params.environment {
+        push_param_local(env, env_name, Expr::Nil, &body_mutations, &mut bindings);
+    }
+
     // Optionals are positional: arg index = required + i.
     for (i, opt) in params.optionals.iter().enumerate() {
         let arg_idx = req_n + i as u32;

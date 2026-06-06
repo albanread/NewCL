@@ -472,129 +472,151 @@ impl Session {
         params: &ParamSpec,
         body_forms: &[Value],
     ) -> Result<Word, EvalError> {
-        let t_lower = startup_timing::now();
-
-        // First, expand any macros used in the body.
-        let mut expanded_body: Vec<Value> = Vec::with_capacity(body_forms.len());
-        for form in body_forms {
-            expanded_body.push(macroexpand_all(form, &self.coord, &mut self.mutator)?);
-        }
-
-        // Strip leading (declare ...) forms — they're processed at
-        // lowering time and must not be evaluated as function calls.
-        let (_, effective_body) = lower::strip_declares(&expanded_body);
-        let effective_body = effective_body.to_vec();
-
-        // Build the env. Required params first at Param(0..N); the
-        // shared prologue helper then layers optionals/rest/keys on
-        // as let-locals (boxed if the body mutates them).
-        let mut env = LocalEnv::with_params(&params.required);
-
-        // Mutable-parameter promotion: if a required param is
-        // mutated in the body, promote it to a boxed local cell.
-        let body_mutations = lower::mutated_in_body(
-            &effective_body,
-            &std::collections::HashSet::new(),
-        );
-        let mut req_box_prologue: Vec<ncl_ir::Expr> = Vec::new();
-        for (i, pname) in params.required.iter().enumerate() {
-            if body_mutations.contains(pname) {
-                let cell_init = ncl_ir::Expr::cons(
-                    ncl_ir::Expr::Param(i),
-                    ncl_ir::Expr::Nil,
-                );
-                env.rebind_as_local_cell(pname);
-                req_box_prologue.push(cell_init);
-            }
-        }
-
-        let mut prologue = lower::build_arglist_prologue(
-            params,
-            &effective_body,
-            &mut env,
+        compile_function_raw(
             &self.coord,
+            &mut self.mutator,
+            name,
+            params,
+            body_forms,
         )
-        .map_err(EvalError::Compile)?;
-        if !req_box_prologue.is_empty() {
-            let mut combined = req_box_prologue;
-            combined.append(&mut prologue);
-            prologue = combined;
-        }
-
-        // Implicit progn over body forms.
-        let lowered_body = if effective_body.len() == 1 {
-            lower_in(&effective_body[0], &env, &self.coord)
-                .map_err(EvalError::Compile)?
-        } else if effective_body.is_empty() {
-            ncl_ir::Expr::Nil
-        } else {
-            let lowered: Result<Vec<_>, _> = effective_body
-                .iter()
-                .map(|f| lower_in(f, &env, &self.coord))
-                .collect();
-            ncl_ir::Expr::progn(lowered.map_err(EvalError::Compile)?)
-        };
-
-        let body_expr = if prologue.is_empty() {
-            lowered_body
-        } else {
-            ncl_ir::Expr::let_(prologue, lowered_body)
-        };
-
-        let arity = params.required.len() as u32;
-
-        // Self-tail-call elimination — turn tail-position calls to THIS
-        // function into a loop so deep self-recursion reuses the frame
-        // instead of overflowing the native stack. Gated to fixed-arity
-        // functions (required params only): with &optional/&rest/&key,
-        // some parameters are bound as let-locals via the prologue, so
-        // a self-call would have to re-run the prologue — out of scope
-        // for this transform. Runs BEFORE instrument_tail_for_mv so the
-        // self-call is matched as a bare `Call`, not wrapped in
-        // EnsureSingleMv; the MV pass then recurses into the resulting
-        // `TailLoop` and leaves the `SelfTailNext` continuations alone.
-        let fixed_arity = params.optionals.is_empty()
-            && params.rest.is_none()
-            && params.keys.is_empty();
-        let body_expr = if fixed_arity {
-            let self_sym = self.coord.intern(name).raw();
-            let (rewritten, found) =
-                lower::rewrite_self_tail_calls(body_expr, self_sym, arity);
-            if found {
-                ncl_ir::Expr::tail_loop(arity, rewritten)
-            } else {
-                rewritten
-            }
-        } else {
-            body_expr
-        };
-
-        // Tail-position transform: wrap any non-`(values ...)` tail
-        // expression in EnsureSingleMv so the multi-value slot is
-        // always exactly the function's actual return values when
-        // the caller reads it. See lower::instrument_tail_for_mv.
-        let body_expr = lower::instrument_tail_for_mv(body_expr);
-
-        let lower_elapsed = startup_timing::elapsed(t_lower);
-        let t_jit = startup_timing::now();
-        let code_ptr = ncl_llvm::jit_compile_function(name, arity, &body_expr)
-            .map_err(EvalError::Jit)?;
-
-        startup_timing::push_form(name, lower_elapsed, startup_timing::elapsed(t_jit));
-        #[cfg(windows)]
-        ncl_runtime::igui::splash::tick();
-
-        let sym_word = self.coord.intern(name);
-        gc_function::alloc_function_in_static(
-            self.coord.static_area(),
-            code_ptr,
-            arity,
-            sym_word,
-            Word::NIL, // top-level functions and macros have no closure env
-            true,      // Lisp-compiled; manages its own MV slot
-        )
-        .ok_or_else(|| EvalError::Jit("static area exhausted".to_string()))
     }
+}
+
+/// Free-function form of `Session::compile_function`. Takes the
+/// coordinator and mutator explicitly instead of `&mut self`, so it
+/// can be called from `macroexpand_all` (which holds coord + mutator
+/// but no `Session`) to compile local macro expanders for MACROLET.
+/// `Session::compile_function` delegates here, so there is a single
+/// source of truth for the compile pipeline.
+pub(crate) fn compile_function_raw(
+    coord: &Arc<GcCoordinator>,
+    mutator: &mut MutatorState,
+    name: &str,
+    params: &ParamSpec,
+    body_forms: &[Value],
+) -> Result<Word, EvalError> {
+    let t_lower = startup_timing::now();
+
+    // First, expand any macros used in the body.
+    let mut expanded_body: Vec<Value> = Vec::with_capacity(body_forms.len());
+    for form in body_forms {
+        expanded_body.push(macroexpand_all(form, coord, mutator)?);
+    }
+
+    // Strip leading (declare ...) forms — they're processed at
+    // lowering time and must not be evaluated as function calls.
+    let (_, effective_body) = lower::strip_declares(&expanded_body);
+    let effective_body = effective_body.to_vec();
+
+    // Build the env. Required params first at Param(0..N); the
+    // shared prologue helper then layers optionals/rest/keys on
+    // as let-locals (boxed if the body mutates them).
+    let mut env = LocalEnv::with_params(&params.required);
+
+    // Mutable-parameter promotion: if a required param is
+    // mutated in the body, promote it to a boxed local cell.
+    let body_mutations = lower::mutated_in_body(
+        &effective_body,
+        &std::collections::HashSet::new(),
+    );
+    let mut req_box_prologue: Vec<ncl_ir::Expr> = Vec::new();
+    for (i, pname) in params.required.iter().enumerate() {
+        if body_mutations.contains(pname) {
+            let cell_init = ncl_ir::Expr::cons(
+                ncl_ir::Expr::Param(i),
+                ncl_ir::Expr::Nil,
+            );
+            env.rebind_as_local_cell(pname);
+            req_box_prologue.push(cell_init);
+        }
+    }
+
+    let mut prologue = lower::build_arglist_prologue(
+        params,
+        &effective_body,
+        &mut env,
+        coord,
+    )
+    .map_err(EvalError::Compile)?;
+    if !req_box_prologue.is_empty() {
+        let mut combined = req_box_prologue;
+        combined.append(&mut prologue);
+        prologue = combined;
+    }
+
+    // Implicit progn over body forms.
+    let lowered_body = if effective_body.len() == 1 {
+        lower_in(&effective_body[0], &env, coord)
+            .map_err(EvalError::Compile)?
+    } else if effective_body.is_empty() {
+        ncl_ir::Expr::Nil
+    } else {
+        let lowered: Result<Vec<_>, _> = effective_body
+            .iter()
+            .map(|f| lower_in(f, &env, coord))
+            .collect();
+        ncl_ir::Expr::progn(lowered.map_err(EvalError::Compile)?)
+    };
+
+    let body_expr = if prologue.is_empty() {
+        lowered_body
+    } else {
+        ncl_ir::Expr::let_(prologue, lowered_body)
+    };
+
+    let arity = params.required.len() as u32;
+
+    // Self-tail-call elimination — turn tail-position calls to THIS
+    // function into a loop so deep self-recursion reuses the frame
+    // instead of overflowing the native stack. Gated to fixed-arity
+    // functions (required params only): with &optional/&rest/&key,
+    // some parameters are bound as let-locals via the prologue, so
+    // a self-call would have to re-run the prologue — out of scope
+    // for this transform. Runs BEFORE instrument_tail_for_mv so the
+    // self-call is matched as a bare `Call`, not wrapped in
+    // EnsureSingleMv; the MV pass then recurses into the resulting
+    // `TailLoop` and leaves the `SelfTailNext` continuations alone.
+    let fixed_arity = params.optionals.is_empty()
+        && params.rest.is_none()
+        && params.keys.is_empty();
+    let body_expr = if fixed_arity {
+        let self_sym = coord.intern(name).raw();
+        let (rewritten, found) =
+            lower::rewrite_self_tail_calls(body_expr, self_sym, arity);
+        if found {
+            ncl_ir::Expr::tail_loop(arity, rewritten)
+        } else {
+            rewritten
+        }
+    } else {
+        body_expr
+    };
+
+    // Tail-position transform: wrap any non-`(values ...)` tail
+    // expression in EnsureSingleMv so the multi-value slot is
+    // always exactly the function's actual return values when
+    // the caller reads it. See lower::instrument_tail_for_mv.
+    let body_expr = lower::instrument_tail_for_mv(body_expr);
+
+    let lower_elapsed = startup_timing::elapsed(t_lower);
+    let t_jit = startup_timing::now();
+    let code_ptr = ncl_llvm::jit_compile_function(name, arity, &body_expr)
+        .map_err(EvalError::Jit)?;
+
+    startup_timing::push_form(name, lower_elapsed, startup_timing::elapsed(t_jit));
+    #[cfg(windows)]
+    ncl_runtime::igui::splash::tick();
+
+    let sym_word = coord.intern(name);
+    gc_function::alloc_function_in_static(
+        coord.static_area(),
+        code_ptr,
+        arity,
+        sym_word,
+        Word::NIL, // top-level functions and macros have no closure env
+        true,      // Lisp-compiled; manages its own MV slot
+    )
+    .ok_or_else(|| EvalError::Jit("static area exhausted".to_string()))
 }
 
 impl Default for Session {
@@ -2212,6 +2234,15 @@ pub struct ParamSpec {
     pub optionals: Vec<OptParam>,
     pub rest: Option<Arc<str>>,
     pub keys: Vec<KeyParam>,
+    /// `&whole` variable (macro lambda lists). Bound to NIL for now —
+    /// non-positional, so it never consumes an argument slot. A real
+    /// binding (the whole macro-call form) is a future enhancement.
+    pub whole: Option<Arc<str>>,
+    /// `&environment` variable (macro lambda lists). Bound to NIL for
+    /// now — non-positional. A real lexical macro environment is a
+    /// future enhancement; until then `(macroexpand x env)` inside an
+    /// expander sees only the global environment.
+    pub environment: Option<Arc<str>>,
 }
 
 /// One `&optional` parameter. `default` is the raw form the user
@@ -2268,6 +2299,8 @@ pub(crate) fn parse_param_list_inner(v: &Value) -> Result<ParamSpec, String> {
     let mut optionals: Vec<OptParam> = Vec::new();
     let mut rest: Option<Arc<str>> = None;
     let mut keys: Vec<KeyParam> = Vec::new();
+    let mut whole: Option<Arc<str>> = None;
+    let mut environment: Option<Arc<str>> = None;
     let mut mode = ArglistMode::Required;
     let mut cur = v.clone();
     loop {
@@ -2321,6 +2354,34 @@ pub(crate) fn parse_param_list_inner(v: &Value) -> Result<ParamSpec, String> {
                         "&AUX" => {
                             return Err("&AUX is not yet supported".into());
                         }
+                        // &WHOLE / &ENVIRONMENT (macro lambda lists).
+                        // Each takes exactly one name. They are
+                        // non-positional — recorded separately and
+                        // bound to NIL in the prologue so they never
+                        // consume an argument slot (and so a 0-arg
+                        // macro call to a `(foo &environment e)` macro
+                        // doesn't read past the supplied args).
+                        "&WHOLE" | "&ENVIRONMENT" => {
+                            let kw = s.name.clone();
+                            let Value::Cons(nc) = cur.clone() else {
+                                return Err(format!(
+                                    "{kw} must be followed by a name"
+                                ));
+                            };
+                            let Value::Symbol(ns) = &nc.car else {
+                                return Err(format!(
+                                    "{kw} name must be a symbol, got {:?}",
+                                    nc.car
+                                ));
+                            };
+                            if &*kw == "&WHOLE" {
+                                whole = Some(Arc::clone(&ns.name));
+                            } else {
+                                environment = Some(Arc::clone(&ns.name));
+                            }
+                            cur = nc.cdr.clone();
+                            continue;
+                        }
                         "&ALLOW-OTHER-KEYS" => {
                             // ncl_lookup_keyword silently ignores
                             // unknown keywords already, so this
@@ -2372,7 +2433,7 @@ pub(crate) fn parse_param_list_inner(v: &Value) -> Result<ParamSpec, String> {
             }
         }
     }
-    Ok(ParamSpec { required, optionals, rest, keys })
+    Ok(ParamSpec { required, optionals, rest, keys, whole, environment })
 }
 
 /// Parse one entry of the form `name`, `(name)`, `(name default)`,
@@ -3572,15 +3633,19 @@ mod end_to_end_tests {
     }
 
     #[test]
-    fn setq_of_param_errors() {
-        // Mutable function parameters not yet supported. (Mutable
-        // let-locals are — those are tested in the dedicated section
-        // above.)
+    fn setq_of_defun_param_promotes_to_cell() {
+        // Mutable function parameters ARE supported for `defun`: a
+        // `(setq param …)` in the body promotes the required param to
+        // a boxed local cell (the mutable-parameter promotion in
+        // `compile_function_raw`). Note the contrast with
+        // `setq_of_param_still_errors`, which covers the *lambda*
+        // path — that one is not wired for in-place param mutation yet.
         let r = eval_str(
             "(defun f (x) (setq x 99) x)
              (f 1)",
-        );
-        assert!(matches!(r, Err(EvalError::Compile(CompileError::NotImplemented(_)))));
+        )
+        .unwrap();
+        assert_eq!(r, "99");
     }
 
     #[test]

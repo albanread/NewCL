@@ -673,9 +673,10 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
    real non-local exit."
   `(%native-block ',name (lambda () ,@body)))
 
-(defmacro return-from (name value)
-  "(return-from NAME val) — non-locally exit the innermost
-   enclosing (block NAME …) with VAL."
+(defmacro return-from (name &optional value)
+  "(return-from NAME [val]) — non-locally exit the innermost
+   enclosing (block NAME …) with VAL (default NIL). Per CL the
+   result form is optional: (return-from foo) returns NIL."
   `(%return-from ',name ,value))
 
 (defmacro catch (tag &rest body)
