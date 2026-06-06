@@ -916,20 +916,73 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
     ((eq kind 'minimize)(%loop-emit-min st expr test))
     (t (error (format nil "LOOP: bad accumulator ~S" kind)))))
 
+;; Accumulate KIND of EXPR into the named VAR (declared here). Unlike
+;; the anonymous accumulators above, INTO vars are ordinary loop
+;; variables — visible in FINALLY and not auto-returned as the loop
+;; result.
+(defun %loop-emit-into (st kind expr var test)
+  (cond
+    ((member kind '(collect append nconc))
+     (let ((tl (gensym "ITL")) (c (gensym "IC")))
+       (%lsp st 1 (list var nil))
+       (%lsp st 1 (list tl nil))
+       (let ((form
+              (if (eq kind 'collect)
+                  (list 'let (list (list c (list 'cons expr nil)))
+                        (list 'if (list 'null var)
+                              (list 'progn (list 'setq var c) (list 'setq tl c))
+                              (list 'progn (list 'setf (list 'cdr tl) c) (list 'setq tl c))))
+                  (list 'let (list (list c (list 'copy-list expr)))
+                        (list 'when c
+                              (list 'if (list 'null var)
+                                    (list 'progn (list 'setq var c) (list 'setq tl (list 'last c)))
+                                    (list 'progn (list 'setf (list 'cdr tl) c) (list 'setq tl (list 'last c)))))))))
+         (%lsp st 4 (%loop-guard form test)))))
+    ((eq kind 'sum)
+     (%lsp st 1 (list var 0))
+     (%lsp st 4 (%loop-guard (list 'setq var (list '+ var expr)) test)))
+    ((eq kind 'count)
+     (%lsp st 1 (list var 0))
+     (%lsp st 4 (%loop-guard (list 'when expr (list 'setq var (list '+ var 1))) test)))
+    ((eq kind 'maximize)
+     (%lsp st 1 (list var nil))
+     (let ((tmp (gensym "MXI")))
+       (%lsp st 4 (%loop-guard
+                   (list 'let (list (list tmp expr))
+                         (list 'when (list 'or (list 'null var) (list '> tmp var))
+                               (list 'setq var tmp))) test))))
+    ((eq kind 'minimize)
+     (%lsp st 1 (list var nil))
+     (let ((tmp (gensym "MNI")))
+       (%lsp st 4 (%loop-guard
+                   (list 'let (list (list tmp expr))
+                         (list 'when (list 'or (list 'null var) (list '< tmp var))
+                               (list 'setq var tmp))) test))))
+    (t (error (format nil "LOOP: bad INTO accumulator ~S" kind)))))
+
 ;; -- FOR clause --
 
-(defun %loop-for-arith (st var start rest)
-  "Parse FOR V FROM start [to|below|downto|above LIM] [by S]."
-  (let ((limit nil) (test-op nil) (step 1) (dir 'up) (rem rest))
+(defun %loop-for-arith (st var start rest down-default)
+  "Parse the numeric stepping clause for FOR V: a START plus any of
+   {to|upto LIM | below LIM | downto LIM | above LIM | by INC}* in any
+   order. DOWN-DEFAULT t means count downward (DOWNFROM) unless a
+   bound keyword overrides the direction."
+  (let ((limit nil) (test-op nil) (step 1)
+        (dir (if down-default 'down 'up)) (rem rest))
     (loop
       (cond
         ((null rem) (return))
-        ((eq (car rem) 'to)     (setq limit (cadr rem)) (setq test-op '>)  (setq rem (cddr rem)))
+        ((or (eq (car rem) 'to) (eq (car rem) 'upto))
+         (setq limit (cadr rem)) (setq test-op '>)  (setq rem (cddr rem)))
         ((eq (car rem) 'below)  (setq limit (cadr rem)) (setq test-op '>=) (setq rem (cddr rem)))
         ((eq (car rem) 'downto) (setq limit (cadr rem)) (setq test-op '<)  (setq dir 'down) (setq rem (cddr rem)))
         ((eq (car rem) 'above)  (setq limit (cadr rem)) (setq test-op '<=) (setq dir 'down) (setq rem (cddr rem)))
         ((eq (car rem) 'by)     (setq step (cadr rem)) (setq rem (cddr rem)))
         (t (return))))
+    ;; A bare `to LIM` under a downward count means "stop when below
+    ;; LIM" — flip the comparison sense.
+    (when (and (eq dir 'down) (eq test-op '>))  (setq test-op '<))
+    (when (and (eq dir 'down) (eq test-op '>=)) (setq test-op '<=))
     (%lsp st 1 (list var start))
     (when limit
       (let ((lv (gensym "LIM")))
@@ -940,39 +993,123 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
         (%lsp st 5 (list 'setq var (list '+ var step))))
     (%lss st 0 rem)))
 
+(defun %loop-arith-prep-p (sym)
+  (member sym '(from upfrom downfrom to upto below downto above by)))
+
+;; -- destructuring + of-type helpers --
+
+(defun %loop-skip-of-type (tail)
+  "If TAIL begins with OF-TYPE, drop the marker and its (advisory) type
+   spec; otherwise return TAIL unchanged. NCL ignores LOOP type
+   declarations — they're optimization hints, not semantics."
+  (if (and (consp tail) (eq (car tail) 'of-type))
+      (cdr (cdr tail))
+      tail))
+
+(defun %loop-pattern-vars (pat)
+  "Flat list of the variable symbols in a LOOP destructuring pattern.
+   NIL entries are discards; supports nested and dotted patterns."
+  (cond
+    ((null pat) nil)
+    ((symbolp pat) (list pat))
+    ((consp pat)
+     (let ((v (car pat)))
+       (append (cond ((null v) nil)
+                     ((symbolp v) (list v))
+                     ((consp v) (%loop-pattern-vars v))
+                     (t nil))
+               (%loop-pattern-vars (cdr pat)))))
+    (t nil)))
+
+(defun %loop-pattern-setqs (pat src)
+  "SETQ forms binding PATTERN's vars by walking SRC with car/cdr."
+  (cond
+    ((null pat) nil)
+    ((symbolp pat) (list (list 'setq pat src)))
+    ((consp pat)
+     (let ((v (car pat)))
+       (append (cond ((null v) nil)
+                     ((symbolp v) (list (list 'setq v (list 'car src))))
+                     ((consp v) (%loop-pattern-setqs v (list 'car src)))
+                     (t nil))
+               (%loop-pattern-setqs (cdr pat) (list 'cdr src)))))
+    (t nil)))
+
+(defun %loop-bind-iter (st var item)
+  "If VAR is a destructuring pattern, declare its vars (nil) and emit
+   body setqs destructuring ITEM into them. VAR a plain symbol is a
+   no-op (ITEM is already that symbol)."
+  (when (consp var)
+    (dolist (v (%loop-pattern-vars var)) (%lsp st 1 (list v nil)))
+    (dolist (sq (%loop-pattern-setqs var item)) (%lsp st 4 sq))))
+
 (defun %loop-clause-for (st)
-  (let* ((cl (%lsg st 0))
-         (var (cadr cl))
-         (prep (caddr cl))
-         (rest (cdddr cl)))
+  ;; (for VAR ... [and VAR ...]*) — parse the first binding, then any
+  ;; AND-joined sibling bindings. NOTE: NCL steps AND-bindings
+  ;; sequentially, not in true parallel; independent bindings (the
+  ;; common case) behave identically.
+  (%loop-parse-for-binding st (cdr (%lsg st 0)))
+  (loop
+    (let ((rem (%lsg st 0)))
+      (if (and rem (eq (car rem) 'and))
+          (%loop-parse-for-binding st (cdr rem))
+          (return)))))
+
+(defun %loop-parse-for-binding (st tokens)
+  "Parse ONE for-binding from TOKENS = (VAR [of-type T] PREP ...);
+   advances slot 0 to the unconsumed tail."
+  (let* ((var (car tokens))
+         (after (%loop-skip-of-type (cdr tokens)))   ; tolerate OF-TYPE
+         (prep (car after))
+         (rest (cdr after))
+         ;; For destructuring patterns, iterate through a hidden var
+         ;; and destructure it into the pattern each step.
+         (item (if (consp var) (gensym "ITM") var)))
     (cond
       ((eq prep 'in)
-       (let ((lv (gensym "IN")))
+       ;; for V in LIST [by STEP-FN]
+       (let ((lv (gensym "IN")) (stepfn nil) (more (cdr rest)))
+         (when (and more (eq (car more) 'by))
+           (setq stepfn (cadr more)) (setq more (cddr more)))
          (%lsp st 1 (list lv (car rest)))
-         (%lsp st 1 (list var nil))
+         (%lsp st 1 (list item nil))
          (%lsp st 3 (list 'null lv))
-         (%lsp st 4 (list 'setq var (list 'car lv)))
-         (%lsp st 5 (list 'setq lv (list 'cdr lv)))
-         (%lss st 0 (cdr rest))))
+         (%lsp st 4 (list 'setq item (list 'car lv)))
+         (%loop-bind-iter st var item)
+         (%lsp st 5 (list 'setq lv (if stepfn (list 'funcall stepfn lv) (list 'cdr lv))))
+         (%lss st 0 more)))
       ((eq prep 'on)
-       (let ((lv (gensym "ON")))
+       ;; for V on LIST [by STEP-FN]
+       (let ((lv (gensym "ON")) (stepfn nil) (more (cdr rest)))
+         (when (and more (eq (car more) 'by))
+           (setq stepfn (cadr more)) (setq more (cddr more)))
          (%lsp st 1 (list lv (car rest)))
-         (%lsp st 1 (list var nil))
+         (%lsp st 1 (list item nil))
          (%lsp st 3 (list 'null lv))
-         (%lsp st 4 (list 'setq var lv))
-         (%lsp st 5 (list 'setq lv (list 'cdr lv)))
-         (%lss st 0 (cdr rest))))
-      ((eq prep 'from)
-       (%loop-for-arith st var (car rest) (cdr rest)))
+         (%lsp st 4 (list 'setq item lv))
+         (%loop-bind-iter st var item)
+         (%lsp st 5 (list 'setq lv (if stepfn (list 'funcall stepfn lv) (list 'cdr lv))))
+         (%lss st 0 more)))
+      ((%loop-arith-prep-p prep)
+       ;; numeric range — VAR must be a symbol. Handles FROM/UPFROM/
+       ;; DOWNFROM with an explicit start, and leading bounds
+       ;; (TO/UPTO/BELOW/DOWNTO/ABOVE/BY with an implicit start of 0).
+       (let ((start 0) (range after) (down nil))
+         (cond
+           ((or (eq prep 'from) (eq prep 'upfrom))
+            (setq start (car rest)) (setq range (cdr rest)))
+           ((eq prep 'downfrom)
+            (setq start (car rest)) (setq range (cdr rest)) (setq down t)))
+         (%loop-for-arith st var start range down)))
       ((eq prep '=)
-       (let ((init (car rest)) (r2 (cdr rest)))
-         (if (and r2 (eq (car r2) 'then))
-             (progn (%lsp st 1 (list var init))
-                    (%lsp st 5 (list 'setq var (cadr r2)))
-                    (%lss st 0 (cddr r2)))
-             (progn (%lsp st 1 (list var init))
-                    (%lsp st 5 (list 'setq var init))
-                    (%lss st 0 r2)))))
+       (let* ((init (car rest))
+              (r2 (cdr rest))
+              (has-then (and r2 (eq (car r2) 'then)))
+              (step (if has-then (cadr r2) init)))
+         (%lsp st 1 (list item init))
+         (%lsp st 5 (list 'setq item step))
+         (%loop-bind-iter st var item)
+         (%lss st 0 (if has-then (cddr r2) r2))))
       (t (error (format nil "LOOP FOR: unknown preposition ~S" prep))))))
 
 ;; -- multi-form clauses (do / initially / finally) --
@@ -999,17 +1136,39 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
          (test0 (cadr cl))
          (test (if negate (list 'not test0) test0))
          (inner-kw (caddr cl))
-         (inner-expr (cadddr cl)))
-    (%lss st 0 (cddddr cl))
+         (inner-expr (cadddr cl))
+         (rest (cddddr cl)))   ; tokens after (when TEST KW EXPR)
     (cond
       ((eq inner-kw 'do)
-       (%lsp st 4 (list 'when test inner-expr)))
+       (%lsp st 4 (list 'when test (%loop-rewrite-returns inner-expr (%lsg st 8))))
+       (%lss st 0 rest))
       ((eq inner-kw 'return)
-       (%lsp st 4 (list 'when test
-                        (list 'return-from (%lsg st 8) inner-expr))))
-      (t (%loop-emit-acc st inner-kw inner-expr test)))))
+       (%lsp st 4 (list 'when test (list 'return-from (%lsg st 8) inner-expr)))
+       (%lss st 0 rest))
+      ((and rest (eq (car rest) 'into))
+       ;; when TEST KIND EXPR into VAR
+       (%loop-emit-into st inner-kw inner-expr (cadr rest) test)
+       (%lss st 0 (cddr rest)))
+      (t (%loop-emit-acc st inner-kw inner-expr test)
+         (%lss st 0 rest)))))
 
 ;; -- per-clause dispatch (split in two to keep each cond small) --
+
+(defun %loop-rewrite-returns (form name)
+  "Rewrite (return X) -> (return-from NAME X) in user DO/FINALLY forms,
+   so a RETURN inside the loop body exits the loop's block (NCL's bare
+   `return` macro otherwise targets the simple-loop break flag, which a
+   tagbody-based extended loop doesn't watch). Does not descend into
+   nested LOOP/BLOCK/DO/DOLIST/DOTIMES (they bind their own block)."
+  (cond
+    ((not (consp form)) form)
+    ((eq (car form) 'return)
+     (list 'return-from name (if (cdr form) (cadr form) nil)))
+    ((member (car form) '(quote loop block dolist dotimes do do*)) form)
+    (t (mapcar (lambda (s) (%loop-rewrite-returns s name)) form))))
+
+(defun %loop-rw-list (forms name)
+  (mapcar (lambda (f) (%loop-rewrite-returns f name)) forms))
 
 (defun %loop-step (st)
   (let ((kw (car (%lsg st 0))))
@@ -1022,28 +1181,57 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
       ((eq kw 'until)   (%lsp st 3 (cadr (%lsg st 0))) (%lss st 0 (cddr (%lsg st 0))))
       ((eq kw 'when)    (%loop-clause-cond st nil))
       ((eq kw 'unless)  (%loop-clause-cond st t))
-      ((eq kw 'do)      (%loop-prepend st 4 (%loop-grab-forms st)))
-      ((eq kw 'initially)(%loop-prepend st 2 (%loop-grab-forms st)))
-      ((eq kw 'finally) (%loop-prepend st 6 (%loop-grab-forms st)))
+      ((eq kw 'do)      (%loop-prepend st 4 (%loop-rw-list (%loop-grab-forms st) (%lsg st 8))))
+      ((eq kw 'initially)(%loop-prepend st 2 (%loop-rw-list (%loop-grab-forms st) (%lsg st 8))))
+      ((eq kw 'finally) (%loop-prepend st 6 (%loop-rw-list (%loop-grab-forms st) (%lsg st 8))))
       ((eq kw 'return)  (%loop-clause-return st))
       (t (%loop-step2 st kw)))))
 
 (defun %loop-step2 (st kw)
   (cond
     ((member kw '(collect append nconc sum count maximize minimize))
-     (let ((expr (cadr (%lsg st 0))))
-       (%lss st 0 (cddr (%lsg st 0)))
-       (%loop-emit-acc st kw expr nil)))
+     (let* ((cl (%lsg st 0))
+            (expr (cadr cl))
+            (rest (cddr cl)))
+       (if (and rest (eq (car rest) 'into))
+           ;; KIND EXPR INTO VAR — named accumulation
+           (progn (%lss st 0 (cddr rest))
+                  (%loop-emit-into st kw expr (cadr rest) nil))
+           (progn (%lss st 0 rest)
+                  (%loop-emit-acc st kw expr nil)))))
     ((eq kw 'thereis)  (%loop-clause-thereis st))
     ((eq kw 'always)   (%loop-clause-always st))
     ((eq kw 'never)    (%loop-clause-never st))
     (t (error (format nil "LOOP: unknown clause ~S" kw)))))
 
 (defun %loop-clause-with (st)
-  (let* ((cl (%lsg st 0)) (var (cadr cl)) (r (cddr cl)))
+  ;; (with VAR [= VAL] [and VAR [= VAL]]*)
+  (%loop-parse-with-binding st (cdr (%lsg st 0)))
+  (loop
+    (let ((rem (%lsg st 0)))
+      (if (and rem (eq (car rem) 'and))
+          (%loop-parse-with-binding st (cdr rem))
+          (return)))))
+
+(defun %loop-parse-with-binding (st tokens)
+  (let* ((var (car tokens))
+         (r (%loop-skip-of-type (cdr tokens))))   ; tolerate OF-TYPE
     (if (and r (eq (car r) '=))
-        (progn (%lsp st 1 (list var (cadr r))) (%lss st 0 (cddr r)))
-        (progn (%lsp st 1 (list var nil)) (%lss st 0 r)))))
+        (let ((val (cadr r)))
+          (if (consp var)
+              ;; destructuring with: bind a hidden var to VAL, then
+              ;; destructure once in the pre-body (WITH is one-shot).
+              (let ((item (gensym "WITM")))
+                (%lsp st 1 (list item val))
+                (dolist (v (%loop-pattern-vars var)) (%lsp st 1 (list v nil)))
+                (dolist (sq (%loop-pattern-setqs var item)) (%lsp st 2 sq)))
+              (%lsp st 1 (list var val)))
+          (%lss st 0 (cddr r)))
+        (progn
+          (if (consp var)
+              (dolist (v (%loop-pattern-vars var)) (%lsp st 1 (list v nil)))
+              (%lsp st 1 (list var nil)))
+          (%lss st 0 r)))))
 
 (defun %loop-clause-repeat (st)
   (let ((cv (gensym "REP")) (n (cadr (%lsg st 0))))
