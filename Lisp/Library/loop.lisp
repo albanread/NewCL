@@ -283,15 +283,16 @@
                (dolist (b (%loop-pattern-bindings var item))
                  (%plan-add-iter-binding plan (car b) (cadr b))
                  (%plan-add-step plan `(setq ,(car b) ,(cadr b))))))))
-      ;; for VAR from N [to|upto|below|downto|above M] [by STEP]
-      ((%cur-eat-keyword? cur 'from)
-       (%parse-from-clause plan cur var (%cur-eat! cur)))
-      ;; for VAR to|upto|below|downto|above M  — no `from`; the start
-      ;; defaults to 0  (CL: `for i below n` ≡ `for i from 0 below n`).
+      ;; for VAR [from|upfrom|downfrom N] [to|upto|below|downto|above M]
+      ;; [by STEP] — the numeric stepping clause. CL lets these
+      ;; sub-keywords appear in any order (e.g. `for i by s from x to
+      ;; 10`, or a bare `for i below n` with no `from`), so route the
+      ;; whole tail to %parse-from-clause, which consumes them
+      ;; order-independently and defaults the start to 0.
       ((let ((k (%cur-peek cur)))
          (and (symbolp k)
-              (member k '(to upto below downto above))))
-       (%parse-from-clause plan cur var 0))
+              (member k '(from upfrom downfrom to upto below downto above by))))
+       (%parse-from-clause plan cur var))
       (t (error "loop: unknown for-spec after ~A" var)))))
 
 (defun %parse-being-clause (plan cur var)
@@ -337,37 +338,52 @@
           (%plan-add-iter-binding plan using-var u-acc)
           (%plan-add-step plan `(setq ,using-var ,u-acc)))))))
 
-(defun %parse-from-clause (plan cur var start)
-  "Parse the range tail [to|upto|below|downto|above M] [by STEP] for a
-   numeric for-clause whose START value is already determined — either
-   the token after `from`, or 0 for a `for i below n`-style clause."
-  (let* ((cmp nil)
-         (limit nil)
-         (step 1)
-         (direction 1))
-    ;; Bound keyword and `by STEP` may appear in either order
-    ;; (CL: `from x by s to 10` and `from x to 10 by s` are both legal).
-    ;; `upto` is a synonym for `to`.
-    (loop
-      (cond
-        ((%cur-eat-keyword? cur 'to)     (setq cmp '<=) (setq limit (%cur-eat! cur)))
-        ((%cur-eat-keyword? cur 'upto)   (setq cmp '<=) (setq limit (%cur-eat! cur)))
-        ((%cur-eat-keyword? cur 'below)  (setq cmp '<)  (setq limit (%cur-eat! cur)))
-        ((%cur-eat-keyword? cur 'downto)
-         (setq cmp '>=) (setq direction -1) (setq limit (%cur-eat! cur)))
-        ((%cur-eat-keyword? cur 'above)
-         (setq cmp '>)  (setq direction -1) (setq limit (%cur-eat! cur)))
-        ((%cur-eat-keyword? cur 'by)     (setq step (%cur-eat! cur)))
-        (t (return))))
-    ;; Bind the loop variable to START first, THEN evaluate a
-    ;; non-literal STEP form (exactly once) — preserving the source
-    ;; left-to-right order so `from x by (incf x)` sees x before the
-    ;; increment.
-    (%plan-add-iter-binding plan var start)
-    (when (consp step)
-      (let ((step-var (gensym "STEP-")))
-        (%plan-add-iter-binding plan step-var step)
-        (setq step step-var)))
+(defun %parse-from-clause (plan cur var)
+  "Parse a numeric stepping for-clause's range:
+     [from|upfrom|downfrom N] [to|upto|below|downto|above M] [by STEP]
+   All sub-keywords are accepted in any order — CL allows e.g.
+   `for i by s from x to 10` as well as `for i from x to 10 by s`.
+   With no `from`, the start defaults to 0 (so `for i below n` ≡
+   `for i from 0 below n`). `upto`=`to`, `upfrom`=`from`; `downfrom`
+   sets the start and steps downward.
+
+   The from/to/by value forms are each evaluated exactly once, in the
+   order they appear in the source (CL 6.1.2.1.1): a `from`/`upfrom`/
+   `downfrom` binds VAR at the point it appears, and `to`/`by` capture
+   non-trivial forms into iter-bindings as they are read, so e.g.
+   `by (incf x) from x` increments x before reading it for the start."
+  (let ((cmp nil) (limit nil) (step 1) (direction 1) (bound-start nil))
+    (flet ((cap (form)
+             ;; Capture a non-trivial form into a fresh iter-binding so
+             ;; it's evaluated once, here, in source order; literals and
+             ;; symbols pass through untouched.
+             (if (consp form)
+                 (let ((g (gensym "LOOPV-")))
+                   (%plan-add-iter-binding plan g form)
+                   g)
+                 form)))
+      (loop
+        (cond
+          ((%cur-eat-keyword? cur 'from)
+           (%plan-add-iter-binding plan var (%cur-eat! cur)) (setq bound-start t))
+          ((%cur-eat-keyword? cur 'upfrom)
+           (%plan-add-iter-binding plan var (%cur-eat! cur)) (setq bound-start t))
+          ((%cur-eat-keyword? cur 'downfrom)
+           (%plan-add-iter-binding plan var (%cur-eat! cur))
+           (setq bound-start t) (setq direction -1))
+          ((%cur-eat-keyword? cur 'to)     (setq cmp '<=) (setq limit (cap (%cur-eat! cur))))
+          ((%cur-eat-keyword? cur 'upto)   (setq cmp '<=) (setq limit (cap (%cur-eat! cur))))
+          ((%cur-eat-keyword? cur 'below)  (setq cmp '<)  (setq limit (cap (%cur-eat! cur))))
+          ((%cur-eat-keyword? cur 'downto)
+           (setq cmp '>=) (setq direction -1) (setq limit (cap (%cur-eat! cur))))
+          ((%cur-eat-keyword? cur 'above)
+           (setq cmp '>)  (setq direction -1) (setq limit (cap (%cur-eat! cur))))
+          ((%cur-eat-keyword? cur 'by)     (setq step (cap (%cur-eat! cur))))
+          (t (return)))))
+    ;; No `from` seen → start at 0 (bound after any captured forms; the
+    ;; literal 0 has no evaluation-order concern).
+    (unless bound-start
+      (%plan-add-iter-binding plan var 0))
     (cond
       (cmp
        (%plan-add-test plan `(not (,cmp ,var ,limit))))
