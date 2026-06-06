@@ -310,12 +310,38 @@ pub extern "C-unwind" fn ncl_div_full(
     bigrational_to_word(m, &(qa / qb)).raw()
 }
 
+/// Decompose any number into (realpart, imagpart) as raw Words. A
+/// real has itself as the realpart and fixnum 0 as the imaginary
+/// part; a complex returns its stored components.
+fn complex_parts(w: Word) -> (u64, u64) {
+    if crate::complex::is_complex(w) {
+        (crate::complex::complex_real(w).raw(), crate::complex::complex_imag(w).raw())
+    } else {
+        (w.raw(), Word::fixnum(0).raw())
+    }
+}
+
 /// Cross-type comparison spanning the full numeric tower. Returns
 /// -1, 0, or +1 as i64.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn ncl_cmp_full(a_raw: u64, b_raw: u64) -> i64 {
     let a = Word::from_raw(a_raw);
     let b = Word::from_raw(b_raw);
+    // Complex numbers are not ordered — only (in)equality is defined.
+    // Return 0 iff the real AND imaginary parts both compare equal,
+    // else a nonzero sentinel. This makes `=` / `/=` correct on complex
+    // (and on complex-vs-real, where the real has a zero imaginary
+    // part). `<` / `>` on a complex are undefined in CL; we do not make
+    // them meaningful here.
+    if crate::complex::is_complex(a) || crate::complex::is_complex(b) {
+        let (ar, ai) = complex_parts(a);
+        let (br, bi) = complex_parts(b);
+        return if ncl_cmp_full(ar, br) == 0 && ncl_cmp_full(ai, bi) == 0 {
+            0
+        } else {
+            1
+        };
+    }
     if crate::float::is_float(a) || crate::float::is_float(b) {
         return crate::float::ncl_cmp_real(a_raw, b_raw);
     }
