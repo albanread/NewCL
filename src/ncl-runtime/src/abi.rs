@@ -337,11 +337,47 @@ fn equal_recursive(a: Word, b: Word) -> bool {
             equal_recursive(cdr_a, cdr_b)
         }
         (Tag::String, Tag::String) => crate::gc_string::string_eq(a, b),
-        // For any other combination — different tags, or non-
-        // structured atom types where we already know the bits
-        // differ — they're not equal.
-        _ => false,
+        // Any other combination is an atom: `equal` reduces to `eql`
+        // here (per CL, equal of non-structured objects is eql). This
+        // is what makes `(equal 3.0 3.0)` true — two boxed floats of
+        // the same value — where the bit-compare fast path above fails.
+        _ => eql_values(a, b),
     }
+}
+
+/// EQL semantics: two values are EQL iff their tagged Words are
+/// bit-identical, OR they are numbers of the SAME type with the same
+/// value, OR they are the same character. Characters and fixnums live
+/// inline in the Word, so the identity fast path already covers them;
+/// the extra work is only for the boxed numeric tower — float, bignum,
+/// ratio, complex — where two equal-valued instances are distinct heap
+/// objects. Each branch requires BOTH operands to be that type, so a
+/// cross-type pair is never EQL even when numerically equal:
+/// `(eql 3 3.0)` is NIL.
+pub fn eql_values(a: Word, b: Word) -> bool {
+    if a.raw() == b.raw() {
+        return true;
+    }
+    if crate::float::is_float(a) && crate::float::is_float(b) {
+        return crate::ratio::ncl_cmp_full(a.raw(), b.raw()) == 0;
+    }
+    if crate::bignum::is_bignum(a) && crate::bignum::is_bignum(b) {
+        return crate::ratio::ncl_cmp_full(a.raw(), b.raw()) == 0;
+    }
+    if crate::ratio::is_ratio(a) && crate::ratio::is_ratio(b) {
+        return crate::ratio::ncl_cmp_full(a.raw(), b.raw()) == 0;
+    }
+    if crate::complex::is_complex(a) && crate::complex::is_complex(b) {
+        // Component-wise EQL: (eql #c(3 -4) #c(3 -4)) is true.
+        return eql_values(
+            crate::complex::complex_real(a),
+            crate::complex::complex_real(b),
+        ) && eql_values(
+            crate::complex::complex_imag(a),
+            crate::complex::complex_imag(b),
+        );
+    }
+    false
 }
 
 /// String equality. Both args must be Tag::String. Returns Word::T
@@ -434,6 +470,9 @@ pub extern "C-unwind" fn ncl_call(
             &format!("not a function: {fn_value:?}"),
         );
     }
+    if let Some(cond) = under_supplied_arity(mutator, fn_value, n_args) {
+        return cond;
+    }
     let env = crate::gc_function::env(fn_value);
     // Diagnostic: an env that isn't NIL and isn't a Vector pointer
     // means the Function's env field has been corrupted (typically
@@ -522,6 +561,48 @@ fn resolve_function_designator(
     }
 }
 
+/// Guard against calling a Lisp-compiled function with fewer
+/// arguments than its required-parameter count.
+///
+/// A Lisp callee's prologue loads each required parameter straight
+/// from `args[i]`; under-supplying makes it read PAST the end of the
+/// argument array into uninitialised memory — a stale stack slot or
+/// a code pointer — and crash with an access violation. That is the
+/// whole "too few arguments" crash family: `(funcall (complement
+/// #'member) …)`, a stray `(some-fn)`, a predicate passed to
+/// `mapcar`/`sort`/`reduce` that's called with the wrong arity, etc.
+///
+/// Native Rust shims are exempt: they manage their own (frequently
+/// variadic) argument lists and validate `n_args` themselves, so a
+/// fixed `arity` field would wrongly reject e.g. `(+)` or `(list)`.
+///
+/// Returns `Some(_)` — a value that flows through the condition
+/// machinery (a recorded condition under a handler, else a clean
+/// process exit) — when the call must be rejected; `None` to proceed.
+#[inline]
+fn under_supplied_arity(
+    mutator: *mut crate::mutator::MutatorState,
+    f_word: Word,
+    n_args: u64,
+) -> Option<u64> {
+    if !crate::gc_function::is_lisp_compiled(f_word) {
+        return None;
+    }
+    let required = crate::gc_function::arity(f_word) as u64;
+    if n_args >= required {
+        return None;
+    }
+    let fname = crate::sym_names::lookup(crate::gc_function::name(f_word).raw())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "anonymous function".to_string());
+    Some(signal_condition_string(
+        mutator,
+        &format!(
+            "{fname}: too few arguments — got {n_args}, requires at least {required}"
+        ),
+    ))
+}
+
 /// Call a Function value directly. Accepts a function designator —
 /// either a Function Word or a symbol whose function cell is bound
 /// to a Function. The latter case is what makes `(funcall '+ 1 2)`
@@ -539,6 +620,9 @@ pub extern "C-unwind" fn ncl_funcall(
             Ok(w) => w,
             Err(nil) => return nil,
         };
+        if let Some(cond) = under_supplied_arity(mutator, f_word, n_args) {
+            return cond;
+        }
         let env = crate::gc_function::env(f_word);
         debug_assert_closure_env_valid("ncl_funcall", 0, f_word, env);
         let code = crate::gc_function::code_ptr(f_word);
@@ -1362,6 +1446,9 @@ pub extern "C-unwind" fn ncl_apply(
         cur = Word::from_raw(unsafe { *p.add(1) });
     }
 
+    if let Some(cond) = under_supplied_arity(mutator, f_word, total as u64) {
+        return cond;
+    }
     let env = crate::gc_function::env(f_word);
     debug_assert_closure_env_valid("ncl_apply", 0, f_word, env);
     let code = crate::gc_function::code_ptr(f_word);
@@ -1587,32 +1674,29 @@ pub extern "C-unwind" fn eq_shim(
     if a == b { Word::T.raw() } else { Word::NIL.raw() }
 }
 
-/// `(eql a b)` — true if the two values are the same object, or
-/// (eventually) the same number / character of the same type and
-/// value. For the data types currently supported (fixnums, chars,
-/// symbols, NIL, T, immediate Words, plus identity-compared
-/// strings/cons/functions), `eql` is exactly `eq` because:
-///
-///   - Fixnums and chars are stored fully in the Word's bits, so
-///     two equal-valued ones compare bit-equal.
-///   - Symbols are interned, so equal-named ones share a Word.
-///   - NIL / T / unbound markers are unique constant Words.
-///   - Strings / conses / functions get identity (CL allows that).
-///
-/// When floats and bignums land, this shim has to grow value
-/// comparisons for those — that's the only behavioral change.
+/// `(eql a b)` — true if the two values are the same object, or two
+/// numbers of the same type with the same value, or the same
+/// character. The work is in `eql_values`: identity covers fixnums,
+/// chars, symbols, NIL/T and same-pointer objects, and the boxed
+/// numeric tower (float/bignum/ratio/complex) gets a same-type +
+/// same-value comparison. `(eql a b)` lowers to a call into this shim
+/// (it is NOT inlined like `eq`); the EQL special-form lowering was
+/// removed so `eq` and `eql` no longer share `Expr::Eq`.
 pub extern "C-unwind" fn eql_shim(
-    _mutator: *mut crate::mutator::MutatorState,
+    mutator: *mut crate::mutator::MutatorState,
     _env: u64,
     args: *const u64,
     n_args: u64,
 ) -> u64 {
     if n_args != 2 {
-        panic!("eql: expected 2 args, got {n_args}");
+        return signal_condition_string(
+            mutator,
+            &format!("eql: expected 2 args, got {n_args}"),
+        );
     }
-    let a = unsafe { *args };
-    let b = unsafe { *args.add(1) };
-    if a == b {
+    let a = Word::from_raw(unsafe { *args });
+    let b = Word::from_raw(unsafe { *args.add(1) });
+    if eql_values(a, b) {
         Word::T.raw()
     } else {
         Word::NIL.raw()
@@ -2308,6 +2392,20 @@ pub extern "C-unwind" fn native_block_shim(
             BLOCK_TARGET.with(|t| t.set(0));
             return our_frame_value;
         }
+        // CL `(return v)` ≡ `(return-from nil v)`. NCL's `return`
+        // lowers to the loop-break primitive (`%loop-return`), which
+        // an enclosing `%native-loop` consumes. When the nearest
+        // enclosing exit point is a `(block nil …)` instead of a loop,
+        // THIS block must consume the loop-break: it gives `return` its
+        // block semantics and stops a stray break from propagating to
+        // the top level and aborting the load. Only a block actually
+        // named NIL qualifies; loops, being innermost, still consume
+        // their own breaks first.
+        if name == Word::NIL.raw() && LOOP_BREAK_PENDING.with(|p| p.get()) {
+            LOOP_BREAK_PENDING.with(|p| p.set(false));
+            ABORT_PENDING.with(|p| p.set(false));
+            return LOOP_BREAK_VALUE.with(|v| v.get());
+        }
         // Not our abort — leave the flag pending so a surrounding
         // block (or handler-case for a condition) catches it.
         // Drop body_result.
@@ -2321,7 +2419,7 @@ pub extern "C-unwind" fn native_block_shim(
 /// see module docstring for the trade-off). Panics if no
 /// matching block is currently active.
 pub extern "C-unwind" fn return_from_shim(
-    _mutator: *mut crate::mutator::MutatorState,
+    mutator: *mut crate::mutator::MutatorState,
     _env: u64,
     args: *const u64,
     n_args: u64,
@@ -2344,10 +2442,20 @@ pub extern "C-unwind" fn return_from_shim(
         }
     });
     if !found {
+        // No matching block on the stack. This is a CONTROL-ERROR in
+        // CL, not an internal invariant — e.g. `(return-from foo)`
+        // where the enclosing `(defun foo …)` didn't establish an
+        // implicit block, or a stale closure outliving its block.
+        // Signal a catchable condition (handler-case sees it; with no
+        // handler the process exits cleanly) rather than panicking,
+        // which would unwind through JIT frames and abort the worker.
         let sym_name = crate::sym_names::lookup(name)
             .map(|s| s.to_string())
             .unwrap_or_else(|| "<unknown>".to_string());
-        panic!("return-from: no enclosing block named {sym_name}");
+        return signal_condition_string(
+            mutator,
+            &format!("return-from: no enclosing block named {sym_name}"),
+        );
     }
     ABORT_PENDING.with(|p| p.set(true));
     BLOCK_TARGET.with(|t| t.set(name));
@@ -2943,18 +3051,45 @@ pub extern "C-unwind" fn fboundp_shim(
     Word::NIL.raw()
 }
 
-/// `(macro-function symbol)` — the macro expander Function for SYMBOL,
-/// or NIL if SYMBOL does not name a macro. NCL macro expanders take the
-/// macro call's *arguments* (the cdr of the form) positionally, matching
-/// how the compiler invokes them; the Lisp-level MACROEXPAND-1 bridges
-/// that to the CL (form env) contract via APPLY.
+/// Bridge to the compiler's lexical macro environment. `macrolet`-local
+/// macros live in the compiler's thread-local macro env (ncl-compiler),
+/// not in the global registry this crate can see. The compiler registers
+/// a hook here at session start; runtime macro introspection
+/// (`macro-function` / `macroexpand` given a non-nil `&environment`)
+/// calls it to resolve a name against the *lexically* enclosing macros
+/// that are live during the current macroexpansion. Takes a symbol-name
+/// (ptr, len) and returns the local expander Function Word, or NIL.
+static LOCAL_MACRO_HOOK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_local_macro_hook(f: extern "C" fn(*const u8, usize) -> u64) {
+    LOCAL_MACRO_HOOK.store(f as usize, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn query_local_macro(name: &str) -> u64 {
+    let p = LOCAL_MACRO_HOOK.load(std::sync::atomic::Ordering::Relaxed);
+    if p == 0 {
+        return Word::NIL.raw();
+    }
+    let f: extern "C" fn(*const u8, usize) -> u64 = unsafe { std::mem::transmute(p) };
+    f(name.as_ptr(), name.len())
+}
+
+/// `(macro-function symbol &optional environment)` — the macro expander
+/// Function for SYMBOL, or NIL if SYMBOL does not name a macro. NCL macro
+/// expanders take the macro call's *arguments* (the cdr of the form)
+/// positionally, matching how the compiler invokes them; the Lisp-level
+/// MACROEXPAND-1 bridges that to the CL (form env) contract via APPLY.
+///
+/// When a non-nil ENVIRONMENT is supplied, the lexical (macrolet) macro
+/// environment is consulted first — so an &environment-bearing macro can
+/// see macros established by an enclosing macrolet.
 pub extern "C-unwind" fn macro_function_shim(
     mutator: *mut crate::mutator::MutatorState,
     _env: u64,
     args: *const u64,
     n_args: u64,
 ) -> u64 {
-    // (macro-function symbol &optional environment) — environment ignored.
     if n_args < 1 {
         panic!("macro-function: expected at least 1 arg (symbol), got {n_args}");
     }
@@ -2962,10 +3097,19 @@ pub extern "C-unwind" fn macro_function_shim(
     if sym.tag() != Tag::Symbol {
         return Word::NIL.raw();
     }
+    let name = crate::sym_names::lookup(sym.raw());
+    // Non-nil &environment → consult the lexical macrolet env first.
+    let env_given = n_args >= 2 && !Word::from_raw(unsafe { *args.add(1) }).is_nil();
+    if env_given {
+        if let Some(n) = &name {
+            let local = query_local_macro(n);
+            if local != Word::NIL.raw() {
+                return local;
+            }
+        }
+    }
     let m = unsafe { &mut *mutator };
-    match crate::sym_names::lookup(sym.raw())
-        .and_then(|name| m.coord().macro_for(&name))
-    {
+    match name.and_then(|name| m.coord().macro_for(&name)) {
         Some(w) => w.raw(),
         None => Word::NIL.raw(),
     }

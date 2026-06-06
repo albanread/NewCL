@@ -440,9 +440,10 @@ UNWIND-PROTECT yet), but the common case of normal return is correct."
    expansion and a generalized boolean true iff expansion occurred. A
    non-macro FORM is returned unchanged with a NIL second value. Special
    operators are not macros, so they are left alone."
-  (declare (ignore environment))
+  ;; ENVIRONMENT is forwarded to MACRO-FUNCTION so that, inside an
+  ;; &environment-bearing expander, a macrolet-local macro is found.
   (if (and (consp form) (symbolp (car form)))
-      (let ((expander (macro-function (car form))))
+      (let ((expander (macro-function (car form) environment)))
         (if expander
             (values (apply expander (cdr form)) t)
             (values form nil)))
@@ -451,12 +452,11 @@ UNWIND-PROTECT yet), but the common case of normal return is correct."
 (defun macroexpand (form &optional environment)
   "Repeatedly MACROEXPAND-1 FORM until its head no longer names a macro.
    Returns the fully-expanded form and a second value true iff any
-   expansion happened."
-  (declare (ignore environment))
-  (let ((expansion (macroexpand-1 form)))
+   expansion happened. ENVIRONMENT is threaded through each step."
+  (let ((expansion (macroexpand-1 form environment)))
     (if (eq expansion form)
         (values form nil)
-        (values (macroexpand expansion) t))))
+        (values (macroexpand expansion environment) t))))
 
 (provide 'symbols)
 nil

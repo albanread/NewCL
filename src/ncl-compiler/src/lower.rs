@@ -800,9 +800,12 @@ fn lower_call_in_mut(
         "CONSP" => unary_op(&head_name, args, env, coord, Expr::is_cons),
         "ATOM" => unary_op(&head_name, args, env, coord, Expr::is_atom),
         "LISTP" => unary_op(&head_name, args, env, coord, Expr::is_listp),
-        // EQL is currently the same as EQ — distinctions come
-        // when floats/chars/bignums need value-equality semantics.
-        "EQL" => binary_op(&head_name, args, env, coord, Expr::eq),
+        // EQL is NOT inlined like EQ. EQ is object identity (a single
+        // word compare); EQL additionally treats two numbers of the
+        // same type and value as equal (floats/bignums/ratios/complex
+        // are boxed, so equal-valued instances are distinct objects).
+        // That value comparison lives in `eql_shim`, so EQL falls
+        // through to an ordinary call into it (see the default arm).
         "LENGTH" => unary_op(&head_name, args, env, coord, Expr::length),
         "EQUAL" => binary_op(&head_name, args, env, coord, Expr::equal),
         "STRING=" => binary_op(&head_name, args, env, coord, Expr::string_eq),
@@ -2273,6 +2276,23 @@ pub(crate) fn build_arglist_prologue(
     let mut bindings: Vec<Expr> = Vec::new();
     let body_mutations = mutated_in_body(body_forms, &HashSet::new());
     let req_n = params.required.len() as u32;
+
+    // `&whole` / `&environment` (macro lambda lists): non-positional
+    // locals bound to NIL. Bound first so they're in scope for any
+    // later default forms. A real binding (the whole call form / the
+    // lexical macro environment) is a future enhancement.
+    if let Some(whole_name) = &params.whole {
+        push_param_local(env, whole_name, Expr::Nil, &body_mutations, &mut bindings);
+    }
+    if let Some(env_name) = &params.environment {
+        // Bind to a non-nil marker (T) rather than NIL: the value is an
+        // opaque "current lexical environment" token. Passing it to
+        // macro-function / macroexpand signals them to consult the live
+        // macrolet env (see macro_function_shim's local-macro bridge);
+        // a NIL env there means "global environment only". CL leaves the
+        // environment object's representation implementation-defined.
+        push_param_local(env, env_name, Expr::True, &body_mutations, &mut bindings);
+    }
 
     // Optionals are positional: arg index = required + i.
     for (i, opt) in params.optionals.iter().enumerate() {
