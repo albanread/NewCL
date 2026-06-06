@@ -3051,18 +3051,45 @@ pub extern "C-unwind" fn fboundp_shim(
     Word::NIL.raw()
 }
 
-/// `(macro-function symbol)` — the macro expander Function for SYMBOL,
-/// or NIL if SYMBOL does not name a macro. NCL macro expanders take the
-/// macro call's *arguments* (the cdr of the form) positionally, matching
-/// how the compiler invokes them; the Lisp-level MACROEXPAND-1 bridges
-/// that to the CL (form env) contract via APPLY.
+/// Bridge to the compiler's lexical macro environment. `macrolet`-local
+/// macros live in the compiler's thread-local macro env (ncl-compiler),
+/// not in the global registry this crate can see. The compiler registers
+/// a hook here at session start; runtime macro introspection
+/// (`macro-function` / `macroexpand` given a non-nil `&environment`)
+/// calls it to resolve a name against the *lexically* enclosing macros
+/// that are live during the current macroexpansion. Takes a symbol-name
+/// (ptr, len) and returns the local expander Function Word, or NIL.
+static LOCAL_MACRO_HOOK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_local_macro_hook(f: extern "C" fn(*const u8, usize) -> u64) {
+    LOCAL_MACRO_HOOK.store(f as usize, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn query_local_macro(name: &str) -> u64 {
+    let p = LOCAL_MACRO_HOOK.load(std::sync::atomic::Ordering::Relaxed);
+    if p == 0 {
+        return Word::NIL.raw();
+    }
+    let f: extern "C" fn(*const u8, usize) -> u64 = unsafe { std::mem::transmute(p) };
+    f(name.as_ptr(), name.len())
+}
+
+/// `(macro-function symbol &optional environment)` — the macro expander
+/// Function for SYMBOL, or NIL if SYMBOL does not name a macro. NCL macro
+/// expanders take the macro call's *arguments* (the cdr of the form)
+/// positionally, matching how the compiler invokes them; the Lisp-level
+/// MACROEXPAND-1 bridges that to the CL (form env) contract via APPLY.
+///
+/// When a non-nil ENVIRONMENT is supplied, the lexical (macrolet) macro
+/// environment is consulted first — so an &environment-bearing macro can
+/// see macros established by an enclosing macrolet.
 pub extern "C-unwind" fn macro_function_shim(
     mutator: *mut crate::mutator::MutatorState,
     _env: u64,
     args: *const u64,
     n_args: u64,
 ) -> u64 {
-    // (macro-function symbol &optional environment) — environment ignored.
     if n_args < 1 {
         panic!("macro-function: expected at least 1 arg (symbol), got {n_args}");
     }
@@ -3070,10 +3097,19 @@ pub extern "C-unwind" fn macro_function_shim(
     if sym.tag() != Tag::Symbol {
         return Word::NIL.raw();
     }
+    let name = crate::sym_names::lookup(sym.raw());
+    // Non-nil &environment → consult the lexical macrolet env first.
+    let env_given = n_args >= 2 && !Word::from_raw(unsafe { *args.add(1) }).is_nil();
+    if env_given {
+        if let Some(n) = &name {
+            let local = query_local_macro(n);
+            if local != Word::NIL.raw() {
+                return local;
+            }
+        }
+    }
     let m = unsafe { &mut *mutator };
-    match crate::sym_names::lookup(sym.raw())
-        .and_then(|name| m.coord().macro_for(&name))
-    {
+    match name.and_then(|name| m.coord().macro_for(&name)) {
         Some(w) => w.raw(),
         None => Word::NIL.raw(),
     }

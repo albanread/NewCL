@@ -278,7 +278,7 @@ fn macro_env_push_guard(frame: MacroFrame) -> FrameGuard {
     macro_env_push(frame);
     FrameGuard
 }
-fn lookup_local_macro(name: &str) -> Option<Word> {
+pub(crate) fn lookup_local_macro(name: &str) -> Option<Word> {
     MACRO_ENV.with(|e| {
         for frame in e.borrow().iter().rev() {
             for (n, w) in frame.macros.iter().rev() {
@@ -289,6 +289,21 @@ fn lookup_local_macro(name: &str) -> Option<Word> {
         }
         None
     })
+}
+
+/// Bridge hook registered with ncl-runtime so that `macro-function`
+/// (and macroexpand with a non-nil `&environment`) can resolve a name
+/// against the live macrolet-local macros. Called — on the same thread
+/// that is running macroexpansion — from the runtime shim; reads the
+/// thread-local `MACRO_ENV`. Returns the local expander Function Word,
+/// or NIL's raw bits when the name has no lexical macro binding.
+pub(crate) extern "C" fn local_macro_hook(ptr: *const u8, len: usize) -> u64 {
+    let name = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len))
+    };
+    lookup_local_macro(name)
+        .map(|w| w.raw())
+        .unwrap_or_else(|| Word::NIL.raw())
 }
 fn lookup_symbol_macro(name: &str) -> Option<Value> {
     MACRO_ENV.with(|e| {

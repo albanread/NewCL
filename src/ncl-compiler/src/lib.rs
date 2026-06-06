@@ -631,6 +631,11 @@ fn install_native_functions(
     coord: &Arc<GcCoordinator>,
     mutator: &mut MutatorState,
 ) {
+    // Let runtime macro introspection (macro-function / macroexpand
+    // with a non-nil &environment) see macrolet-local macros, which
+    // live in the macroexpander's lexical environment. Registering the
+    // bridge hook is idempotent and cheap.
+    ncl_runtime::abi::set_local_macro_hook(crate::macroexpand::local_macro_hook);
     install_native(coord, mutator, "FORMAT", ncl_runtime::format_shim, 2);
     // APPEND (binary) is needed natively because backquote-splicing
     // macros expand to `(append ... ...)`. Loading it here means

@@ -2285,7 +2285,13 @@ pub(crate) fn build_arglist_prologue(
         push_param_local(env, whole_name, Expr::Nil, &body_mutations, &mut bindings);
     }
     if let Some(env_name) = &params.environment {
-        push_param_local(env, env_name, Expr::Nil, &body_mutations, &mut bindings);
+        // Bind to a non-nil marker (T) rather than NIL: the value is an
+        // opaque "current lexical environment" token. Passing it to
+        // macro-function / macroexpand signals them to consult the live
+        // macrolet env (see macro_function_shim's local-macro bridge);
+        // a NIL env there means "global environment only". CL leaves the
+        // environment object's representation implementation-defined.
+        push_param_local(env, env_name, Expr::True, &body_mutations, &mut bindings);
     }
 
     // Optionals are positional: arg index = required + i.
