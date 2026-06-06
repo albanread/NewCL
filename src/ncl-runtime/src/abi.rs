@@ -337,11 +337,47 @@ fn equal_recursive(a: Word, b: Word) -> bool {
             equal_recursive(cdr_a, cdr_b)
         }
         (Tag::String, Tag::String) => crate::gc_string::string_eq(a, b),
-        // For any other combination — different tags, or non-
-        // structured atom types where we already know the bits
-        // differ — they're not equal.
-        _ => false,
+        // Any other combination is an atom: `equal` reduces to `eql`
+        // here (per CL, equal of non-structured objects is eql). This
+        // is what makes `(equal 3.0 3.0)` true — two boxed floats of
+        // the same value — where the bit-compare fast path above fails.
+        _ => eql_values(a, b),
     }
+}
+
+/// EQL semantics: two values are EQL iff their tagged Words are
+/// bit-identical, OR they are numbers of the SAME type with the same
+/// value, OR they are the same character. Characters and fixnums live
+/// inline in the Word, so the identity fast path already covers them;
+/// the extra work is only for the boxed numeric tower — float, bignum,
+/// ratio, complex — where two equal-valued instances are distinct heap
+/// objects. Each branch requires BOTH operands to be that type, so a
+/// cross-type pair is never EQL even when numerically equal:
+/// `(eql 3 3.0)` is NIL.
+pub fn eql_values(a: Word, b: Word) -> bool {
+    if a.raw() == b.raw() {
+        return true;
+    }
+    if crate::float::is_float(a) && crate::float::is_float(b) {
+        return crate::ratio::ncl_cmp_full(a.raw(), b.raw()) == 0;
+    }
+    if crate::bignum::is_bignum(a) && crate::bignum::is_bignum(b) {
+        return crate::ratio::ncl_cmp_full(a.raw(), b.raw()) == 0;
+    }
+    if crate::ratio::is_ratio(a) && crate::ratio::is_ratio(b) {
+        return crate::ratio::ncl_cmp_full(a.raw(), b.raw()) == 0;
+    }
+    if crate::complex::is_complex(a) && crate::complex::is_complex(b) {
+        // Component-wise EQL: (eql #c(3 -4) #c(3 -4)) is true.
+        return eql_values(
+            crate::complex::complex_real(a),
+            crate::complex::complex_real(b),
+        ) && eql_values(
+            crate::complex::complex_imag(a),
+            crate::complex::complex_imag(b),
+        );
+    }
+    false
 }
 
 /// String equality. Both args must be Tag::String. Returns Word::T
@@ -1638,32 +1674,29 @@ pub extern "C-unwind" fn eq_shim(
     if a == b { Word::T.raw() } else { Word::NIL.raw() }
 }
 
-/// `(eql a b)` — true if the two values are the same object, or
-/// (eventually) the same number / character of the same type and
-/// value. For the data types currently supported (fixnums, chars,
-/// symbols, NIL, T, immediate Words, plus identity-compared
-/// strings/cons/functions), `eql` is exactly `eq` because:
-///
-///   - Fixnums and chars are stored fully in the Word's bits, so
-///     two equal-valued ones compare bit-equal.
-///   - Symbols are interned, so equal-named ones share a Word.
-///   - NIL / T / unbound markers are unique constant Words.
-///   - Strings / conses / functions get identity (CL allows that).
-///
-/// When floats and bignums land, this shim has to grow value
-/// comparisons for those — that's the only behavioral change.
+/// `(eql a b)` — true if the two values are the same object, or two
+/// numbers of the same type with the same value, or the same
+/// character. The work is in `eql_values`: identity covers fixnums,
+/// chars, symbols, NIL/T and same-pointer objects, and the boxed
+/// numeric tower (float/bignum/ratio/complex) gets a same-type +
+/// same-value comparison. `(eql a b)` lowers to a call into this shim
+/// (it is NOT inlined like `eq`); the EQL special-form lowering was
+/// removed so `eq` and `eql` no longer share `Expr::Eq`.
 pub extern "C-unwind" fn eql_shim(
-    _mutator: *mut crate::mutator::MutatorState,
+    mutator: *mut crate::mutator::MutatorState,
     _env: u64,
     args: *const u64,
     n_args: u64,
 ) -> u64 {
     if n_args != 2 {
-        panic!("eql: expected 2 args, got {n_args}");
+        return signal_condition_string(
+            mutator,
+            &format!("eql: expected 2 args, got {n_args}"),
+        );
     }
-    let a = unsafe { *args };
-    let b = unsafe { *args.add(1) };
-    if a == b {
+    let a = Word::from_raw(unsafe { *args });
+    let b = Word::from_raw(unsafe { *args.add(1) });
+    if eql_values(a, b) {
         Word::T.raw()
     } else {
         Word::NIL.raw()

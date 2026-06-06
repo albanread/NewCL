@@ -800,9 +800,12 @@ fn lower_call_in_mut(
         "CONSP" => unary_op(&head_name, args, env, coord, Expr::is_cons),
         "ATOM" => unary_op(&head_name, args, env, coord, Expr::is_atom),
         "LISTP" => unary_op(&head_name, args, env, coord, Expr::is_listp),
-        // EQL is currently the same as EQ — distinctions come
-        // when floats/chars/bignums need value-equality semantics.
-        "EQL" => binary_op(&head_name, args, env, coord, Expr::eq),
+        // EQL is NOT inlined like EQ. EQ is object identity (a single
+        // word compare); EQL additionally treats two numbers of the
+        // same type and value as equal (floats/bignums/ratios/complex
+        // are boxed, so equal-valued instances are distinct objects).
+        // That value comparison lives in `eql_shim`, so EQL falls
+        // through to an ordinary call into it (see the default arm).
         "LENGTH" => unary_op(&head_name, args, env, coord, Expr::length),
         "EQUAL" => binary_op(&head_name, args, env, coord, Expr::equal),
         "STRING=" => binary_op(&head_name, args, env, coord, Expr::string_eq),

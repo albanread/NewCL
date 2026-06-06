@@ -1876,6 +1876,33 @@ fn emit_bool_select<'ctx>(
 
 /// Emit a binary integer comparison, return Word::T or Word::NIL.
 #[allow(clippy::too_many_arguments)]
+/// `eq` — object identity. Two values are EQ iff their tagged Words
+/// are bit-identical: this covers symbols, NIL/T, fixnums, characters
+/// (all stored inline in the Word) and pointer types (same object).
+/// Unlike `emit_cmp`, it does NOT compare numeric value through the
+/// tower, so `(eq 3 3.0)` is NIL — matching CL identity semantics and
+/// the `eq_shim` used for `#'eq`. It's also strictly cheaper: one
+/// `icmp` instead of a tag-check + fast/slow numeric dispatch.
+fn emit_ref_eq<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    arity: u32,
+    params: &mut Vec<IntValue<'ctx>>,
+    locals: &mut Vec<IntValue<'ctx>>,
+    a: &Expr,
+    b: &Expr,
+) -> Result<IntValue<'ctx>, String> {
+    let lhs = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
+    let rhs = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
+    let i64_t = context.i64_type();
+    let cmp = builder
+        .build_int_compare(IntPredicate::EQ, lhs, rhs, "ref_eq")
+        .map_err(|e| format!("icmp ref_eq: {e}"))?;
+    emit_bool_select(builder, cmp, i64_t)
+}
+
 fn emit_cmp<'ctx>(
     context: &'ctx Context,
     builder: &Builder<'ctx>,
@@ -2646,7 +2673,7 @@ fn emit_expr<'ctx>(
             let cons_val = emit_expr(context, builder, function, helpers, arity, params, locals, x)?;
             emit_car_or_cdr(context, builder, function, helpers, cons_val, /*is_cdr=*/true)
         }
-        Expr::Eq(a, b) => emit_cmp(context, builder, function, helpers, arity, params, locals, a, b, IntPredicate::EQ),
+        Expr::Eq(a, b) => emit_ref_eq(context, builder, function, helpers, arity, params, locals, a, b),
         Expr::Lt(a, b) => emit_cmp(context, builder, function, helpers, arity, params, locals, a, b, IntPredicate::SLT),
         Expr::Gt(a, b) => emit_cmp(context, builder, function, helpers, arity, params, locals, a, b, IntPredicate::SGT),
         Expr::Le(a, b) => emit_cmp(context, builder, function, helpers, arity, params, locals, a, b, IntPredicate::SLE),
