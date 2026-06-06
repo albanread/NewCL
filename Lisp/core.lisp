@@ -1507,10 +1507,13 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
 (defun third (x) (car (cdr (cdr x))))
 
 (defun complement (pred)
-  "Return a predicate that negates PRED. PRED is currently
-   assumed unary; CL allows variadic but Closette only uses
-   the unary case."
-  (lambda (x) (not (funcall pred x))))
+  "Return a function that negates PRED: it accepts the same
+   arguments as PRED and returns (not (apply PRED args)). Variadic
+   per CL — e.g. (funcall (complement #'member) x list) works, not
+   just unary predicates. (A unary-only complement silently dropped
+   extra args, then called PRED with too few — reading past the
+   argument array into garbage.)"
+  (lambda (&rest args) (not (apply pred args))))
 
 (defun fdefinition (name)
   "Return the function bound to NAME. Same as `symbol-function`
