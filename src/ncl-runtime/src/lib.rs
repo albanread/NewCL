@@ -97,6 +97,8 @@ pub use igui::lisp_shims::{
     text_write_char_shim, text_write_shim,
     open_repl_window_shim, repl_output_shim, repl_error_shim, repl_pop_input_shim,
     open_doc_window_shim, doc_set_markdown_shim, doc_append_markdown_shim,
+    canvas_open_shim, canvas_present_shim,
+    mdi_arrange_icons_shim, mdi_cascade_shim, mdi_tile_shim,
 };
 pub use audio::{
     audio_abc_play_shim, audio_abc_stop_shim, audio_beep_shim, audio_blip_shim,

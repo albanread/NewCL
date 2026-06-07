@@ -277,6 +277,20 @@ pub enum SurfaceCmd {
         fill: Option<Rgba>,
         stroke: Option<(StrokeStyle, Rgba)>,
     },
+    /// Blit a host-owned BGRA32 pixel buffer (one `u32` per pixel, in
+    /// 0xAARRGGBB form / little-endian B,G,R,A bytes) at (x, y), sized
+    /// `w`×`h`. This is the canvas fast path: a Lisp program pokes
+    /// pixels directly into a host buffer (see `igui::canvas`) and the
+    /// `present` step emits exactly one `Blit` per frame. `pixels` is an
+    /// independent per-frame snapshot, so the GUI thread can own it for
+    /// the batch's lifetime while Lisp keeps writing the live buffer.
+    Blit {
+        x: f32,
+        y: f32,
+        w: u32,
+        h: u32,
+        pixels: Arc<Vec<u32>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -320,6 +334,25 @@ pub fn submit(batch: PaneBatch) -> bool {
 pub fn snapshot(child_id: i64) -> Option<Arc<PaneBatch>> {
     let guard = PANE_STATES.lock().expect("PANE_STATES poisoned");
     guard.as_ref().and_then(|m| m.get(&child_id).cloned())
+}
+
+/// Replace child `child_id`'s display batch with a single `Blit` of
+/// `pixels` (w×h BGRA32) at the origin, and trigger a repaint. The
+/// canvas `present` step calls this once per frame; `pixels` is a
+/// fresh per-frame snapshot owned by the resulting batch.
+pub fn present_pixels(child_id: i64, w: u32, h: u32, pixels: Arc<Vec<u32>>) -> bool {
+    submit(PaneBatch {
+        child_id,
+        sequence: next_sequence(),
+        flags: 0,
+        cmds: vec![SurfaceCmd::Blit {
+            x: 0.0,
+            y: 0.0,
+            w,
+            h,
+            pixels,
+        }],
+    })
 }
 
 #[allow(dead_code)] // used when child windows close

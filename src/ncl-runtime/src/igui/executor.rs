@@ -243,6 +243,9 @@ pub fn execute(batch: &PaneBatch) -> Result<bool, IGuiError> {
             | SurfaceCmd::DrawPath { .. } => {
                 eprintln!("[igui-executor] Phase 5 command on dormant DC path — ignored");
             }
+            SurfaceCmd::Blit { .. } => {
+                eprintln!("[igui-executor] canvas Blit on dormant DC path — ignored");
+            }
         }
     }
 

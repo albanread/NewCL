@@ -1646,3 +1646,100 @@ pub extern "C-unwind" fn doc_append_markdown_shim(
         Word::NIL.raw()
     }
 }
+
+// ─── Canvas: fast pixel-direct rendering ─────────────────────────────
+//
+// A canvas is a host-owned BGRA32 framebuffer bound to a render-host
+// child by id. `canvas-open` returns the buffer's base ADDRESS as a
+// fixnum; Lisp writes pixels into it with the foreign-buffer pokes
+// (`buffer-set-u32 base byte-offset argb`) — no per-pixel boundary
+// crossing. `canvas-present` snapshots it and draws one frame.
+
+/// `(canvas-open child-id w h)` — open or resize the canvas for
+/// CHILD-ID to W×H BGRA32, returning the base address (fixnum) of its
+/// pixel buffer, or NIL on bad dimensions. Poke a pixel at (x, y) with
+/// `(buffer-set-u32 base (* (+ (* y w) x) 4) #xAARRGGBB)`.
+pub extern "C-unwind" fn canvas_open_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 3 {
+        return Word::NIL.raw();
+    }
+    let (Some(id), Some(w), Some(h)) =
+        (arg_fixnum(args, 0), arg_fixnum(args, 1), arg_fixnum(args, 2))
+    else {
+        return Word::NIL.raw();
+    };
+    let base = super::canvas::canvas_open(id, w, h);
+    if base == 0 {
+        Word::NIL.raw()
+    } else {
+        Word::fixnum(base as i64).raw()
+    }
+}
+
+/// `(canvas-present child-id)` — snapshot the canvas and draw it this
+/// frame (one Blit); returns the base address (fixnum) for the next
+/// frame's writes, or NIL if no canvas is open for CHILD-ID.
+pub extern "C-unwind" fn canvas_present_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if n_args != 1 {
+        return Word::NIL.raw();
+    }
+    let Some(id) = arg_fixnum(args, 0) else {
+        return Word::NIL.raw();
+    };
+    let base = super::canvas::canvas_present(id);
+    if base == 0 {
+        Word::NIL.raw()
+    } else {
+        Word::fixnum(base as i64).raw()
+    }
+}
+
+// ─── MDI window-management verbs (minimized-icon arrangement etc.) ────
+//
+// When the frame is maximized/full and child windows are minimized,
+// Win32 shows them as small icons in the MDI client area; these verbs
+// arrange/cascade/tile them. See `window::dispatch_mdi_verb`.
+
+/// `(mdi-arrange-icons)` — arrange minimized child-window icons into a
+/// row at the bottom of the MDI client (WM_MDIICONARRANGE). Returns T.
+pub extern "C-unwind" fn mdi_arrange_icons_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    _args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    window::dispatch_mdi_verb(super::menu::MdiVerb::ArrangeIcons);
+    Word::T.raw()
+}
+
+/// `(mdi-cascade)` — cascade the open child windows (WM_MDICASCADE).
+pub extern "C-unwind" fn mdi_cascade_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    _args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    window::dispatch_mdi_verb(super::menu::MdiVerb::Cascade);
+    Word::T.raw()
+}
+
+/// `(mdi-tile)` — tile the open child windows horizontally (WM_MDITILE).
+pub extern "C-unwind" fn mdi_tile_shim(
+    _mutator: *mut crate::mutator::MutatorState,
+    _env: u64,
+    _args: *const u64,
+    _n_args: u64,
+) -> u64 {
+    window::dispatch_mdi_verb(super::menu::MdiVerb::TileH);
+    Word::T.raw()
+}

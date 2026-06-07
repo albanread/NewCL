@@ -1879,6 +1879,23 @@ fn install_igui(coord: &Arc<GcCoordinator>, mutator: &mut MutatorState) {
                    ncl_runtime::doc_set_markdown_shim, 2);
     install_native(coord, mutator, "DOC-APPEND-MARKDOWN",
                    ncl_runtime::doc_append_markdown_shim, 2);
+
+    // Canvas — host-owned BGRA32 framebuffer with fast pixel-direct
+    // writes from Lisp. CANVAS-OPEN returns the buffer base address;
+    // poke pixels with BUFFER-SET-U32 then CANVAS-PRESENT to draw.
+    install_native(coord, mutator, "CANVAS-OPEN",
+                   ncl_runtime::canvas_open_shim, 3);
+    install_native(coord, mutator, "CANVAS-PRESENT",
+                   ncl_runtime::canvas_present_shim, 1);
+
+    // MDI window-management verbs (incl. arranging minimized-child
+    // icons when a window is maximized/full within the frame).
+    install_native(coord, mutator, "MDI-ARRANGE-ICONS",
+                   ncl_runtime::mdi_arrange_icons_shim, 0);
+    install_native(coord, mutator, "MDI-CASCADE",
+                   ncl_runtime::mdi_cascade_shim, 0);
+    install_native(coord, mutator, "MDI-TILE",
+                   ncl_runtime::mdi_tile_shim, 0);
 }
 
 fn install_native(

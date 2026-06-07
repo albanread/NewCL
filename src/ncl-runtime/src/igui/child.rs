@@ -229,6 +229,50 @@ fn execute_d2d_batch(
                 }));
             },
             SurfaceCmd::PresentHint => {}
+            SurfaceCmd::Blit { x, y, w, h, pixels } => {
+                // Canvas fast path: upload the host BGRA32 buffer to a
+                // D2D bitmap and draw it 1:1. One CreateBitmap+DrawBitmap
+                // per frame — the per-pixel work happened in Lisp via
+                // direct memory pokes (see igui::canvas).
+                let need = (*w as usize) * (*h as usize);
+                if *w > 0 && *h > 0 && pixels.len() >= need {
+                    use windows::Win32::Graphics::Direct2D::{
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
+                    };
+                    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+                    let bitmap = unsafe {
+                        target.CreateBitmap(
+                            D2D_SIZE_U { width: *w, height: *h },
+                            Some(pixels.as_ptr() as *const core::ffi::c_void),
+                            *w * 4,
+                            &D2D1_BITMAP_PROPERTIES {
+                                pixelFormat: D2D1_PIXEL_FORMAT {
+                                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                                },
+                                dpiX: 96.0,
+                                dpiY: 96.0,
+                            },
+                        )
+                    }
+                    .map_err(|e| IGuiError::D2D(format!("CreateBitmap (Blit): {e}")))?;
+                    let dst = D2D_RECT_F {
+                        left: *x,
+                        top: *y,
+                        right: *x + *w as f32,
+                        bottom: *y + *h as f32,
+                    };
+                    unsafe {
+                        target.DrawBitmap(
+                            &bitmap,
+                            Some(&dst),
+                            1.0,
+                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                            None,
+                        )
+                    };
+                }
+            }
             SurfaceCmd::FillRect {
                 rect,
                 corner_radius,
@@ -1072,6 +1116,9 @@ fn log_ui_batch(child_id: i64, batch: &batch_mod::PaneBatch) {
             SurfaceCmd::PresentHint => {
                 eprintln!("[igui-batch-ui]   #{index} PresentHint");
             }
+            SurfaceCmd::Blit { x, y, w, h, .. } => eprintln!(
+                "[igui-batch-ui]   #{index} Blit {w}x{h} @ ({x:.1}, {y:.1})"
+            ),
             SurfaceCmd::FillRect {
                 rect,
                 corner_radius,
@@ -1506,6 +1553,12 @@ fn execute_gdi_batch(
                         message: "text query unsupported on GDI fallback".into(),
                     },
                 );
+            }
+            // Canvas Blit needs the D2D bitmap path; the GDI fallback is
+            // transient (used only until the D2D target is created), so
+            // we skip it rather than carry a parallel StretchDIBits path.
+            SurfaceCmd::Blit { .. } => {
+                eprintln!("[igui-gdi] canvas Blit on GDI fallback — skipped (D2D is the canvas path)");
             }
             // Phase 5 commands all skipped in the GDI fallback path —
             // Direct2D is the real path.
