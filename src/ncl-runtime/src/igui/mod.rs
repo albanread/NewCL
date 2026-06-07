@@ -30,6 +30,7 @@
 #![cfg(windows)]
 
 pub mod batch;
+pub mod canvas;
 pub mod channels;
 mod child;
 pub mod crash_handler;

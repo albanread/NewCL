@@ -886,6 +886,17 @@ unsafe extern "system" fn frame_wnd_proc(
                 }
                 return LRESULT(0);
             }
+            // Command ids at/above the MDICLIENT idFirstChild (0xCC00)
+            // belong to Win32's MDI machinery — above all the restore /
+            // minimize / close buttons that a *maximized* MDI child
+            // injects into the frame's menu bar (the "small window icons"
+            // visible when a child is full within the frame). Those MUST
+            // reach DefFrameProcW, or the buttons are dead — returning
+            // LRESULT(0) here used to swallow them. Genuine user-menu ids
+            // are far below 0xCC00, so they still surface as Menu events.
+            if cmd_id >= 0xCC00 {
+                return unsafe { DefFrameProcW(hwnd, Some(mdi), msg, wparam, lparam) };
+            }
             // User menu items: push EvMenu so the language thread can
             // dispatch on item_id.
             channels::push(IGuiEvent::Menu {
