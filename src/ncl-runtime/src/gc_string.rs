@@ -56,6 +56,36 @@ pub fn alloc_string_in_young(
     Word::from_ptr(p as *const u8, Tag::String)
 }
 
+/// Allocate a String of `n` copies of codepoint `c` on the young
+/// heap — the one-shot allocator behind `make-string`. O(n): one
+/// allocation plus a packed two-codepoints-per-cell fill. (The
+/// previous Lisp-side `make-string` grew the result one
+/// `string-append-char` at a time — a full copy of the accumulated
+/// string per character, O(n²) — which silently made every
+/// "allocate then fill in place" string builder quadratic too.)
+pub fn alloc_string_filled(
+    m: &mut crate::mutator::MutatorState,
+    n: usize,
+    c: char,
+) -> Word {
+    let payload_cells = 1 + n.div_ceil(2);
+    let p = m.alloc_string_buffer(payload_cells as u32);
+    let cp = c as u32 as u64;
+    unsafe {
+        *p.add(CHAR_COUNT_OFFSET) = n as u64;
+        let packed = cp | (cp << 32);
+        for cell in 0..n.div_ceil(2) {
+            *p.add(CHARS_START_OFFSET + cell) = packed;
+        }
+        // Odd length: the trailing half-cell must be zero-padded
+        // (see the layout comment at the top of this file).
+        if n % 2 == 1 {
+            *p.add(CHARS_START_OFFSET + n / 2) = cp;
+        }
+    }
+    Word::from_ptr(p as *const u8, Tag::String)
+}
+
 unsafe fn fill_string_payload(p: *mut u64, chars: &[u32]) {
     let n = chars.len();
     unsafe {

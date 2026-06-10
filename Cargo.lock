@@ -1074,7 +1074,7 @@ dependencies = [
 [[package]]
 name = "newgc-core"
 version = "0.0.0"
-source = "git+https://github.com/albanread/GC-.git?rev=c500539#c500539e5a6eb5c7f13c299dde27509ad56beff4"
+source = "git+https://github.com/albanread/GC-.git?rev=5c21e94#5c21e94fdb679dd22d4a7d1e766c4dc7f605464c"
 dependencies = [
  "libc",
  "loom",

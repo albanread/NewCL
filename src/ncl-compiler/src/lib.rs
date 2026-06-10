@@ -862,6 +862,12 @@ fn install_native_functions(
                    ncl_runtime::chars::char_code_shim, 1);
     install_native(coord, mutator, "CODE-CHAR",
                    ncl_runtime::chars::code_char_shim, 1);
+    // (%make-string-fill n ch) — one-pass string allocator behind
+    // make-string. Library/strings.lisp delegates to it; without
+    // this, make-string was an O(n²) string-append-char loop and
+    // every fill-in-place string builder inherited the quadratic.
+    install_native(coord, mutator, "%MAKE-STRING-FILL",
+                   ncl_runtime::chars::make_string_fill_shim, 2);
     install_native(coord, mutator, "CHAR-UPCASE",
                    ncl_runtime::chars::char_upcase_shim, 1);
     install_native(coord, mutator, "CHAR-DOWNCASE",

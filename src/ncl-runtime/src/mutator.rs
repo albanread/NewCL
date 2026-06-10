@@ -818,6 +818,16 @@ impl MutatorState {
     /// is driving a collection, this parks until the world resumes
     /// (the roots Vec is updated in place with forwarded values).
     pub fn safepoint(&mut self) {
+        // Fast path: nothing pending — two atomic loads and out.
+        // This runs on EVERY allocation (alloc_cons polls at the top
+        // of its loop), so the stack-window publish and the RefCell
+        // borrow below must not run unconditionally. The window is
+        // only read by a collector once we park (or go native), and
+        // racing past a just-raised epoch only defers the park to
+        // the next poll site — one allocation away.
+        if !self.gc.safepoint_pending() {
+            return;
+        }
         // Cover live frames before a poll that may park (and be scanned).
         self.publish_stack_window();
         // Disjoint borrow of `self.gc` and `self.roots`.

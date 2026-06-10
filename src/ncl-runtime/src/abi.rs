@@ -358,26 +358,39 @@ pub fn eql_values(a: Word, b: Word) -> bool {
     if a.raw() == b.raw() {
         return true;
     }
-    if crate::float::is_float(a) && crate::float::is_float(b) {
-        return crate::ratio::ncl_cmp_full(a.raw(), b.raw()) == 0;
+    // All four boxed-numeric types are Vector-tagged heap objects
+    // distinguished by HeapHeader type. Decode each operand's tag +
+    // header ONCE and dispatch on the pair — the old predicate
+    // chain (is_float && is_float, is_bignum && is_bignum, …)
+    // re-decoded the tag and re-loaded the header per probe, up to
+    // four times per operand, then ncl_cmp_full decoded both again.
+    let ta = match crate::ratio::heap_numeric_type(a) {
+        Some(t) => t,
+        None => return false,
+    };
+    if crate::ratio::heap_numeric_type(b) != Some(ta) {
+        // Different types (or b isn't a boxed number): never EQL,
+        // even when numerically equal — (eql 3 3.0) is NIL.
+        return false;
     }
-    if crate::bignum::is_bignum(a) && crate::bignum::is_bignum(b) {
-        return crate::ratio::ncl_cmp_full(a.raw(), b.raw()) == 0;
+    use crate::heap::HeapType;
+    match ta {
+        HeapType::Float | HeapType::Bignum | HeapType::Ratio => {
+            crate::ratio::cmp_full_typed(a, b, Some(ta), Some(ta)) == 0
+        }
+        HeapType::Complex => {
+            // Component-wise EQL: (eql #c(3 -4) #c(3 -4)) is true.
+            eql_values(
+                crate::complex::complex_real(a),
+                crate::complex::complex_real(b),
+            ) && eql_values(
+                crate::complex::complex_imag(a),
+                crate::complex::complex_imag(b),
+            )
+        }
+        // heap_numeric_type only yields the four variants above.
+        _ => false,
     }
-    if crate::ratio::is_ratio(a) && crate::ratio::is_ratio(b) {
-        return crate::ratio::ncl_cmp_full(a.raw(), b.raw()) == 0;
-    }
-    if crate::complex::is_complex(a) && crate::complex::is_complex(b) {
-        // Component-wise EQL: (eql #c(3 -4) #c(3 -4)) is true.
-        return eql_values(
-            crate::complex::complex_real(a),
-            crate::complex::complex_real(b),
-        ) && eql_values(
-            crate::complex::complex_imag(a),
-            crate::complex::complex_imag(b),
-        );
-    }
-    false
 }
 
 /// String equality. Both args must be Tag::String. Returns Word::T
@@ -1435,20 +1448,40 @@ pub extern "C-unwind" fn ncl_apply(
     }
 
     let total = n_prefix as usize + tail_len;
-    let mut buf: Vec<u64> = Vec::with_capacity(total);
+    if let Some(cond) = under_supplied_arity(mutator, f_word, total as u64) {
+        return cond;
+    }
+
+    // Args buffer. Virtually every apply is small — (apply f a b
+    // '(c d)) under mapcar/reduce — so use a stack array for ≤16
+    // args and only heap-allocate above that. `Vec::new()` doesn't
+    // allocate, so the fast path performs zero heap allocations.
+    // Nothing between here and the call can trigger GC, so raw u64
+    // words on the Rust stack are safe (and conservatively scanned
+    // if the callee parks).
+    const APPLY_STACK_ARGS: usize = 16;
+    let mut stack_buf = [0u64; APPLY_STACK_ARGS];
+    let mut heap_buf: Vec<u64> = Vec::new();
+    let buf: &mut [u64] = if total <= APPLY_STACK_ARGS {
+        &mut stack_buf[..total]
+    } else {
+        heap_buf.resize(total, 0);
+        &mut heap_buf[..]
+    };
+    let mut k = 0;
     for i in 0..n_prefix {
-        buf.push(unsafe { *prefix.add(i as usize) });
+        buf[k] = unsafe { *prefix.add(i as usize) };
+        k += 1;
     }
     let mut cur = Word::from_raw(tail_list);
     while !cur.is_nil() {
         let p = cur.as_ptr::<u64>(Tag::Cons).expect("cons");
-        buf.push(unsafe { *p });
+        buf[k] = unsafe { *p };
+        k += 1;
         cur = Word::from_raw(unsafe { *p.add(1) });
     }
+    debug_assert_eq!(k, total, "apply: tail list changed length between walks");
 
-    if let Some(cond) = under_supplied_arity(mutator, f_word, total as u64) {
-        return cond;
-    }
     let env = crate::gc_function::env(f_word);
     debug_assert_closure_env_valid("ncl_apply", 0, f_word, env);
     let code = crate::gc_function::code_ptr(f_word);

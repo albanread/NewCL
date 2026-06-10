@@ -321,19 +321,55 @@ fn complex_parts(w: Word) -> (u64, u64) {
     }
 }
 
+/// Heap-numeric type of W: `Some(Float | Bignum | Ratio | Complex)`
+/// when W is a boxed number, `None` otherwise (fixnums included —
+/// they're immediate). One tag decode + at most one header load.
+///
+/// The hot comparison/eql paths dispatch on this instead of
+/// chaining `is_float` / `is_bignum` / `is_ratio` / `is_complex`,
+/// each of which re-decoded the tag AND re-loaded the heap header.
+#[inline]
+pub(crate) fn heap_numeric_type(w: Word) -> Option<HeapType> {
+    if w.tag() != Tag::Vector {
+        return None;
+    }
+    let p = w.as_ptr::<u64>(Tag::Vector)?;
+    match HeapHeader::from_raw(unsafe { *p }).ty() {
+        t @ (HeapType::Float
+        | HeapType::Bignum
+        | HeapType::Ratio
+        | HeapType::Complex) => Some(t),
+        _ => None,
+    }
+}
+
 /// Cross-type comparison spanning the full numeric tower. Returns
 /// -1, 0, or +1 as i64.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn ncl_cmp_full(a_raw: u64, b_raw: u64) -> i64 {
     let a = Word::from_raw(a_raw);
     let b = Word::from_raw(b_raw);
+    cmp_full_typed(a, b, heap_numeric_type(a), heap_numeric_type(b))
+}
+
+/// `ncl_cmp_full` body with the operands' heap-numeric types
+/// pre-decoded, so callers that already know them (`eql_values`)
+/// don't pay a second round of tag/header reads.
+pub(crate) fn cmp_full_typed(
+    a: Word,
+    b: Word,
+    ha: Option<HeapType>,
+    hb: Option<HeapType>,
+) -> i64 {
+    let a_raw = a.raw();
+    let b_raw = b.raw();
     // Complex numbers are not ordered — only (in)equality is defined.
     // Return 0 iff the real AND imaginary parts both compare equal,
     // else a nonzero sentinel. This makes `=` / `/=` correct on complex
     // (and on complex-vs-real, where the real has a zero imaginary
     // part). `<` / `>` on a complex are undefined in CL; we do not make
     // them meaningful here.
-    if crate::complex::is_complex(a) || crate::complex::is_complex(b) {
+    if ha == Some(HeapType::Complex) || hb == Some(HeapType::Complex) {
         let (ar, ai) = complex_parts(a);
         let (br, bi) = complex_parts(b);
         return if ncl_cmp_full(ar, br) == 0 && ncl_cmp_full(ai, bi) == 0 {
@@ -342,7 +378,7 @@ pub extern "C-unwind" fn ncl_cmp_full(a_raw: u64, b_raw: u64) -> i64 {
             1
         };
     }
-    if crate::float::is_float(a) || crate::float::is_float(b) {
+    if ha == Some(HeapType::Float) || hb == Some(HeapType::Float) {
         return crate::float::ncl_cmp_real(a_raw, b_raw);
     }
     // Both rational — compare via BigRational. Cheaper than going

@@ -320,6 +320,37 @@ pub extern "C-unwind" fn digit_char_shim(
     Word::char(c).raw()
 }
 
+/// `(%make-string-fill n ch)` — fresh young-heap string of N copies
+/// of character CH, allocated and filled in one pass. The primitive
+/// behind `make-string`; every Lisp-side construction loop
+/// (string-upcase and friends fill the result in place with
+/// `(setf (char ...))`) relies on this being O(n), not append-per-char.
+pub extern "C-unwind" fn make_string_fill_shim(
+    mutator: *mut MutatorState,
+    _env: u64,
+    args: *const u64,
+    n_args: u64,
+) -> u64 {
+    if let Some(cond) = require_arity(mutator, "%make-string-fill", 2, n_args) {
+        return cond;
+    }
+    let n = match arg(args, 0).as_fixnum() {
+        Some(v) if v >= 0 => v as usize,
+        _ => {
+            return signal_condition_string(
+                mutator,
+                "%make-string-fill: size must be a non-negative fixnum",
+            );
+        }
+    };
+    let c = match demand_char(mutator, "%make-string-fill", arg(args, 1)) {
+        Ok(c) => c,
+        Err(cond) => return cond,
+    };
+    let m = unsafe { &mut *mutator };
+    crate::gc_string::alloc_string_filled(m, n, c).raw()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

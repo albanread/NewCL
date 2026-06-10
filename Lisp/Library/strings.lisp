@@ -187,28 +187,34 @@
 ;; Override the simpler string-upcase / string-downcase in xp.lisp with the
 ;; full ANSI interface.  Call sites without keyword args are unaffected.
 
+;; All three allocate the result once with MAKE-STRING and fill it
+;; in place with (SETF (CHAR ...)). The previous versions grew the
+;; result one STRING-APPEND-CHAR at a time — a fresh copy of the
+;; whole accumulated string PER CHARACTER, i.e. O(n²) work and n
+;; heap allocations for an n-character input.
+
 (defun string-upcase (s &key (start 0) end)
   "Return a copy of S with characters in [START, END) upcased."
-  (let* ((a (string s)) (n (length a)) (e (or end n)) (out "") (i 0))
+  (let* ((a (string s)) (n (length a)) (e (or end n))
+         (out (make-string n)) (i 0))
     (loop
       (when (>= i n) (return out))
-      (setq out
-            (string-append-char out
-                                (if (and (>= i start) (< i e))
-                                    (char-upcase (char a i))
-                                    (char a i))))
+      (setf (char out i)
+            (if (and (>= i start) (< i e))
+                (char-upcase (char a i))
+                (char a i)))
       (setq i (+ i 1)))))
 
 (defun string-downcase (s &key (start 0) end)
   "Return a copy of S with characters in [START, END) downcased."
-  (let* ((a (string s)) (n (length a)) (e (or end n)) (out "") (i 0))
+  (let* ((a (string s)) (n (length a)) (e (or end n))
+         (out (make-string n)) (i 0))
     (loop
       (when (>= i n) (return out))
-      (setq out
-            (string-append-char out
-                                (if (and (>= i start) (< i e))
-                                    (char-downcase (char a i))
-                                    (char a i))))
+      (setf (char out i)
+            (if (and (>= i start) (< i e))
+                (char-downcase (char a i))
+                (char a i)))
       (setq i (+ i 1)))))
 
 (defun string-capitalize (s &key (start 0) end)
@@ -216,21 +222,21 @@
    a non-alphanumeric character (or at the start) is upcased and the rest
    downcased. Characters outside the range are copied verbatim."
   (let* ((a (string s)) (n (length a)) (e (or end n))
-         (out "") (i 0) (new-word t))
+         (out (make-string n)) (i 0) (new-word t))
     (loop
       (when (>= i n) (return out))
       (let ((c (char a i)))
         (cond
           ((or (< i start) (>= i e))
-           (setq out (string-append-char out c)))
+           (setf (char out i) c))
           ((alphanumericp c)
-           (setq out (string-append-char out
-                                         (if new-word
-                                             (char-upcase   c)
-                                             (char-downcase c))))
+           (setf (char out i)
+                 (if new-word
+                     (char-upcase   c)
+                     (char-downcase c)))
            (setq new-word nil))
           (t
-           (setq out (string-append-char out c))
+           (setf (char out i) c)
            (setq new-word t))))
       (setq i (+ i 1)))))
 
@@ -260,11 +266,11 @@
 
 (defun make-string (size &key (initial-element #\Space))
   "Return a fresh string of SIZE characters, each INITIAL-ELEMENT."
-  (let ((out "") (i 0))
-    (loop
-      (when (>= i size) (return out))
-      (setq out (string-append-char out initial-element))
-      (setq i (+ i 1)))))
+  ;; One-pass native allocator. The previous string-append-char loop
+  ;; copied the whole accumulated string per character — O(n²) — and
+  ;; quietly made every make-string + (setf (char ...)) builder
+  ;; quadratic with it.
+  (%make-string-fill size initial-element))
 
 ;; ── File probe ───────────────────────────────────────────────────────────────
 

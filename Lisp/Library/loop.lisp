@@ -102,8 +102,13 @@
 
 ;; ── Plan structure ────────────────────────────────────────────────────────
 ;;
-;; The plan accumulates as we parse. Each field is a list we add to.
-;; Final code emission walks the plan.
+;; The plan accumulates as we parse. Each list field is built in
+;; REVERSE (cons-prepend — O(1) per clause; the old append-per-add
+;; recopied the whole field each time, O(n²) across a clause-heavy
+;; loop). Readers restore source order with `reverse` at the two
+;; boundaries: %loop-emit / %loop-result-form / the into-reversal
+;; walker at emit time, and %parse-when-unless's added-forms capture
+;; mid-parse.
 
 (defstruct loop-plan
   (name nil)            ; named block tag, or NIL
@@ -127,44 +132,42 @@
 
 (defun %plan-add-with (plan var init)
   (setf (loop-plan-with-bindings plan)
-        (append (loop-plan-with-bindings plan)
-                (list (cons var init)))))
+        (cons (cons var init) (loop-plan-with-bindings plan))))
 
 (defun %plan-add-iter-binding (plan var init)
   (setf (loop-plan-iter-bindings plan)
-        (append (loop-plan-iter-bindings plan)
-                (list (cons var init)))))
+        (cons (cons var init) (loop-plan-iter-bindings plan))))
 
 (defun %plan-add-test (plan form)
   (cond
     ((loop-plan-body-seen plan)
      (setf (loop-plan-post-body-tests plan)
-           (append (loop-plan-post-body-tests plan) (list form))))
+           (cons form (loop-plan-post-body-tests plan))))
     (t
      (setf (loop-plan-iter-tests plan)
-           (append (loop-plan-iter-tests plan) (list form))))))
+           (cons form (loop-plan-iter-tests plan))))))
 
 (defun %plan-add-step (plan form)
   (setf (loop-plan-iter-steps plan)
-        (append (loop-plan-iter-steps plan) (list form))))
+        (cons form (loop-plan-iter-steps plan))))
 
 (defun %plan-add-body (plan form)
   (setf (loop-plan-body plan)
-        (append (loop-plan-body plan) (list form)))
+        (cons form (loop-plan-body plan)))
   (setf (loop-plan-body-seen plan) t))
 
 (defun %plan-add-initially (plan form)
   (setf (loop-plan-initially plan)
-        (append (loop-plan-initially plan) (list form))))
+        (cons form (loop-plan-initially plan))))
 
 (defun %plan-add-finally (plan form)
   (setf (loop-plan-finally plan)
-        (append (loop-plan-finally plan) (list form))))
+        (cons form (loop-plan-finally plan))))
 
 (defun %plan-add-accumulator (plan kind var extras)
   (setf (loop-plan-accumulators plan)
-        (append (loop-plan-accumulators plan)
-                (list (cons kind (cons var extras))))))
+        (cons (cons kind (cons var extras))
+              (loop-plan-accumulators plan))))
 
 ;; ── Clause parsers ────────────────────────────────────────────────────────
 
@@ -523,15 +526,24 @@
 
 ;; (when EXPR CLAUSE) / (unless EXPR CLAUSE) — single sub-clause.
 ;; We bury the sub-clause's effect inside an (if ...) in the body.
-;; Implementation: temporarily save the body length, parse the
-;; sub-clause's body additions, then wrap them in a conditional.
+;; Implementation: save the body list (a shared tail, since adders
+;; only cons onto the front), parse the sub-clause, then peel the
+;; new front cells off as the additions and wrap them.
 (defun %parse-when-unless (plan cur negate)
   (let* ((expr (%cur-eat! cur))
-         (saved-len (length (loop-plan-body plan))))
+         (saved-tail (loop-plan-body plan)))
     (%parse-one-clause plan cur)
-    (let ((added (subseq (loop-plan-body plan) saved-len)))
-      ;; Trim plan body back to its pre-sub-clause length.
-      (setf (loop-plan-body plan) (subseq (loop-plan-body plan) 0 saved-len))
+    ;; body is reverse-accumulated: everything in front of
+    ;; SAVED-TAIL (compared by EQ) was added by the sub-clause.
+    ;; Pushing front-to-back restores the additions' source order.
+    (let ((added nil)
+          (p (loop-plan-body plan)))
+      (loop
+        (when (eq p saved-tail) (return nil))
+        (setq added (cons (car p) added))
+        (setq p (cdr p)))
+      ;; Trim plan body back to its pre-sub-clause state.
+      (setf (loop-plan-body plan) saved-tail)
       ;; Wrap the additions in an if.
       (let ((wrapped
              (cond
@@ -627,7 +639,9 @@
    bind that variable instead and contribute NOTHING to the loop value
    — the user retrieves them via `finally`."
   (let ((anon (remove-if (lambda (a) (cddr a))   ; cddr = the into-var, if any
-                         (loop-plan-accumulators plan))))
+                         ;; stored newest-first; restore source order
+                         ;; so (car (last anon)) is the LAST clause.
+                         (reverse (loop-plan-accumulators plan)))))
     (cond
       ((null anon) nil)
       (t
@@ -644,7 +658,7 @@
    later reader) sees the items in collection order. APPEND-into already
    builds in order, and numeric accumulators need no fixup."
   (let ((seen nil) (forms nil))
-    (dolist (a (loop-plan-accumulators plan))
+    (dolist (a (reverse (loop-plan-accumulators plan)))
       (let ((kind (car a)) (var (cadr a)) (into (cddr a)))
         (when (and into (eq kind 'collect) (not (member var seen)))
           (setq seen (cons var seen))
@@ -663,16 +677,18 @@
          finally-forms ...
          result-form))"
   (let* ((name (or (loop-plan-name plan) 'nil))
+         ;; Plan list fields are reverse-accumulated (see the plan
+         ;; structure comment) — restore source order here, once.
          (all-bindings
           (append
            ;; with-bindings come first (user-visible scope).
            (mapcar (lambda (pair) `(,(car pair) ,(cdr pair)))
-                   (loop-plan-with-bindings plan))
+                   (reverse (loop-plan-with-bindings plan)))
            ;; iter-bindings come second (loop-internal).
            (mapcar (lambda (pair) `(,(car pair) ,(cdr pair)))
-                   (loop-plan-iter-bindings plan))))
-         (tests (loop-plan-iter-tests plan))
-         (post-tests (loop-plan-post-body-tests plan))
+                   (reverse (loop-plan-iter-bindings plan)))))
+         (tests (reverse (loop-plan-iter-tests plan)))
+         (post-tests (reverse (loop-plan-post-body-tests plan)))
          (test-form
           (cond
             ((null tests) 'nil)            ; no automatic termination
@@ -689,12 +705,12 @@
          ;; we added don't contain `return`, but it's harmless to
          ;; walk them.
          (body (mapcar (lambda (f) (%loop-rewrite-return f name))
-                       (loop-plan-body plan)))
-         (steps (loop-plan-iter-steps plan))
+                       (reverse (loop-plan-body plan))))
+         (steps (reverse (loop-plan-iter-steps plan)))
          (initially (mapcar (lambda (f) (%loop-rewrite-return f name))
-                            (loop-plan-initially plan)))
+                            (reverse (loop-plan-initially plan))))
          (finally (mapcar (lambda (f) (%loop-rewrite-return f name))
-                          (loop-plan-finally plan)))
+                          (reverse (loop-plan-finally plan))))
          (result (%loop-result-form plan)))
     ;; The simple `loop`'s `return` doesn't unwind — subsequent
     ;; body forms run after it (see core.lisp's caveat). So we
