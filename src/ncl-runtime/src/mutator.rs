@@ -25,7 +25,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
 use newgc_core::{
@@ -454,7 +453,7 @@ impl GcCoordinator {
         MutatorState {
             coord: Arc::clone(self),
             gc,
-            roots: RefCell::new(Vec::new()),
+            roots: RootStack::new(),
             stack_hi: hi,
         }
     }
@@ -484,6 +483,152 @@ impl GcCoordinator {
     }
 }
 
+// -- Explicit root stack ----------------------------------------------------
+
+/// The two pointers the JIT reads to inline root push/pop. `#[repr(C)]`
+/// guarantees `cur` at offset 0 and `end` at offset 8; `ncl_root_hdr`
+/// hands JIT'd code a `*mut RootStackHdr` so the safepoint wrap can do
+/// `*cur = v; cur += 1` (push) and `cur -= 1; v = *cur` (pop) inline,
+/// taking the runtime call only when `cur == end` (buffer full).
+#[repr(C)]
+pub struct RootStackHdr {
+    /// Next free slot, i.e. `base + len`. Inline push writes here then
+    /// bumps; inline pop decrements then reads.
+    cur: *mut Word,
+    /// One past the last usable slot (`base + cap`). `cur == end` means
+    /// full → the inline path falls back to `push_root` (which grows).
+    end: *mut Word,
+}
+
+/// NCL's precise explicit-root stack. The collector visits `[base, cur)`
+/// in place (and forwards entries) alongside the conservative stack pin.
+/// Single-thread access — the owning thread on the hot path, or the
+/// STW-parked collector on that same thread — so no lock or `RefCell`:
+/// every mutating entry point already holds `&mut MutatorState`.
+///
+/// The backing `Vec` is kept full-length (slots are POD `Word`s,
+/// NIL-padded); the logical top is `hdr.cur`, so a realloc only happens
+/// on the cold `grow` path. `base` mirrors `buf.as_mut_ptr()`; both are
+/// recomputed after a grow.
+pub struct RootStack {
+    hdr: RootStackHdr,
+    base: *mut Word,
+    buf: Vec<Word>,
+}
+
+/// Initial capacity (slots). Generous so `grow` is rare; 1024 Words =
+/// 8 KB, trivially small next to the heap reservation.
+const ROOT_STACK_INIT_CELLS: usize = 1024;
+
+impl RootStack {
+    fn new() -> Self {
+        let mut buf = vec![Word::NIL; ROOT_STACK_INIT_CELLS];
+        let base = buf.as_mut_ptr();
+        let end = unsafe { base.add(buf.len()) };
+        RootStack { hdr: RootStackHdr { cur: base, end }, base, buf }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        // Pointer difference in Word units == logical depth.
+        (self.hdr.cur as usize - self.base as usize) / std::mem::size_of::<Word>()
+    }
+
+    /// Push `w`; returns the depth BEFORE the push (matching the old
+    /// `push_root` contract). Grows on a full buffer.
+    #[inline]
+    fn push(&mut self, w: Word) -> usize {
+        let depth = self.len();
+        if self.hdr.cur == self.hdr.end {
+            self.grow();
+        }
+        unsafe {
+            *self.hdr.cur = w;
+            self.hdr.cur = self.hdr.cur.add(1);
+        }
+        depth
+    }
+
+    /// Double the backing buffer, preserving the logical contents, and
+    /// recompute `base`/`cur`/`end` against the (possibly moved) alloc.
+    #[cold]
+    fn grow(&mut self) {
+        self.grow_to(self.len() + 1);
+    }
+
+    #[inline]
+    fn pop(&mut self) -> Option<Word> {
+        if self.hdr.cur == self.base {
+            return None;
+        }
+        unsafe {
+            self.hdr.cur = self.hdr.cur.sub(1);
+            Some(*self.hdr.cur)
+        }
+    }
+
+    /// Ensure at least `n` free slots above `cur`, growing (and moving
+    /// the buffer) if needed. Preserves the logical contents and depth.
+    /// The JIT calls this once per allocating call-site, then stores its
+    /// roots inline into the guaranteed-free slots — so the per-root
+    /// push needs no bounds branch and no runtime call.
+    #[inline]
+    fn reserve(&mut self, n: usize) {
+        let free = (self.hdr.end as usize - self.hdr.cur as usize)
+            / std::mem::size_of::<Word>();
+        if free < n {
+            self.grow_to(self.len() + n);
+        }
+    }
+
+    #[cold]
+    fn grow_to(&mut self, needed: usize) {
+        let len = self.len();
+        let mut new_cap = self.buf.len().max(ROOT_STACK_INIT_CELLS);
+        while new_cap < needed {
+            new_cap = new_cap.saturating_mul(2);
+        }
+        self.buf.resize(new_cap, Word::NIL);
+        self.base = self.buf.as_mut_ptr();
+        unsafe {
+            self.hdr.cur = self.base.add(len);
+            self.hdr.end = self.base.add(new_cap);
+        }
+    }
+
+    #[inline]
+    fn at(&self, idx: usize) -> Word {
+        debug_assert!(idx < self.len(), "root index {idx} out of range {}", self.len());
+        unsafe { *self.base.add(idx) }
+    }
+
+    #[inline]
+    fn set_at(&mut self, idx: usize, w: Word) {
+        debug_assert!(idx < self.len(), "root index {idx} out of range {}", self.len());
+        unsafe { *self.base.add(idx) = w; }
+    }
+
+    #[inline]
+    fn count(&self) -> usize {
+        self.len()
+    }
+
+    fn truncate(&mut self, depth: usize) {
+        if depth < self.len() {
+            self.hdr.cur = unsafe { self.base.add(depth) };
+        }
+    }
+
+    fn as_slice(&self) -> &[Word] {
+        unsafe { std::slice::from_raw_parts(self.base, self.len()) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [Word] {
+        let len = self.len();
+        unsafe { std::slice::from_raw_parts_mut(self.base, len) }
+    }
+}
+
 // -- MutatorState (per-Lisp-thread) -----------------------------------------
 
 /// Per-Lisp-thread state. Owned by one thread at a time; never
@@ -500,18 +645,17 @@ pub struct MutatorState {
     /// path, and the cooperative safepoint protocol.
     gc: newgc_core::Mutator<LispLayout>,
     /// NCL's explicit root stack. Visited (and updated in place) by
-    /// the collector via `poll_safepoint` / `collect_minor`. Behind a
-    /// `RefCell` (not `Mutex`) — this stack is only ever touched by the
-    /// owning thread (push/pop on the hot path, and the collector scans
-    /// it from this same thread at its own safepoint; cross-thread root
-    /// visiting is handled inside newgc-core, not here). The `RefCell`
-    /// still gives the interior mutability needed to borrow `roots`
-    /// disjointly from `self.gc`, but with a ~1ns non-atomic borrow
-    /// check instead of a ~25ns mutex lock. This matters enormously:
-    /// the safepoint wrap pushes/pops one root per live variable around
-    /// *every* call, so the lock was ~90% of per-call cost (fib 30:
-    /// 184ms → 20ms with rooting disabled).
-    roots: RefCell<Vec<Word>>,
+    /// the collector via `poll_safepoint` / `collect_minor`. No lock or
+    /// `RefCell`: only the owning thread touches it (push/pop on the hot
+    /// path; the collector scans it from this same thread at its own
+    /// safepoint — cross-thread root visiting lives in newgc-core), and
+    /// every mutating path holds `&mut MutatorState`. The safepoint wrap
+    /// pushes/pops one root per live variable around *every* call, so
+    /// the JIT reads `roots.hdr` (via `ncl_root_hdr`) and inlines the
+    /// push/pop as a store + pointer bump — no runtime call on the
+    /// fast path. (History: Mutex → RefCell cut fib30 184ms→20ms with
+    /// rooting off; inlining removes the remaining per-root call cost.)
+    roots: RootStack,
     /// Upper bound (stack base) of this thread's stack, captured at
     /// registration. The conservative scan window is republished as
     /// `[current-frame, stack_hi]` right before every safepoint /
@@ -731,8 +875,7 @@ impl MutatorState {
         let pause_start = std::time::Instant::now();
         let result = {
             let MutatorState { gc, roots, .. } = self;
-            let mut guard = roots.borrow_mut();
-            gc.collect_minor(guard.as_mut_slice(), |evac| {
+            gc.collect_minor(roots.as_mut_slice(), |evac| {
                 // NCL-specific root source: static→young pointers.
                 // The newgc collector already visited every mutator's
                 // published roots + conservatively pinned all stacks
@@ -832,8 +975,7 @@ impl MutatorState {
         self.publish_stack_window();
         // Disjoint borrow of `self.gc` and `self.roots`.
         let MutatorState { gc, roots, .. } = self;
-        let mut guard = roots.borrow_mut();
-        gc.poll_safepoint(guard.as_mut_slice());
+        gc.poll_safepoint(roots.as_mut_slice());
     }
 
     /// Mark the calling thread as in a blocking native call (`sleep`,
@@ -850,8 +992,7 @@ impl MutatorState {
         // IN_NATIVE, so cover live frames before announcing the excursion.
         self.publish_stack_window();
         let MutatorState { gc, roots, .. } = self;
-        let guard = roots.borrow_mut();
-        gc.enter_native(guard.as_slice());
+        gc.enter_native(roots.as_slice());
     }
 
     /// Leave a native excursion (see `enter_blocked`). Maps to newgc's
@@ -861,8 +1002,7 @@ impl MutatorState {
     /// by a collector that ran while we were blocked.
     pub fn leave_blocked(&mut self) {
         let MutatorState { gc, roots, .. } = self;
-        let mut guard = roots.borrow_mut();
-        gc.leave_native(guard.as_mut_slice());
+        gc.leave_native(roots.as_mut_slice());
     }
 
     /// Lock-free write barrier. Mark the card containing `addr` as
@@ -938,38 +1078,52 @@ impl MutatorState {
     // ABI shims call them through a shared ref) and operate on the
     // `self.roots` Mutex.
 
-    pub fn push_root(&self, w: Word) -> usize {
-        let mut roots = self.roots.borrow_mut();
-        roots.push(w);
-        roots.len() - 1
+    pub fn push_root(&mut self, w: Word) -> usize {
+        self.roots.push(w)
     }
 
-    pub fn pop_root(&self) -> Option<Word> {
-        self.roots.borrow_mut().pop()
+    pub fn pop_root(&mut self) -> Option<Word> {
+        self.roots.pop()
     }
 
     pub fn root_at(&self, idx: usize) -> Word {
-        *self.roots.borrow_mut().get(idx).expect("root index out of range")
+        self.roots.at(idx)
     }
 
-    pub fn set_root_at(&self, idx: usize, w: Word) {
-        let mut roots = self.roots.borrow_mut();
-        roots[idx] = w;
+    pub fn set_root_at(&mut self, idx: usize, w: Word) {
+        self.roots.set_at(idx, w);
     }
 
     pub fn root_count(&self) -> usize {
-        self.roots.borrow_mut().len()
+        self.roots.count()
+    }
+
+    /// Pointer to the JIT-visible root-stack header (`{cur, end}`).
+    /// `ncl_root_hdr` exposes this so emitted code can inline the
+    /// push/pop. Stable for the mutator's lifetime (the header lives in
+    /// the pinned `MutatorState`; only its pointer *contents* change,
+    /// which the inline path re-reads each push).
+    pub fn root_hdr(&mut self) -> *mut RootStackHdr {
+        &mut self.roots.hdr
+    }
+
+    /// Reserve `n` free root slots and return the header pointer. The
+    /// JIT calls this once per allocating call-site, then stores its
+    /// roots straight into `[cur, cur+n)` and bumps `cur` — no per-root
+    /// bounds branch, no per-root call. After the wrapped call it reloads
+    /// `cur` from this same (stable) header to pop, which transparently
+    /// handles a buffer realloc a callee may have triggered.
+    pub fn roots_reserve(&mut self, n: usize) -> *mut RootStackHdr {
+        self.roots.reserve(n);
+        &mut self.roots.hdr
     }
 
     /// Drop every root above `depth`. Used by the panic-recovery path
     /// in `catch_gc_stall_as_condition` to discard any roots that a
     /// signal-aborted callee pushed but didn't pop. Calling with
     /// `depth > root_count()` is a no-op.
-    pub fn truncate_roots(&self, depth: usize) {
-        let mut roots = self.roots.borrow_mut();
-        if depth < roots.len() {
-            roots.truncate(depth);
-        }
+    pub fn truncate_roots(&mut self, depth: usize) {
+        self.roots.truncate(depth);
     }
 
     // -- Force a GC (tests, explicit user calls) ----------------------------

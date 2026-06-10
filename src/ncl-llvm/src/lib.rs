@@ -38,7 +38,7 @@ use ncl_runtime::{
     ncl_abort_pending, ncl_alloc_cons, ncl_apply, ncl_aref_generic, ncl_aset_generic,
     ncl_build_rest_list, ncl_call, ncl_dynamic_bind, ncl_dynamic_unbind, ncl_equal, ncl_funcall,
     ncl_length, ncl_load_function, ncl_load_value, ncl_lookup_keyword,
-    ncl_make_closure, ncl_pop_root, ncl_push_root, ncl_set_car,
+    ncl_make_closure, ncl_pop_root, ncl_push_root, ncl_roots_reserve, ncl_set_car,
     ncl_set_cdr, ncl_set_mv_many, ncl_set_mv_single, ncl_store_value,
     ncl_string_char, ncl_string_eq, ncl_string_set,
     MutatorState, Tag, Word,
@@ -709,6 +709,7 @@ fn build_engine_and_get_fn_addr(
         bind(engine, helpers.alloc_cons, ncl_alloc_cons as usize);
         bind(engine, helpers.push_root, ncl_push_root as usize);
         bind(engine, helpers.pop_root, ncl_pop_root as usize);
+        bind(engine, helpers.roots_reserve, ncl_roots_reserve as usize);
         bind(engine, helpers.call_fn, ncl_call as usize);
         bind(engine, helpers.funcall_fn, ncl_funcall as usize);
         bind(engine, helpers.make_closure, ncl_make_closure as usize);
@@ -776,6 +777,7 @@ struct Helpers<'ctx> {
     alloc_cons: FunctionValue<'ctx>,
     push_root: FunctionValue<'ctx>,
     pop_root: FunctionValue<'ctx>,
+    roots_reserve: FunctionValue<'ctx>,
     call_fn: FunctionValue<'ctx>,
     funcall_fn: FunctionValue<'ctx>,
     make_closure: FunctionValue<'ctx>,
@@ -873,6 +875,16 @@ fn declare_runtime_helpers<'ctx>(
     let pop_root = module.add_function(
         "ncl_pop_root",
         pop_root_type,
+        Some(Linkage::External),
+    );
+
+    // ncl_roots_reserve(mutator, n) -> *RootStackHdr ({cur,end})
+    // The safepoint wrap calls this once per allocating site, then
+    // inlines the n root stores against the returned header.
+    let roots_reserve_type = ptr_t.fn_type(&[ptr_t.into(), i64_t.into()], false);
+    let roots_reserve = module.add_function(
+        "ncl_roots_reserve",
+        roots_reserve_type,
         Some(Linkage::External),
     );
 
@@ -1157,6 +1169,7 @@ fn declare_runtime_helpers<'ctx>(
         alloc_cons,
         push_root,
         pop_root,
+        roots_reserve,
         call_fn,
         funcall_fn,
         make_closure,
@@ -1208,6 +1221,7 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(&helpers.alloc_cons, ncl_alloc_cons as *const () as usize);
     engine.add_global_mapping(&helpers.push_root, ncl_push_root as *const () as usize);
     engine.add_global_mapping(&helpers.pop_root, ncl_pop_root as *const () as usize);
+    engine.add_global_mapping(&helpers.roots_reserve, ncl_roots_reserve as *const () as usize);
     engine.add_global_mapping(&helpers.call_fn, ncl_call as *const () as usize);
     engine.add_global_mapping(&helpers.funcall_fn, ncl_funcall as *const () as usize);
     engine.add_global_mapping(&helpers.make_closure, ncl_make_closure as *const () as usize);
@@ -1368,6 +1382,7 @@ fn emit_overflow_op<'ctx>(
     let mutator_arg = function.get_nth_param(0).unwrap();
     let extra_roots = [slow_lhs, slow_rhs];
     let slow_result = emit_safepoint_wrap(
+        context,
         builder,
         function,
         helpers,
@@ -1509,6 +1524,7 @@ fn emit_div_op<'ctx>(
     let mutator_arg = function.get_nth_param(0).unwrap();
     let extra_roots = [lhs, rhs];
     let slow_result = emit_safepoint_wrap(
+        context,
         builder,
         function,
         helpers,
@@ -1765,6 +1781,7 @@ fn merge_locals_params_at_join<'ctx>(
 
 #[allow(dead_code)]
 fn emit_safepoint_wrap<'ctx, T>(
+    context: &'ctx Context,
     builder: &Builder<'ctx>,
     function: &FunctionValue<'ctx>,
     helpers: &Helpers<'ctx>,
@@ -1781,65 +1798,112 @@ fn emit_safepoint_wrap<'ctx, T>(
     if no_roots_enabled() {
         return emit_call();
     }
+
+    // Roots are pushed/popped INLINE: one `ncl_roots_reserve(mutator,n)`
+    // call returns the `{cur, end}` header (with `n` slots guaranteed
+    // free); we then store each root straight into `[cur, cur+n)` and
+    // bump `cur` — no per-root runtime call. This is the call storm that
+    // was 55-77% of call-heavy runtime (tak 275ms→62ms with rooting
+    // off). Layout in the reserved region (matching the old push order):
+    // params, then locals, then extra_roots.
+    let n = params.len() + locals.len() + extra_roots.len();
+    if n == 0 {
+        // Nothing live to protect — just the call.
+        return emit_call();
+    }
+    let i64_t = context.i64_type();
+    let ptr_t = context.ptr_type(AddressSpace::default());
     let mutator_arg = function.get_nth_param(0).unwrap();
+    let n_const = i64_t.const_int(n as u64, false);
+    let total_bytes = i64_t.const_int(n as u64 * 8, false);
 
-    for param in params.iter().copied() {
-        builder
-            .build_call(
-                helpers.push_root,
-                &[mutator_arg.into(), param.into()],
-                "push_root",
-            )
-            .map_err(|e| format!("call push_root: {e}"))?;
-    }
+    // hdr = ncl_roots_reserve(mutator, n) — ensures room, returns &{cur,end}.
+    let hdr = builder
+        .build_call(helpers.roots_reserve, &[mutator_arg.into(), n_const.into()], "root_hdr")
+        .map_err(|e| format!("call roots_reserve: {e}"))?
+        .try_as_basic_value()
+        .unwrap_basic()
+        .into_pointer_value();
 
-    for local in locals.iter().copied() {
-        builder
-            .build_call(
-                helpers.push_root,
-                &[mutator_arg.into(), local.into()],
-                "push_root",
-            )
-            .map_err(|e| format!("call push_root: {e}"))?;
+    // base = hdr.cur (offset 0). Store each root at base + k*8.
+    let base = builder
+        .build_load(i64_t, hdr, "root_base")
+        .map_err(|e| format!("load root cur: {e}"))?
+        .into_int_value();
+    for (k, v) in params
+        .iter()
+        .chain(locals.iter())
+        .chain(extra_roots.iter())
+        .copied()
+        .enumerate()
+    {
+        let slot_i = if k == 0 {
+            base
+        } else {
+            builder
+                .build_int_add(base, i64_t.const_int(k as u64 * 8, false), "root_slot_i")
+                .map_err(|e| format!("add: {e}"))?
+        };
+        let slot = builder
+            .build_int_to_ptr(slot_i, ptr_t, "root_slot")
+            .map_err(|e| format!("int_to_ptr: {e}"))?;
+        builder.build_store(slot, v).map_err(|e| format!("store root: {e}"))?;
     }
-
-    for root in extra_roots.iter().copied() {
-        builder
-            .build_call(
-                helpers.push_root,
-                &[mutator_arg.into(), root.into()],
-                "push_root",
-            )
-            .map_err(|e| format!("call push_root: {e}"))?;
-    }
+    // Publish the new top BEFORE the call so any roots the callee pushes
+    // land above ours (not over them).
+    let new_top = builder
+        .build_int_add(base, total_bytes, "root_newtop")
+        .map_err(|e| format!("add: {e}"))?;
+    builder.build_store(hdr, new_top).map_err(|e| format!("store cur: {e}"))?;
 
     let result = emit_call()?;
 
-    for _ in 0..extra_roots.len() {
-        builder
-            .build_call(helpers.pop_root, &[mutator_arg.into()], "pop_root")
-            .map_err(|e| format!("call pop_root: {e}"))?;
-    }
-
-    for idx in (0..locals.len()).rev() {
-        let popped = builder
-            .build_call(helpers.pop_root, &[mutator_arg.into()], "pop_root")
-            .map_err(|e| format!("call pop_root: {e}"))?
-            .try_as_basic_value()
-            .unwrap_basic()
+    // Pop + write back. Reload `cur` from the (stable) header — a callee
+    // may have grown/MOVED the buffer, so the pre-call `base` SSA could
+    // be stale; the reloaded top, minus our batch, is our region's base
+    // in whatever buffer is current now. The collector has updated each
+    // slot in place with the forwarded value, which the writeback reads.
+    let top = builder
+        .build_load(i64_t, hdr, "root_top2")
+        .map_err(|e| format!("reload cur: {e}"))?
+        .into_int_value();
+    let new_base = builder
+        .build_int_sub(top, total_bytes, "root_base2")
+        .map_err(|e| format!("sub: {e}"))?;
+    let p = params.len();
+    // locals occupy slots [p, p+L); write each back from its slot.
+    for j in 0..locals.len() {
+        let off = (p + j) as u64 * 8;
+        let addr_i = builder
+            .build_int_add(new_base, i64_t.const_int(off, false), "lw_i")
+            .map_err(|e| format!("add: {e}"))?;
+        let addr = builder
+            .build_int_to_ptr(addr_i, ptr_t, "lw")
+            .map_err(|e| format!("int_to_ptr: {e}"))?;
+        locals[j] = builder
+            .build_load(i64_t, addr, "lw_v")
+            .map_err(|e| format!("load: {e}"))?
             .into_int_value();
-        locals[idx] = popped;
     }
-
-    for idx in (0..params.len()).rev() {
-        let popped = builder
-            .build_call(helpers.pop_root, &[mutator_arg.into()], "pop_root")
-            .map_err(|e| format!("call pop_root: {e}"))?
-            .try_as_basic_value()
-            .unwrap_basic()
+    // params occupy slots [0, P).
+    for i in 0..params.len() {
+        let addr_i = if i == 0 {
+            new_base
+        } else {
+            builder
+                .build_int_add(new_base, i64_t.const_int(i as u64 * 8, false), "pw_i")
+                .map_err(|e| format!("add: {e}"))?
+        };
+        let addr = builder
+            .build_int_to_ptr(addr_i, ptr_t, "pw")
+            .map_err(|e| format!("int_to_ptr: {e}"))?;
+        params[i] = builder
+            .build_load(i64_t, addr, "pw_v")
+            .map_err(|e| format!("load: {e}"))?
             .into_int_value();
-        params[idx] = popped;
     }
+    // hdr.cur = new_base — drop our whole batch in one store.
+    builder.build_store(hdr, new_base).map_err(|e| format!("store cur pop: {e}"))?;
 
     Ok(result)
 }
@@ -2083,6 +2147,7 @@ fn emit_expr<'ctx>(
             let n_args = function.get_nth_param(3).unwrap();
             let start_const = i64_t.const_int(*start as u64, false);
             let result = emit_safepoint_wrap(
+                context,
                 builder,
                 function,
                 helpers,
@@ -2416,6 +2481,7 @@ fn emit_expr<'ctx>(
             let arity_const = i64_t.const_int(*lam_arity as u64, false);
             let n_const = i64_t.const_int(n as u64, false);
             let result = emit_safepoint_wrap(
+                context,
                 builder,
                 function,
                 helpers,
@@ -2482,6 +2548,7 @@ fn emit_expr<'ctx>(
             extra_roots.push(fn_val);
             extra_roots.extend(arg_vals.iter().copied());
             let result = emit_safepoint_wrap(
+                context,
                 builder,
                 function,
                 helpers,
@@ -2550,6 +2617,7 @@ fn emit_expr<'ctx>(
             extra_roots.extend(prefix_vals.iter().copied());
             extra_roots.push(tail_val);
             let result = emit_safepoint_wrap(
+                context,
                 builder,
                 function,
                 helpers,
@@ -2641,6 +2709,7 @@ fn emit_expr<'ctx>(
             let mutator_arg = function.get_nth_param(0).unwrap();
             let extra_roots = [car_val, cdr_val];
             let result = emit_safepoint_wrap(
+                context,
                 builder,
                 function,
                 helpers,
@@ -2832,6 +2901,7 @@ fn emit_expr<'ctx>(
             let mutator_arg = function.get_nth_param(0).unwrap();
             let sym_const = i64_t.const_int(*sym_word, false);
             let result = emit_safepoint_wrap(
+                context,
                 builder,
                 function,
                 helpers,
@@ -2856,6 +2926,7 @@ fn emit_expr<'ctx>(
             let mutator_arg = function.get_nth_param(0).unwrap();
             let sym_const = i64_t.const_int(*sym_word, false);
             let result = emit_safepoint_wrap(
+                context,
                 builder,
                 function,
                 helpers,
@@ -3185,6 +3256,7 @@ fn emit_expr<'ctx>(
                 ncl_runtime::gc_function::ENV_OFFSET as u64;
 
             let result = emit_safepoint_wrap(
+                context,
                 builder,
                 function,
                 helpers,

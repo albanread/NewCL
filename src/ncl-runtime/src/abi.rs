@@ -2283,11 +2283,31 @@ pub extern "C-unwind" fn ncl_abort_pending() -> i32 {
 }
 
 /// JIT-callable explicit root push. Returns the root depth before
-/// the push, mirroring `MutatorState::push_root`.
+/// the push, mirroring `MutatorState::push_root`. Used by the runtime
+/// itself (rest-list builder, make-closure); the JIT's safepoint wrap
+/// goes through `ncl_roots_reserve` + inline stores instead.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn ncl_push_root(mutator: *mut MutatorState, w: u64) -> u64 {
     let m = unsafe { &mut *mutator };
     m.push_root(Word::from_raw(w)) as u64
+}
+
+/// JIT-callable batch root reservation. Ensures at least `n` free
+/// slots above `cur` (growing/moving the buffer if needed) and returns
+/// the `{cur, end}` header pointer. The JIT emits ONE call per
+/// allocating call-site, then stores its `n` roots straight into the
+/// reserved slots and bumps `cur` inline — replacing the old per-root
+/// `ncl_push_root` / `ncl_pop_root` call storm (55-77% of call-heavy
+/// runtime). The header pointer is stable for the mutator's lifetime,
+/// so the post-call pop reloads `cur` from it (handling a realloc a
+/// callee may have caused).
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn ncl_roots_reserve(
+    mutator: *mut MutatorState,
+    n: u64,
+) -> *mut crate::mutator::RootStackHdr {
+    let m = unsafe { &mut *mutator };
+    m.roots_reserve(n as usize)
 }
 
 /// JIT-callable explicit root pop. Returns the popped raw Word.

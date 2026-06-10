@@ -68,7 +68,7 @@ pub use abi::{
     ncl_length, ncl_load_function, ncl_load_value, ncl_lookup_keyword,
     ncl_debug_check_cons,
     ncl_dynamic_bind, ncl_dynamic_unbind,
-    ncl_make_closure, ncl_pop_root, ncl_push_root, ncl_set_car,
+    ncl_make_closure, ncl_pop_root, ncl_push_root, ncl_roots_reserve, ncl_set_car,
     ncl_set_cdr, ncl_set_mv_many, ncl_set_mv_single, ncl_store_value,
     ncl_string_char, ncl_string_eq, ncl_string_set,
     vector_shim, word_hash_shim, equal_hash_shim,
