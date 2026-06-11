@@ -1,0 +1,336 @@
+# Unboxed Float Arithmetic — Plan
+
+*Status: proposed. Author: perf investigation 2026-06-10. Owner: TBD.*
+
+The single biggest remaining numeric lever in NCL. This plan tracks float
+values as native `f64` in registers through JIT codegen and boxes them
+only when they escape, eliminating the per-operation heap allocation +
+generic-dispatch tower that currently dominates all float-heavy code.
+
+---
+
+## 1. Why — the validated ceiling
+
+NCL floats are **heap-boxed**: every `f64` is a 3-cell `HeapType::Float`
+object (`Tag::Vector` pointer; header at cell 0, `%FLOAT` marker at cell
+1, raw `f64` bits at cell 2 — see `float.rs`). The JIT (`emit_overflow_op`,
+`emit_cmp`, `emit_div_op` in `ncl-llvm/src/lib.rs`) inlines arithmetic
+**only when both operands are fixnums** (`(lhs|rhs)&7 == 0`). Floats have
+a non-zero tag, so every float `*`/`+`/`-`/`/`/`>` falls to a generic
+runtime call tower:
+
+```
+emit_overflow_op slow-path  →  ncl_mul_complex  →  ncl_mul_full
+                            →  ncl_mul_float     →  alloc_float (heap box)
+```
+
+Each float op therefore costs: a non-inlinable call, repeated tag
+decoding down the tower, **and a fresh 24-byte heap allocation** for the
+result — all immediately dead, feeding GC churn.
+
+### Measured (480×360, max-iter 100 Mandelbrot render)
+
+| Variant | Time | vs baseline |
+|---|---|---|
+| Baseline — boxed-float Lisp inner loop | **1714 ms** | — |
+| **Ceiling** — Lisp render loop + per-pixel call, **native `f64` inner loop** | **21 ms** | **~82×** |
+| Floor — entire render native (no Lisp loop) | 7 ms | 245× |
+
+(Pixel sums identical across all three; measured via a throwaway native
+`mandel-iter` shim, since reverted.) The inner-loop boxing/dispatch is
+**~99 % of render time**; the per-pixel Lisp call + boxed coordinate math
+that unboxing would *keep* is only ~14 ms. Conclusion: unboxing just the
+inner-loop arithmetic captures essentially the entire win.
+
+### What we already ruled out
+
+- **A fixed-point (pure-fixnum) rewrite** was only **1.4×** faster — a red
+  herring, because `ash`/shift is itself an un-inlined shim call. Not a
+  ceiling on the float work.
+- **An inline float fast-path that still reboxes** (`is_float` check →
+  unbox → native `fmul` → `ncl_box_float`) was *implemented, correct, and
+  ~1.8× **slower*** than the generic tower, then reverted. Lesson: a
+  per-op rebox does not help — **the cost is the per-op allocation, not
+  the dispatch.** The value must stay unboxed across the whole expression
+  and loop, never round-tripping through the heap. This plan is built
+  around that lesson.
+
+---
+
+## 2. Design
+
+### 2.1 The representation abstraction
+
+Today `emit_expr(...) -> Result<IntValue<'ctx>, String>` — every
+expression yields one tagged `Word` (an `i64`). We give each SSA value a
+**representation**:
+
+```rust
+enum Repr<'ctx> {
+    /// A tagged NCL Word (i64). The universal representation; what
+    /// everything is today.
+    Word(IntValue<'ctx>),
+    /// An unboxed IEEE-754 double in a register. Never a GC root.
+    F64(FloatValue<'ctx>),
+}
+```
+
+`emit_expr` returns `Repr`. Two boundary coercions mediate everything:
+
+- `coerce_to_word(Repr) -> IntValue` — if `F64`, box via `ncl_box_float`
+  (re-add the helper from the reverted #2 spike); if `Word`, identity.
+- `coerce_to_f64(Repr) -> FloatValue` — if `F64`, identity; if `Word`,
+  emit the inline unbox **guarded by a type check** (or call a coercion
+  helper for the int→float / error cases).
+
+**Invariant:** a `Word` produced by `coerce_to_word(F64 x)` is a freshly
+heap-allocated float and must be rooted like any allocation if it can be
+live across a later GC (the existing safepoint-wrap machinery handles
+this — boxing happens at an escape, which is exactly where a Word is
+needed and rooted).
+
+### 2.2 Where float-typedness comes from
+
+The compiler may represent a value as `F64` only when it can **prove**
+it is a float. Sources, in priority order:
+
+1. **Float literals** — `0.0`, `4.0`, `2.0d0` → `Repr::F64(const)`.
+2. **Float-producing ops** — `(f64 OP f64)` for `+ - * /`; `sqrt`/`sin`/…
+   results (once we add unboxed-return shims, Sprint 5; until then their
+   results are `Word` and re-unboxed on use).
+3. **Coercion forms** — `(float x)`, `(coerce x 'double-float)`.
+4. **Declarations** — `(declare (double-float v))` / `(declare (type
+   double-float v))` on locals and params.
+5. **Local inference** — a `let`/`setq` variable whose initialiser is
+   `F64` and whose every `setq` is `F64` is itself `F64` (intra-procedural;
+   the loop-carried `zx`/`zy` case).
+
+Anything not provably float stays `Word` (current behaviour). **No
+speculation in the early sprints** — unproven ⇒ boxed ⇒ identical to
+today. This is what keeps each sprint a strict superset (no regressions).
+
+### 2.3 Escape / boundary rules (when an `F64` must be boxed)
+
+`coerce_to_word` is inserted wherever an `F64` flows into a Word context:
+
+- stored into a cons / vector / struct / array slot;
+- returned from the function (until Sprint 5's unboxed-return convention);
+- passed as an argument to a general (non-float-specialised) call;
+- bound to, or `setq`'d into, a variable whose chosen representation is
+  `Word`;
+- used by a Word-only primitive (`eq`, `consp`, `print`, hash, generic
+  `=` against a non-float, …);
+- merged at a control-flow join (`if`/`cond`/`loop` phi) with a `Word`
+  sibling — unify to `Word` (box the `F64` arm). If both arms are `F64`,
+  the join stays `F64`.
+
+### 2.4 Variable representation is fixed per scope
+
+A variable cannot be `F64` on one read and `Word` on another — the loop
+phi must have a single type. So **representation is decided before
+emission** by a per-function pre-pass (`assign_reprs`) over the body:
+
+1. Seed: declared floats, and locals whose initialiser is statically
+   `F64`.
+2. Propagate through `setq`: if any assignment to `v` is non-`F64` (or
+   `v` escapes to a Word context that forces Word), demote `v` to `Word`
+   for its whole scope.
+3. Fixed-point until stable. Conservative: any doubt ⇒ `Word`.
+
+`F64` locals are emitted as an `f64` `alloca` (which `mem2reg`/SROA
+promotes to SSA + phis at `-O2`) or directly as phi-threaded SSA. The
+`alloca` route is simplest and optimises cleanly — mirror how mutable
+boxed locals are already handled.
+
+### 2.5 Mixed int/float coercion
+
+`(+ fixnum-expr f64-expr)` and friends: when one side is `F64` and the
+other is a **statically-known fixnum** (literal, or a declared/inferred
+fixnum), emit `sitofp` (untag the fixnum, `sitofp i64→double`) and do the
+native op. When the other side's type is unknown, **box and go generic**
+(today's path) — correct, just not accelerated. The render's
+`(+ -2.5 (* px xs))` (fixnum `px` × float `xs`) is the motivating case.
+
+### 2.6 Safety
+
+`(declare (double-float cx))` is a promise. Default (`safety >= 1`):
+unbox the param **with a runtime check** that signals a `type-error` if a
+non-float is passed (one branch at function entry, negligible). Under
+`(optimize (safety 0))`: unchecked unbox. This matches CL semantics and
+keeps the default safe.
+
+### 2.7 Explicitly out of scope
+
+- **NaN-boxing** floats as immediates — would remove boxing globally but
+  is a sweeping change to the entire `Word` representation (NCL uses
+  3-tag-bit fixnums today). Rejected; not worth the blast radius.
+- **`single-float`** as a distinct representation — NCL floats are
+  doubles. Treat `single-float` declarations as `double-float` for now
+  (note in `coerce`); a separate `f32` repr is a later, low-value add.
+
+---
+
+## 3. Sprints
+
+Each sprint is independently shippable, lands behind the existing
+build/test gates, and **must not regress** the ANSI suite (held at
+490 / 56 / 85) or the gauntlet (`ALL-PASS`). The ordering front-loads
+de-risking (Sprint 0 is a behaviour-identical refactor) and back-loads
+the payoff (Sprint 3 hits the Mandelbrot ceiling), mirroring the
+root-stack work (prove the plumbing first, then switch the optimisation
+on).
+
+### Sprint 0 — `Repr` scaffolding (behaviour-identical)
+
+**Goal:** thread `Repr` through codegen with *every* value still a
+`Word`. No optimisation yet — pure refactor, provably a no-op.
+
+- Define `Repr` + `coerce_to_word` / `coerce_to_f64`.
+- Change `emit_expr` (and the helpers it calls) to return `Repr`,
+  wrapping every current result as `Repr::Word(..)`; callers
+  `coerce_to_word` at use sites.
+- Re-add `ncl_box_float(mutator, f64) -> Word` (float.rs) + JIT helper
+  binding (from the reverted #2 spike) — unused until Sprint 1, but lands
+  the plumbing + the `jit_float_layout_contract` unit test that locks
+  `(w&7)==3 && (*(w&!7)&31)==7`, f64 at byte 16.
+- **Gate:** ANSI unchanged, gauntlet green, `ncl-runtime` unit tests
+  green. Diff is large but mechanical; reviewable as "no behavioural
+  change."
+
+### Sprint 1 — unboxed float *expressions* (no variables)
+
+**Goal:** a float expression tree with no variable involvement computes
+in registers and boxes once at the end.
+
+- Float literal → `Repr::F64(const_float)` (instead of a static-area
+  boxed Word load).
+- `emit_overflow_op` / `emit_div_op`: when **both** operands are
+  `Repr::F64`, emit native `fadd`/`fsub`/`fmul`/`fdiv` → `Repr::F64`. Else
+  unchanged (box + generic).
+- `emit_cmp`: both `F64` → `fcmp` → bool (no box, no `ncl_cmp_full`).
+- Mixed `F64` + static-fixnum → `sitofp` + native (§2.5).
+- **Gate:** ANSI + gauntlet; new `float-arith` correctness suite
+  (contagion, chained `(+ (* 2.0 3.0) 1.0)`, NaN/inf/-0.0, mixed). Bench:
+  a pure-float-expression microbench improves; `mb-iter` does **not** yet
+  (its values live in variables — Sprint 2).
+
+### Sprint 2 — float-typed locals (`let` / `setq`)
+
+**Goal:** `zx`/`zy`/`zx2`/`zy2` stay unboxed across the loop.
+
+- `assign_reprs` pre-pass (§2.4): declarations + local inference decide
+  each variable's repr.
+- Emit `F64` locals as `f64` allocas; `let`-init and `setq` store `f64`
+  (no box) when both var and value are `F64`; reads yield `Repr::F64`.
+- Loop-carried consistency: the pre-pass guarantees a single repr per
+  variable, so the loop-header phi is well-typed.
+- **Gate:** ANSI + gauntlet + `float-arith` suite extended with
+  loop-carried float accumulators. `mb-iter` now unboxes its locals — but
+  `cx`/`cy` are params (still boxed), so it isn't at the ceiling yet;
+  expect a partial win.
+
+### Sprint 3 — float *params* via declaration (**the payoff**)
+
+**Goal:** `(defun mb-iter (cx cy max) (declare (double-float cx cy)) …)`
+unboxes end-to-end and hits the measured ceiling.
+
+- Parse + honour `(declare (double-float …))` / `(declare (type
+  double-float …))` on parameters (extend the declare handling in
+  `ncl-compiler/src/lib.rs` + `lower.rs`).
+- Prologue: unbox declared float params to `f64` (checked per §2.6).
+- **Gate:** ANSI + gauntlet + the **Mandelbrot bench as the headline
+  metric** — target the ~21 ms ceiling (realistically tens-of-× over
+  1714 ms; JIT `-O2` won't fully match `rustc -O3`). Add `mandel` (already
+  in `bench/bench.lisp`) before/after to the perf memo.
+- Update `Lisp/demos/mandelbrot.lisp` with the declarations so the
+  shipped demo is fast.
+
+### Sprint 4 — inference / guarded speculation for undeclared params (stretch)
+
+**Goal:** undeclared float-heavy functions get unboxed too.
+
+- If a param is used only in float contexts, speculatively unbox **with a
+  deopt guard**: a fast entry check `is_float(p)`; on the rare miss,
+  branch to a boxed slow clone of the body (or fall back to per-op
+  generic). Higher complexity/risk — keep behind a clear win and full
+  tests. Optional; declarations already cover the important cases.
+
+### Sprint 5 — unboxed float *return/call* convention (stretch)
+
+**Goal:** float-returning helpers (`sqrt`, user fns declared
+`(values double-float)`) avoid box-at-return + unbox-at-caller.
+
+- A secondary calling convention returning a raw `f64` for functions
+  whose return type is a declared float; native float shims (`sqrt`/`sin`/
+  …) gain unboxed-return variants the JIT calls directly.
+- Only worthwhile if float-returning calls show up hot after Sprints 1–3.
+
+---
+
+## 4. Testing & metrics
+
+- **Non-negotiable gate every sprint:** ANSI suite `490/56/85` unchanged
+  (`demos/ansi-runner.lisp`); gauntlet `ALL-PASS`; `ncl-runtime` unit
+  tests green. Run the **console** build (`cargo build --release` without
+  `--features gui-app`, or `nclterm.exe`) — the gui-app build has no
+  console stdout.
+- **Float correctness suite** (new, `bench/` or a test file): float·float
+  and contagion for `+ - * / < > <= >= =`; chained expressions;
+  loop-carried accumulators; declared + inferred + undeclared paths;
+  edge cases NaN / ±inf / -0.0 / fixnum-overflow-to-float; `eql`/`=`
+  identity; printing round-trip. A wrong unbox/box surfaces here first.
+- **`jit_float_layout_contract`** unit test (Sprint 0) locks the memory
+  layout the JIT hardcodes.
+- **Headline benchmark:** the Mandelbrot render (target ~21 ms ceiling),
+  plus a pure-float-arith kernel and a float dot-product added to
+  `bench/bench.lisp`. Record before/after in the perf memo each sprint.
+- **GC pressure check:** `gc-stats` `:minor-gcs` / `:total-minor-pause-us`
+  before/after — unboxed floats should slash float-workload minors toward
+  zero (they stop allocating).
+
+## 5. Risks
+
+- **Partial unboxing collapses the win** (the #2 lesson). If a value
+  boxes even once per loop iteration, the per-op alloc returns and the
+  speedup evaporates. Mitigation: `assign_reprs` must *prove* loop-carried
+  `F64` consistency; add an assertion/log when a "float-looking" loop var
+  is demoted to `Word`, so silent pessimisation is visible.
+- **Representation mismatch at joins** — a value `F64` on one branch and
+  `Word` on another. Rule: unify to `Word`. Must be applied at *every*
+  `if`/`cond`/`case`/`loop`/`and`/`or` join; a missed join = a type-confused
+  phi = miscompile. Enumerate joins exhaustively; the float-correctness
+  suite must cover branchy float code.
+- **Boundary completeness** — every escape in §2.3 must box. A missed
+  escape hands a raw `f64` bit-pattern to code expecting a tagged Word →
+  silent corruption. This is corruption-class; treat like the GC work.
+- **Safety semantics** — declared-but-violated types. Default to checked
+  unboxing; only `(optimize (safety 0))` is unchecked.
+- **GC interaction** — unboxed `f64` in registers are *not* roots (good,
+  fewer roots), but a *boxed* float live across a GC must be rooted; the
+  box happens at an escape where a Word is needed and the existing
+  safepoint-wrap already roots it. Verify with a float-allocation-heavy
+  GC-stress (mirror the cons cases).
+
+## 6. Touch points (current code)
+
+- `ncl-llvm/src/lib.rs`: `emit_expr` signature → `Repr`; `emit_overflow_op`,
+  `emit_cmp`, `emit_div_op` (native FP paths); helper decl/bind for
+  `ncl_box_float`; the boundary coercions; the function prologue / param
+  binding.
+- `ncl-compiler/src/lib.rs`, `src/lower.rs`: `(declare …)` parsing,
+  `assign_reprs` pre-pass, param-repr at lowering.
+- `ncl-ir` / `Expr`: may need per-binding type annotations carried from
+  the declare pass to codegen.
+- `ncl-runtime/src/float.rs`: re-add `ncl_box_float`; the
+  `jit_float_layout_contract` test; (Sprint 5) unboxed-return shims.
+- `Lisp/demos/mandelbrot.lisp`: add declarations (Sprint 3).
+- `bench/bench.lisp`: float kernels.
+
+## 7. Prior art
+
+The SBCL/CMUCL "representation selection" model: primitive `f64`
+representation, box/unbox at boundaries chosen by type derivation, driven
+by declarations + flow inference. NCL's version is deliberately smaller
+(one unboxed repr, `f64`; conservative inference; declarations do the
+heavy lifting first). See also `docs/GC_PRECISE_ROOTS_PLAN.md` for the
+staged-de-risking style this plan follows.
