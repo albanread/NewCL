@@ -116,4 +116,40 @@
      (sort (list 5 3 9 1 7 2 8 4 6) #'<)
      '(1 2 3 4 5 6 7 8 9))
 
+;; ── unboxed-float arithmetic (Sprint 1) ─────────────────────────────
+;; Native f64 fast path for float-typed expressions; the value stays
+;; unboxed across the expression and boxes once at the escape. See
+;; docs/performance-unbox-float.md.
+(chk "float-mul"          (* 2.0 3.0) 6.0)
+(chk "float-add"          (+ 1.5 2.5) 4.0)
+(chk "float-sub"          (- 5.0 1.5) 3.5)
+(chk "float-chain"        (+ (* 2.0 3.0) 1.0) 7.0)
+(chk "float-nested"       (* (+ 1.0 1.0) (- 4.0 1.0)) 6.0)
+;; int→float contagion with a fixnum constant operand
+(chk "float-contagion+"   (+ 2.0 3) 5.0)
+(chk "float-contagion*"   (* 2 1.5) 3.0)
+(chk "float-contagion-"   (- 10 0.5) 9.5)
+;; comparisons — native ordered fcmp
+(chk "float->"            (> 3.0 2.0) t)
+(chk "float-<"            (< 1.0 2.0) t)
+(chk "float->="           (>= 4.0 4.0) t)
+(chk "float-<="           (<= 4.0 4.0) t)
+(chk "float-="            (= 1.0 1.0) t)
+(chk "float->-false"      (> 2.0 3.0) nil)
+(chk "float-cmp-mixed"    (< 1 2.0) t)
+(chk "float-=-mixed"      (= 2 2.0) t)
+;; -0.0 = 0.0 under IEEE ordered-equal
+(chk "float-negzero-="    (= 0.0 -0.0) t)
+;; a float that escapes to a Word (boxed in a list) then re-enters
+;; arithmetic via the generic/contagion path
+(chk "float-box-roundtrip" (+ (car (list 1.5)) 0.5) 2.0)
+(chk "float-eql"          (eql 2.0 2.0) t)
+(chk "eq-int-vs-float"    (eq 3 3.0) nil)
+;; integers MUST stay integers — no accidental float contagion
+(chk "int-add-stays-int"  (+ 1 2) 3)
+(chk "int-mul-stays-int"  (* 3 4) 12)
+(chk "int-cmp-stays"      (< 1 2) t)
+(chk "int-=-stays"        (= 3 3) t)
+(chk "bignum-still-ok"    (* 1000000000000 1000000000000) 1000000000000000000000000)
+
 (format t "~%GAUNTLET ~A~%" (if (= *fails* 0) "ALL-PASS" (format nil "~A FAILS" *fails*)))

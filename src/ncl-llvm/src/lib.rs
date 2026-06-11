@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use inkwell::AddressSpace;
 use new_asm;
-use inkwell::IntPredicate;
+use inkwell::{FloatPredicate, IntPredicate};
 use inkwell::OptimizationLevel;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
@@ -1989,20 +1989,20 @@ fn emit_ref_eq<'ctx>(
     emit_bool_select(builder, cmp, i64_t)
 }
 
-fn emit_cmp<'ctx>(
+/// Integer/generic binary comparison on already-emitted Word operands.
+/// Fast path: raw i64 compare on both-fixnum; slow path: `ncl_cmp_full`
+/// numeric-tower compare. Takes pre-emitted values (not `Expr`s) so the
+/// float-aware caller can route here after coercing its operands to
+/// Word without re-emitting them (double side effects).
+fn emit_cmp_vals<'ctx>(
     context: &'ctx Context,
     builder: &Builder<'ctx>,
     function: &FunctionValue<'ctx>,
     helpers: &Helpers<'ctx>,
-    arity: u32,
-    params: &mut Vec<IntValue<'ctx>>,
-    locals: &mut Vec<IntValue<'ctx>>,
-    a: &Expr,
-    b: &Expr,
+    lhs: IntValue<'ctx>,
+    rhs: IntValue<'ctx>,
     pred: IntPredicate,
 ) -> Result<IntValue<'ctx>, String> {
-    let lhs = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
-    let rhs = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
     let i64_t = context.i64_type();
     let zero = i64_t.const_zero();
     let seven = i64_t.const_int(7, false);
@@ -2108,7 +2108,24 @@ enum Repr<'ctx> {
     /// A tagged NCL Word (i64). The universal representation.
     Word(IntValue<'ctx>),
     /// An unboxed IEEE-754 double in a register. Never a GC root.
-    F64(FloatValue<'ctx>),
+    /// `boxed_const` carries a pre-boxed static-area Word when the value
+    /// is a compile-time constant (a float literal), so `coerce_to_word`
+    /// folds back to that shared constant instead of a fresh young-heap
+    /// box. `None` for runtime-computed doubles.
+    F64 {
+        val: FloatValue<'ctx>,
+        boxed_const: Option<IntValue<'ctx>>,
+    },
+}
+
+impl<'ctx> Repr<'ctx> {
+    /// A runtime-computed (non-constant) unboxed double.
+    fn f64(val: FloatValue<'ctx>) -> Repr<'ctx> {
+        Repr::F64 { val, boxed_const: None }
+    }
+    fn is_f64(&self) -> bool {
+        matches!(self, Repr::F64 { .. })
+    }
 }
 
 /// Boundary coercion: an unboxed `F64` flowing into a Word context is
@@ -2125,7 +2142,10 @@ fn coerce_to_word<'ctx>(
 ) -> Result<IntValue<'ctx>, String> {
     match r {
         Repr::Word(w) => Ok(w),
-        Repr::F64(f) => {
+        // Compile-time constant: fold back to the shared static-area box
+        // (zero per-eval allocation) instead of a fresh young-heap box.
+        Repr::F64 { boxed_const: Some(w), .. } => Ok(w),
+        Repr::F64 { val: f, boxed_const: None } => {
             let mutator = function.get_nth_param(0).unwrap();
             let call = builder
                 .build_call(helpers.box_float, &[mutator.into(), f.into()], "box_float")
@@ -2149,7 +2169,7 @@ fn coerce_to_f64<'ctx>(
     r: Repr<'ctx>,
 ) -> Result<FloatValue<'ctx>, String> {
     match r {
-        Repr::F64(f) => Ok(f),
+        Repr::F64 { val, .. } => Ok(val),
         Repr::Word(w) => {
             let i64_t = context.i64_type();
             let ptr_t = context.ptr_type(AddressSpace::default());
@@ -2182,9 +2202,136 @@ fn coerce_to_f64<'ctx>(
     }
 }
 
-/// Representation-aware expression emitter. Sprint 0: a thin shim over
-/// `emit_expr` — every value is still a `Word`. Sprint 1+ adds
-/// float-aware arms *above* the fallback that may return `Repr::F64`.
+#[derive(Clone, Copy)]
+enum ArithOp { Add, Sub, Mul }
+
+/// If `r` (the already-emitted repr of `e`) can serve as an unboxed f64
+/// operand *statically*, return it. That is: an `F64` repr (a float
+/// literal or nested float arithmetic), OR a fixnum *constant* literal,
+/// which contaminates to float under CL's float/integer rules. A
+/// runtime Word of unknown type returns `None` — it must NOT be
+/// force-unboxed (Sprint 1 does no type inference; that arrives in
+/// Sprints 2-4).
+fn repr_as_f64_static<'ctx>(
+    context: &'ctx Context,
+    r: &Repr<'ctx>,
+    e: &Expr,
+) -> Option<FloatValue<'ctx>> {
+    match r {
+        Repr::F64 { val, .. } => Some(*val),
+        Repr::Word(_) => match e {
+            // An integer literal contaminates to an exact double.
+            Expr::Const(n) => Some(context.f64_type().const_float(*n as f64)),
+            _ => None,
+        },
+    }
+}
+
+/// `+ - *` with the float fast path. Emits native `fadd`/`fsub`/`fmul`
+/// (→ `Repr::F64`, value stays unboxed) when at least one operand is
+/// float-typed and BOTH operands reduce statically to f64; otherwise
+/// the existing tagged-fixnum / bignum-promote path, unchanged.
+#[allow(clippy::too_many_arguments)]
+fn emit_arith_repr<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    arity: u32,
+    params: &mut Vec<IntValue<'ctx>>,
+    locals: &mut Vec<IntValue<'ctx>>,
+    op: ArithOp,
+    a: &Expr,
+    b: &Expr,
+) -> Result<Repr<'ctx>, String> {
+    let ra = emit_expr_repr(context, builder, function, helpers, arity, params, locals, a)?;
+    let rb = emit_expr_repr(context, builder, function, helpers, arity, params, locals, b)?;
+    if ra.is_f64() || rb.is_f64() {
+        if let (Some(fa), Some(fb)) =
+            (repr_as_f64_static(context, &ra, a), repr_as_f64_static(context, &rb, b))
+        {
+            let val = match op {
+                ArithOp::Add => builder.build_float_add(fa, fb, "fadd"),
+                ArithOp::Sub => builder.build_float_sub(fa, fb, "fsub"),
+                ArithOp::Mul => builder.build_float_mul(fa, fb, "fmul"),
+            }
+            .map_err(|e| format!("native float arith: {e}"))?;
+            return Ok(Repr::f64(val));
+        }
+    }
+    // Fallback: tagged-Word integer / generic path (today's behaviour).
+    // Coercing an F64 operand here boxes it — correct: a float mixed
+    // with a runtime non-float Word routes through the generic helper,
+    // which handles contagion.
+    let lhs = coerce_to_word(builder, function, helpers, ra)?;
+    let rhs = coerce_to_word(builder, function, helpers, rb)?;
+    let i64_t = context.i64_type();
+    let res = match op {
+        ArithOp::Add => emit_overflow_op(
+            context, builder, function, helpers, params, locals,
+            lhs, rhs, lhs, rhs, helpers.sadd_with_overflow, helpers.add_promote, "add",
+        )?,
+        ArithOp::Sub => emit_overflow_op(
+            context, builder, function, helpers, params, locals,
+            lhs, rhs, lhs, rhs, helpers.ssub_with_overflow, helpers.sub_promote, "sub",
+        )?,
+        ArithOp::Mul => {
+            let three = i64_t.const_int(3, false);
+            let rhs_untagged = builder
+                .build_right_shift(rhs, three, true, "untag_rhs")
+                .map_err(|e| format!("ashr: {e}"))?;
+            emit_overflow_op(
+                context, builder, function, helpers, params, locals,
+                lhs, rhs_untagged, lhs, rhs, helpers.smul_with_overflow, helpers.mul_promote, "mul",
+            )?
+        }
+    };
+    Ok(Repr::Word(res))
+}
+
+/// Numeric comparison with the float fast path. Native *ordered* `fcmp`
+/// (IEEE semantics: NaN compares `false`, so `(= nan nan)` ⇒ NIL) when
+/// at least one operand is float-typed and both reduce to f64; otherwise
+/// the tagged-fixnum / numeric-tower compare on Words. NOTE: the boxed
+/// path (`ncl_cmp_full`/`ncl_cmp_real`) currently treats NaN as "equal";
+/// the native path here is IEEE-ordered. See plan §2.6a — the
+/// float-arith suite pins the native behaviour.
+#[allow(clippy::too_many_arguments)]
+fn emit_cmp_repr<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    arity: u32,
+    params: &mut Vec<IntValue<'ctx>>,
+    locals: &mut Vec<IntValue<'ctx>>,
+    a: &Expr,
+    b: &Expr,
+    fpred: FloatPredicate,
+    ipred: IntPredicate,
+) -> Result<Repr<'ctx>, String> {
+    let ra = emit_expr_repr(context, builder, function, helpers, arity, params, locals, a)?;
+    let rb = emit_expr_repr(context, builder, function, helpers, arity, params, locals, b)?;
+    if ra.is_f64() || rb.is_f64() {
+        if let (Some(fa), Some(fb)) =
+            (repr_as_f64_static(context, &ra, a), repr_as_f64_static(context, &rb, b))
+        {
+            let cmp = builder
+                .build_float_compare(fpred, fa, fb, "fcmp")
+                .map_err(|e| format!("native fcmp: {e}"))?;
+            return Ok(Repr::Word(emit_bool_select(builder, cmp, context.i64_type())?));
+        }
+    }
+    let lhs = coerce_to_word(builder, function, helpers, ra)?;
+    let rhs = coerce_to_word(builder, function, helpers, rb)?;
+    Ok(Repr::Word(emit_cmp_vals(
+        context, builder, function, helpers, lhs, rhs, ipred,
+    )?))
+}
+
+/// Representation-aware expression emitter. Float-typed arms compute on
+/// unboxed `f64` and may return `Repr::F64`; everything else falls
+/// through to `emit_expr` (always a `Word`).
 fn emit_expr_repr<'ctx>(
     context: &'ctx Context,
     builder: &Builder<'ctx>,
@@ -2195,9 +2342,44 @@ fn emit_expr_repr<'ctx>(
     locals: &mut Vec<IntValue<'ctx>>,
     expr: &Expr,
 ) -> Result<Repr<'ctx>, String> {
-    Ok(Repr::Word(emit_expr(
-        context, builder, function, helpers, arity, params, locals, expr,
-    )?))
+    match expr {
+        Expr::Float { bits, boxed } => Ok(Repr::F64 {
+            val: context.f64_type().const_float(f64::from_bits(*bits)),
+            boxed_const: Some(context.i64_type().const_int(*boxed, false)),
+        }),
+        Expr::Add(a, b) => emit_arith_repr(
+            context, builder, function, helpers, arity, params, locals, ArithOp::Add, a, b,
+        ),
+        Expr::Sub(a, b) => emit_arith_repr(
+            context, builder, function, helpers, arity, params, locals, ArithOp::Sub, a, b,
+        ),
+        Expr::Mul(a, b) => emit_arith_repr(
+            context, builder, function, helpers, arity, params, locals, ArithOp::Mul, a, b,
+        ),
+        Expr::Lt(a, b) => emit_cmp_repr(
+            context, builder, function, helpers, arity, params, locals, a, b,
+            FloatPredicate::OLT, IntPredicate::SLT,
+        ),
+        Expr::Gt(a, b) => emit_cmp_repr(
+            context, builder, function, helpers, arity, params, locals, a, b,
+            FloatPredicate::OGT, IntPredicate::SGT,
+        ),
+        Expr::Le(a, b) => emit_cmp_repr(
+            context, builder, function, helpers, arity, params, locals, a, b,
+            FloatPredicate::OLE, IntPredicate::SLE,
+        ),
+        Expr::Ge(a, b) => emit_cmp_repr(
+            context, builder, function, helpers, arity, params, locals, a, b,
+            FloatPredicate::OGE, IntPredicate::SGE,
+        ),
+        Expr::NumEq(a, b) => emit_cmp_repr(
+            context, builder, function, helpers, arity, params, locals, a, b,
+            FloatPredicate::OEQ, IntPredicate::EQ,
+        ),
+        _ => Ok(Repr::Word(emit_expr(
+            context, builder, function, helpers, arity, params, locals, expr,
+        )?)),
+    }
 }
 
 fn emit_expr<'ctx>(
@@ -2215,6 +2397,10 @@ fn emit_expr<'ctx>(
     match expr {
         Expr::Const(n) => Ok(i64_t.const_int(Word::fixnum(*n).raw(), false)),
         Expr::Word(w) => Ok(i64_t.const_int(*w, false)),
+        // A float literal in a Word context: load the pre-allocated
+        // static-area box (zero per-eval allocation — the constant-fold
+        // target). The unboxed value is produced by emit_expr_repr.
+        Expr::Float { boxed, .. } => Ok(i64_t.const_int(*boxed, false)),
         Expr::Nil => Ok(i64_t.const_int(Word::NIL.raw(), false)),
         Expr::True => Ok(i64_t.const_int(Word::T.raw(), false)),
         Expr::Local(idx) => {
@@ -2768,45 +2954,17 @@ fn emit_expr<'ctx>(
             emit_post_call_abort_check(context, builder, function, helpers)?;
             Ok(result)
         }
-        Expr::Add(a, b) => {
-            let lhs = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
-            let rhs = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
-            emit_overflow_op(
-                context, builder, function, helpers, params, locals,
-                lhs, rhs, lhs, rhs,
-                helpers.sadd_with_overflow, helpers.add_promote,
-                "add",
-            )
-        }
-        Expr::Sub(a, b) => {
-            let lhs = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
-            let rhs = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
-            emit_overflow_op(
-                context, builder, function, helpers, params, locals,
-                lhs, rhs, lhs, rhs,
-                helpers.ssub_with_overflow, helpers.sub_promote,
-                "sub",
-            )
-        }
-        Expr::Mul(a, b) => {
-            let lhs = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
-            let rhs = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
-            // (a<<3) * (b<<3) overflows the *fixnum* range when a*b
-            // doesn't fit in 61 bits. We pre-shift rhs by 3 so the
-            // intrinsic operates on (a<<3) * b (which equals (a*b)<<3).
-            // smul.with.overflow then catches any overflow of i64 —
-            // i.e., any (a*b) that wouldn't fit in 61 bits given the
-            // <<3. Slow path uses the ORIGINAL tagged operands.
-            let three = i64_t.const_int(3, false);
-            let rhs_untagged = builder
-                .build_right_shift(rhs, three, true, "untag_rhs")
-                .map_err(|e| format!("ashr: {e}"))?;
-            emit_overflow_op(
-                context, builder, function, helpers, params, locals,
-                lhs, rhs_untagged, lhs, rhs,
-                helpers.smul_with_overflow, helpers.mul_promote,
-                "mul",
-            )
+        // `+ - *` and the numeric comparisons delegate to the
+        // representation-aware emitter (which has the unboxed-float fast
+        // path) and box the result back to a Word for this Word context.
+        // The fixnum/bignum behaviour is unchanged when no operand is a
+        // float. See emit_arith_repr / emit_cmp_repr.
+        Expr::Add(..) | Expr::Sub(..) | Expr::Mul(..)
+        | Expr::Lt(..) | Expr::Gt(..) | Expr::Le(..) | Expr::Ge(..) | Expr::NumEq(..) => {
+            let r = emit_expr_repr(
+                context, builder, function, helpers, arity, params, locals, expr,
+            )?;
+            coerce_to_word(builder, function, helpers, r)
         }
         Expr::Truncate(a, b) => {
             let lhs = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
@@ -2867,11 +3025,6 @@ fn emit_expr<'ctx>(
             emit_car_or_cdr(context, builder, function, helpers, cons_val, /*is_cdr=*/true)
         }
         Expr::Eq(a, b) => emit_ref_eq(context, builder, function, helpers, arity, params, locals, a, b),
-        Expr::Lt(a, b) => emit_cmp(context, builder, function, helpers, arity, params, locals, a, b, IntPredicate::SLT),
-        Expr::Gt(a, b) => emit_cmp(context, builder, function, helpers, arity, params, locals, a, b, IntPredicate::SGT),
-        Expr::Le(a, b) => emit_cmp(context, builder, function, helpers, arity, params, locals, a, b, IntPredicate::SLE),
-        Expr::Ge(a, b) => emit_cmp(context, builder, function, helpers, arity, params, locals, a, b, IntPredicate::SGE),
-        Expr::NumEq(a, b) => emit_cmp(context, builder, function, helpers, arity, params, locals, a, b, IntPredicate::EQ),
         Expr::IsNull(x) => {
             let v = emit_expr(context, builder, function, helpers, arity, params, locals, x)?;
             let nil = i64_t.const_int(Word::NIL.raw(), false);

@@ -18,6 +18,14 @@ pub enum Expr {
     /// resolved values whose tagged bit pattern is known. Emitted
     /// as a single i64 constant.
     Word(u64),
+    /// A float literal. `bits` is the IEEE-754 f64 bit pattern (used
+    /// for the unboxed `Repr::F64` value the JIT can compute on
+    /// natively); `boxed` is the raw Word of a pre-allocated static-area
+    /// boxed Float — the constant-fold target when the literal is needed
+    /// as a tagged Word, so a float literal in a Word context costs zero
+    /// per-evaluation allocation (matching pre-unboxing behaviour). See
+    /// `docs/performance-unbox-float.md` Sprint 1.
+    Float { bits: u64, boxed: u64 },
     /// The literal `nil`.
     Nil,
     /// The truth value `t`.

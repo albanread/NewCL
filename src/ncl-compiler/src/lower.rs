@@ -358,6 +358,10 @@ fn lower_in_mut(
             Ok(Expr::Word(w.raw()))
         }
         Value::Float(f) => {
+            // Pre-box the literal in the static area (the constant-fold
+            // target for Word contexts — zero per-eval allocation), and
+            // carry the raw f64 bits so the JIT can compute on it
+            // unboxed. See docs/performance-unbox-float.md Sprint 1.
             let w = ncl_runtime::float::alloc_float_in_static(
                 coord.static_area(), coord, *f,
             )
@@ -366,7 +370,7 @@ fn lower_in_mut(
                     "static area exhausted while allocating float literal".into(),
                 )
             })?;
-            Ok(Expr::Word(w.raw()))
+            Ok(Expr::Float { bits: f.to_bits(), boxed: w.raw() })
         }
         Value::Ratio(n, d) => {
             let w = ncl_runtime::ratio::alloc_ratio_in_static(
