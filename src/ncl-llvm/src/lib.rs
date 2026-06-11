@@ -737,6 +737,9 @@ fn build_engine_and_get_fn_addr(
         bind(engine, helpers.mul_promote, ncl_mul_complex as usize);
         bind(engine, helpers.truncate_promote, ncl_truncate_promote as usize);
         bind(engine, helpers.rem_promote, ncl_rem_promote as usize);
+        bind(engine, helpers.logand_promote, ncl_runtime::bignum::ncl_logand_promote as usize);
+        bind(engine, helpers.logior_promote, ncl_runtime::bignum::ncl_logior_promote as usize);
+        bind(engine, helpers.logxor_promote, ncl_runtime::bignum::ncl_logxor_promote as usize);
         bind(engine, helpers.cmp_int, ncl_cmp_full as usize);
         bind(
             engine,
@@ -808,6 +811,10 @@ struct Helpers<'ctx> {
     mul_promote: FunctionValue<'ctx>,
     truncate_promote: FunctionValue<'ctx>,
     rem_promote: FunctionValue<'ctx>,
+    /// Bignum-aware slow paths for the inline bitwise ops.
+    logand_promote: FunctionValue<'ctx>,
+    logior_promote: FunctionValue<'ctx>,
+    logxor_promote: FunctionValue<'ctx>,
     /// Cross-type integer comparison. Returns -1, 0, or +1 (i64).
     cmp_int: FunctionValue<'ctx>,
     /// LLVM intrinsic for signed-add-with-overflow. Returns
@@ -1133,6 +1140,13 @@ fn declare_runtime_helpers<'ctx>(
         promote_type,
         Some(Linkage::External),
     );
+    // Bitwise-op bignum slow paths (same promote ABI).
+    let logand_promote = module.add_function(
+        "ncl_logand_promote", promote_type, Some(Linkage::External));
+    let logior_promote = module.add_function(
+        "ncl_logior_promote", promote_type, Some(Linkage::External));
+    let logxor_promote = module.add_function(
+        "ncl_logxor_promote", promote_type, Some(Linkage::External));
     let cmp_type = i64_t.fn_type(&[i64_t.into(), i64_t.into()], false);
     let cmp_int = module.add_function(
         "ncl_cmp_int",
@@ -1235,6 +1249,9 @@ fn declare_runtime_helpers<'ctx>(
         mul_promote,
         truncate_promote,
         rem_promote,
+        logand_promote,
+        logior_promote,
+        logxor_promote,
         cmp_int,
         sadd_with_overflow,
         ssub_with_overflow,
@@ -1294,6 +1311,9 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(&helpers.mul_promote, ncl_mul_complex as *const () as usize);
     engine.add_global_mapping(&helpers.truncate_promote, ncl_truncate_promote as *const () as usize);
     engine.add_global_mapping(&helpers.rem_promote, ncl_rem_promote as *const () as usize);
+    engine.add_global_mapping(&helpers.logand_promote, ncl_runtime::bignum::ncl_logand_promote as *const () as usize);
+    engine.add_global_mapping(&helpers.logior_promote, ncl_runtime::bignum::ncl_logior_promote as *const () as usize);
+    engine.add_global_mapping(&helpers.logxor_promote, ncl_runtime::bignum::ncl_logxor_promote as *const () as usize);
     engine.add_global_mapping(&helpers.cmp_int, ncl_cmp_full as *const () as usize);
     engine.add_global_mapping(
         &helpers.debug_check_cons,
@@ -1481,6 +1501,103 @@ fn emit_overflow_op<'ctx>(
         &slow_locals_post_wrap,
         &slow_params_post_wrap,
         slow_end_block,
+    )?;
+    Ok(phi.as_basic_value().into_int_value())
+}
+
+#[derive(Clone, Copy)]
+enum BitOp { And, Ior, Xor }
+
+/// Emit a tag-checked bitwise `logand`/`logior`/`logxor`. Fast path:
+/// both operands fixnum → the raw bitwise op on the *tagged* words. A
+/// fixnum's tag bits are 000, and `000 OP 000 = 000`, so the result is
+/// already a correctly-tagged fixnum — no untag/retag, no overflow.
+/// Slow path: a bignum-aware promote helper, safepoint-wrapped because
+/// it can allocate a bignum result. Mirrors `emit_overflow_op` minus the
+/// overflow intrinsic.
+#[allow(clippy::too_many_arguments)]
+fn emit_bitwise_op<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    params: &mut Vec<IntValue<'ctx>>,
+    locals: &mut Vec<IntValue<'ctx>>,
+    lhs: IntValue<'ctx>,
+    rhs: IntValue<'ctx>,
+    promote_helper: FunctionValue<'ctx>,
+    op: BitOp,
+    op_name: &str,
+) -> Result<IntValue<'ctx>, String> {
+    let i64_t = context.i64_type();
+    let seven = i64_t.const_int(7, false);
+    let zero = i64_t.const_zero();
+    let tag_or = builder
+        .build_or(lhs, rhs, &format!("{op_name}_tag_or"))
+        .map_err(|e| format!("or: {e}"))?;
+    let tag_bits = builder
+        .build_and(tag_or, seven, &format!("{op_name}_tag_bits"))
+        .map_err(|e| format!("and: {e}"))?;
+    let both_fixnum = builder
+        .build_int_compare(IntPredicate::EQ, tag_bits, zero, &format!("{op_name}_both_fix"))
+        .map_err(|e| format!("icmp: {e}"))?;
+
+    let fast_block = context.append_basic_block(*function, &format!("{op_name}_fast"));
+    let slow_block = context.append_basic_block(*function, &format!("{op_name}_slow"));
+    let join_block = context.append_basic_block(*function, &format!("{op_name}_join"));
+    builder
+        .build_conditional_branch(both_fixnum, fast_block, slow_block)
+        .map_err(|e| format!("br {op_name} tag-check: {e}"))?;
+
+    // Fast: raw bitwise op on the tagged words.
+    builder.position_at_end(fast_block);
+    let fast_result = match op {
+        BitOp::And => builder.build_and(lhs, rhs, &format!("{op_name}_fast")),
+        BitOp::Ior => builder.build_or(lhs, rhs, &format!("{op_name}_fast")),
+        BitOp::Xor => builder.build_xor(lhs, rhs, &format!("{op_name}_fast")),
+    }
+    .map_err(|e| format!("{op_name} fast: {e}"))?;
+    builder
+        .build_unconditional_branch(join_block)
+        .map_err(|e| format!("br fast→join {op_name}: {e}"))?;
+    let fast_end_block = builder.get_insert_block().unwrap();
+
+    // Slow: bignum-aware promote (allocates → safepoint-wrapped).
+    let fast_locals_snapshot = locals.clone();
+    let fast_params_snapshot = params.clone();
+    builder.position_at_end(slow_block);
+    let mutator_arg = function.get_nth_param(0).unwrap();
+    let extra_roots = [lhs, rhs];
+    let slow_result = emit_safepoint_wrap(
+        context, builder, function, helpers, params, locals, &extra_roots,
+        || {
+            let call = builder
+                .build_call(
+                    promote_helper,
+                    &[mutator_arg.into(), lhs.into(), rhs.into()],
+                    &format!("{op_name}_promote"),
+                )
+                .map_err(|e| format!("call {op_name}_promote: {e}"))?;
+            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+        },
+    )?;
+    emit_post_call_abort_check(context, builder, function, helpers)?;
+    let slow_locals_post_wrap = locals.clone();
+    let slow_params_post_wrap = params.clone();
+    builder
+        .build_unconditional_branch(join_block)
+        .map_err(|e| format!("br slow→join {op_name}: {e}"))?;
+    let slow_end_block = builder.get_insert_block().unwrap();
+
+    builder.position_at_end(join_block);
+    let phi = builder
+        .build_phi(i64_t, &format!("{op_name}_result"))
+        .map_err(|e| format!("phi {op_name}: {e}"))?;
+    phi.add_incoming(&[(&fast_result, fast_end_block), (&slow_result, slow_end_block)]);
+    merge_locals_params_at_join(
+        context, builder, locals, params,
+        &fast_locals_snapshot, &fast_params_snapshot, fast_end_block,
+        &slow_locals_post_wrap, &slow_params_post_wrap, slow_end_block,
     )?;
     Ok(phi.as_basic_value().into_int_value())
 }
@@ -3223,6 +3340,24 @@ fn emit_expr<'ctx>(
                 context, builder, function, helpers, params, locals,
                 lhs, rhs, helpers.rem_promote, true, "rem",
             )
+        }
+        Expr::LogAnd(a, b) => {
+            let lhs = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
+            let rhs = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
+            emit_bitwise_op(context, builder, function, helpers, params, locals,
+                lhs, rhs, helpers.logand_promote, BitOp::And, "logand")
+        }
+        Expr::LogIor(a, b) => {
+            let lhs = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
+            let rhs = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
+            emit_bitwise_op(context, builder, function, helpers, params, locals,
+                lhs, rhs, helpers.logior_promote, BitOp::Ior, "logior")
+        }
+        Expr::LogXor(a, b) => {
+            let lhs = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
+            let rhs = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
+            emit_bitwise_op(context, builder, function, helpers, params, locals,
+                lhs, rhs, helpers.logxor_promote, BitOp::Xor, "logxor")
         }
         Expr::Cons(car, cdr) => {
             let car_val = emit_expr(context, builder, function, helpers, arity, params, locals, car)?;

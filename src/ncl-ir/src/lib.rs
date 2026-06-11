@@ -124,6 +124,15 @@ pub enum Expr {
     /// LLVM `srem` and CL's `rem`). Both operands tagged; result is
     /// already tagged because `srem (a<<3) (b<<3) = (a rem b) << 3`.
     Rem(Box<Expr>, Box<Expr>),
+    /// Bitwise `logand` / `logior` / `logxor` on integers. Fixnums are
+    /// `n<<3` (tag 000), so the raw bitwise op on the tagged words yields
+    /// the correctly-tagged result with no untag/retag — the JIT inlines
+    /// that for the both-fixnum case and calls a bignum-aware helper
+    /// otherwise. Integers only (no float contagion), so unlike `mod` /
+    /// `truncate` these are safe to lower to dedicated nodes.
+    LogAnd(Box<Expr>, Box<Expr>),
+    LogIor(Box<Expr>, Box<Expr>),
+    LogXor(Box<Expr>, Box<Expr>),
     /// Allocate a cons cell. Calls `ncl_alloc_cons` at runtime.
     Cons(Box<Expr>, Box<Expr>),
     /// Read the car field of a cons.
@@ -310,6 +319,9 @@ impl Expr {
         Expr::Truncate(Box::new(a), Box::new(b))
     }
     pub fn rem(a: Expr, b: Expr) -> Expr { Expr::Rem(Box::new(a), Box::new(b)) }
+    pub fn logand(a: Expr, b: Expr) -> Expr { Expr::LogAnd(Box::new(a), Box::new(b)) }
+    pub fn logior(a: Expr, b: Expr) -> Expr { Expr::LogIor(Box::new(a), Box::new(b)) }
+    pub fn logxor(a: Expr, b: Expr) -> Expr { Expr::LogXor(Box::new(a), Box::new(b)) }
     pub fn cons(car: Expr, cdr: Expr) -> Expr { Expr::Cons(Box::new(car), Box::new(cdr)) }
     pub fn car(x: Expr) -> Expr { Expr::Car(Box::new(x)) }
     pub fn cdr(x: Expr) -> Expr { Expr::Cdr(Box::new(x)) }

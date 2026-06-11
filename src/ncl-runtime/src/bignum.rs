@@ -409,6 +409,47 @@ pub extern "C-unwind" fn ncl_mod_promote(
     bigint_to_word(m, &na.mod_floor(&nb)).raw()
 }
 
+/// 2-operand JIT slow-path helpers for the inline bitwise ops. The JIT
+/// emits the both-fixnum fast path inline (a raw `and`/`or`/`xor` on the
+/// tagged words — tag bits are 000 for fixnums, so the result is
+/// correctly tagged) and calls these only when an operand is a bignum.
+/// ABI mirrors `ncl_add_promote`: `(mutator, a, b) -> Word`.
+fn bit_promote_2(
+    mutator: *mut MutatorState,
+    a_raw: u64,
+    b_raw: u64,
+    name: &str,
+    op: impl Fn(BigInt, BigInt) -> BigInt,
+) -> u64 {
+    let na = match integer_to_bigint(Word::from_raw(a_raw)) {
+        Some(n) => n,
+        None => return crate::abi::signal_condition_string(
+            mutator, &format!("{name}: non-integer argument"),
+        ),
+    };
+    let nb = match integer_to_bigint(Word::from_raw(b_raw)) {
+        Some(n) => n,
+        None => return crate::abi::signal_condition_string(
+            mutator, &format!("{name}: non-integer argument"),
+        ),
+    };
+    let m = unsafe { &mut *mutator };
+    bigint_to_word(m, &op(na, nb)).raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn ncl_logand_promote(m: *mut MutatorState, a: u64, b: u64) -> u64 {
+    bit_promote_2(m, a, b, "logand", |x, y| x & y)
+}
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn ncl_logior_promote(m: *mut MutatorState, a: u64, b: u64) -> u64 {
+    bit_promote_2(m, a, b, "logior", |x, y| x | y)
+}
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn ncl_logxor_promote(m: *mut MutatorState, a: u64, b: u64) -> u64 {
+    bit_promote_2(m, a, b, "logxor", |x, y| x ^ y)
+}
+
 // ─── Lisp-callable math shims (registered via install_native) ────────────
 
 /// `(truncate a b)` — integer truncating division. Quotient rounds

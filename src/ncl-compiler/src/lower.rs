@@ -670,6 +670,13 @@ fn lower_call_in_mut(
     match head_name.as_str() {
         "+" => fold_arithmetic(&head_name, args, env, coord, 0, Expr::add),
         "*" => fold_arithmetic(&head_name, args, env, coord, 1, Expr::mul),
+        // Bitwise ops inline to dedicated nodes (raw tagged-fixnum op +
+        // bignum-aware slow path). Integers only, so — unlike mod /
+        // truncate / rem — they need no polymorphic Lisp wrapper.
+        // Variadic: identity is -1 for logand, 0 for logior/logxor.
+        "LOGAND" => fold_arithmetic(&head_name, args, env, coord, -1, Expr::logand),
+        "LOGIOR" => fold_arithmetic(&head_name, args, env, coord, 0, Expr::logior),
+        "LOGXOR" => fold_arithmetic(&head_name, args, env, coord, 0, Expr::logxor),
         // TRUNCATE and REM used to be special-form-intercepted and
         // lowered to inline LLVM srem / sdiv. We demoted them to
         // ordinary native calls (truncate_shim / rem_shim in
