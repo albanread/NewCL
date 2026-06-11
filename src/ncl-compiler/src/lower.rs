@@ -677,6 +677,7 @@ fn lower_call_in_mut(
         "LOGAND" => fold_arithmetic(&head_name, args, env, coord, -1, Expr::logand),
         "LOGIOR" => fold_arithmetic(&head_name, args, env, coord, 0, Expr::logior),
         "LOGXOR" => fold_arithmetic(&head_name, args, env, coord, 0, Expr::logxor),
+        "ASH" => binary_op(&head_name, args, env, coord, Expr::ash),
         // TRUNCATE and REM used to be special-form-intercepted and
         // lowered to inline LLVM srem / sdiv. We demoted them to
         // ordinary native calls (truncate_shim / rem_shim in

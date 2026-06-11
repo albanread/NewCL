@@ -133,6 +133,11 @@ pub enum Expr {
     LogAnd(Box<Expr>, Box<Expr>),
     LogIor(Box<Expr>, Box<Expr>),
     LogXor(Box<Expr>, Box<Expr>),
+    /// `(ash n shift)` — arithmetic shift. The JIT inlines the common
+    /// case (both fixnum, small non-negative shift, no overflow) as a
+    /// shifted-and-overflow-checked tagged op; everything else (bignum,
+    /// negative/large shift, overflow) falls to `ncl_ash_promote`.
+    Ash(Box<Expr>, Box<Expr>),
     /// Allocate a cons cell. Calls `ncl_alloc_cons` at runtime.
     Cons(Box<Expr>, Box<Expr>),
     /// Read the car field of a cons.
@@ -322,6 +327,7 @@ impl Expr {
     pub fn logand(a: Expr, b: Expr) -> Expr { Expr::LogAnd(Box::new(a), Box::new(b)) }
     pub fn logior(a: Expr, b: Expr) -> Expr { Expr::LogIor(Box::new(a), Box::new(b)) }
     pub fn logxor(a: Expr, b: Expr) -> Expr { Expr::LogXor(Box::new(a), Box::new(b)) }
+    pub fn ash(n: Expr, shift: Expr) -> Expr { Expr::Ash(Box::new(n), Box::new(shift)) }
     pub fn cons(car: Expr, cdr: Expr) -> Expr { Expr::Cons(Box::new(car), Box::new(cdr)) }
     pub fn car(x: Expr) -> Expr { Expr::Car(Box::new(x)) }
     pub fn cdr(x: Expr) -> Expr { Expr::Cdr(Box::new(x)) }

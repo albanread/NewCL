@@ -437,6 +437,42 @@ fn bit_promote_2(
     bigint_to_word(m, &op(na, nb)).raw()
 }
 
+/// `(ash n shift)` slow path: 2-operand promote ABI. The JIT inlines the
+/// common small-left-shift fixnum case; this handles bignum `n`, large
+/// or negative shifts, and fixnum-overflow-to-bignum. Mirrors
+/// `ash_shim`'s bigint logic.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn ncl_ash_promote(mutator: *mut MutatorState, n_raw: u64, shift_raw: u64) -> u64 {
+    use num_traits::{Pow, Signed};
+    use num_integer::Integer;
+    let n = match integer_to_bigint(Word::from_raw(n_raw)) {
+        Some(n) => n,
+        None => return crate::abi::signal_condition_string(
+            mutator, "ash: first arg must be an integer"),
+    };
+    let shift = match Word::from_raw(shift_raw).as_fixnum() {
+        Some(s) => s,
+        None => return crate::abi::signal_condition_string(
+            mutator, "ash: shift count must be a fixnum"),
+    };
+    let result = if shift >= 0 {
+        if shift > u32::MAX as i64 {
+            return crate::abi::signal_condition_string(mutator, "ash: shift count too large");
+        }
+        n << (shift as usize)
+    } else {
+        let s = (-shift) as usize;
+        if n.is_negative() {
+            let divisor: BigInt = BigInt::from(2).pow(s as u32);
+            n.div_floor(&divisor)
+        } else {
+            n >> s
+        }
+    };
+    let m = unsafe { &mut *mutator };
+    bigint_to_word(m, &result).raw()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn ncl_logand_promote(m: *mut MutatorState, a: u64, b: u64) -> u64 {
     bit_promote_2(m, a, b, "logand", |x, y| x & y)

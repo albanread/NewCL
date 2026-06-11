@@ -740,6 +740,7 @@ fn build_engine_and_get_fn_addr(
         bind(engine, helpers.logand_promote, ncl_runtime::bignum::ncl_logand_promote as usize);
         bind(engine, helpers.logior_promote, ncl_runtime::bignum::ncl_logior_promote as usize);
         bind(engine, helpers.logxor_promote, ncl_runtime::bignum::ncl_logxor_promote as usize);
+        bind(engine, helpers.ash_promote, ncl_runtime::bignum::ncl_ash_promote as usize);
         bind(engine, helpers.cmp_int, ncl_cmp_full as usize);
         bind(
             engine,
@@ -815,6 +816,7 @@ struct Helpers<'ctx> {
     logand_promote: FunctionValue<'ctx>,
     logior_promote: FunctionValue<'ctx>,
     logxor_promote: FunctionValue<'ctx>,
+    ash_promote: FunctionValue<'ctx>,
     /// Cross-type integer comparison. Returns -1, 0, or +1 (i64).
     cmp_int: FunctionValue<'ctx>,
     /// LLVM intrinsic for signed-add-with-overflow. Returns
@@ -1147,6 +1149,8 @@ fn declare_runtime_helpers<'ctx>(
         "ncl_logior_promote", promote_type, Some(Linkage::External));
     let logxor_promote = module.add_function(
         "ncl_logxor_promote", promote_type, Some(Linkage::External));
+    let ash_promote = module.add_function(
+        "ncl_ash_promote", promote_type, Some(Linkage::External));
     let cmp_type = i64_t.fn_type(&[i64_t.into(), i64_t.into()], false);
     let cmp_int = module.add_function(
         "ncl_cmp_int",
@@ -1252,6 +1256,7 @@ fn declare_runtime_helpers<'ctx>(
         logand_promote,
         logior_promote,
         logxor_promote,
+        ash_promote,
         cmp_int,
         sadd_with_overflow,
         ssub_with_overflow,
@@ -1314,6 +1319,7 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(&helpers.logand_promote, ncl_runtime::bignum::ncl_logand_promote as *const () as usize);
     engine.add_global_mapping(&helpers.logior_promote, ncl_runtime::bignum::ncl_logior_promote as *const () as usize);
     engine.add_global_mapping(&helpers.logxor_promote, ncl_runtime::bignum::ncl_logxor_promote as *const () as usize);
+    engine.add_global_mapping(&helpers.ash_promote, ncl_runtime::bignum::ncl_ash_promote as *const () as usize);
     engine.add_global_mapping(&helpers.cmp_int, ncl_cmp_full as *const () as usize);
     engine.add_global_mapping(
         &helpers.debug_check_cons,
@@ -1598,6 +1604,104 @@ fn emit_bitwise_op<'ctx>(
         context, builder, locals, params,
         &fast_locals_snapshot, &fast_params_snapshot, fast_end_block,
         &slow_locals_post_wrap, &slow_params_post_wrap, slow_end_block,
+    )?;
+    Ok(phi.as_basic_value().into_int_value())
+}
+
+/// Emit `(ash n shift)`. Fast path: both operands fixnum, `shift` is a
+/// small non-negative count (`0..32`), and the left shift doesn't lose
+/// high bits. A fixnum is `v<<3`, so `(v<<3) << s == (v<<s) << 3` is the
+/// correctly-tagged result; the overflow check is
+/// `(tagged << s) >>a s == tagged`. Everything else — bignum `n`,
+/// negative/large shift, or overflow — falls to the safepoint-wrapped
+/// `ncl_ash_promote` (which also covers right shifts and bignum results).
+#[allow(clippy::too_many_arguments)]
+fn emit_ash_op<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    params: &mut Vec<IntValue<'ctx>>,
+    locals: &mut Vec<IntValue<'ctx>>,
+    n: IntValue<'ctx>,
+    shift: IntValue<'ctx>,
+) -> Result<IntValue<'ctx>, String> {
+    let i64_t = context.i64_type();
+    let seven = i64_t.const_int(7, false);
+    let zero = i64_t.const_zero();
+    let three = i64_t.const_int(3, false);
+    let lim = i64_t.const_int(32, false);
+
+    let tag_or = builder.build_or(n, shift, "ash_tag_or").map_err(|e| format!("or: {e}"))?;
+    let tag_bits = builder.build_and(tag_or, seven, "ash_tag_bits").map_err(|e| format!("and: {e}"))?;
+    let both_fix = builder
+        .build_int_compare(IntPredicate::EQ, tag_bits, zero, "ash_both_fix")
+        .map_err(|e| format!("icmp: {e}"))?;
+
+    let check_bb = context.append_basic_block(*function, "ash_check");
+    let shift_bb = context.append_basic_block(*function, "ash_shift");
+    let fast_bb = context.append_basic_block(*function, "ash_fast");
+    let slow_bb = context.append_basic_block(*function, "ash_slow");
+    let join_bb = context.append_basic_block(*function, "ash_join");
+
+    builder.build_conditional_branch(both_fix, check_bb, slow_bb)
+        .map_err(|e| format!("br ash tag: {e}"))?;
+
+    // Shift count in range 0..32? (unsigned compare: a negative untagged
+    // shift wraps to a huge value and fails → handled by the slow path).
+    builder.position_at_end(check_bb);
+    let shift_i = builder.build_right_shift(shift, three, true, "ash_shift_i")
+        .map_err(|e| format!("ashr: {e}"))?;
+    let in_range = builder
+        .build_int_compare(IntPredicate::ULT, shift_i, lim, "ash_in_range")
+        .map_err(|e| format!("icmp: {e}"))?;
+    builder.build_conditional_branch(in_range, shift_bb, slow_bb)
+        .map_err(|e| format!("br ash range: {e}"))?;
+
+    // Left shift + overflow check.
+    builder.position_at_end(shift_bb);
+    let candidate = builder.build_left_shift(n, shift_i, "ash_cand")
+        .map_err(|e| format!("shl: {e}"))?;
+    let back = builder.build_right_shift(candidate, shift_i, true, "ash_back")
+        .map_err(|e| format!("ashr: {e}"))?;
+    let no_ovf = builder
+        .build_int_compare(IntPredicate::EQ, back, n, "ash_no_ovf")
+        .map_err(|e| format!("icmp: {e}"))?;
+    builder.build_conditional_branch(no_ovf, fast_bb, slow_bb)
+        .map_err(|e| format!("br ash ovf: {e}"))?;
+
+    builder.position_at_end(fast_bb);
+    builder.build_unconditional_branch(join_bb).map_err(|e| format!("br ash fast: {e}"))?;
+    let fast_end = builder.get_insert_block().unwrap();
+
+    // Slow: bignum-aware ash (allocates → safepoint-wrapped).
+    let fast_locals_snapshot = locals.clone();
+    let fast_params_snapshot = params.clone();
+    builder.position_at_end(slow_bb);
+    let mutator_arg = function.get_nth_param(0).unwrap();
+    let extra_roots = [n, shift];
+    let slow_result = emit_safepoint_wrap(
+        context, builder, function, helpers, params, locals, &extra_roots,
+        || {
+            let call = builder
+                .build_call(helpers.ash_promote, &[mutator_arg.into(), n.into(), shift.into()], "ash_promote")
+                .map_err(|e| format!("call ash_promote: {e}"))?;
+            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+        },
+    )?;
+    emit_post_call_abort_check(context, builder, function, helpers)?;
+    let slow_locals_post_wrap = locals.clone();
+    let slow_params_post_wrap = params.clone();
+    builder.build_unconditional_branch(join_bb).map_err(|e| format!("br ash slow: {e}"))?;
+    let slow_end = builder.get_insert_block().unwrap();
+
+    builder.position_at_end(join_bb);
+    let phi = builder.build_phi(i64_t, "ash_result").map_err(|e| format!("phi ash: {e}"))?;
+    phi.add_incoming(&[(&candidate, fast_end), (&slow_result, slow_end)]);
+    merge_locals_params_at_join(
+        context, builder, locals, params,
+        &fast_locals_snapshot, &fast_params_snapshot, fast_end,
+        &slow_locals_post_wrap, &slow_params_post_wrap, slow_end,
     )?;
     Ok(phi.as_basic_value().into_int_value())
 }
@@ -3358,6 +3462,11 @@ fn emit_expr<'ctx>(
             let rhs = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
             emit_bitwise_op(context, builder, function, helpers, params, locals,
                 lhs, rhs, helpers.logxor_promote, BitOp::Xor, "logxor")
+        }
+        Expr::Ash(a, b) => {
+            let n = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
+            let shift = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
+            emit_ash_op(context, builder, function, helpers, params, locals, n, shift)
         }
         Expr::Cons(car, cdr) => {
             let car_val = emit_expr(context, builder, function, helpers, arity, params, locals, car)?;
