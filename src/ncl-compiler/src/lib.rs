@@ -547,6 +547,9 @@ pub(crate) fn compile_function_raw(
     // See docs/performance-unbox-float.md Sprint 3.
     let float_params = lower::extract_float_names(&decl_specs);
     if !float_params.is_empty() {
+        // The function opted into float types — allow auto-inlining of
+        // its simple loops (gated in lower_call_in_mut on this flag).
+        env.mark_float_decl();
         for pname in &params.required {
             if float_params.contains(pname.as_ref())
                 && !body_mutations.contains(pname)

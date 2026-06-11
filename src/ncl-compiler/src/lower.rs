@@ -114,6 +114,14 @@ pub struct LocalEnv {
     /// the inline loop's exit) instead of the flag-based `%loop-return`
     /// runtime call. Reset to false inside any lambda body (for_lambda).
     in_inline_loop: bool,
+    /// True once a `(double-float …)` / `(single-float …)` declaration
+    /// has been seen in this function (on a param or an enclosing let).
+    /// Auto-inlining of a simple `(loop …)` is gated on this — we only
+    /// transform loops in functions that opted into float types, keeping
+    /// the blast radius to exactly the code the unboxed-float work
+    /// targets and leaving all other loops byte-identical on
+    /// `%native-loop`. Reset per function / lambda.
+    has_float_decl: bool,
     /// Set when this env is the inner env of a lambda body. Lookups
     /// that miss in `bindings` fall back to here, capturing on hit.
     capture_parent: Option<Box<LocalEnv>>,
@@ -139,6 +147,7 @@ impl LocalEnv {
             closure_count: 0,
             f64_count: 0,
             in_inline_loop: false,
+            has_float_decl: false,
             capture_parent: None,
             captures: Vec::new(),
         }
@@ -162,6 +171,9 @@ impl LocalEnv {
             // A lambda body is NOT part of any enclosing inline loop —
             // its (return) targets the lambda's own dynamic loop.
             in_inline_loop: false,
+            // A lambda is its own function-ish scope; float declarations
+            // from the outer function don't apply to its loops.
+            has_float_decl: false,
             capture_parent: Some(Box::new(parent)),
             captures: Vec::new(),
         }
@@ -297,6 +309,13 @@ impl LocalEnv {
     /// unboxed. Caller must ensure the param is declared double-float,
     /// not mutated, and not special. No-op if the name isn't a plain
     /// `Param` (e.g. already promoted to a cell by mutation analysis).
+    /// Record that this function declared a float type (param or local),
+    /// enabling auto-inline of its simple `(loop …)`s. See
+    /// `has_float_decl` / docs/performance-unbox-float.md.
+    pub fn mark_float_decl(&mut self) {
+        self.has_float_decl = true;
+    }
+
     pub fn rebind_as_param_f64(&mut self, name: &str) {
         for (n, b) in self.bindings.iter_mut().rev() {
             if &**n == name {
@@ -903,7 +922,8 @@ fn lower_call_in_mut(
         // the guard fails, control falls through to the ordinary call
         // lowering (the catch-all), keeping the loop on %native-loop.
         "%NATIVE-LOOP"
-            if args.len() == 1
+            if env.has_float_decl
+                && args.len() == 1
                 && native_loop_lambda_body(&args[0])
                     .map_or(false, |b| native_loop_inlinable(&b, coord)) =>
         {
@@ -1481,6 +1501,11 @@ fn lower_let(
     // cell there. Immutable float locals are always safe (captured by
     // value). See docs/performance-unbox-float.md Sprint 2.
     let locally_float = extract_float_names(&decl_specs);
+    if !locally_float.is_empty() {
+        // Float locals in this let → the function is float-aware; allow
+        // auto-inlining of loops in this scope (and inner scopes).
+        env.has_float_decl = true;
+    }
     let body_closure = !locally_float.is_empty() && body_has_closure(body_forms, coord);
     let is_float_local: Vec<bool> = binding_names
         .iter()
