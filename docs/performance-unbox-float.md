@@ -13,8 +13,9 @@ generic-dispatch tower that currently dominates all float-heavy code.
 
 NCL floats are **heap-boxed**: every `f64` is a 3-cell `HeapType::Float`
 object (`Tag::Vector` pointer; header at cell 0, `%FLOAT` marker at cell
-1, raw `f64` bits at cell 2 — see `float.rs`). The JIT (`emit_overflow_op`,
-`emit_cmp`, `emit_div_op` in `ncl-llvm/src/lib.rs`) inlines arithmetic
+1, raw `f64` bits at cell 2 — see `src/ncl-runtime/src/float.rs`). The JIT
+(`emit_overflow_op`, `emit_cmp`, `emit_div_op` in `src/ncl-llvm/src/lib.rs`)
+inlines arithmetic
 **only when both operands are fixnums** (`(lhs|rhs)&7 == 0`). Floats have
 a non-zero tag, so every float `*`/`+`/`-`/`/`/`>` falls to a generic
 runtime call tower:
@@ -142,14 +143,32 @@ promotes to SSA + phis at `-O2`) or directly as phi-threaded SSA. The
 `alloca` route is simplest and optimises cleanly — mirror how mutable
 boxed locals are already handled.
 
+**Root-tracking boundary (must be explicit).** The existing codegen
+threads Word locals/params as a `Vec<IntValue>` that the safepoint wrap
+re-roots and pop-reloads after a GC (`merge_locals_params_at_join`,
+`emit_safepoint_wrap` in `src/ncl-llvm/src/lib.rs`). An `F64` `alloca`
+must live **outside** that vector: it is not a GC root, and it must
+**not** be reloaded post-GC (a stack-slot `f64` does not move). This is
+why the `alloca` route is attractive — it sidesteps the root machinery
+entirely. But the converse is a corruption-class hazard: if a future
+change ever threads an `F64` slot through the Word `locals`/`params`
+vectors, the wrap will treat raw `f64` bits as a heap pointer to root and
+forward. Keep `F64` slots in a separate side-table; never in the Word
+root set.
+
 ### 2.5 Mixed int/float coercion
 
 `(+ fixnum-expr f64-expr)` and friends: when one side is `F64` and the
 other is a **statically-known fixnum** (literal, or a declared/inferred
-fixnum), emit `sitofp` (untag the fixnum, `sitofp i64→double`) and do the
-native op. When the other side's type is unknown, **box and go generic**
-(today's path) — correct, just not accelerated. The render's
-`(+ -2.5 (* px xs))` (fixnum `px` × float `xs`) is the motivating case.
+fixnum), convert and do the native op. When the other side's type is
+unknown, **box and go generic** (today's path) — correct, just not
+accelerated. The render's `(+ -2.5 (* px xs))` (fixnum `px` × float `xs`)
+is the motivating case.
+
+**Order of operations matters:** a tagged fixnum is `n << 3`, so the
+conversion is **`ashr 3` (untag) *then* `sitofp i64→double`** — not
+`sitofp` of the tagged word, which would compute `8 × n`. The canonical
+off-by-8× bug; the `float-arith` suite's mixed cases must catch it.
 
 ### 2.6 Safety
 
@@ -159,6 +178,20 @@ non-float is passed (one branch at function entry, negligible). Under
 `(optimize (safety 0))`: unchecked unbox. This matches CL semantics and
 keeps the default safe.
 
+### 2.6a NaN consistency between the unboxed and boxed paths
+
+A subtlety the "strict superset" claim depends on: the *same* source
+comparison must give the *same* answer whether the compiler proved
+float-typedness (native `fcmp`) or not (boxed `ncl_cmp_real`). The boxed
+path today collapses NaN to "equal" (`ncl_cmp_real` returns `0` for
+unordered — `src/ncl-runtime/src/float.rs`), whereas IEEE `fcmp OEQ`
+yields the correct `(= nan nan) ⇒ NIL`. So an `F64`-typed comparison and
+its boxed twin would **disagree on NaN**. Resolve this when the native
+path lands (Sprint 1): preferably fix *both* to IEEE-ordered semantics;
+at minimum the `float-arith` suite must assert the two paths agree.
+Silent divergence here is a "same code, different answer depending on
+inference" trap.
+
 ### 2.7 Explicitly out of scope
 
 - **NaN-boxing** floats as immediates — would remove boxing globally but
@@ -167,6 +200,11 @@ keeps the default safe.
 - **`single-float`** as a distinct representation — NCL floats are
   doubles. Treat `single-float` declarations as `double-float` for now
   (note in `coerce`); a separate `f32` repr is a later, low-value add.
+  This is a real semantic deviation (`typep`, `coerce`, print
+  round-trip), not just a perf simplification — before relying on it,
+  confirm it does not move the ANSI `490/56/85` baseline, and if any of
+  the 56 known failures are already `single-float`-related, note that so
+  the gate isn't misread as a regression.
 
 ---
 
@@ -203,15 +241,30 @@ on).
 in registers and boxes once at the end.
 
 - Float literal → `Repr::F64(const_float)` (instead of a static-area
-  boxed Word load).
+  boxed Word load — today `lower.rs` boxes the literal via
+  `alloc_float_in_static` and emits `Expr::Word(ptr)`).
+- **Constant-fold invariant (avoids a regression):** `coerce_to_word` of
+  a **compile-time-constant** `F64` must fold *back* to the static-area
+  box (the existing `alloc_float_in_static` path → `Expr::Word`), **not**
+  emit a fresh young-heap `ncl_box_float`. Otherwise a literal that flows
+  into a Word sink (`(list 0.0)`, `(print 3.14)`, `(setq *x* 1.5)`,
+  return, generic call) turns a free, shared static-constant load into a
+  per-evaluation young-heap allocation — GC churn that passes the
+  correctness gate while silently pessimising. Only **runtime-computed**
+  `F64` values take the `ncl_box_float` path.
 - `emit_overflow_op` / `emit_div_op`: when **both** operands are
   `Repr::F64`, emit native `fadd`/`fsub`/`fmul`/`fdiv` → `Repr::F64`. Else
   unchanged (box + generic).
 - `emit_cmp`: both `F64` → `fcmp` → bool (no box, no `ncl_cmp_full`).
-- Mixed `F64` + static-fixnum → `sitofp` + native (§2.5).
+  Settle the NaN-consistency question here (§2.6a): the native `fcmp`
+  result must agree with the boxed `ncl_cmp_real` path for the same
+  source.
+- Mixed `F64` + static-fixnum → untag (`ashr 3`) + `sitofp` + native
+  (§2.5).
 - **Gate:** ANSI + gauntlet; new `float-arith` correctness suite
-  (contagion, chained `(+ (* 2.0 3.0) 1.0)`, NaN/inf/-0.0, mixed). Bench:
-  a pure-float-expression microbench improves; `mb-iter` does **not** yet
+  (contagion, chained `(+ (* 2.0 3.0) 1.0)`, NaN/inf/-0.0, mixed, and the
+  native-vs-boxed agreement assertion from §2.6a). Bench: a
+  pure-float-expression microbench improves; `mb-iter` does **not** yet
   (its values live in variables — Sprint 2).
 
 ### Sprint 2 — float-typed locals (`let` / `setq`)
@@ -220,8 +273,16 @@ in registers and boxes once at the end.
 
 - `assign_reprs` pre-pass (§2.4): declarations + local inference decide
   each variable's repr.
-- Emit `F64` locals as `f64` allocas; `let`-init and `setq` store `f64`
-  (no box) when both var and value are `F64`; reads yield `Repr::F64`.
+- **Sequence the two seeds: declared locals first, inference second.**
+  Honouring `(declare (double-float zx zy zx2 zy2))` on locals is
+  strictly simpler than the fixed-point inference of §2.2 item 5, and the
+  Sprint-3 demo adds those declarations anyway — so the headline
+  Mandelbrot win can ride entirely on declared locals, keeping the
+  inference pass off the critical path. Land declared-locals (2a), gate,
+  then add inference (2b).
+- Emit `F64` locals as `f64` allocas (in a side-table, **not** the Word
+  root vector — §2.4); `let`-init and `setq` store `f64` (no box) when
+  both var and value are `F64`; reads yield `Repr::F64`.
 - Loop-carried consistency: the pre-pass guarantees a single repr per
   variable, so the loop-header phi is well-typed.
 - **Gate:** ANSI + gauntlet + `float-arith` suite extended with
@@ -235,13 +296,22 @@ in registers and boxes once at the end.
 unboxes end-to-end and hits the measured ceiling.
 
 - Parse + honour `(declare (double-float …))` / `(declare (type
-  double-float …))` on parameters (extend the declare handling in
-  `ncl-compiler/src/lib.rs` + `lower.rs`).
-- Prologue: unbox declared float params to `f64` (checked per §2.6).
+  double-float …))` on parameters. The scaffolding exists —
+  `strip_declares` / `match_declare` in `src/ncl-compiler/src/lower.rs`
+  already collect declspecs, but only `special` is honoured today; this
+  extends that to type declares (in `src/ncl-compiler/src/lib.rs` +
+  `lower.rs`).
+- Prologue: unbox declared float params to `f64` (checked per §2.6). Once
+  unboxed to a register, the incoming boxed argument may go dead — it
+  need not be rooted past the prologue (the conservative stack pin
+  already kept it live up to the unbox).
 - **Gate:** ANSI + gauntlet + the **Mandelbrot bench as the headline
-  metric** — target the ~21 ms ceiling (realistically tens-of-× over
-  1714 ms; JIT `-O2` won't fully match `rustc -O3`). Add `mandel` (already
-  in `bench/bench.lisp`) before/after to the perf memo.
+  metric**. Judge the sprint by *approaching* the ceiling, **not** by
+  hitting 21 ms on the nose: the 21 ms was a native Rust shim, whereas
+  Sprint 3 keeps the inner loop as JIT'd Lisp at `-O2`, which won't fully
+  match `rustc -O3`. Realistic target is tens-of-× over 1714 ms (tens of
+  ms), not 21 ms. Add `mandel` (already in `bench/bench.lisp`)
+  before/after to the perf memo.
 - Update `Lisp/demos/mandelbrot.lisp` with the declarations so the
   shipped demo is fast.
 
@@ -281,8 +351,10 @@ unboxes end-to-end and hits the measured ceiling.
   identity; printing round-trip. A wrong unbox/box surfaces here first.
 - **`jit_float_layout_contract`** unit test (Sprint 0) locks the memory
   layout the JIT hardcodes.
-- **Headline benchmark:** the Mandelbrot render (target ~21 ms ceiling),
-  plus a pure-float-arith kernel and a float dot-product added to
+- **Headline benchmark:** the Mandelbrot render — judged by *approaching*
+  the ~21 ms ceiling, not hitting it (the ceiling was a native shim;
+  JIT'd Lisp at `-O2` lands at tens of ms, see Sprint 3) — plus a
+  pure-float-arith kernel and a float dot-product added to
   `bench/bench.lisp`. Record before/after in the perf memo each sprint.
 - **GC pressure check:** `gc-stats` `:minor-gcs` / `:total-minor-pause-us`
   before/after — unboxed floats should slash float-workload minors toward
@@ -309,19 +381,35 @@ unboxes end-to-end and hits the measured ceiling.
   fewer roots), but a *boxed* float live across a GC must be rooted; the
   box happens at an escape where a Word is needed and the existing
   safepoint-wrap already roots it. Verify with a float-allocation-heavy
-  GC-stress (mirror the cons cases).
+  GC-stress (mirror the cons cases). **The inverse hazard:** an `F64`
+  `alloca`/slot must never enter the Word `locals`/`params` root vectors
+  (§2.4) — if it does, the safepoint wrap will treat raw `f64` bits as a
+  heap pointer and try to forward them. Corruption-class; keep `F64`
+  slots in a separate side-table.
+- **Native/boxed path divergence** — the same source op can take a native
+  (`fadd`/`fcmp`) or a boxed (`ncl_*_float`/`ncl_cmp_real`) path depending
+  only on whether the compiler proved float-typedness. These must agree
+  bit-for-bit on results, NaN ordering, and `-0.0` (§2.6a). A divergence
+  is a "works differently after I added a declaration" bug — the
+  `float-arith` suite must assert agreement, not just per-path
+  correctness.
 
 ## 6. Touch points (current code)
 
-- `ncl-llvm/src/lib.rs`: `emit_expr` signature → `Repr`; `emit_overflow_op`,
-  `emit_cmp`, `emit_div_op` (native FP paths); helper decl/bind for
-  `ncl_box_float`; the boundary coercions; the function prologue / param
-  binding.
-- `ncl-compiler/src/lib.rs`, `src/lower.rs`: `(declare …)` parsing,
+- `src/ncl-llvm/src/lib.rs`: `emit_expr` signature → `Repr` (~64 call
+  sites in this file); `emit_overflow_op`, `emit_cmp`, `emit_div_op`
+  (native FP paths); helper decl/bind for `ncl_box_float`; the boundary
+  coercions; the function prologue / param binding;
+  `merge_locals_params_at_join` / `emit_safepoint_wrap` (keep `F64` slots
+  out of the Word root vectors — §2.4).
+- `src/ncl-compiler/src/lib.rs`, `src/ncl-compiler/src/lower.rs`:
+  `(declare …)` parsing (extend `strip_declares` / `match_declare`, which
+  today honour only `special`); float-literal lowering currently boxes
+  via `alloc_float_in_static` (§ Sprint 1 constant-fold invariant);
   `assign_reprs` pre-pass, param-repr at lowering.
-- `ncl-ir` / `Expr`: may need per-binding type annotations carried from
-  the declare pass to codegen.
-- `ncl-runtime/src/float.rs`: re-add `ncl_box_float`; the
+- `src/ncl-ir/src/lib.rs` / `Expr`: may need per-binding type annotations
+  carried from the declare pass to codegen.
+- `src/ncl-runtime/src/float.rs`: re-add `ncl_box_float`; the
   `jit_float_layout_contract` test; (Sprint 5) unboxed-return shims.
 - `Lisp/demos/mandelbrot.lisp`: add declarations (Sprint 3).
 - `bench/bench.lisp`: float kernels.
