@@ -475,8 +475,33 @@ throughout: ANSI 490/56/85, gauntlet `ALL-PASS` (+41 new float checks),
    `fast-loop` already realizes the headline.
 
    Note (test harness): the ANSI summary count flickers 56↔57 across
-   runs, but the failing *set* is stable at 55 unique expressions — a
-   pre-existing flaky duplicate-counted case, unrelated to this work.
+   runs. The culprit is a pre-existing inherently-random ANSI test —
+   `(< (zap 5 3) 3)` reduces to `(< (random 4) 3)`, false 1/4 of the
+   time — not any of this work. The 55 *deterministic* failures are
+   stable.
+
+3. **Auto-detection (DONE — no syntax change).** The compiler now
+   recognises when a simple `(loop …)` — which macroexpands to
+   `(%native-loop (lambda () body))` — can be lowered inline, and does so
+   automatically, giving the `fast-loop` win to ordinary code.
+
+   **Conservative gate (`native_loop_inlinable`):** inline only when the
+   body calls no Lisp-compiled (user) function and creates no
+   closure / nested loop / non-local-control form — only special forms
+   and primitive operators that lower to dedicated `Expr` nodes
+   (Add/Mul/Lt/Car/…) or native shims. That makes every exit a *lexical*
+   `(return)` (→ a direct break) and rules out a *dynamic* `%loop-return`
+   or a signal/`return-from` unwind that the inline form can't model
+   (it has no lambda boundary for the per-call `ABORT_PENDING`
+   early-return to land on). Anything unproven stays on `%native-loop`.
+   The *same* predicate gates the unbox/box decision, so they can't
+   disagree. Scope: only the simple `(loop …)` path — `dotimes` / `do` /
+   extended-`LOOP` use other expansions and are untouched.
+
+   Measured: a plain `(loop …)` Mandelbrot (no `fast-loop`, no special
+   syntax — just `(declare (double-float …))`) now runs at **60 ms**,
+   identical to explicit `fast-loop`, vs 10836 ms boxed. The float work
+   finally pays off in idiomatic code, automatically.
 
 ## 7. Prior art
 
