@@ -2407,6 +2407,77 @@ fn emit_f64_store_value<'ctx>(
     }
 }
 
+/// Emit `e` purely for its side effects, discarding its value WITHOUT
+/// boxing a discarded float. A `(setq float-local …)` in statement
+/// position would otherwise emit a dead `ncl_box_float` every iteration
+/// (LLVM can't DCE it — allocation is a side effect). Used ONLY for the
+/// `fast-loop` body (whose value is unused); it recurses through
+/// Progn/Let tails so nested float stores are covered. Deliberately
+/// scoped to fast-loop — it does NOT change the global Progn/Let
+/// emission, so non-loop code is byte-for-byte unaffected. Anything not
+/// recognised as float-producing falls back to the normal Word emit and
+/// is discarded.
+#[allow(clippy::too_many_arguments)]
+fn emit_for_effect<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    arity: u32,
+    params: &mut Vec<IntValue<'ctx>>,
+    locals: &mut Vec<IntValue<'ctx>>,
+    e: &Expr,
+) -> Result<(), String> {
+    match e {
+        Expr::Progn(forms) => {
+            for f in forms {
+                emit_for_effect(context, builder, function, helpers, arity, params, locals, f)?;
+            }
+            Ok(())
+        }
+        Expr::Let { bindings, body } => {
+            let saved = locals.len();
+            for binding in bindings {
+                match binding {
+                    Expr::F64LocalStore { .. } => {
+                        emit_expr_repr(
+                            context, builder, function, helpers, arity, params, locals, binding,
+                        )?;
+                        locals.push(context.i64_type().const_int(Word::NIL.raw(), false));
+                    }
+                    _ => {
+                        let v = emit_expr(
+                            context, builder, function, helpers, arity, params, locals, binding,
+                        )?;
+                        locals.push(v);
+                    }
+                }
+            }
+            emit_for_effect(context, builder, function, helpers, arity, params, locals, body)?;
+            locals.truncate(saved);
+            Ok(())
+        }
+        // Float-producing forms: emit via the repr path and drop the
+        // f64 — no box. (An If/cond in statement position falls to the
+        // Word path below and would box a float branch; the common
+        // fast-loop body is straight-line setqs, so this is fine.)
+        Expr::F64LocalStore { .. }
+        | Expr::Float { .. }
+        | Expr::F64LocalRead(_)
+        | Expr::F64ParamRead(_)
+        | Expr::Add(..)
+        | Expr::Sub(..)
+        | Expr::Mul(..) => {
+            emit_expr_repr(context, builder, function, helpers, arity, params, locals, e)?;
+            Ok(())
+        }
+        _ => {
+            emit_expr(context, builder, function, helpers, arity, params, locals, e)?;
+            Ok(())
+        }
+    }
+}
+
 /// Representation-aware expression emitter. Float-typed arms compute on
 /// unboxed `f64` and may return `Repr::F64`; everything else falls
 /// through to `emit_expr` (always a `Word`).
@@ -2549,11 +2620,17 @@ fn emit_expr<'ctx>(
             if forms.is_empty() {
                 return Ok(i64_t.const_int(Word::NIL.raw(), false));
             }
-            let mut last = i64_t.const_int(Word::NIL.raw(), false);
-            for f in forms {
-                last = emit_expr(context, builder, function, helpers, arity, params, locals, f)?;
+            // Non-last forms are evaluated for effect and discarded —
+            // emit them via the repr path so a discarded float result
+            // isn't boxed (a dead ncl_box_float per statement). Only the
+            // last form's value becomes the Progn's (Word) value.
+            for f in &forms[..forms.len() - 1] {
+                emit_expr_repr(context, builder, function, helpers, arity, params, locals, f)?;
             }
-            Ok(last)
+            emit_expr(
+                context, builder, function, helpers, arity, params, locals,
+                forms.last().unwrap(),
+            )
         }
         Expr::Let { bindings, body } => {
             let saved = locals.len();
@@ -3667,7 +3744,9 @@ fn emit_expr<'ctx>(
             builder.position_at_end(body_bb);
             for i in 0..locals.len() { locals[i] = iter_locals[i]; }
             for i in 0..params.len() { params[i] = iter_params[i]; }
-            let _ = emit_expr(
+            // Effect context: the body's value is unused (fast-loop yields
+            // RESULT), so emit it without boxing discarded float stores.
+            emit_for_effect(
                 context, builder, function, helpers, arity, params, locals, body,
             )?;
             let body_end = builder.get_insert_block().unwrap();
