@@ -85,6 +85,17 @@ pub enum Expr {
     /// the let bindings were entered (per nested let scopes), reset
     /// when the let scope exits.
     Local(usize),
+    /// Read an unboxed `f64` local from its dedicated stack slot
+    /// (`slot` is a per-function f64-slot index, distinct from `Local`
+    /// indices). Emitted for a `let` local declared `(double-float ..)`.
+    /// See docs/performance-unbox-float.md Sprint 2.
+    F64LocalRead(usize),
+    /// Store an unboxed `f64` into local slot `slot` (the value is
+    /// coerced to f64) and yield it. The lowered form of a float local's
+    /// `let`-init and of `(setq float-local v)`. Mutation is in-place in
+    /// the stack slot — no heap cons box, so the value stays unboxed
+    /// across a loop.
+    F64LocalStore { slot: usize, value: Box<Expr> },
     /// Sequential evaluation: each form runs, the last one's value
     /// is the result. Empty progn yields `nil` per CL convention.
     Progn(Vec<Expr>),

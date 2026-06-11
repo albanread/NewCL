@@ -73,6 +73,11 @@ pub enum Binding {
     ParamCell(usize),
     /// Let-bound local, boxed for mutation.
     LocalCell(usize),
+    /// Let-bound local declared `double-float` — stored unboxed in a
+    /// dedicated f64 stack slot (the carried index is the f64-slot, not
+    /// a `Local` index). Used for both immutable and (uncaptured)
+    /// mutable float locals. See docs/performance-unbox-float.md Sprint 2.
+    LocalF64(usize),
     /// Closure-captured cell. The captured Word IS the cons; reads
     /// auto-deref, writes go through SetCar.
     ClosureRefCell(usize),
@@ -97,6 +102,12 @@ pub struct LocalEnv {
     fn_bindings: Vec<(Arc<str>, Binding)>,
     local_count: usize,
     closure_count: usize,
+    /// Monotonic per-function counter of unboxed-f64 local slots. NOT
+    /// reset by `restore` — each float local across the whole function
+    /// gets a unique slot (allocas aren't stack-reused, which keeps the
+    /// codegen trivial and avoids aliasing). See docs/performance-
+    /// unbox-float.md Sprint 2.
+    f64_count: usize,
     /// Set when this env is the inner env of a lambda body. Lookups
     /// that miss in `bindings` fall back to here, capturing on hit.
     capture_parent: Option<Box<LocalEnv>>,
@@ -120,6 +131,7 @@ impl LocalEnv {
             fn_bindings: Vec::new(),
             local_count: 0,
             closure_count: 0,
+            f64_count: 0,
             capture_parent: None,
             captures: Vec::new(),
         }
@@ -139,6 +151,7 @@ impl LocalEnv {
             fn_bindings: Vec::new(),
             local_count: 0,
             closure_count: 0,
+            f64_count: 0,
             capture_parent: Some(Box::new(parent)),
             captures: Vec::new(),
         }
@@ -183,6 +196,10 @@ impl LocalEnv {
             // so capture-by-value is sound: snapshot the boxed value
             // (F64ParamRead boxes via coerce in a Word/captures context).
             Binding::ParamF64(i) => (Expr::F64ParamRead(i), Binding::ClosureRef(idx)),
+            // A captured float local is immutable here (mutable ones are
+            // gated away from LocalF64 when the body has a closure), so
+            // snapshot-by-value (the boxed current value) is sound.
+            Binding::LocalF64(slot) => (Expr::F64LocalRead(slot), Binding::ClosureRef(idx)),
             Binding::Local(i) => (Expr::Local(i), Binding::ClosureRef(idx)),
             Binding::ClosureRef(i) => (Expr::ClosureRef(i), Binding::ClosureRef(idx)),
             // Cell variants: capture the cons itself; inner sees a Cell.
@@ -229,6 +246,7 @@ impl LocalEnv {
         let (outer_expr, inner_binding) = match parent_b {
             Binding::Param(i) => (Expr::Param(i), Binding::ClosureRef(idx)),
             Binding::ParamF64(i) => (Expr::F64ParamRead(i), Binding::ClosureRef(idx)),
+            Binding::LocalF64(slot) => (Expr::F64LocalRead(slot), Binding::ClosureRef(idx)),
             Binding::Local(i) => (Expr::Local(i), Binding::ClosureRef(idx)),
             Binding::ClosureRef(i) => (Expr::ClosureRef(i), Binding::ClosureRef(idx)),
             Binding::ParamCell(i) => (Expr::Param(i), Binding::ClosureRefCell(idx)),
@@ -280,6 +298,23 @@ impl LocalEnv {
         }
     }
 
+    /// Allocate a fresh (monotonic, function-global) unboxed-f64 local
+    /// slot index. Not reused across scopes — see `f64_count`.
+    pub fn next_f64_slot(&mut self) -> usize {
+        let s = self.f64_count;
+        self.f64_count += 1;
+        s
+    }
+
+    /// Push a `double-float` let-local bound to f64 slot `slot`. It also
+    /// consumes a `Local`-vec position (the codegen pushes a dummy Word
+    /// there) so the dense `Local(i)` indexing of sibling non-float
+    /// bindings is undisturbed; reads go through `F64LocalRead(slot)`.
+    pub fn push_local_f64(&mut self, name: Arc<str>, slot: usize) {
+        self.bindings.push((name, Binding::LocalF64(slot)));
+        self.local_count += 1;
+    }
+
     /// Promote an existing required-parameter binding `Param(i)` to a
     /// `LocalCell`.  The caller is responsible for inserting a
     /// `(cons Param(i) nil)` init expression into the prologue at the
@@ -326,6 +361,7 @@ fn binding_read(b: Binding) -> Expr {
         Binding::Param(i) => Expr::Param(i),
         Binding::ParamF64(i) => Expr::F64ParamRead(i),
         Binding::Local(i) => Expr::Local(i),
+        Binding::LocalF64(slot) => Expr::F64LocalRead(slot),
         Binding::ClosureRef(i) => Expr::ClosureRef(i),
         Binding::ParamCell(i) => Expr::car(Expr::Param(i)),
         Binding::LocalCell(i) => Expr::car(Expr::Local(i)),
@@ -1088,6 +1124,30 @@ pub fn mutated_in_body(
     out
 }
 
+/// True if any form (recursively) creates a closure — a `lambda`,
+/// `flet`, or `labels`. `#'(lambda …)` is found by recursion through
+/// the `function` form; `#'symbol` is not a closure. Used to gate
+/// unboxing of *mutable* float locals: a mutable float local kept in an
+/// f64 stack slot cannot be shared by reference with a capturing
+/// closure, so when a closure is present we fall back to the boxed
+/// (cons-cell) representation. Immutable float locals are always safe
+/// (captured by value). See docs/performance-unbox-float.md Sprint 2.
+fn form_has_closure(form: &Value) -> bool {
+    let Ok(items) = list_to_vec(form) else { return false };
+    if let Some(Value::Symbol(s)) = items.first() {
+        match &*s.name {
+            "LAMBDA" | "FLET" | "LABELS" => return true,
+            "QUOTE" => return false,
+            _ => {}
+        }
+    }
+    items.iter().any(form_has_closure)
+}
+
+fn body_has_closure(body_forms: &[Value]) -> bool {
+    body_forms.iter().any(form_has_closure)
+}
+
 fn lower_let(
     args: &[Value],
     env: &mut LocalEnv,
@@ -1201,15 +1261,39 @@ fn lower_let(
         .zip(is_special_binding.iter())
         .map(|(n, special)| !special && mutated.contains(n))
         .collect();
-    for (i, b) in needs_box.iter().enumerate() {
-        if *b {
+    // Unboxed-float locals: a binding declared (double-float ..) that is
+    // not special. A *mutable* float local is only unboxed when the body
+    // creates no closure — an f64 stack slot can't be shared by
+    // reference with a capturing lambda, so we fall back to the boxed
+    // cell there. Immutable float locals are always safe (captured by
+    // value). See docs/performance-unbox-float.md Sprint 2.
+    let locally_float = extract_float_names(&decl_specs);
+    let body_closure = !locally_float.is_empty() && body_has_closure(body_forms);
+    let is_float_local: Vec<bool> = binding_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            locally_float.contains(n)
+                && !is_special_binding[i]
+                && !(needs_box[i] && body_closure)
+        })
+        .collect();
+    let mut f64_slots: Vec<Option<usize>> = vec![None; binding_names.len()];
+    for i in 0..binding_names.len() {
+        if is_float_local[i] {
+            // Store the (coerced-to-f64) init into a dedicated f64 slot.
+            let slot = env.next_f64_slot();
+            f64_slots[i] = Some(slot);
+            let init = std::mem::replace(&mut binding_exprs[i], Expr::Nil);
+            binding_exprs[i] = Expr::F64LocalStore { slot, value: Box::new(init) };
+        } else if needs_box[i] {
             // Wrap init in (cons init nil) — the cell representation.
             let init = std::mem::replace(&mut binding_exprs[i], Expr::Nil);
             binding_exprs[i] = Expr::cons(init, Expr::Nil);
         }
     }
 
-    // Extend env with new LEXICAL locals (cell or plain). Special
+    // Extend env with new LEXICAL locals (cell, f64, or plain). Special
     // bindings are NOT added to the lexical env — symbol reads/writes
     // for them fall through to LoadGlobal/StoreGlobal as intended.
     let cp = env.checkpoint();
@@ -1220,6 +1304,8 @@ fn lower_let(
             // add the name to the lexical env. The temp will be
             // passed to DynamicBind as Expr::Local(slot_idx).
             env.push_local(Arc::from("__dyn_temp__"));
+        } else if is_float_local[i] {
+            env.push_local_f64(Arc::clone(name), f64_slots[i].unwrap());
         } else if needs_box[i] {
             env.push_local_cell(Arc::clone(name));
         } else {
@@ -1639,6 +1725,10 @@ fn lower_setq_pair(
         let value = lower_in_mut(value_form, env, coord)?;
         return match b {
             Binding::LocalCell(i) => Ok(Expr::set_car(Expr::Local(i), value)),
+            // Float local: store unboxed into its f64 slot (no cons box).
+            Binding::LocalF64(slot) => {
+                Ok(Expr::F64LocalStore { slot, value: Box::new(value) })
+            }
             Binding::ParamCell(i) => Ok(Expr::set_car(Expr::Param(i), value)),
             Binding::ClosureRefCell(i) => {
                 Ok(Expr::set_car(Expr::ClosureRef(i), value))

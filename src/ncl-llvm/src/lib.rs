@@ -24,7 +24,7 @@ use inkwell::context::Context;
 use inkwell::execution_engine::{ExecutionEngine, JitFunction};
 use inkwell::module::{Linkage, Module};
 use inkwell::attributes::AttributeLoc;
-use inkwell::values::{AsValueRef, FloatValue, FunctionValue, IntValue, PhiValue};
+use inkwell::values::{AsValueRef, FloatValue, FunctionValue, IntValue, PhiValue, PointerValue};
 
 pub(crate) mod jit_mm;
 
@@ -832,6 +832,13 @@ struct Helpers<'ctx> {
     /// boundary helper. Boxes an unboxed double into a heap Float at an
     /// escape. See `docs/performance-unbox-float.md`.
     box_float: FunctionValue<'ctx>,
+    /// Per-function unboxed-f64 local slots (`Expr::F64LocalRead/Store`).
+    /// Lazily `alloca`'d in the entry block on first use, indexed by the
+    /// f64-slot number assigned during lowering. Interior-mutable so it
+    /// threads through the shared `helpers` ref like `tail_loop`, with no
+    /// new `emit_expr` parameter. Fresh per function (Helpers is rebuilt
+    /// per compile). See docs/performance-unbox-float.md Sprint 2.
+    f64_slots: std::cell::RefCell<Vec<Option<PointerValue<'ctx>>>>,
     /// Self-tail-call loop context, set while emitting the body of an
     /// `Expr::TailLoop`. `SelfTailNext` reads it to find the loop
     /// header block to branch back to and the per-parameter phi nodes
@@ -1221,6 +1228,7 @@ fn declare_runtime_helpers<'ctx>(
         dynamic_bind,
         dynamic_unbind,
         box_float,
+        f64_slots: std::cell::RefCell::new(Vec::new()),
         tail_loop: std::cell::RefCell::new(None),
     }
 }
@@ -2328,6 +2336,77 @@ fn emit_cmp_repr<'ctx>(
     )?))
 }
 
+/// Get (lazily allocating in the entry block) the `f64*` stack slot for
+/// an unboxed-float local. Entry-block placement keeps the alloca
+/// `static` so the backend can promote it to a register/phi; allocating
+/// it mid-loop would not promote. The slot is a non-pointer stack cell —
+/// it is never a GC root and never reloaded across a safepoint.
+fn f64_slot_ptr<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    slot: usize,
+) -> Result<PointerValue<'ctx>, String> {
+    {
+        let slots = helpers.f64_slots.borrow();
+        if let Some(Some(p)) = slots.get(slot) {
+            return Ok(*p);
+        }
+    }
+    // Allocate at the start of the entry block, then restore position.
+    let entry = function
+        .get_first_basic_block()
+        .ok_or("function has no entry block")?;
+    let saved = builder.get_insert_block();
+    match entry.get_first_instruction() {
+        Some(first) => builder.position_before(&first),
+        None => builder.position_at_end(entry),
+    }
+    let ptr = builder
+        .build_alloca(context.f64_type(), &format!("f64slot{slot}"))
+        .map_err(|e| format!("alloca f64 slot: {e}"))?;
+    if let Some(b) = saved {
+        builder.position_at_end(b);
+    }
+    let mut slots = helpers.f64_slots.borrow_mut();
+    if slots.len() <= slot {
+        slots.resize(slot + 1, None);
+    }
+    slots[slot] = Some(ptr);
+    Ok(ptr)
+}
+
+/// Emit `value` and coerce it to an unboxed f64 for storing into a
+/// float local. A float expr yields its f64 directly; an integer
+/// *constant* literal is `sitofp`'d (so a float local initialised with
+/// an int literal — `(let ((x 3)) (declare (double-float x)))` — becomes
+/// 3.0 rather than an unchecked unbox of a non-heap fixnum); any other
+/// Word takes the unchecked unbox (the declaration is a promise).
+#[allow(clippy::too_many_arguments)]
+fn emit_f64_store_value<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    arity: u32,
+    params: &mut Vec<IntValue<'ctx>>,
+    locals: &mut Vec<IntValue<'ctx>>,
+    value: &Expr,
+) -> Result<FloatValue<'ctx>, String> {
+    let r = emit_expr_repr(context, builder, function, helpers, arity, params, locals, value)?;
+    match r {
+        Repr::F64 { val, .. } => Ok(val),
+        Repr::Word(w) => {
+            if let Expr::Const(n) = value {
+                Ok(context.f64_type().const_float(*n as f64))
+            } else {
+                coerce_to_f64(context, builder, Repr::Word(w))
+            }
+        }
+    }
+}
+
 /// Representation-aware expression emitter. Float-typed arms compute on
 /// unboxed `f64` and may return `Repr::F64`; everything else falls
 /// through to `emit_expr` (always a `Word`).
@@ -2354,6 +2433,24 @@ fn emit_expr_repr<'ctx>(
                 .get(*idx)
                 .ok_or_else(|| format!("F64ParamRead({idx}) out of range for arity {arity}"))?;
             Ok(Repr::f64(coerce_to_f64(context, builder, Repr::Word(w))?))
+        }
+        Expr::F64LocalRead(slot) => {
+            let ptr = f64_slot_ptr(context, builder, function, helpers, *slot)?;
+            let v = builder
+                .build_load(context.f64_type(), ptr, "f64local")
+                .map_err(|e| format!("load f64 local: {e}"))?
+                .into_float_value();
+            Ok(Repr::f64(v))
+        }
+        Expr::F64LocalStore { slot, value } => {
+            let f = emit_f64_store_value(
+                context, builder, function, helpers, arity, params, locals, value,
+            )?;
+            let ptr = f64_slot_ptr(context, builder, function, helpers, *slot)?;
+            builder
+                .build_store(ptr, f)
+                .map_err(|e| format!("store f64 local: {e}"))?;
+            Ok(Repr::f64(f))
         }
         Expr::Add(a, b) => emit_arith_repr(
             context, builder, function, helpers, arity, params, locals, ArithOp::Add, a, b,
@@ -2440,6 +2537,14 @@ fn emit_expr<'ctx>(
                 .copied()
                 .ok_or_else(|| format!("F64ParamRead({idx}) out of range for arity {arity}"))
         }
+        // Float local in a Word context (read used as a value, or a setq
+        // whose result escapes): compute the f64 then box it.
+        Expr::F64LocalRead(_) | Expr::F64LocalStore { .. } => {
+            let r = emit_expr_repr(
+                context, builder, function, helpers, arity, params, locals, expr,
+            )?;
+            coerce_to_word(builder, function, helpers, r)
+        }
         Expr::Progn(forms) => {
             if forms.is_empty() {
                 return Ok(i64_t.const_int(Word::NIL.raw(), false));
@@ -2456,10 +2561,24 @@ fn emit_expr<'ctx>(
                 // Evaluate in CURRENT locals (outer scope) — let's
                 // parallel-binding semantics. The binding doesn't
                 // see itself or sibling bindings.
-                let v = emit_expr(
-                    context, builder, function, helpers, arity, params, locals, binding,
-                )?;
-                locals.push(v);
+                match binding {
+                    // A float-local init stores into its own f64 slot;
+                    // the locals-vec position is a dummy (reads go via
+                    // F64LocalRead, never Local(i)). Emit via the repr
+                    // path so we do NOT box the value just to discard it.
+                    Expr::F64LocalStore { .. } => {
+                        emit_expr_repr(
+                            context, builder, function, helpers, arity, params, locals, binding,
+                        )?;
+                        locals.push(i64_t.const_int(Word::NIL.raw(), false));
+                    }
+                    _ => {
+                        let v = emit_expr(
+                            context, builder, function, helpers, arity, params, locals, binding,
+                        )?;
+                        locals.push(v);
+                    }
+                }
             }
             let result = emit_expr(
                 context, builder, function, helpers, arity, params, locals, body,

@@ -172,4 +172,22 @@
 ;; an integer arg to an undeclared mate still contaminates correctly
 (chk "fparam-mix-int" (g-scale 2.0 3) 6.0)
 
+;; ── declared double-float locals (Sprint 2) ─────────────────────────
+;; A (declare (double-float ..)) let-local is stored unboxed in an f64
+;; stack slot. Mutable locals captured by a loop-lambda safely fall back
+;; to the boxed representation — still correct, just not unboxed.
+(defun g-floc ()  (let ((x 2.0)) (declare (double-float x)) (* x x)))
+(defun g-floc2 () (let ((a 2.0)) (declare (double-float a))
+                    (let ((b (* a a))) (declare (double-float b)) (+ a b))))
+(defun g-floc-word () (let ((x 1.5)) (declare (double-float x)) (list x)))
+(defun g-floc-int-init () (let ((x 3)) (declare (double-float x)) (* x 2.0)))
+(defun g-facc (n) (let ((acc 0.0) (i 0)) (declare (double-float acc))
+                    (loop (when (>= i n) (return acc))
+                          (setq acc (+ acc 1.0)) (setq i (+ i 1)))))
+(chk "flocal-immut"     (g-floc) 4.0)
+(chk "flocal-nested"    (g-floc2) 6.0)
+(chk "flocal-word-ctx"  (g-floc-word) '(1.5))
+(chk "flocal-int-init"  (g-floc-int-init) 6.0)
+(chk "flocal-loop-acc"  (g-facc 100) 100.0)
+
 (format t "~%GAUNTLET ~A~%" (if (= *fails* 0) "ALL-PASS" (format nil "~A FAILS" *fails*)))

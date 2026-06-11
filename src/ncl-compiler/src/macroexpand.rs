@@ -366,6 +366,15 @@ pub fn macroexpand_all(
     if let Some(head_name) = head_symbol_name(v) {
         match &*head_name {
             "QUOTE" => return Ok(v.clone()),
+            // (declare ...) carries compile-time metadata (type / ignore
+            // / special declarations) that the lowering reads. It must
+            // survive macroexpansion intact — NOT be expanded by the
+            // no-op `declare` macro (which returns nil) — or nested
+            // declares (e.g. inside `let`) would be destroyed before
+            // lower_let sees them. A stray declare that reaches lowering
+            // is neutralised there (DECLARE => nil). See
+            // docs/performance-unbox-float.md Sprint 2.
+            "DECLARE" => return Ok(v.clone()),
             "BACKQUOTE" => {
                 // ` form — desugar to a tree of cons/list/append/
                 // quote, then macroexpand the result (it may contain
