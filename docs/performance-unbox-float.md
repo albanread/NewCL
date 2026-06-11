@@ -414,6 +414,44 @@ unboxes end-to-end and hits the measured ceiling.
 - `Lisp/demos/mandelbrot.lisp`: add declarations (Sprint 3).
 - `bench/bench.lisp`: float kernels.
 
+## 6.5 Implementation findings (Sprints 0–3 landed)
+
+Sprints 0, 1, 3, and 2 are implemented and committed on `perf/unbox-float`
+(behaviour-identical scaffolding; unboxed float **expressions**; unboxed
+declared float **params**; unboxed declared float **locals**). Gates held
+throughout: ANSI 490/56/85, gauntlet `ALL-PASS` (+41 new float checks),
+`ncl-runtime` units green. Two findings materially change §2.4 / §3:
+
+1. **Mutable locals are heap-boxed cons cells, not allocas.** A `setq`
+   target lowers to `Binding::LocalCell` — a 1-cell cons, read via `car`,
+   written via `set-car`. So "emit F64 locals as f64 allocas" is a *new
+   storage class*, not a tweak. Implemented: declared float locals get a
+   dedicated f64 stack slot (`Binding::LocalF64` + `Expr::F64Local{Read,
+   Store}`); immutable always, mutable only when uncaptured (see below).
+
+2. **`(loop …)` expands to `(%native-loop (lambda () …))` — a closure.**
+   This is the decisive one. Loop-carried mutable locals are *captured*
+   by that lambda, so they must stay boxed (an f64 stack slot can't be
+   shared by reference with a separately-compiled lambda). The
+   Mandelbrot inner loop (`zx`/`zy`) is exactly this case. Measured:
+
+   | kernel | undeclared | declared | result |
+   |---|---|---|---|
+   | float-param `dist2` swept in a loop | 405 ms | **232 ms** | **1.75×** |
+   | Mandelbrot grid (loop-carried `zx`/`zy`) | 41 ms | 44 ms | wash |
+
+   The param/expression wins are real (1.75× on float-call-heavy code).
+   But the **82× Mandelbrot ceiling is unreachable while loop carries
+   box** — declaring the loop vars is a wash (boundary unbox/rebox
+   cancels the native-arithmetic savings).
+
+   **Route to the ceiling (not yet done):** f64 phis in `TailLoop` +
+   `SelfTailNext`, and writing the kernel as self-tail-recursive
+   (`zx`/`zy`/`n` become parameters, which lower to register phis with no
+   capturing lambda). This is a further large change to the loop/phi
+   codegen (mixed i64/f64 phis, the join machinery) and a deviation from
+   the `(loop …)`-shaped demo the plan assumed. Tracked as Sprint 3.5.
+
 ## 7. Prior art
 
 The SBCL/CMUCL "representation selection" model: primitive `f64`
