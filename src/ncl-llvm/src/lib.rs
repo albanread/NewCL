@@ -848,6 +848,12 @@ struct Helpers<'ctx> {
     /// adding a parameter to that (already large) function's signature
     /// and all ~40 of its recursive call sites.
     tail_loop: std::cell::RefCell<Option<TailCtx<'ctx>>>,
+    /// Stack of active `Expr::InlineLoop` frames. `Expr::LoopBreak`
+    /// reads the top frame to find the loop's exit block and records its
+    /// (value, predecessor-block) so the exit's result phi can be built.
+    /// A stack handles nesting defensively (inlinable bodies exclude
+    /// nested loops, so in practice it holds at most one frame).
+    inline_loops: std::cell::RefCell<Vec<InlineLoopFrame<'ctx>>>,
 }
 
 /// Loop context published by `Expr::TailLoop` for the `SelfTailNext`
@@ -858,6 +864,15 @@ struct Helpers<'ctx> {
 struct TailCtx<'ctx> {
     loop_header: inkwell::basic_block::BasicBlock<'ctx>,
     param_phis: Vec<PhiValue<'ctx>>,
+}
+
+/// Active `Expr::InlineLoop` context for the `Expr::LoopBreak`s nested
+/// in its body.
+struct InlineLoopFrame<'ctx> {
+    exit_block: inkwell::basic_block::BasicBlock<'ctx>,
+    /// (break value, the block the break branches from) — incomings for
+    /// the exit block's result phi.
+    breaks: Vec<(IntValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)>,
 }
 
 fn declare_runtime_helpers<'ctx>(
@@ -1230,6 +1245,7 @@ fn declare_runtime_helpers<'ctx>(
         box_float,
         f64_slots: std::cell::RefCell::new(Vec::new()),
         tail_loop: std::cell::RefCell::new(None),
+        inline_loops: std::cell::RefCell::new(Vec::new()),
     }
 }
 
@@ -2431,6 +2447,16 @@ fn emit_for_effect<'ctx>(
     match e {
         Expr::Progn(forms) => {
             for f in forms {
+                // A LoopBreak / return mid-Progn terminates the block;
+                // the rest of the forms are unreachable — stop emitting
+                // (emitting into a terminated block is invalid).
+                if builder
+                    .get_insert_block()
+                    .and_then(|b| b.get_terminator())
+                    .is_some()
+                {
+                    break;
+                }
                 emit_for_effect(context, builder, function, helpers, arity, params, locals, f)?;
             }
             Ok(())
@@ -3768,6 +3794,113 @@ fn emit_expr<'ctx>(
                 context, builder, function, helpers, arity, params, locals, result,
             )?;
             Ok(result_val)
+        }
+        Expr::InlineLoop { body } => {
+            // Auto-inlined `(loop …)`: a real back-edge in this function
+            // (no capturing lambda), so loop carries stay unboxed. Same
+            // header-phi scheme as FastLoop; exits via LoopBreak, whose
+            // values feed the exit block's result phi.
+            let preheader = builder.get_insert_block().unwrap();
+            let pre_locals = locals.clone();
+            let pre_params = params.clone();
+            let header = context.append_basic_block(*function, "iloop_header");
+            let exit_bb = context.append_basic_block(*function, "iloop_exit");
+            builder
+                .build_unconditional_branch(header)
+                .map_err(|e| format!("iloop preheader br: {e}"))?;
+
+            builder.position_at_end(header);
+            let mut local_phis: Vec<PhiValue> = Vec::with_capacity(pre_locals.len());
+            for (i, v) in pre_locals.iter().enumerate() {
+                let phi = builder
+                    .build_phi(i64_t, &format!("iloop_l{i}"))
+                    .map_err(|e| format!("iloop local phi: {e}"))?;
+                phi.add_incoming(&[(v, preheader)]);
+                local_phis.push(phi);
+            }
+            let mut param_phis: Vec<PhiValue> = Vec::with_capacity(pre_params.len());
+            for (i, v) in pre_params.iter().enumerate() {
+                let phi = builder
+                    .build_phi(i64_t, &format!("iloop_p{i}"))
+                    .map_err(|e| format!("iloop param phi: {e}"))?;
+                phi.add_incoming(&[(v, preheader)]);
+                param_phis.push(phi);
+            }
+            for (i, phi) in local_phis.iter().enumerate() {
+                locals[i] = phi.as_basic_value().into_int_value();
+            }
+            for (i, phi) in param_phis.iter().enumerate() {
+                params[i] = phi.as_basic_value().into_int_value();
+            }
+
+            // Publish the loop frame so nested LoopBreaks find the exit.
+            helpers.inline_loops.borrow_mut().push(InlineLoopFrame {
+                exit_block: exit_bb,
+                breaks: Vec::new(),
+            });
+            // Body runs for effect (its value is unused; the loop yields
+            // a break value). emit_for_effect avoids boxing discarded
+            // float stores.
+            emit_for_effect(context, builder, function, helpers, arity, params, locals, body)?;
+            // Back-edge — unless the body diverged (e.g. an unconditional
+            // break left the block terminated).
+            if builder
+                .get_insert_block()
+                .and_then(|b| b.get_terminator())
+                .is_none()
+            {
+                let body_end = builder.get_insert_block().unwrap();
+                for (i, phi) in local_phis.iter().enumerate() {
+                    phi.add_incoming(&[(&locals[i], body_end)]);
+                }
+                for (i, phi) in param_phis.iter().enumerate() {
+                    phi.add_incoming(&[(&params[i], body_end)]);
+                }
+                builder
+                    .build_unconditional_branch(header)
+                    .map_err(|e| format!("iloop back-edge br: {e}"))?;
+            }
+
+            let frame = helpers.inline_loops.borrow_mut().pop().unwrap();
+            builder.position_at_end(exit_bb);
+            if frame.breaks.is_empty() {
+                // No break — an infinite loop. The exit is unreachable.
+                builder
+                    .build_unreachable()
+                    .map_err(|e| format!("iloop unreachable: {e}"))?;
+                Ok(i64_t.const_int(Word::NIL.raw(), false))
+            } else {
+                let phi = builder
+                    .build_phi(i64_t, "iloop_result")
+                    .map_err(|e| format!("iloop result phi: {e}"))?;
+                for (v, b) in &frame.breaks {
+                    phi.add_incoming(&[(v, *b)]);
+                }
+                Ok(phi.as_basic_value().into_int_value())
+            }
+        }
+        Expr::LoopBreak { value } => {
+            let v = emit_expr(context, builder, function, helpers, arity, params, locals, value)?;
+            let cur = builder.get_insert_block().unwrap();
+            let exit = {
+                let frames = helpers.inline_loops.borrow();
+                frames
+                    .last()
+                    .ok_or_else(|| "LoopBreak emitted outside an InlineLoop".to_string())?
+                    .exit_block
+            };
+            builder
+                .build_unconditional_branch(exit)
+                .map_err(|e| format!("loopbreak br: {e}"))?;
+            helpers
+                .inline_loops
+                .borrow_mut()
+                .last_mut()
+                .unwrap()
+                .breaks
+                .push((v, cur));
+            // The block is now terminated; this value is never used.
+            Ok(i64_t.const_int(Word::NIL.raw(), false))
         }
         Expr::Call { sym_word, args } => {
             // Evaluate each argument first.

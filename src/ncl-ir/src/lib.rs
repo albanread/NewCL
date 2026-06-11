@@ -288,6 +288,18 @@ pub enum Expr {
         result: Box<Expr>,
         body: Box<Expr>,
     },
+    /// Inline infinite loop with embedded breaks — the lowered form of a
+    /// `(loop …)` the compiler proved safe to inline (body calls no user
+    /// functions and creates no closures; see `native_loop_inlinable`).
+    /// `body` runs forever; a `LoopBreak` exits with a value. Same
+    /// register/unboxed-carry benefit as `FastLoop`, but matches the
+    /// `(loop … (return v) …)` shape. See docs/performance-unbox-float.md.
+    InlineLoop { body: Box<Expr> },
+    /// Break the innermost enclosing `InlineLoop`, yielding `value` —
+    /// the lowered form of `(return v)` (`%loop-return`) inside an
+    /// inlined loop. A direct branch to the loop exit; no flag, no
+    /// ABORT_PENDING.
+    LoopBreak { value: Box<Expr> },
 }
 
 impl Expr {

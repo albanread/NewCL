@@ -108,6 +108,12 @@ pub struct LocalEnv {
     /// codegen trivial and avoids aliasing). See docs/performance-
     /// unbox-float.md Sprint 2.
     f64_count: usize,
+    /// True while lowering the body of a loop the compiler proved safe
+    /// to inline (see `native_loop_inlinable`). In this state a
+    /// `(%loop-return v)` lowers to a direct `Expr::LoopBreak` (branch to
+    /// the inline loop's exit) instead of the flag-based `%loop-return`
+    /// runtime call. Reset to false inside any lambda body (for_lambda).
+    in_inline_loop: bool,
     /// Set when this env is the inner env of a lambda body. Lookups
     /// that miss in `bindings` fall back to here, capturing on hit.
     capture_parent: Option<Box<LocalEnv>>,
@@ -132,6 +138,7 @@ impl LocalEnv {
             local_count: 0,
             closure_count: 0,
             f64_count: 0,
+            in_inline_loop: false,
             capture_parent: None,
             captures: Vec::new(),
         }
@@ -152,6 +159,9 @@ impl LocalEnv {
             local_count: 0,
             closure_count: 0,
             f64_count: 0,
+            // A lambda body is NOT part of any enclosing inline loop —
+            // its (return) targets the lambda's own dynamic loop.
+            in_inline_loop: false,
             capture_parent: Some(Box::new(parent)),
             captures: Vec::new(),
         }
@@ -885,6 +895,30 @@ fn lower_call_in_mut(
         }
         "LET" => lower_let(args, env, coord),
         "FAST-LOOP" => lower_fast_loop(args, env, coord),
+        // Auto-inline a simple `(loop …)` (which macroexpanded to
+        // `(%native-loop (lambda () body))`) when the compiler can prove
+        // it safe — body calls no user functions and creates no closures
+        // (native_loop_inlinable). Then loop carries stay unboxed / in
+        // registers, exactly like `fast-loop`, with no source change. If
+        // the guard fails, control falls through to the ordinary call
+        // lowering (the catch-all), keeping the loop on %native-loop.
+        "%NATIVE-LOOP"
+            if args.len() == 1
+                && native_loop_lambda_body(&args[0])
+                    .map_or(false, |b| native_loop_inlinable(&b, coord)) =>
+        {
+            lower_native_loop_inline(&args[0], env, coord)
+        }
+        // `(return v)` inside an inlined loop body → a direct break.
+        // Outside one, it falls through to the ordinary %loop-return
+        // call (flag-based), preserving its dynamic semantics.
+        "%LOOP-RETURN" if env.in_inline_loop => {
+            let v = match args.first() {
+                Some(a) => lower_in_mut(a, env, coord)?,
+                None => Expr::Nil,
+            };
+            Ok(Expr::LoopBreak { value: Box::new(v) })
+        }
         "FLET" => lower_flet(args, env, coord),
         "LABELS" => lower_labels(args, env, coord),
         // `(values v1 v2 ... vN)` — write all into the multi-value
@@ -1133,20 +1167,138 @@ pub fn mutated_in_body(
 /// closure, so when a closure is present we fall back to the boxed
 /// (cons-cell) representation. Immutable float locals are always safe
 /// (captured by value). See docs/performance-unbox-float.md Sprint 2.
-fn form_has_closure(form: &Value) -> bool {
+fn form_has_closure(form: &Value, coord: &Arc<GcCoordinator>) -> bool {
     let Ok(items) = list_to_vec(form) else { return false };
     if let Some(Value::Symbol(s)) = items.first() {
         match &*s.name {
             "LAMBDA" | "FLET" | "LABELS" => return true,
             "QUOTE" => return false,
+            // (%native-loop (lambda () body…)). When the compiler will
+            // inline this loop (its body calls no user fns / makes no
+            // closures), the lambda evaporates — it is NOT a real
+            // closure, so an enclosing float loop var stays unboxable.
+            // When NOT inlinable, the lambda captures → it is a closure.
+            "%NATIVE-LOOP" => {
+                if let Some(body) = items.get(1).and_then(native_loop_lambda_body) {
+                    if native_loop_inlinable(&body, coord) {
+                        return false;
+                    }
+                }
+                return true;
+            }
             _ => {}
         }
     }
-    items.iter().any(form_has_closure)
+    items.iter().any(|f| form_has_closure(f, coord))
 }
 
-fn body_has_closure(body_forms: &[Value]) -> bool {
-    body_forms.iter().any(form_has_closure)
+fn body_has_closure(body_forms: &[Value], coord: &Arc<GcCoordinator>) -> bool {
+    body_forms.iter().any(|f| form_has_closure(f, coord))
+}
+
+/// Extract the body forms of a `(%native-loop ARG)`'s thunk: ARG must be
+/// `(lambda () body…)` with an empty parameter list. Returns the body
+/// forms, or None if ARG isn't a nullary lambda.
+fn native_loop_lambda_body(arg: &Value) -> Option<Vec<Value>> {
+    let items = list_to_vec(arg).ok()?;
+    match items.first() {
+        Some(Value::Symbol(s)) if &*s.name == "LAMBDA" => {
+            let params_empty = match items.get(1) {
+                Some(Value::Nil) => true,
+                Some(v) => list_to_vec(v).map(|p| p.is_empty()).unwrap_or(false),
+                None => false,
+            };
+            if params_empty { Some(items[2..].to_vec()) } else { None }
+        }
+        _ => None,
+    }
+}
+
+/// Conservatively decide whether a `(loop …)` body (the forms inside its
+/// `(lambda () …)`) is safe to lower as an inline loop. Safe means: no
+/// closure-creating or non-local-control form, and every operator is a
+/// special form or a *native primitive* — NOT a Lisp-compiled user
+/// function. That guarantees the only way out is a *lexical* `(return)`
+/// (lowered to a direct break) and rules out a *dynamic* `%loop-return`
+/// or a signal/return-from that the inline form (which has no lambda
+/// boundary for the ABORT_PENDING unwind to land on) can't model. A
+/// head we don't recognise falls to the conservative default (treat as
+/// a user call → not inlinable). See docs/performance-unbox-float.md.
+fn native_loop_inlinable(body_forms: &[Value], coord: &Arc<GcCoordinator>) -> bool {
+    body_forms.iter().all(|f| form_inline_safe(f, coord))
+}
+
+fn form_inline_safe(form: &Value, coord: &Arc<GcCoordinator>) -> bool {
+    let items = match form {
+        Value::Cons(_) => match list_to_vec(form) {
+            Ok(v) => v,
+            Err(_) => return false, // improper list — bail conservatively
+        },
+        _ => return true, // atom (symbol / number / string / char / nil)
+    };
+    if items.is_empty() {
+        return true; // () == nil
+    }
+    let Value::Symbol(head) = &items[0] else {
+        return false; // computed / ((lambda …) …) head
+    };
+    let h = &*head.name;
+    // Closures, nested loops, and non-local control are never inlinable.
+    const BAD: &[&str] = &[
+        "LAMBDA", "FLET", "LABELS", "FUNCTION",
+        "LOOP", "%NATIVE-LOOP", "DO", "DO*", "DOTIMES", "DOLIST",
+        "BLOCK", "RETURN-FROM", "%NATIVE-BLOCK", "CATCH", "THROW",
+        "UNWIND-PROTECT", "%NATIVE-UNWIND-PROTECT", "HANDLER-CASE",
+        "HANDLER-BIND", "TAGBODY", "GO", "MULTIPLE-VALUE-CALL",
+        "MULTIPLE-VALUE-BIND", "MULTIPLE-VALUE-PROG1",
+    ];
+    if BAD.iter().any(|b| *b == h) {
+        return false;
+    }
+    match h {
+        "QUOTE" => true,   // quoted data — not code
+        "DECLARE" => true, // a no-op type/ignore declaration — not code
+        "THE" => items.get(2).map_or(true, |e| form_inline_safe(e, coord)),
+        "LET" | "LET*" => {
+            let bindings_ok = match items.get(1) {
+                Some(bl) => list_to_vec(bl).map_or(false, |bs| {
+                    bs.iter().all(|b| match b {
+                        Value::Symbol(_) => true,
+                        Value::Cons(_) => list_to_vec(b)
+                            .map_or(false, |p| p.get(1).map_or(true, |i| form_inline_safe(i, coord))),
+                        _ => false,
+                    })
+                }),
+                None => true,
+            };
+            bindings_ok && items[2..].iter().all(|f| form_inline_safe(f, coord))
+        }
+        // Special forms + primitive operators whose arguments are all
+        // ordinary expressions. The arithmetic / comparison / data
+        // operators here are special-cased by `lower_call_in_mut` to
+        // *dedicated* Expr nodes (Add/Mul/Lt/Car/…), never an
+        // `Expr::Call` — so they're inline-safe regardless of whether the
+        // symbol also carries a (Lisp or native) function cell for `#'`.
+        "IF" | "PROGN" | "SETQ" | "SETF" | "WHEN" | "UNLESS" | "AND" | "OR"
+        | "NOT" | "VALUES" | "PROG1" | "PROG2" | "%LOOP-RETURN" | "RETURN"
+        | "PSETQ"
+        | "+" | "-" | "*" | "<" | ">" | "<=" | ">=" | "=" | "/="
+        | "EQ" | "EQL" | "EQUAL" | "CONS" | "LIST" | "CAR" | "CDR"
+        | "FIRST" | "REST" | "NULL" | "CONSP" | "ATOM" | "LISTP"
+        | "LENGTH" | "STRING=" | "CHAR" | "STRING-CHAR" | "AREF" | "SVREF" => {
+            items[1..].iter().all(|f| form_inline_safe(f, coord))
+        }
+        _ => {
+            // Operator application. Safe iff the head is a native
+            // primitive (not a Lisp-compiled user function — those may
+            // (return) dynamically or signal).
+            let sym = coord.intern(&head.name);
+            if call_is_lisp_compiled(sym.raw()) {
+                return false;
+            }
+            items[1..].iter().all(|f| form_inline_safe(f, coord))
+        }
+    }
 }
 
 /// `(fast-loop TEST RESULT BODY...)` — an inline loop with no capturing
@@ -1156,6 +1308,29 @@ fn body_has_closure(body_forms: &[Value]) -> bool {
 /// (which steps the loop variables via `setq`) and repeat. TEST,
 /// RESULT, and BODY are lowered in the current env, so they see the
 /// enclosing `let`'s loop variables. See docs/performance-unbox-float.md.
+/// Lower a `(%native-loop (lambda () body…))` the compiler proved
+/// inlinable (see `native_loop_inlinable`) to an `Expr::InlineLoop`. The
+/// body is lowered IN THE CURRENT ENV (not a fresh lambda env), so loop
+/// variables resolve directly to the enclosing locals — no capture, no
+/// boxing. `in_inline_loop` is set so `(%loop-return v)` lowers to a
+/// direct `LoopBreak`.
+fn lower_native_loop_inline(
+    lambda_arg: &Value,
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
+    let body_forms = native_loop_lambda_body(lambda_arg)
+        .expect("caller's guard ensured a nullary lambda thunk");
+    let saved = env.in_inline_loop;
+    env.in_inline_loop = true;
+    let lowered: Result<Vec<_>, _> = body_forms
+        .iter()
+        .map(|f| lower_in_mut(f, env, coord))
+        .collect();
+    env.in_inline_loop = saved;
+    Ok(Expr::InlineLoop { body: Box::new(Expr::progn(lowered?)) })
+}
+
 fn lower_fast_loop(
     args: &[Value],
     env: &mut LocalEnv,
@@ -1306,7 +1481,7 @@ fn lower_let(
     // cell there. Immutable float locals are always safe (captured by
     // value). See docs/performance-unbox-float.md Sprint 2.
     let locally_float = extract_float_names(&decl_specs);
-    let body_closure = !locally_float.is_empty() && body_has_closure(body_forms);
+    let body_closure = !locally_float.is_empty() && body_has_closure(body_forms, coord);
     let is_float_local: Vec<bool> = binding_names
         .iter()
         .enumerate()
