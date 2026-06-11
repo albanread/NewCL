@@ -57,6 +57,10 @@ pub fn intern_value_symbol(coord: &GcCoordinator, s: &std::sync::Arc<Symbol>) ->
 pub enum Binding {
     /// Function parameter — read from the call's args[idx].
     Param(usize),
+    /// Function parameter declared `double-float` — read unboxed.
+    /// Only assigned to required params that are NOT mutated and NOT
+    /// special. See docs/performance-unbox-float.md Sprint 3.
+    ParamF64(usize),
     /// Let-bound local — read from the emitter's locals stack[idx].
     Local(usize),
     /// Closure reference — read from env[idx] in the current
@@ -175,6 +179,10 @@ impl LocalEnv {
         let idx = self.closure_count;
         let (outer_expr, inner_binding) = match parent_b {
             Binding::Param(i) => (Expr::Param(i), Binding::ClosureRef(idx)),
+            // A float param is immutable (mutated ones aren't ParamF64),
+            // so capture-by-value is sound: snapshot the boxed value
+            // (F64ParamRead boxes via coerce in a Word/captures context).
+            Binding::ParamF64(i) => (Expr::F64ParamRead(i), Binding::ClosureRef(idx)),
             Binding::Local(i) => (Expr::Local(i), Binding::ClosureRef(idx)),
             Binding::ClosureRef(i) => (Expr::ClosureRef(i), Binding::ClosureRef(idx)),
             // Cell variants: capture the cons itself; inner sees a Cell.
@@ -220,6 +228,7 @@ impl LocalEnv {
         let idx = self.closure_count;
         let (outer_expr, inner_binding) = match parent_b {
             Binding::Param(i) => (Expr::Param(i), Binding::ClosureRef(idx)),
+            Binding::ParamF64(i) => (Expr::F64ParamRead(i), Binding::ClosureRef(idx)),
             Binding::Local(i) => (Expr::Local(i), Binding::ClosureRef(idx)),
             Binding::ClosureRef(i) => (Expr::ClosureRef(i), Binding::ClosureRef(idx)),
             Binding::ParamCell(i) => (Expr::Param(i), Binding::ClosureRefCell(idx)),
@@ -254,6 +263,21 @@ impl LocalEnv {
         self.bindings.push((name, Binding::LocalCell(idx)));
         self.local_count += 1;
         idx
+    }
+
+    /// Rebind a required parameter `Param(i)` to `ParamF64(i)` — read
+    /// unboxed. Caller must ensure the param is declared double-float,
+    /// not mutated, and not special. No-op if the name isn't a plain
+    /// `Param` (e.g. already promoted to a cell by mutation analysis).
+    pub fn rebind_as_param_f64(&mut self, name: &str) {
+        for (n, b) in self.bindings.iter_mut().rev() {
+            if &**n == name {
+                if let Binding::Param(i) = *b {
+                    *b = Binding::ParamF64(i);
+                }
+                break;
+            }
+        }
     }
 
     /// Promote an existing required-parameter binding `Param(i)` to a
@@ -300,6 +324,7 @@ impl LocalEnv {
 fn binding_read(b: Binding) -> Expr {
     match b {
         Binding::Param(i) => Expr::Param(i),
+        Binding::ParamF64(i) => Expr::F64ParamRead(i),
         Binding::Local(i) => Expr::Local(i),
         Binding::ClosureRef(i) => Expr::ClosureRef(i),
         Binding::ParamCell(i) => Expr::car(Expr::Param(i)),
@@ -1621,6 +1646,10 @@ fn lower_setq_pair(
             Binding::Param(_) => Err(CompileError::NotImplemented(format!(
                 "setq of function parameter: {name} (mutable parameters not yet supported)"
             ))),
+            Binding::ParamF64(_) => Err(CompileError::NotImplemented(format!(
+                "setq of double-float parameter: {name} (a mutated param is never \
+                 declared-float-unboxed — this is an internal inconsistency)"
+            ))),
             Binding::Local(_) => Err(CompileError::NotImplemented(format!(
                 "internal: non-cell local {name} reached setq path \
                  — mutation analysis missed this binding"
@@ -1880,6 +1909,42 @@ fn extract_special_names(specs: &[Value]) -> HashSet<Arc<str>> {
         if &*head.name != "SPECIAL" { continue; }
         for name_val in rest {
             if let Value::Symbol(s) = name_val {
+                out.insert(Arc::clone(&s.name));
+            }
+        }
+    }
+    out
+}
+
+/// Collect names declared as a float type — `(double-float a b)`,
+/// `(single-float x)` (treated as double — NCL floats are doubles, see
+/// plan §2.7), the supertype `(float …)`, or the `(type <ftype> …)`
+/// long form. Symbols are upcased by the reader, so we match upcase.
+pub fn extract_float_names(specs: &[Value]) -> HashSet<Arc<str>> {
+    fn is_float_type(n: &str) -> bool {
+        matches!(
+            n,
+            "DOUBLE-FLOAT" | "SINGLE-FLOAT" | "LONG-FLOAT" | "SHORT-FLOAT" | "FLOAT"
+        )
+    }
+    let mut out = HashSet::new();
+    for spec in specs {
+        let Ok(items) = list_to_vec(spec) else { continue };
+        let [Value::Symbol(head), rest @ ..] = items.as_slice() else { continue };
+        let names: &[Value] = if &*head.name == "TYPE" {
+            // (type <typespec> name...) — typespec must be a float type.
+            match rest {
+                [Value::Symbol(ty), ns @ ..] if is_float_type(&ty.name) => ns,
+                _ => continue,
+            }
+        } else if is_float_type(&head.name) {
+            // (double-float name...) shorthand declaration.
+            rest
+        } else {
+            continue;
+        };
+        for nv in names {
+            if let Value::Symbol(s) = nv {
                 out.insert(Arc::clone(&s.name));
             }
         }

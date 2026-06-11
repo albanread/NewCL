@@ -497,14 +497,23 @@ pub(crate) fn compile_function_raw(
 ) -> Result<Word, EvalError> {
     let t_lower = startup_timing::now();
 
+    // Capture `(declare ...)` specs from the RAW body, BEFORE
+    // macroexpansion. `declare` is a no-op macro that expands to nil
+    // (core.lisp), so the metadata is destroyed by macroexpand_all —
+    // we must read the leading declares here to honour type
+    // declarations (e.g. (double-float ...)). See
+    // docs/performance-unbox-float.md Sprint 3.
+    let (decl_specs, _) = lower::strip_declares(body_forms);
+
     // First, expand any macros used in the body.
     let mut expanded_body: Vec<Value> = Vec::with_capacity(body_forms.len());
     for form in body_forms {
         expanded_body.push(macroexpand_all(form, coord, mutator)?);
     }
 
-    // Strip leading (declare ...) forms — they're processed at
-    // lowering time and must not be evaluated as function calls.
+    // Strip leading (declare ...) forms — after macroexpansion they are
+    // nil (the declare macro), but strip any that survive to keep the
+    // body clean.
     let (_, effective_body) = lower::strip_declares(&expanded_body);
     let effective_body = effective_body.to_vec();
 
@@ -528,6 +537,23 @@ pub(crate) fn compile_function_raw(
             );
             env.rebind_as_local_cell(pname);
             req_box_prologue.push(cell_init);
+        }
+    }
+
+    // Unboxed-float parameters: a required param declared
+    // `(double-float ...)` that is NOT mutated (mutated ones were just
+    // boxed above) and NOT special is read as a native f64 — the JIT
+    // unboxes the argument once and computes without per-op boxing.
+    // See docs/performance-unbox-float.md Sprint 3.
+    let float_params = lower::extract_float_names(&decl_specs);
+    if !float_params.is_empty() {
+        for pname in &params.required {
+            if float_params.contains(pname.as_ref())
+                && !body_mutations.contains(pname)
+                && !coord.is_special(coord.intern(pname))
+            {
+                env.rebind_as_param_f64(pname);
+            }
         }
     }
 

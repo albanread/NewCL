@@ -152,4 +152,24 @@
 (chk "int-=-stays"        (= 3 3) t)
 (chk "bignum-still-ok"    (* 1000000000000 1000000000000) 1000000000000000000000000)
 
+;; ── declared double-float parameters (Sprint 3) ─────────────────────
+;; Params declared (double-float ...) are read unboxed; arithmetic on
+;; them is native f64 with one box at the escape.
+(defun g-dist2 (x y) (declare (double-float x y)) (+ (* x x) (* y y)))
+(defun g-pid   (x)   (declare (double-float x)) x)
+(defun g-lerp  (a b) (declare (double-float a b)) (+ a (* 0.5 (- b a))))
+(defun g-poly  (x)   (declare (double-float x)) (+ (* x (* x x)) (* 2.0 (* x x)) (* 3.0 x) 4.0))
+(defun g-cmpf  (x y) (declare (double-float x y)) (if (> x y) :x :y))
+;; (type double-float ...) long form, and an undeclared param mixing in.
+(defun g-scale (x k) (declare (type double-float x)) (* x k))
+(chk "fparam-dist2"   (g-dist2 3.0 4.0) 25.0)
+(chk "fparam-pid"     (g-pid 3.5) 3.5)
+(chk "fparam-lerp"    (g-lerp 0.0 10.0) 5.0)
+(chk "fparam-poly"    (g-poly 2.0) 26.0)
+(chk "fparam-cmp"     (g-cmpf 3.0 2.0) :x)
+(chk "fparam-cmp2"    (g-cmpf 1.0 2.0) :y)
+(chk "fparam-type-lf" (g-scale 2.0 3.0) 6.0)
+;; an integer arg to an undeclared mate still contaminates correctly
+(chk "fparam-mix-int" (g-scale 2.0 3) 6.0)
+
 (format t "~%GAUNTLET ~A~%" (if (= *fails* 0) "ALL-PASS" (format nil "~A FAILS" *fails*)))

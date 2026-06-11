@@ -2162,7 +2162,6 @@ fn coerce_to_word<'ctx>(
 /// float param whose entry check is emitted separately in Sprint 3).
 /// Mixed int→float coercion (`sitofp` of an untagged fixnum) is a
 /// *different* path emitted at the arithmetic site, not here.
-#[allow(dead_code)]
 fn coerce_to_f64<'ctx>(
     context: &'ctx Context,
     builder: &Builder<'ctx>,
@@ -2347,6 +2346,15 @@ fn emit_expr_repr<'ctx>(
             val: context.f64_type().const_float(f64::from_bits(*bits)),
             boxed_const: Some(context.i64_type().const_int(*boxed, false)),
         }),
+        // A declared double-float param: unbox the boxed argument to a
+        // native f64 (unchecked — the declaration is a promise). LLVM
+        // CSEs repeated unboxes of the same loop-invariant param.
+        Expr::F64ParamRead(idx) => {
+            let w = *params
+                .get(*idx)
+                .ok_or_else(|| format!("F64ParamRead({idx}) out of range for arity {arity}"))?;
+            Ok(Repr::f64(coerce_to_f64(context, builder, Repr::Word(w))?))
+        }
         Expr::Add(a, b) => emit_arith_repr(
             context, builder, function, helpers, arity, params, locals, ArithOp::Add, a, b,
         ),
@@ -2422,6 +2430,15 @@ fn emit_expr<'ctx>(
                 .get(*idx)
                 .copied()
                 .ok_or_else(|| format!("Param({idx}) out of range for arity {arity}"))
+        }
+        // In a Word context, a float param is just its original boxed
+        // argument Word — no unbox/rebox round-trip. The unboxed f64 is
+        // produced by emit_expr_repr.
+        Expr::F64ParamRead(idx) => {
+            params
+                .get(*idx)
+                .copied()
+                .ok_or_else(|| format!("F64ParamRead({idx}) out of range for arity {arity}"))
         }
         Expr::Progn(forms) => {
             if forms.is_empty() {

@@ -34,6 +34,13 @@ pub enum Expr {
     /// Only valid inside a function body — top-level expressions
     /// don't have parameters and Param is a compile error there.
     Param(usize),
+    /// Read the Nth parameter as an unboxed `f64`. Emitted when the
+    /// parameter is `(declare (double-float ...))`'d. In a float
+    /// context the JIT unboxes the (boxed-float) argument once and
+    /// computes natively; in a Word context it uses the original boxed
+    /// argument. The unbox is unchecked — the declaration is a promise
+    /// (CL `(safety 0)` semantics). See docs/performance-unbox-float.md.
+    F64ParamRead(usize),
     /// `&rest` accessor: build and return a freshly-allocated list
     /// containing args[start..n_args] in order. Used at the entry
     /// of variadic functions to bind the rest parameter. The
