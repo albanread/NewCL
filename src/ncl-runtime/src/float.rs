@@ -55,6 +55,19 @@ pub fn alloc_float_in_static(
     Some(Word::from_ptr(p as *const u8, Tag::Vector))
 }
 
+/// Box a raw `f64` into a heap `Float` Word. The JIT's
+/// `coerce_to_word(F64)` boundary calls this at an *escape* — when an
+/// unboxed double must become a tagged Word (stored into a cons/vector,
+/// returned, passed to a generic call, …). The result is a young-heap
+/// allocation; it is kept alive across any later GC by the conservative
+/// stack pin while it lives in a JIT register, exactly like every other
+/// freshly-allocated intermediate. See `docs/performance-unbox-float.md`.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn ncl_box_float(mutator: *mut MutatorState, value: f64) -> u64 {
+    let m = unsafe { &mut *mutator };
+    alloc_float(m, value).raw()
+}
+
 /// True iff WORD is a heap-allocated float.
 pub fn is_float(w: Word) -> bool {
     if w.tag() != Tag::Vector {
@@ -581,6 +594,40 @@ mod tests {
         assert_eq!(float_to_string(1.5), "1.5");
         // ryu picks shortest representation
         assert_eq!(float_to_string(0.1 + 0.2), "0.30000000000000004");
+    }
+
+    /// Locks the exact heap layout the JIT hardcodes when it inlines
+    /// float unbox/box (`coerce_to_f64` / `coerce_to_word` in
+    /// `ncl-llvm`). If any of these constants move, the JIT codegen must
+    /// change in lockstep. See `docs/performance-unbox-float.md` §2.1.
+    #[test]
+    fn jit_float_layout_contract() {
+        let coord = GcCoordinator::new(small_config());
+        let mut m = coord.register_mutator();
+        let w = alloc_float(&mut m, 1.5);
+
+        // (1) A float Word carries Tag::Vector == 0b011 == 3.
+        assert_eq!(w.raw() & 7, 3, "float Word tag must be Tag::Vector (3)");
+
+        // (2) Clearing the tag bits yields the heap base (cell 0 = the
+        //     header). HeapType::Float == 7 lives in the header's low 5
+        //     bits (TYPE_SHIFT = 0, TYPE_MASK = 31).
+        let base = (w.raw() & !7u64) as *const u64;
+        let header = unsafe { *base };
+        assert_eq!(header & 31, 7, "header low 5 bits must be HeapType::Float (7)");
+
+        // (3) The raw f64 bits live at cell 2 == byte 16.
+        let bits = unsafe { *base.add(2) };
+        assert_eq!(f64::from_bits(bits), 1.5, "f64 payload at cell 2 (byte 16)");
+
+        // (4) ncl_box_float produces the identical layout.
+        let b = ncl_box_float(&mut m as *mut MutatorState, -0.0);
+        assert_eq!(b & 7, 3);
+        let bbase = (b & !7u64) as *const u64;
+        assert_eq!(unsafe { *bbase } & 31, 7);
+        let bbits = unsafe { *bbase.add(2) };
+        // -0.0 round-trips bit-exactly (sign bit preserved).
+        assert!(f64::from_bits(bbits) == 0.0 && f64::from_bits(bbits).is_sign_negative());
     }
 
     #[test]

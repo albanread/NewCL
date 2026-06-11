@@ -24,7 +24,7 @@ use inkwell::context::Context;
 use inkwell::execution_engine::{ExecutionEngine, JitFunction};
 use inkwell::module::{Linkage, Module};
 use inkwell::attributes::AttributeLoc;
-use inkwell::values::{AsValueRef, FunctionValue, IntValue, PhiValue};
+use inkwell::values::{AsValueRef, FloatValue, FunctionValue, IntValue, PhiValue};
 
 pub(crate) mod jit_mm;
 
@@ -470,7 +470,7 @@ fn build_lisp_function(
     // function.get_nth_param(1)) so it always sees the post-GC env.
     let env_param = function.get_nth_param(1).unwrap().into_int_value();
     let mut locals: Vec<IntValue<'_>> = vec![env_param];
-    let result = emit_expr(
+    let result_repr = emit_expr_repr(
         context,
         &builder,
         &function,
@@ -480,6 +480,7 @@ fn build_lisp_function(
         &mut locals,
         body,
     )?;
+    let result = coerce_to_word(&builder, &function, &helpers, result_repr)?;
     // Only emit the return if the current block isn't already
     // terminated. A self-tail-call body whose every tail path loops
     // (e.g. `(if c (f ...) (g ...))` with both arms self-calls) leaves
@@ -744,6 +745,7 @@ fn build_engine_and_get_fn_addr(
         );
         bind(engine, helpers.dynamic_bind, ncl_dynamic_bind as usize);
         bind(engine, helpers.dynamic_unbind, ncl_dynamic_unbind as usize);
+        bind(engine, helpers.box_float, ncl_runtime::float::ncl_box_float as usize);
     }
     // sadd/ssub/smul.with.overflow are LLVM intrinsics — LLVM
     // resolves them itself, no mapping needed.
@@ -826,6 +828,10 @@ struct Helpers<'ctx> {
     /// of the dynamic scope.
     dynamic_bind: FunctionValue<'ctx>,
     dynamic_unbind: FunctionValue<'ctx>,
+    /// `ncl_box_float(mutator, f64) -> Word` — the `coerce_to_word(F64)`
+    /// boundary helper. Boxes an unboxed double into a heap Float at an
+    /// escape. See `docs/performance-unbox-float.md`.
+    box_float: FunctionValue<'ctx>,
     /// Self-tail-call loop context, set while emitting the body of an
     /// `Expr::TailLoop`. `SelfTailNext` reads it to find the loop
     /// header block to branch back to and the per-parameter phi nodes
@@ -1165,6 +1171,17 @@ fn declare_runtime_helpers<'ctx>(
         Some(Linkage::External),
     );
 
+    // ncl_box_float(mutator, f64) -> Word. The f64 arg lands in an XMM
+    // register per the platform C ABI (LLVM + Rust extern "C" agree on
+    // the `(ptr, double) -> i64` signature).
+    let f64_t = context.f64_type();
+    let box_float_type = i64_t.fn_type(&[ptr_t.into(), f64_t.into()], false);
+    let box_float = module.add_function(
+        "ncl_box_float",
+        box_float_type,
+        Some(Linkage::External),
+    );
+
     Helpers {
         alloc_cons,
         push_root,
@@ -1203,6 +1220,7 @@ fn declare_runtime_helpers<'ctx>(
         debug_check_cons,
         dynamic_bind,
         dynamic_unbind,
+        box_float,
         tail_loop: std::cell::RefCell::new(None),
     }
 }
@@ -1264,6 +1282,10 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(
         &helpers.dynamic_unbind,
         ncl_runtime::ncl_dynamic_unbind as *const () as usize,
+    );
+    engine.add_global_mapping(
+        &helpers.box_float,
+        ncl_runtime::float::ncl_box_float as *const () as usize,
     );
     // sadd/ssub/smul.with.overflow are LLVM intrinsics — no
     // global mapping; LLVM resolves them itself.
@@ -2074,6 +2096,108 @@ fn emit_tag_eq<'ctx>(
         .build_int_compare(IntPredicate::EQ, tag_bits, expected, "tag_eq")
         .map_err(|e| format!("icmp: {e}"))?;
     emit_bool_select(builder, cmp, i64_t)
+}
+
+/// The representation of an emitted SSA value. Today everything is a
+/// tagged `Word` (i64). The unboxed-float work (see
+/// `docs/performance-unbox-float.md`) lets float-typed values flow as a
+/// native `f64` in a register and box only at an escape. `emit_expr`
+/// always yields `Word`; `emit_expr_repr` may yield `F64`.
+#[derive(Clone, Copy)]
+enum Repr<'ctx> {
+    /// A tagged NCL Word (i64). The universal representation.
+    Word(IntValue<'ctx>),
+    /// An unboxed IEEE-754 double in a register. Never a GC root.
+    F64(FloatValue<'ctx>),
+}
+
+/// Boundary coercion: an unboxed `F64` flowing into a Word context is
+/// boxed via `ncl_box_float`; a `Word` is the identity. For a
+/// compile-time-constant `F64`, Sprint 1 will fold this back to a
+/// static-area boxed constant (see plan §Sprint 1) instead of a
+/// per-evaluation young-heap box; until a constant `F64` is produced,
+/// the only inputs here are runtime values.
+fn coerce_to_word<'ctx>(
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    r: Repr<'ctx>,
+) -> Result<IntValue<'ctx>, String> {
+    match r {
+        Repr::Word(w) => Ok(w),
+        Repr::F64(f) => {
+            let mutator = function.get_nth_param(0).unwrap();
+            let call = builder
+                .build_call(helpers.box_float, &[mutator.into(), f.into()], "box_float")
+                .map_err(|e| format!("call ncl_box_float: {e}"))?;
+            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+        }
+    }
+}
+
+/// Boundary coercion: an `F64` is the identity; a `Word` is *unboxed*
+/// by reading the f64 bits at cell 2 (byte 16) of the Float heap
+/// object. The Word arm is **unchecked** — valid only where the caller
+/// has proven `w` is a float (both-`F64` arithmetic, or a declared
+/// float param whose entry check is emitted separately in Sprint 3).
+/// Mixed int→float coercion (`sitofp` of an untagged fixnum) is a
+/// *different* path emitted at the arithmetic site, not here.
+#[allow(dead_code)]
+fn coerce_to_f64<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    r: Repr<'ctx>,
+) -> Result<FloatValue<'ctx>, String> {
+    match r {
+        Repr::F64(f) => Ok(f),
+        Repr::Word(w) => {
+            let i64_t = context.i64_type();
+            let ptr_t = context.ptr_type(AddressSpace::default());
+            let f64_t = context.f64_type();
+            // base = w & ~7  (clear the Tag::Vector bits → heap pointer)
+            let mask = i64_t.const_int(!7u64, false);
+            let base_int = builder
+                .build_and(w, mask, "funbox_base")
+                .map_err(|e| format!("and: {e}"))?;
+            let base_ptr = builder
+                .build_int_to_ptr(base_int, ptr_t, "funbox_ptr")
+                .map_err(|e| format!("inttoptr: {e}"))?;
+            // cell 2 (byte 16) holds the raw f64 bits.
+            let two = i64_t.const_int(2, false);
+            let slot = unsafe {
+                builder
+                    .build_in_bounds_gep(i64_t, base_ptr, &[two], "funbox_slot")
+                    .map_err(|e| format!("gep: {e}"))?
+            };
+            let bits = builder
+                .build_load(i64_t, slot, "funbox_bits")
+                .map_err(|e| format!("load: {e}"))?
+                .into_int_value();
+            let f = builder
+                .build_bit_cast(bits, f64_t, "funbox_f64")
+                .map_err(|e| format!("bitcast: {e}"))?
+                .into_float_value();
+            Ok(f)
+        }
+    }
+}
+
+/// Representation-aware expression emitter. Sprint 0: a thin shim over
+/// `emit_expr` — every value is still a `Word`. Sprint 1+ adds
+/// float-aware arms *above* the fallback that may return `Repr::F64`.
+fn emit_expr_repr<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    arity: u32,
+    params: &mut Vec<IntValue<'ctx>>,
+    locals: &mut Vec<IntValue<'ctx>>,
+    expr: &Expr,
+) -> Result<Repr<'ctx>, String> {
+    Ok(Repr::Word(emit_expr(
+        context, builder, function, helpers, arity, params, locals, expr,
+    )?))
 }
 
 fn emit_expr<'ctx>(
