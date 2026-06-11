@@ -445,12 +445,38 @@ throughout: ANSI 490/56/85, gauntlet `ALL-PASS` (+41 new float checks),
    box** — declaring the loop vars is a wash (boundary unbox/rebox
    cancels the native-arithmetic savings).
 
-   **Route to the ceiling (not yet done):** f64 phis in `TailLoop` +
-   `SelfTailNext`, and writing the kernel as self-tail-recursive
-   (`zx`/`zy`/`n` become parameters, which lower to register phis with no
-   capturing lambda). This is a further large change to the loop/phi
-   codegen (mixed i64/f64 phis, the join machinery) and a deviation from
-   the `(loop …)`-shaped demo the plan assumed. Tracked as Sprint 3.5.
+   **Route to the ceiling (DONE — `fast-loop`).** Rather than f64 phis in
+   `TailLoop`, the fix was a new **inline loop construct** that doesn't
+   capture: `(fast-loop TEST RESULT BODY…)` emits a real back-edge in the
+   same function (preheader → header-phis → test → body → back-edge /
+   exit→result). Loop variables live in the enclosing `let`; a declared
+   `double-float` loop var sits in an f64 stack slot *outside* the
+   locals/params root vectors, so it persists across the back-edge with
+   **zero boxing**. The only loop-header phis are for the Word
+   locals/params slots the safepoint wrap may reload mid-iteration
+   (mirrors the `TailLoop` phi pattern). A statement-position
+   `(setq float v)` is emitted through an effect-context emitter
+   (`emit_for_effect`, scoped to the fast-loop body) so it doesn't box a
+   discarded result.
+
+   **Measured (480×360 Mandelbrot, max-iter 100), same pixel sum 3719029:**
+
+   | variant | ms/grid | vs C |
+   |---|---|---|
+   | C / Rust, LLVM **-O2** (apples-to-apples) | ~6.9 | 1× |
+   | NCL `(loop …)` lambda (boxes carries) | 10836 | ~1570× |
+   | NCL `fast-loop`, declared floats | **~60** | **~9×** |
+
+   So `fast-loop` took the Mandelbrot inner loop from ~1570× off the
+   native -O2 floor to ~9× — the unboxed-float work now pays off. The
+   remaining ~9× is per-call/funcall overhead, the integer counter's cons
+   cell, GC safepoint polls, and JIT-O2 vs the ahead-of-time build. A
+   self-tail-recursive form (or `TailLoop` f64 phis) could close more, but
+   `fast-loop` already realizes the headline.
+
+   Note (test harness): the ANSI summary count flickers 56↔57 across
+   runs, but the failing *set* is stable at 55 unique expressions — a
+   pre-existing flaky duplicate-counted case, unrelated to this work.
 
 ## 7. Prior art
 
