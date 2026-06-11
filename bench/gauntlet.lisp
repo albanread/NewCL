@@ -190,4 +190,33 @@
 (chk "flocal-int-init"  (g-floc-int-init) 6.0)
 (chk "flocal-loop-acc"  (g-facc 100) 100.0)
 
+;; ── fast-loop: inline loop, unboxed loop carries (the real lever) ───
+;; (fast-loop TEST RESULT BODY...) — no capturing lambda, so declared
+;; double-float loop variables stay in f64 stack slots across iterations.
+(defun g-countup (n) (let ((i 0)) (fast-loop (>= i n) i (setq i (+ i 1)))))
+(defun g-fl-acc (n) (let ((acc 0.0) (i 0)) (declare (double-float acc))
+                      (fast-loop (>= i n) acc (setq acc (+ acc 2.0)) (setq i (+ i 1)))))
+(defun g-fl-empty () (let ((i 42)) (fast-loop t i)))   ; test true on entry
+(defun g-mbi (cx cy max)
+  (declare (double-float cx cy))
+  (let ((zx 0.0) (zy 0.0) (n 0))
+    (declare (double-float zx zy))
+    (fast-loop (or (>= n max) (> (+ (* zx zx) (* zy zy)) 4.0)) n
+      (let ((nx (+ (- (* zx zx) (* zy zy)) cx)) (ny (+ (* 2.0 (* zx zy)) cy)))
+        (declare (double-float nx ny)) (setq zx nx) (setq zy ny))
+      (setq n (+ n 1)))))
+(chk "floop-countup"   (g-countup 100000) 100000)
+(chk "floop-facc"      (g-fl-acc 50) 100.0)
+(chk "floop-empty"     (g-fl-empty) 42)
+(chk "floop-mbi-inset" (g-mbi 0.0 0.0 100) 100)
+(chk "floop-mbi-esc"   (g-mbi 2.0 2.0 100) 1)
+(chk "floop-mbi-mid"   (g-mbi -0.5 0.0 100) 100)
+;; nested fast-loop + GC churn alongside (cons-allocating loop body)
+(defun g-fl-nested ()
+  (let ((sum 0) (py 0))
+    (fast-loop (>= py 50) sum
+      (let ((px 0)) (fast-loop (>= px 50) nil (setq sum (+ sum 1)) (setq px (+ px 1))))
+      (setq py (+ py 1)))))
+(chk "floop-nested"    (g-fl-nested) 2500)
+
 (format t "~%GAUNTLET ~A~%" (if (= *fails* 0) "ALL-PASS" (format nil "~A FAILS" *fails*)))

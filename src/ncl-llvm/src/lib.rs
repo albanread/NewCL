@@ -3598,6 +3598,98 @@ fn emit_expr<'ctx>(
             // harmless placeholder.
             Ok(i64_t.const_int(Word::NIL.raw(), false))
         }
+        Expr::FastLoop { test, result, body } => {
+            // Inline loop with a real back-edge in THIS function — no
+            // capturing lambda, so loop-carried unboxed-f64 locals (which
+            // live in entry-block allocas, NOT in `locals`/`params`)
+            // persist across iterations with zero boxing. The only values
+            // that need loop-header phis are the Word slots in
+            // `locals`/`params`, which the safepoint wrap may reload mid-
+            // iteration (e.g. a cons cell relocated by a GC). Mirrors the
+            // TailLoop phi pattern, generalised to both vectors.
+            let preheader = builder.get_insert_block().unwrap();
+            let pre_locals = locals.clone();
+            let pre_params = params.clone();
+            let header = context.append_basic_block(*function, "floop_header");
+            let body_bb = context.append_basic_block(*function, "floop_body");
+            let exit_bb = context.append_basic_block(*function, "floop_exit");
+            builder
+                .build_unconditional_branch(header)
+                .map_err(|e| format!("floop preheader br: {e}"))?;
+
+            // Header phis (must be first in the block), seeded from the
+            // preheader; the body's back-edge adds the second incoming.
+            builder.position_at_end(header);
+            let mut local_phis: Vec<PhiValue> = Vec::with_capacity(pre_locals.len());
+            for (i, v) in pre_locals.iter().enumerate() {
+                let phi = builder
+                    .build_phi(i64_t, &format!("floop_l{i}"))
+                    .map_err(|e| format!("floop local phi: {e}"))?;
+                phi.add_incoming(&[(v, preheader)]);
+                local_phis.push(phi);
+            }
+            let mut param_phis: Vec<PhiValue> = Vec::with_capacity(pre_params.len());
+            for (i, v) in pre_params.iter().enumerate() {
+                let phi = builder
+                    .build_phi(i64_t, &format!("floop_p{i}"))
+                    .map_err(|e| format!("floop param phi: {e}"))?;
+                phi.add_incoming(&[(v, preheader)]);
+                param_phis.push(phi);
+            }
+            for (i, phi) in local_phis.iter().enumerate() {
+                locals[i] = phi.as_basic_value().into_int_value();
+            }
+            for (i, phi) in param_phis.iter().enumerate() {
+                params[i] = phi.as_basic_value().into_int_value();
+            }
+
+            // Exit test, evaluated from the loop-header state. Truthy
+            // (non-NIL) ⇒ leave the loop. The test may itself reload
+            // locals/params (if it allocates); the post-test values
+            // dominate both successor blocks, so snapshot them for use in
+            // the body and exit.
+            let test_val = emit_expr(
+                context, builder, function, helpers, arity, params, locals, test,
+            )?;
+            let nil = i64_t.const_int(Word::NIL.raw(), false);
+            let is_true = builder
+                .build_int_compare(IntPredicate::NE, test_val, nil, "floop_test")
+                .map_err(|e| format!("floop test cmp: {e}"))?;
+            let iter_locals = locals.clone();
+            let iter_params = params.clone();
+            builder
+                .build_conditional_branch(is_true, exit_bb, body_bb)
+                .map_err(|e| format!("floop cond br: {e}"))?;
+
+            // Body: step the loop variables (setq → f64-slot store /
+            // set-car), then branch back, feeding the post-body slot
+            // values into the header phis.
+            builder.position_at_end(body_bb);
+            for i in 0..locals.len() { locals[i] = iter_locals[i]; }
+            for i in 0..params.len() { params[i] = iter_params[i]; }
+            let _ = emit_expr(
+                context, builder, function, helpers, arity, params, locals, body,
+            )?;
+            let body_end = builder.get_insert_block().unwrap();
+            for (i, phi) in local_phis.iter().enumerate() {
+                phi.add_incoming(&[(&locals[i], body_end)]);
+            }
+            for (i, phi) in param_phis.iter().enumerate() {
+                phi.add_incoming(&[(&params[i], body_end)]);
+            }
+            builder
+                .build_unconditional_branch(header)
+                .map_err(|e| format!("floop back-edge br: {e}"))?;
+
+            // Exit: yield RESULT, computed from the loop-header state.
+            builder.position_at_end(exit_bb);
+            for i in 0..locals.len() { locals[i] = iter_locals[i]; }
+            for i in 0..params.len() { params[i] = iter_params[i]; }
+            let result_val = emit_expr(
+                context, builder, function, helpers, arity, params, locals, result,
+            )?;
+            Ok(result_val)
+        }
         Expr::Call { sym_word, args } => {
             // Evaluate each argument first.
             let arg_vals: Vec<IntValue> = args

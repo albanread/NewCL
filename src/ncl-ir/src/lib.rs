@@ -275,6 +275,19 @@ pub enum Expr {
     /// "returns" — its block ends in the back-branch — so its result
     /// value is unused (codegen yields NIL as a placeholder).
     SelfTailNext { args: Vec<Expr> },
+    /// Inline loop — the lowered form of `(fast-loop TEST RESULT
+    /// BODY…)`. Semantics: `loop { if TEST → break with RESULT; else
+    /// BODY }`. Unlike `(loop …)` (which expands to a capturing lambda
+    /// and forces every loop-carried variable to be heap-boxed), this
+    /// emits a real back-edge in the SAME function, so loop variables
+    /// stay in registers / unboxed f64 stack slots. Loop variables live
+    /// in the enclosing scope and are stepped by `setq` in BODY. See
+    /// docs/performance-unbox-float.md.
+    FastLoop {
+        test: Box<Expr>,
+        result: Box<Expr>,
+        body: Box<Expr>,
+    },
 }
 
 impl Expr {

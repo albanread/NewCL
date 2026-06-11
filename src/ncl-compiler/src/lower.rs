@@ -884,6 +884,7 @@ fn lower_call_in_mut(
             binary_op(&head_name, args, env, coord, Expr::aref)
         }
         "LET" => lower_let(args, env, coord),
+        "FAST-LOOP" => lower_fast_loop(args, env, coord),
         "FLET" => lower_flet(args, env, coord),
         "LABELS" => lower_labels(args, env, coord),
         // `(values v1 v2 ... vN)` — write all into the multi-value
@@ -1146,6 +1147,43 @@ fn form_has_closure(form: &Value) -> bool {
 
 fn body_has_closure(body_forms: &[Value]) -> bool {
     body_forms.iter().any(form_has_closure)
+}
+
+/// `(fast-loop TEST RESULT BODY...)` — an inline loop with no capturing
+/// lambda, so loop-carried locals (declared `double-float`, or plain
+/// fixnum cells) stay unboxed / in registers across iterations. Each
+/// pass: if TEST is non-nil, stop and yield RESULT; otherwise run BODY
+/// (which steps the loop variables via `setq`) and repeat. TEST,
+/// RESULT, and BODY are lowered in the current env, so they see the
+/// enclosing `let`'s loop variables. See docs/performance-unbox-float.md.
+fn lower_fast_loop(
+    args: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
+    if args.len() < 2 {
+        return Err(CompileError::BadArity {
+            head: "FAST-LOOP".into(),
+            expected: "at least 2 (test result body...)",
+            got: args.len(),
+        });
+    }
+    let test = lower_in_mut(&args[0], env, coord)?;
+    let result = lower_in_mut(&args[1], env, coord)?;
+    let body = if args.len() == 2 {
+        Expr::Nil
+    } else {
+        let lowered: Result<Vec<_>, _> = args[2..]
+            .iter()
+            .map(|f| lower_in_mut(f, env, coord))
+            .collect();
+        Expr::progn(lowered?)
+    };
+    Ok(Expr::FastLoop {
+        test: Box::new(test),
+        result: Box::new(result),
+        body: Box::new(body),
+    })
 }
 
 fn lower_let(
