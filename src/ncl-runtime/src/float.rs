@@ -68,6 +68,29 @@ pub extern "C-unwind" fn ncl_box_float(mutator: *mut MutatorState, value: f64) -
     alloc_float(m, value).raw()
 }
 
+/// Checked slow path for the JIT's `coerce_to_f64(Word)` boundary. The
+/// JIT inlines the fast path (the Word *is* a heap `Float`, read cell 2)
+/// and calls this ONLY when the Word is not a float — e.g. a
+/// `(declare (double-float x))` parameter that received a non-float at
+/// runtime. Coerces any real (fixnum / bignum / ratio → nearest double)
+/// and signals a condition for a non-real, instead of dereferencing a
+/// non-pointer (which segfaults — that was the bug). On the signalled
+/// path it returns NaN; the pending condition is taken at the caller's
+/// next abort check.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn ncl_unbox_float_checked(mutator: *mut MutatorState, w_raw: u64) -> f64 {
+    match to_f64(Word::from_raw(w_raw)) {
+        Some(f) => f,
+        None => {
+            crate::abi::signal_condition_string(
+                mutator,
+                "double-float-declared value is not a real number",
+            );
+            f64::NAN
+        }
+    }
+}
+
 /// True iff WORD is a heap-allocated float.
 pub fn is_float(w: Word) -> bool {
     if w.tag() != Tag::Vector {

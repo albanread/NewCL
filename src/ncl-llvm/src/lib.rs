@@ -750,6 +750,7 @@ fn build_engine_and_get_fn_addr(
         bind(engine, helpers.dynamic_bind, ncl_dynamic_bind as usize);
         bind(engine, helpers.dynamic_unbind, ncl_dynamic_unbind as usize);
         bind(engine, helpers.box_float, ncl_runtime::float::ncl_box_float as usize);
+        bind(engine, helpers.unbox_float_checked, ncl_runtime::float::ncl_unbox_float_checked as usize);
     }
     // sadd/ssub/smul.with.overflow are LLVM intrinsics — LLVM
     // resolves them itself, no mapping needed.
@@ -841,6 +842,11 @@ struct Helpers<'ctx> {
     /// boundary helper. Boxes an unboxed double into a heap Float at an
     /// escape. See `docs/performance-unbox-float.md`.
     box_float: FunctionValue<'ctx>,
+    /// `ncl_unbox_float_checked(mutator, Word) -> f64` — the checked slow
+    /// path of `coerce_to_f64(Word)`. Called when the Word is NOT a heap
+    /// Float (e.g. a non-float arg to a declared double-float param);
+    /// coerces a real or signals, instead of segfaulting.
+    unbox_float_checked: FunctionValue<'ctx>,
     /// Per-function unboxed-f64 local slots (`Expr::F64LocalRead/Store`).
     /// Lazily `alloca`'d in the entry block on first use, indexed by the
     /// f64-slot number assigned during lowering. Interior-mutable so it
@@ -1222,6 +1228,14 @@ fn declare_runtime_helpers<'ctx>(
         Some(Linkage::External),
     );
 
+    // ncl_unbox_float_checked(mutator, Word) -> f64
+    let unbox_float_checked_type = f64_t.fn_type(&[ptr_t.into(), i64_t.into()], false);
+    let unbox_float_checked = module.add_function(
+        "ncl_unbox_float_checked",
+        unbox_float_checked_type,
+        Some(Linkage::External),
+    );
+
     Helpers {
         alloc_cons,
         push_root,
@@ -1265,6 +1279,7 @@ fn declare_runtime_helpers<'ctx>(
         dynamic_bind,
         dynamic_unbind,
         box_float,
+        unbox_float_checked,
         f64_slots: std::cell::RefCell::new(Vec::new()),
         tail_loop: std::cell::RefCell::new(None),
         inline_loops: std::cell::RefCell::new(Vec::new()),
@@ -1336,6 +1351,10 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(
         &helpers.box_float,
         ncl_runtime::float::ncl_box_float as *const () as usize,
+    );
+    engine.add_global_mapping(
+        &helpers.unbox_float_checked,
+        ncl_runtime::float::ncl_unbox_float_checked as *const () as usize,
     );
     // sadd/ssub/smul.with.overflow are LLVM intrinsics — no
     // global mapping; LLVM resolves them itself.
@@ -2400,16 +2419,22 @@ fn coerce_to_word<'ctx>(
     }
 }
 
-/// Boundary coercion: an `F64` is the identity; a `Word` is *unboxed*
-/// by reading the f64 bits at cell 2 (byte 16) of the Float heap
-/// object. The Word arm is **unchecked** — valid only where the caller
-/// has proven `w` is a float (both-`F64` arithmetic, or a declared
-/// float param whose entry check is emitted separately in Sprint 3).
-/// Mixed int→float coercion (`sitofp` of an untagged fixnum) is a
-/// *different* path emitted at the arithmetic site, not here.
+/// Boundary coercion: an `F64` is the identity; a `Word` is *unboxed*.
+/// The Word arm is **checked**: it inlines the fast path (the Word is a
+/// heap `Float` — read the f64 bits at cell 2 / byte 16) guarded by a
+/// type test `(w & 7)==3 (Tag::Vector) && (*(w&!7) & 31)==7
+/// (HeapType::Float)`, and on a miss calls `ncl_unbox_float_checked`
+/// (coerce a real, or signal). This guard is what keeps a non-float
+/// argument to a `(declare (double-float x))` parameter from
+/// dereferencing a non-pointer and segfaulting. The check is
+/// loop-invariant for a fixed param, so LLVM hoists it out of the loop —
+/// the hot path stays a single inlined load. (The bit constants are
+/// locked by `float::jit_float_layout_contract`.)
 fn coerce_to_f64<'ctx>(
     context: &'ctx Context,
     builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
     r: Repr<'ctx>,
 ) -> Result<FloatValue<'ctx>, String> {
     match r {
@@ -2418,30 +2443,65 @@ fn coerce_to_f64<'ctx>(
             let i64_t = context.i64_type();
             let ptr_t = context.ptr_type(AddressSpace::default());
             let f64_t = context.f64_type();
-            // base = w & ~7  (clear the Tag::Vector bits → heap pointer)
-            let mask = i64_t.const_int(!7u64, false);
-            let base_int = builder
-                .build_and(w, mask, "funbox_base")
-                .map_err(|e| format!("and: {e}"))?;
-            let base_ptr = builder
-                .build_int_to_ptr(base_int, ptr_t, "funbox_ptr")
-                .map_err(|e| format!("inttoptr: {e}"))?;
-            // cell 2 (byte 16) holds the raw f64 bits.
-            let two = i64_t.const_int(2, false);
+            let m = |e: inkwell::builder::BuilderError| format!("coerce_to_f64: {e}");
+
+            // is_float fast-path gate: (w & 7) == 3 (Tag::Vector).
+            let tag = builder.build_and(w, i64_t.const_int(7, false), "cf_tag").map_err(m)?;
+            let is_vec = builder
+                .build_int_compare(IntPredicate::EQ, tag, i64_t.const_int(0b011, false), "cf_isvec")
+                .map_err(m)?;
+
+            let hdr_bb = context.append_basic_block(*function, "cf_hdr");
+            let fast_bb = context.append_basic_block(*function, "cf_fast");
+            let slow_bb = context.append_basic_block(*function, "cf_slow");
+            let cont_bb = context.append_basic_block(*function, "cf_cont");
+
+            builder.build_conditional_branch(is_vec, hdr_bb, slow_bb).map_err(m)?;
+
+            // hdr_bb: it's a Vector — confirm header type == HeapType::Float (7).
+            builder.position_at_end(hdr_bb);
+            let base_int = builder.build_and(w, i64_t.const_int(!7u64, false), "cf_base").map_err(m)?;
+            let base_ptr = builder.build_int_to_ptr(base_int, ptr_t, "cf_ptr").map_err(m)?;
+            let hdr = builder
+                .build_load(i64_t, base_ptr, "cf_hdrw")
+                .map_err(m)?
+                .into_int_value();
+            let ty = builder.build_and(hdr, i64_t.const_int(0b11111, false), "cf_ty").map_err(m)?;
+            let is_f = builder
+                .build_int_compare(IntPredicate::EQ, ty, i64_t.const_int(7, false), "cf_isf")
+                .map_err(m)?;
+            builder.build_conditional_branch(is_f, fast_bb, slow_bb).map_err(m)?;
+
+            // fast_bb: inline unbox — load cell 2 (byte 16) as a double.
+            builder.position_at_end(fast_bb);
             let slot = unsafe {
                 builder
-                    .build_in_bounds_gep(i64_t, base_ptr, &[two], "funbox_slot")
-                    .map_err(|e| format!("gep: {e}"))?
+                    .build_in_bounds_gep(i64_t, base_ptr, &[i64_t.const_int(2, false)], "cf_slot")
+                    .map_err(m)?
             };
-            let bits = builder
-                .build_load(i64_t, slot, "funbox_bits")
-                .map_err(|e| format!("load: {e}"))?
-                .into_int_value();
-            let f = builder
-                .build_bit_cast(bits, f64_t, "funbox_f64")
-                .map_err(|e| format!("bitcast: {e}"))?
+            let fast_f = builder
+                .build_load(f64_t, slot, "cf_f")
+                .map_err(m)?
                 .into_float_value();
-            Ok(f)
+            let fast_end = builder.get_insert_block().unwrap();
+            builder.build_unconditional_branch(cont_bb).map_err(m)?;
+
+            // slow_bb: not a float — coerce-a-real-or-signal (no segfault).
+            builder.position_at_end(slow_bb);
+            let mutator = function.get_nth_param(0).unwrap();
+            let slow_f = builder
+                .build_call(helpers.unbox_float_checked, &[mutator.into(), w.into()], "cf_chk")
+                .map_err(m)?
+                .try_as_basic_value()
+                .unwrap_basic()
+                .into_float_value();
+            let slow_end = builder.get_insert_block().unwrap();
+            builder.build_unconditional_branch(cont_bb).map_err(m)?;
+
+            builder.position_at_end(cont_bb);
+            let phi = builder.build_phi(f64_t, "cf_phi").map_err(m)?;
+            phi.add_incoming(&[(&fast_f, fast_end), (&slow_f, slow_end)]);
+            Ok(phi.as_basic_value().into_float_value())
         }
     }
 }
@@ -2638,7 +2698,7 @@ fn emit_f64_store_value<'ctx>(
             if let Expr::Const(n) = value {
                 Ok(context.f64_type().const_float(*n as f64))
             } else {
-                coerce_to_f64(context, builder, Repr::Word(w))
+                coerce_to_f64(context, builder, function, helpers, Repr::Word(w))
             }
         }
     }
@@ -2750,7 +2810,7 @@ fn emit_expr_repr<'ctx>(
             let w = *params
                 .get(*idx)
                 .ok_or_else(|| format!("F64ParamRead({idx}) out of range for arity {arity}"))?;
-            Ok(Repr::f64(coerce_to_f64(context, builder, Repr::Word(w))?))
+            Ok(Repr::f64(coerce_to_f64(context, builder, function, helpers, Repr::Word(w))?))
         }
         Expr::F64LocalRead(slot) => {
             let ptr = f64_slot_ptr(context, builder, function, helpers, *slot)?;
