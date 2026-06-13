@@ -2459,7 +2459,7 @@ fn lower_lambda(
     // lowering time, not evaluated as calls. Locally-declared
     // specials inside a lambda body are handled by the (let ...)
     // forms within; we just need to not trip on the bare DECLARE.
-    let (_decl_specs, body_forms) = strip_declares(all_body_forms);
+    let (decl_specs, body_forms) = strip_declares(all_body_forms);
 
     // Inner env starts with required params at Param(0..N) and a
     // capture parent that begins as a clone of `outer_env`. The
@@ -2493,6 +2493,24 @@ fn lower_lambda(
             let cell_init = Expr::cons(Expr::Param(i), Expr::Nil);
             inner_env.rebind_as_local_cell(name);
             req_box_prologue.push(cell_init);
+        }
+    }
+
+    // Unboxed-float parameters: a required param declared `(double-float
+    // ..)` that is not mutated (mutated ones were boxed above) and not
+    // special is read as a native f64 — same as `defun`'s float handling.
+    // Previously lambda bodies discarded their declares, so a float-typed
+    // lambda never unboxed its params or enabled loop auto-inlining.
+    let float_params = extract_float_names(&decl_specs);
+    if !float_params.is_empty() {
+        inner_env.mark_float_decl();
+        for pname in &params.required {
+            if float_params.contains(pname.as_ref())
+                && !body_mutations.contains(pname)
+                && !coord.is_special(coord.intern(pname))
+            {
+                inner_env.rebind_as_param_f64(pname);
+            }
         }
     }
 
