@@ -1288,12 +1288,42 @@ fn form_inline_safe(form: &Value, coord: &Arc<GcCoordinator>) -> bool {
         "DECLARE" => true, // a no-op type/ignore declaration — not code
         "THE" => items.get(2).map_or(true, |e| form_inline_safe(e, coord)),
         "LET" | "LET*" => {
+            // A binding with a COMPUTED (cons) initialiser that is NOT
+            // declared `double-float` would box its (possibly f64) result
+            // into a Word local *every iteration* — and a per-iteration
+            // heap box inside an inlined loop is the corruption source
+            // (an undeclared float temp register-resident at a GC isn't
+            // precisely rooted). Refuse to inline such a loop; it falls
+            // back to the ordinary boxed loop macro, which is correct
+            // (just slower). Atom/literal inits (e.g. `(n 0)`, `(x y)`)
+            // allocate nothing per iteration, and a computed init that IS
+            // declared double-float lands in an unboxed f64 slot — both
+            // stay inlinable + fast. See docs/performance-unbox-float.md.
+            let float_names = match items.get(2..) {
+                Some(body) => {
+                    let (decl_specs, _) = strip_declares(body);
+                    extract_float_names(&decl_specs)
+                }
+                None => Default::default(),
+            };
             let bindings_ok = match items.get(1) {
                 Some(bl) => list_to_vec(bl).map_or(false, |bs| {
                     bs.iter().all(|b| match b {
                         Value::Symbol(_) => true,
-                        Value::Cons(_) => list_to_vec(b)
-                            .map_or(false, |p| p.get(1).map_or(true, |i| form_inline_safe(i, coord))),
+                        Value::Cons(_) => list_to_vec(b).map_or(false, |pair| {
+                            let name_ok = matches!(pair.first(), Some(Value::Symbol(_)));
+                            let computed_ok = match (pair.first(), pair.get(1)) {
+                                // computed init → must be declared float
+                                (Some(Value::Symbol(s)), Some(Value::Cons(_))) => {
+                                    float_names.contains(&s.name)
+                                }
+                                // atom/literal init or `(name)` → no float box
+                                _ => true,
+                            };
+                            let init_ok =
+                                pair.get(1).map_or(true, |i| form_inline_safe(i, coord));
+                            name_ok && computed_ok && init_ok
+                        }),
                         _ => false,
                     })
                 }),
