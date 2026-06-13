@@ -1299,10 +1299,10 @@ fn form_inline_safe(form: &Value, coord: &Arc<GcCoordinator>) -> bool {
             // allocate nothing per iteration, and a computed init that IS
             // declared double-float lands in an unboxed f64 slot — both
             // stay inlinable + fast. See docs/performance-unbox-float.md.
-            let float_names = match items.get(2..) {
+            let (float_names, special_names) = match items.get(2..) {
                 Some(body) => {
                     let (decl_specs, _) = strip_declares(body);
-                    extract_float_names(&decl_specs)
+                    (extract_float_names(&decl_specs), extract_special_names(&decl_specs))
                 }
                 None => Default::default(),
             };
@@ -1313,9 +1313,19 @@ fn form_inline_safe(form: &Value, coord: &Arc<GcCoordinator>) -> bool {
                         Value::Cons(_) => list_to_vec(b).map_or(false, |pair| {
                             let name_ok = matches!(pair.first(), Some(Value::Symbol(_)));
                             let computed_ok = match (pair.first(), pair.get(1)) {
-                                // computed init → must be declared float
+                                // A computed init is only box-free (and thus
+                                // inline-loop-safe) when it lands in an
+                                // unboxed f64 slot: declared double-float AND
+                                // NOT special. `lower_let` boxes a special
+                                // binding's init under dynamic-bind even when
+                                // declared float (`is_float_local` requires
+                                // `!is_special`), so a special+double-float
+                                // computed init would box per iteration — the
+                                // exact corruption hazard this gate forbids.
                                 (Some(Value::Symbol(s)), Some(Value::Cons(_))) => {
                                     float_names.contains(&s.name)
+                                        && !special_names.contains(&s.name)
+                                        && !coord.is_special(coord.intern(&s.name))
                                 }
                                 // atom/literal init or `(name)` → no float box
                                 _ => true,

@@ -27,7 +27,7 @@ pub const FLOAT_PAYLOAD_CELLS: u32 = 2;
 
 /// Allocate a float on the young heap.
 pub fn alloc_float(m: &mut MutatorState, value: f64) -> Word {
-    let marker = m.coord().intern("%FLOAT");
+    let marker = m.coord().marker_float();
     let w = m.alloc_typed_vector(HeapType::Float, FLOAT_PAYLOAD_CELLS);
     let p = w.as_mut_ptr::<u64>(Tag::Vector).expect("just-allocated vector");
     unsafe {

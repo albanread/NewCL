@@ -205,6 +205,18 @@ pub struct GcCoordinator {
     /// lexical local or a dynamic rebind of the symbol's value cell.
     specials: Mutex<HashSet<u64>>,
 
+    /// Cached interned marker symbols for the boxed numeric types
+    /// (`%FLOAT`, `%RATIO`, `%BIGNUM`, `%COMPLEX`). Every box stamps its
+    /// marker into cell 1; re-interning it through the global
+    /// `intern_table` Mutex+hash on *every* allocation serialised the
+    /// numeric-box hot path (worst on floats). Filled once on first use —
+    /// the symbol lives forever in the static area, so the raw bits stay
+    /// valid for the process lifetime — then read lock-free.
+    marker_float: std::sync::OnceLock<u64>,
+    marker_ratio: std::sync::OnceLock<u64>,
+    marker_bignum: std::sync::OnceLock<u64>,
+    marker_complex: std::sync::OnceLock<u64>,
+
     /// Cumulative GC counters. All atomics so the trigger thread
     /// can publish updates without anyone else's lock. Exposed to
     /// Lisp via `(gc-stats)`.
@@ -321,6 +333,10 @@ impl GcCoordinator {
             intern_table: Mutex::new(HashMap::new()),
             macros: Mutex::new(HashMap::new()),
             specials: Mutex::new(HashSet::new()),
+            marker_float: std::sync::OnceLock::new(),
+            marker_ratio: std::sync::OnceLock::new(),
+            marker_bignum: std::sync::OnceLock::new(),
+            marker_complex: std::sync::OnceLock::new(),
             stats: GcStats::default(),
         });
         // Hand the coordinator to the crash-report builder so an
@@ -395,6 +411,28 @@ impl GcCoordinator {
         crate::sym_names::register(sym.raw(), Arc::clone(&key));
         table.insert(key, sym.raw());
         sym
+    }
+
+    /// Cached `%FLOAT` marker — interned once, then a lock-free read.
+    /// Replaces a per-allocation `intern("%FLOAT")` (global Mutex+hash).
+    #[inline]
+    pub fn marker_float(&self) -> Word {
+        Word::from_raw(*self.marker_float.get_or_init(|| self.intern("%FLOAT").raw()))
+    }
+    /// Cached `%RATIO` marker. See [`marker_float`](Self::marker_float).
+    #[inline]
+    pub fn marker_ratio(&self) -> Word {
+        Word::from_raw(*self.marker_ratio.get_or_init(|| self.intern("%RATIO").raw()))
+    }
+    /// Cached `%BIGNUM` marker. See [`marker_float`](Self::marker_float).
+    #[inline]
+    pub fn marker_bignum(&self) -> Word {
+        Word::from_raw(*self.marker_bignum.get_or_init(|| self.intern("%BIGNUM").raw()))
+    }
+    /// Cached `%COMPLEX` marker. See [`marker_float`](Self::marker_float).
+    #[inline]
+    pub fn marker_complex(&self) -> Word {
+        Word::from_raw(*self.marker_complex.get_or_init(|| self.intern("%COMPLEX").raw()))
     }
 
     /// Look up an interned symbol by name without allocating. Returns

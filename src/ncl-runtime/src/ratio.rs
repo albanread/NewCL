@@ -96,7 +96,7 @@ pub fn bigrational_to_word(m: &mut MutatorState, q: &BigRational) -> Word {
 fn alloc_ratio_raw(m: &mut MutatorState, num: &BigInt, den: &BigInt) -> Word {
     let num_w = bigint_to_word(m, num);
     let den_w = bigint_to_word(m, den);
-    let marker = m.coord().intern("%RATIO");
+    let marker = m.coord().marker_ratio();
     let w = m.alloc_typed_vector(HeapType::Ratio, RATIO_PAYLOAD_CELLS);
     let p = w.as_mut_ptr::<u64>(Tag::Vector).expect("just-allocated vector");
     unsafe {

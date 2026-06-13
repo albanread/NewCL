@@ -38,7 +38,7 @@ fn alloc_bignum_raw(m: &mut MutatorState, sign: i8, limbs: &[u64]) -> Word {
     debug_assert!(*limbs.last().unwrap() != 0);
 
     let total_cells = BIGNUM_HEADER_CELLS + limbs.len();
-    let bignum_marker = m.coord().intern("%BIGNUM");
+    let bignum_marker = m.coord().marker_bignum();
 
     // alloc_vector_with_header writes the heap header and returns a
     // Vector-tagged Word; we then fill in the rest of the cells.
