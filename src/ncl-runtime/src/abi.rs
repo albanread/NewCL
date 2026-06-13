@@ -1764,7 +1764,9 @@ pub extern "C-unwind" fn lt_shim(
     }
     let a = unsafe { *args };
     let b = unsafe { *args.add(1) };
-    if crate::ratio::ncl_cmp_full(a, b) < 0 {
+    if !crate::float::cmp_unordered(Word::from_raw(a), Word::from_raw(b))
+        && crate::ratio::ncl_cmp_full(a, b) < 0
+    {
         Word::T.raw()
     } else {
         Word::NIL.raw()
@@ -1783,7 +1785,9 @@ pub extern "C-unwind" fn gt_shim(
     }
     let a = unsafe { *args };
     let b = unsafe { *args.add(1) };
-    if crate::ratio::ncl_cmp_full(a, b) > 0 {
+    if !crate::float::cmp_unordered(Word::from_raw(a), Word::from_raw(b))
+        && crate::ratio::ncl_cmp_full(a, b) > 0
+    {
         Word::T.raw()
     } else {
         Word::NIL.raw()
@@ -1802,7 +1806,9 @@ pub extern "C-unwind" fn le_shim(
     }
     let a = unsafe { *args };
     let b = unsafe { *args.add(1) };
-    if crate::ratio::ncl_cmp_full(a, b) <= 0 {
+    if !crate::float::cmp_unordered(Word::from_raw(a), Word::from_raw(b))
+        && crate::ratio::ncl_cmp_full(a, b) <= 0
+    {
         Word::T.raw()
     } else {
         Word::NIL.raw()
@@ -1821,7 +1827,9 @@ pub extern "C-unwind" fn ge_shim(
     }
     let a = unsafe { *args };
     let b = unsafe { *args.add(1) };
-    if crate::ratio::ncl_cmp_full(a, b) >= 0 {
+    if !crate::float::cmp_unordered(Word::from_raw(a), Word::from_raw(b))
+        && crate::ratio::ncl_cmp_full(a, b) >= 0
+    {
         Word::T.raw()
     } else {
         Word::NIL.raw()
@@ -1841,7 +1849,9 @@ pub extern "C-unwind" fn num_eq_shim(
     }
     let a = unsafe { *args };
     let b = unsafe { *args.add(1) };
-    if crate::ratio::ncl_cmp_full(a, b) == 0 {
+    if !crate::float::cmp_unordered(Word::from_raw(a), Word::from_raw(b))
+        && crate::ratio::ncl_cmp_full(a, b) == 0
+    {
         Word::T.raw()
     } else {
         Word::NIL.raw()
@@ -1863,7 +1873,9 @@ pub extern "C-unwind" fn num_ne_shim(
     }
     let a = unsafe { *args };
     let b = unsafe { *args.add(1) };
-    if crate::ratio::ncl_cmp_full(a, b) != 0 {
+    if crate::float::cmp_unordered(Word::from_raw(a), Word::from_raw(b))
+        || crate::ratio::ncl_cmp_full(a, b) != 0
+    {
         Word::T.raw()
     } else {
         Word::NIL.raw()

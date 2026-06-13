@@ -3037,22 +3037,31 @@ fn chainable_cmp(
             lower_in_mut(&args[1], env, coord)?,
         )),
         _ => {
-            // Lower all args, then chain pairwise comparisons with AND.
-            let lowered: Result<Vec<_>, _> = args
+            // Evaluate each operand exactly once, left-to-right, into a
+            // fresh temp, then chain pairwise comparisons over the temps.
+            // Cloning the lowered Exprs into adjacent comparisons would
+            // emit every interior operand TWICE and double-run its side
+            // effects — e.g. `(= (incf x) (incf y) (incf z))` must bump
+            // each place once. (Same single-temp discipline as `lower_or`.)
+            let lowered: Vec<Expr> = args
                 .iter()
                 .map(|a| lower_in_mut(a, env, coord))
+                .collect::<Result<_, _>>()?;
+            let cp = env.checkpoint();
+            let idxs: Vec<usize> = (0..lowered.len())
+                .map(|_| env.push_local(std::sync::Arc::from("__cmp_tmp__")))
                 .collect();
-            let lowered = lowered?;
-            let mut pairs = Vec::new();
-            for i in 0..lowered.len() - 1 {
-                pairs.push(build(lowered[i].clone(), lowered[i + 1].clone()));
+            let mut pairs = Vec::with_capacity(idxs.len() - 1);
+            for w in idxs.windows(2) {
+                pairs.push(build(Expr::Local(w[0]), Expr::Local(w[1])));
             }
-            // Chain with nested if (short-circuit AND semantics)
+            env.restore(cp);
+            // Chain with nested if (short-circuit AND semantics).
             let mut result = pairs.pop().unwrap();
             while let Some(p) = pairs.pop() {
                 result = Expr::if_(p, result, Expr::Nil);
             }
-            Ok(result)
+            Ok(Expr::let_(lowered, result))
         }
     }
 }

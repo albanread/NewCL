@@ -304,6 +304,35 @@ pub extern "C-unwind" fn ncl_cmp_real(a_raw: u64, b_raw: u64) -> i64 {
     crate::bignum::ncl_cmp_int(a_raw, b_raw)
 }
 
+/// True iff comparing A and B is IEEE-*unordered* — at least one operand
+/// is a float NaN. CL's number comparisons (`<`, `>`, `<=`, `>=`, `=`)
+/// must all return NIL when an operand is NaN, and `/=` must return T.
+///
+/// `ncl_cmp_real`/`ncl_cmp_full` collapse the unordered case to 0
+/// ("equal") because they return a 3-way ordering, and `eql`/`equal`
+/// rely on that tower compare. So we detect the unordered case
+/// *separately* at the comparison-predicate sites (the abi.rs shims and
+/// the JIT's `ncl_num_cmp`) rather than perturbing the shared compare.
+pub fn cmp_unordered(a: Word, b: Word) -> bool {
+    (is_float(a) && float_value(a).is_nan()) || (is_float(b) && float_value(b).is_nan())
+}
+
+/// Numeric-tower comparison for the JIT's inlined `<`/`>`/`<=`/`>=`/`=`
+/// slow path. Identical to `ncl_cmp_full` for ordered operands; returns
+/// the sentinel `i64::MIN` when the comparison is IEEE-unordered (a NaN
+/// operand). The JIT maps that sentinel to "false" for every ordered
+/// predicate (see `emit_cmp_vals`). `eql`/`equal`/`equalp` keep calling
+/// `ncl_cmp_full` directly and are unaffected.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn ncl_num_cmp(a_raw: u64, b_raw: u64) -> i64 {
+    let a = Word::from_raw(a_raw);
+    let b = Word::from_raw(b_raw);
+    if cmp_unordered(a, b) {
+        return i64::MIN;
+    }
+    crate::ratio::ncl_cmp_full(a_raw, b_raw)
+}
+
 // ─── Lisp-callable shims ─────────────────────────────────────────────────
 
 /// `(/ a b)` — Lisp-callable shim wrapping the full-lattice

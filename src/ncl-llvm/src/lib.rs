@@ -34,7 +34,7 @@ use ncl_runtime::{
         ncl_truncate_promote, ncl_rem_promote,
     },
     complex::{ncl_add_complex, ncl_sub_complex, ncl_mul_complex},
-    ratio::ncl_cmp_full,
+    float::ncl_num_cmp,
     ncl_abort_pending, ncl_alloc_cons, ncl_apply, ncl_aref_generic, ncl_aset_generic,
     ncl_build_rest_list, ncl_call, ncl_dynamic_bind, ncl_dynamic_unbind, ncl_equal, ncl_funcall,
     ncl_length, ncl_load_function, ncl_load_value, ncl_lookup_keyword,
@@ -741,7 +741,7 @@ fn build_engine_and_get_fn_addr(
         bind(engine, helpers.logior_promote, ncl_runtime::bignum::ncl_logior_promote as usize);
         bind(engine, helpers.logxor_promote, ncl_runtime::bignum::ncl_logxor_promote as usize);
         bind(engine, helpers.ash_promote, ncl_runtime::bignum::ncl_ash_promote as usize);
-        bind(engine, helpers.cmp_int, ncl_cmp_full as usize);
+        bind(engine, helpers.cmp_int, ncl_num_cmp as usize);
         bind(
             engine,
             helpers.debug_check_cons,
@@ -1335,7 +1335,7 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(&helpers.logior_promote, ncl_runtime::bignum::ncl_logior_promote as *const () as usize);
     engine.add_global_mapping(&helpers.logxor_promote, ncl_runtime::bignum::ncl_logxor_promote as *const () as usize);
     engine.add_global_mapping(&helpers.ash_promote, ncl_runtime::bignum::ncl_ash_promote as *const () as usize);
-    engine.add_global_mapping(&helpers.cmp_int, ncl_cmp_full as *const () as usize);
+    engine.add_global_mapping(&helpers.cmp_int, ncl_num_cmp as *const () as usize);
     engine.add_global_mapping(
         &helpers.debug_check_cons,
         ncl_runtime::ncl_debug_check_cons as *const () as usize,
@@ -2318,6 +2318,18 @@ fn emit_cmp_vals<'ctx>(
     let slow_cmp = builder
         .build_int_compare(pred, cmp_result, zero, "cmp_slow")
         .map_err(|e| format!("icmp slow: {e}"))?;
+    // IEEE-unordered guard: ncl_num_cmp returns i64::MIN when a NaN
+    // operand makes the comparison unordered, and every ordered predicate
+    // (<,>,<=,>=,=) must then be false. (`/=` is shim-only and never
+    // reaches this inline path.) For ordinary -1/0/+1 results this is a
+    // no-op AND with `true`. See `ncl_num_cmp` in float.rs.
+    let i64_min = i64_t.const_int(i64::MIN as u64, false);
+    let ordered = builder
+        .build_int_compare(IntPredicate::NE, cmp_result, i64_min, "cmp_ordered")
+        .map_err(|e| format!("icmp ordered: {e}"))?;
+    let slow_cmp = builder
+        .build_and(slow_cmp, ordered, "cmp_slow_ord")
+        .map_err(|e| format!("and ordered: {e}"))?;
     let slow_result = emit_bool_select(builder, slow_cmp, i64_t)?;
     builder
         .build_unconditional_branch(join_block)
@@ -2596,10 +2608,10 @@ fn emit_arith_repr<'ctx>(
 /// Numeric comparison with the float fast path. Native *ordered* `fcmp`
 /// (IEEE semantics: NaN compares `false`, so `(= nan nan)` ⇒ NIL) when
 /// at least one operand is float-typed and both reduce to f64; otherwise
-/// the tagged-fixnum / numeric-tower compare on Words. NOTE: the boxed
-/// path (`ncl_cmp_full`/`ncl_cmp_real`) currently treats NaN as "equal";
-/// the native path here is IEEE-ordered. See plan §2.6a — the
-/// float-arith suite pins the native behaviour.
+/// the tagged-fixnum / numeric-tower compare on Words. The boxed path
+/// routes through `ncl_num_cmp`, which returns the `i64::MIN` unordered
+/// sentinel for a NaN operand; `emit_cmp_vals` maps that to "false" for
+/// every ordered predicate, so the boxed path is now IEEE-ordered too.
 #[allow(clippy::too_many_arguments)]
 fn emit_cmp_repr<'ctx>(
     context: &'ctx Context,
@@ -4167,6 +4179,22 @@ fn emit_expr<'ctx>(
 
             let frame = helpers.inline_loops.borrow_mut().pop().unwrap();
             builder.position_at_end(exit_bb);
+            // Reset the local/param slots to their loop-header phi values
+            // (which dominate exit_bb — the exit is reached only via breaks
+            // inside the body, all dominated by the header). Without this,
+            // the slots still hold body-latch SSA values that do NOT
+            // dominate the exit, so any code after the loop that reads them
+            // is an invalid-IR miscompile (e.g. publishing garbage as a GC
+            // root). FastLoop resets identically at its exit. NOTE: this is
+            // the breaking iteration's *start* value; loops should surface
+            // results via `(return x)` (captured precisely by the result
+            // phi below), not by reading mutated loop variables afterwards.
+            for (i, phi) in local_phis.iter().enumerate() {
+                locals[i] = phi.as_basic_value().into_int_value();
+            }
+            for (i, phi) in param_phis.iter().enumerate() {
+                params[i] = phi.as_basic_value().into_int_value();
+            }
             if frame.breaks.is_empty() {
                 // No break — an infinite loop. The exit is unreachable.
                 builder
