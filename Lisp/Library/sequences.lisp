@@ -134,11 +134,19 @@
          (%seq-foreach (lambda (x) (setq out (cons x out))) s))
        (reverse out)))
     ((eq result-type 'string)
-     ;; Build via format ~A on each char.
-     (let ((out ""))
-       (dolist (s seqs)
-         (%seq-foreach (lambda (c) (setq out (string-append-char out c))) s))
-       out))
+     ;; Two-pass: size the result once (sum of input lengths), then fill
+     ;; by index. The old `string-append-char` accumulator rebuilt the
+     ;; whole string every char — O(n^2). make-string + (setf char) is O(n).
+     (let ((total 0))
+       (dolist (s seqs) (setq total (+ total (length s))))
+       (let ((out (make-string total))
+             (i 0))
+         (dolist (s seqs)
+           (%seq-foreach (lambda (c)
+                           (setf (char out i) c)
+                           (setq i (+ i 1)))
+                         s))
+         out)))
     ((eq result-type 'vector)
      (let ((total 0))
        (dolist (s seqs) (setq total (+ total (length s))))
@@ -163,21 +171,36 @@
      NIL       → discard results, return NIL (side-effect form)
 
    Stops at the shortest input."
-  (let* ((lengths (mapcar (lambda (s) (length s)) seqs))
-         (n (cond ((null lengths) 0)
-                  (t (%list-min lengths))))
-         (out nil))
-    (let ((i 0))
-      (loop
-        (cond
-          ((>= i n) (return nil))
-          (t
-           (let ((args (mapcar (lambda (s) (elt s i)) seqs)))
-             (let ((r (apply fn args)))
-               (cond
-                 ((null result-type) nil)
-                 (t (setq out (cons r out))))))
-           (setq i (+ i 1))))))
+  (let ((out
+          (if (and seqs (every (lambda (s) (listp s)) seqs))
+              ;; All-lists fast path: walk parallel cons cursors (O(total
+              ;; elements)). The general path's `(elt s i)` is O(i) on a
+              ;; list, making map O(m*n^2); here each step is car/cdr.
+              ;; Stops at the shortest input (some cursor reaches nil).
+              (let ((cursors seqs)
+                    (acc nil))
+                (loop
+                  (cond
+                    ((some (lambda (c) (null c)) cursors) (return acc))
+                    (t
+                     (let ((r (apply fn (mapcar (lambda (c) (car c)) cursors))))
+                       (cond ((null result-type) nil)
+                             (t (setq acc (cons r acc)))))
+                     (setq cursors (mapcar (lambda (c) (cdr c)) cursors))))))
+              ;; Vector / mixed path: elt is O(1) on vectors/strings.
+              (let* ((lengths (mapcar (lambda (s) (length s)) seqs))
+                     (n (cond ((null lengths) 0)
+                              (t (%list-min lengths))))
+                     (acc nil)
+                     (i 0))
+                (loop
+                  (cond
+                    ((>= i n) (return acc))
+                    (t
+                     (let ((r (apply fn (mapcar (lambda (s) (elt s i)) seqs))))
+                       (cond ((null result-type) nil)
+                             (t (setq acc (cons r acc)))))
+                     (setq i (+ i 1)))))))))
     (cond
       ((null result-type) nil)
       ((eq result-type 'list)   (reverse out))
@@ -190,10 +213,13 @@
            (setq i (+ i 1)))
          v))
       ((eq result-type 'string)
-       (let ((s "")
-             (rev (reverse out)))
+       ;; O(n) two-pass build (was string-append-char → O(n^2)).
+       (let* ((rev (reverse out))
+              (s (make-string (length rev)))
+              (i 0))
          (dolist (c rev)
-           (setq s (string-append-char s c)))
+           (setf (char s i) c)
+           (setq i (+ i 1)))
          s))
       (t (error "map: unsupported result-type ~A" result-type)))))
 
@@ -214,22 +240,49 @@
    first element is the seed; with it, INITIAL-VALUE is the
    seed and every element is folded in."
   (declare (ignore from-end))   ; right-fold deferred
-  (let* ((real-end (cond ((null end) (length seq)) (t end)))
-         (i start)
-         (acc (cond
-                ((eq initial-value %reduce-no-init)
-                 (cond
-                   ((>= start real-end)
-                    (error "reduce: empty sequence and no :initial-value"))
-                   (t (let ((v (funcall key (elt seq start))))
-                        (setq i (+ start 1))
-                        v))))
-                (t initial-value))))
-    (loop
-      (cond
-        ((>= i real-end) (return acc))
-        (t (setq acc (funcall fn acc (funcall key (elt seq i))))
-           (setq i (+ i 1)))))))
+  (cond
+    ((listp seq)
+     ;; List fast path: walk the spine with a moving cursor so element
+     ;; access is O(1) per step instead of O(i) via `elt` — which made
+     ;; the whole fold O(n^2) on lists. Honours :start (skip via nthcdr)
+     ;; and :end (index limit); :key applied per element; identical seed
+     ;; semantics to the vector path below.
+     (let* ((cur (nthcdr start seq))
+            (idx start)
+            (acc (cond
+                   ((eq initial-value %reduce-no-init)
+                    (cond
+                      ((or (null cur) (and end (>= start end)))
+                       (error "reduce: empty sequence and no :initial-value"))
+                      (t (let ((v (funcall key (car cur))))
+                           (setq cur (cdr cur))
+                           (setq idx (+ idx 1))
+                           v))))
+                   (t initial-value))))
+       (loop
+         (cond
+           ((or (null cur) (and end (>= idx end))) (return acc))
+           (t (setq acc (funcall fn acc (funcall key (car cur))))
+              (setq cur (cdr cur))
+              (setq idx (+ idx 1)))))))
+    (t
+     ;; Vector / string: elt is O(1).
+     (let* ((real-end (cond ((null end) (length seq)) (t end)))
+            (i start)
+            (acc (cond
+                   ((eq initial-value %reduce-no-init)
+                    (cond
+                      ((>= start real-end)
+                       (error "reduce: empty sequence and no :initial-value"))
+                      (t (let ((v (funcall key (elt seq start))))
+                           (setq i (+ start 1))
+                           v))))
+                   (t initial-value))))
+       (loop
+         (cond
+           ((>= i real-end) (return acc))
+           (t (setq acc (funcall fn acc (funcall key (elt seq i))))
+              (setq i (+ i 1)))))))))
 
 ;; ── Search / position / find / count (generic) ──────────────────────────
 
@@ -333,13 +386,22 @@
            (t (setq acc (cons (car lst) acc))
               (setq lst (cdr lst)))))))
     ((stringp seq)
-     (let ((out ""))
+     ;; Two-pass: count kept, allocate, fill — string-append-char was O(n^2).
+     (let ((kept 0))
        (%seq-foreach
         (lambda (c)
           (unless (funcall test item (funcall key c))
-            (setq out (string-append-char out c))))
+            (setq kept (+ kept 1))))
         seq)
-       out))
+       (let ((out (make-string kept))
+             (i 0))
+         (%seq-foreach
+          (lambda (c)
+            (unless (funcall test item (funcall key c))
+              (setf (char out i) c)
+              (setq i (+ i 1))))
+          seq)
+         out)))
     ((vectorp seq)
      ;; Two-pass: count kept, allocate, fill.
      (let ((kept 0))
@@ -383,15 +445,16 @@
         seq)
        (reverse out)))
     ((stringp seq)
-     (let ((out ""))
+     ;; Length is preserved → size once and fill by index (was O(n^2)).
+     (let* ((out (make-string (length seq)))
+            (i 0))
        (%seq-foreach
         (lambda (c)
-          (setq out (string-append-char out
-                                        (cond
-                                          ((funcall test old-item
-                                                    (funcall key c))
-                                           new-item)
-                                          (t c)))))
+          (setf (char out i)
+                (cond
+                  ((funcall test old-item (funcall key c)) new-item)
+                  (t c)))
+          (setq i (+ i 1)))
         seq)
        out))
     ((vectorp seq)
@@ -437,33 +500,52 @@
    between SEQ1 and SEQ2, or NIL if they're equal up to the
    shorter one's length. The mismatch position is in SEQ1's
    indexing scheme."
-  (let* ((n1 (length seq1))
-         (n2 (length seq2))
-         (n  (cond ((< n1 n2) n1) (t n2)))
-         (i 0)
-         (result nil)
-         (done nil))
-    (loop
-      (cond
-        (done (return result))
-        ((>= i n)
-         ;; Walked through the shorter; if lengths differ, mismatch
-         ;; is at index n (one past the shorter end). Else nil.
-         (setq result (cond ((= n1 n2) nil) (t n)))
-         (setq done t))
-        (t (cond
-             ((funcall test
-                       (funcall key (elt seq1 i))
-                       (funcall key (elt seq2 i)))
-              (setq i (+ i 1)))
-             (t (setq result i)
-                (setq done t))))))))
+  (if (and (listp seq1) (listp seq2))
+      ;; Both lists: walk cursors (O(min n)) — paired `elt` was O(n^2).
+      ;; Same result: index of first differing element; if one is a strict
+      ;; prefix of the other, the index one past the shorter; else nil.
+      (let ((c1 seq1) (c2 seq2) (i 0) (result nil) (done nil))
+        (loop
+          (cond
+            (done (return result))
+            ((and (null c1) (null c2)) (setq done t))             ; equal → nil
+            ((or (null c1) (null c2)) (setq result i) (setq done t))
+            ((funcall test (funcall key (car c1)) (funcall key (car c2)))
+             (setq c1 (cdr c1)) (setq c2 (cdr c2)) (setq i (+ i 1)))
+            (t (setq result i) (setq done t)))))
+      (let* ((n1 (length seq1))
+             (n2 (length seq2))
+             (n  (cond ((< n1 n2) n1) (t n2)))
+             (i 0)
+             (result nil)
+             (done nil))
+        (loop
+          (cond
+            (done (return result))
+            ((>= i n)
+             ;; Walked through the shorter; if lengths differ, mismatch
+             ;; is at index n (one past the shorter end). Else nil.
+             (setq result (cond ((= n1 n2) nil) (t n)))
+             (setq done t))
+            (t (cond
+                 ((funcall test
+                           (funcall key (elt seq1 i))
+                           (funcall key (elt seq2 i)))
+                  (setq i (+ i 1)))
+                 (t (setq result i)
+                    (setq done t)))))))))
 
 (defun search (sub-seq seq &key (test #'eql) (key #'identity))
   "Return the index in SEQ of the first occurrence of SUB-SEQ,
    or NIL if absent. O(n*m) — naive scan, sufficient for the
    typical short-needle case."
-  (let* ((nsub (length sub-seq))
+  ;; Coerce list operands to vectors once so the inner index reads are
+  ;; O(1). A list `elt` inside the nested scan made search O(n^2*m);
+  ;; vector indices match the original list indices, so the result is
+  ;; identical.
+  (let ((sub-seq (cond ((listp sub-seq) (coerce sub-seq 'vector)) (t sub-seq)))
+        (seq (cond ((listp seq) (coerce seq 'vector)) (t seq))))
+   (let* ((nsub (length sub-seq))
          (nseq (length seq))
          (limit (- nseq nsub))
          (start 0)
@@ -489,7 +571,7 @@
                     (t (setq j (+ j 1)))))
                 (cond
                   (ok (setq result start) (setq done t))
-                  (t (setq start (+ start 1))))))))))))
+                  (t (setq start (+ start 1)))))))))))))
 
 ;; ── fill / replace ──────────────────────────────────────────────────────
 
