@@ -3330,6 +3330,18 @@ fn emit_expr<'ctx>(
             let idx = N.fetch_add(1, Ordering::Relaxed);
             let lam_name = format!("lambda_{idx}");
             let code_addr = build_lisp_function(&lam_name, body, *lam_arity)?;
+            // No-capture lambda → a constant closure. Allocate its Function
+            // record ONCE, now (compile time), in the non-moving static area
+            // and embed it as an IR constant — eliding the per-evaluation
+            // ncl_make_closure heap allocation entirely. Falls through to the
+            // runtime path if no coordinator is installed / static exhausted.
+            if captures.is_empty() {
+                if let Some(w) = ncl_runtime::gc_function::alloc_no_capture_closure_static(
+                    code_addr, *lam_arity,
+                ) {
+                    return Ok(i64_t.const_int(w, false));
+                }
+            }
             // 2. Evaluate each capture expression in CURRENT scope.
             let cap_vals: Vec<IntValue> = captures
                 .iter()
