@@ -212,13 +212,25 @@
 ;; for example. The implementations below desugar each candidate
 ;; check to (funcall test item (funcall key elem)).
 
+;; Fixed-arity tail-recursive helper for the common (eql, identity) case.
+;; Self-tail-call elimination turns this into a tight loop — no per-element
+;; funcall, no &key re-parse — WITHOUT needing the LOOP macro, which isn't
+;; defined this early in the bootstrap.
+(defun %member-eql (item lst)
+  (cond ((null lst) nil)
+        ((eql item (car lst)) lst)
+        (t (%member-eql item (cdr lst)))))
+
 (defun member (item lst &key (test #'eql) (key #'identity))
   "Return the tail of LST starting at the first ELEM where
    (funcall TEST ITEM (funcall KEY ELEM)) is true, or NIL."
-  (cond
-    ((null lst) nil)
-    ((funcall test item (funcall key (car lst))) lst)
-    (t (member item (cdr lst) :test test :key key))))
+  ;; Fast path: default (eql test, identity key) — ~40x SBCL before this.
+  (if (and (eq test #'eql) (eq key #'identity))
+      (%member-eql item lst)
+      (cond
+        ((null lst) nil)
+        ((funcall test item (funcall key (car lst))) lst)
+        (t (member item (cdr lst) :test test :key key)))))
 
 (defun find (item lst &key (test #'eql) (key #'identity))
   "Return the first element of LST that matches ITEM under TEST
@@ -238,16 +250,28 @@
     ((funcall test item (funcall key (car lst))) i)
     (t (%position-from item (cdr lst) (+ i 1) test key))))
 
+;; Fixed-arity tail-recursive helper (see %member-eql) — self-tail-call
+;; elimination compiles this to a tight loop with no per-element funcall.
+(defun %assoc-eql (item alist)
+  (cond ((null alist) nil)
+        ((eql item (car (car alist))) (car alist))
+        (t (%assoc-eql item (cdr alist)))))
+
 (defun assoc (item alist &key (test #'eql) (key #'identity))
   "Walk ALIST; return the first entry whose CAR matches ITEM
    under TEST (with KEY applied to the entry's car). Default
    TEST is eql to match CL — earlier this was equal because we
    didn't have keyword args; callers that relied on equal should
    pass `:test #'equal`."
-  (cond
-    ((null alist) nil)
-    ((funcall test item (funcall key (car (car alist)))) (car alist))
-    (t (assoc item (cdr alist) :test test :key key))))
+  ;; Fast path: the overwhelmingly common (eql test, identity key) case.
+  ;; assoc was ~44x SBCL before this; it is the dominant cost in
+  ;; symbol/alist-heavy code (unification, property lists, …).
+  (if (and (eq test #'eql) (eq key #'identity))
+      (%assoc-eql item alist)
+      (cond
+        ((null alist) nil)
+        ((funcall test item (funcall key (car (car alist)))) (car alist))
+        (t (assoc item (cdr alist) :test test :key key)))))
 
 ;; -- nth, nthcdr, last -------------------------------------------------------
 

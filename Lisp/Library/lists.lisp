@@ -237,9 +237,13 @@
   "Return LIST unchanged if (funcall test (funcall key item)
    (funcall key element)) is true for some element. Otherwise
    return (cons item list)."
-  (if (member (funcall key item) list :key key :test test)
-      list
-      (cons item list)))
+  ;; Fast path: default (eql test, identity key) reuses member's fast path,
+  ;; dropping the (funcall key item) + keyword marshalling of the general case.
+  (if (and (eq test #'eql) (eq key #'identity))
+      (if (member item list) list (cons item list))
+      (if (member (funcall key item) list :key key :test test)
+          list
+          (cons item list))))
 
 (defmacro pushnew (item place &rest keyword-args)
   "Push ITEM onto PLACE (a generalized variable holding a list) only

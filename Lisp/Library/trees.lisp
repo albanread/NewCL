@@ -132,19 +132,34 @@
    same way SUBST does; at each node, looks up the node (or its
    key) in ALIST under TEST. Hit → return the cdr of the matching
    pair; miss → recurse."
-  (when test-not (setq test (complement test-not)))
-  (let ((match (if key
-                   (assoc (funcall key tree) alist :test test)
-                   (assoc tree alist :test test))))
-    (cond
-      (match (cdr match))
-      ((consp tree)
-       (let ((a (sublis alist (car tree) :key key :test test))
-             (d (sublis alist (cdr tree) :key key :test test)))
-         (if (and (eql a (car tree)) (eql d (cdr tree)))
-             tree
-             (cons a d))))
-      (t tree))))
+  ;; Fast path: eql test, no key, no test-not. Recurse without re-marshalling
+  ;; &key on every node, and let the (now fast) eql/identity assoc do the
+  ;; lookup. Structure sharing preserved exactly as the general body.
+  (if (and (eq test #'eql) (null key) (null test-not))
+      (let ((match (assoc tree alist)))
+        (cond
+          (match (cdr match))
+          ((consp tree)
+           (let ((a (sublis alist (car tree)))
+                 (d (sublis alist (cdr tree))))
+             (if (and (eql a (car tree)) (eql d (cdr tree)))
+                 tree
+                 (cons a d))))
+          (t tree)))
+      (progn
+        (when test-not (setq test (complement test-not)))
+        (let ((match (if key
+                         (assoc (funcall key tree) alist :test test)
+                         (assoc tree alist :test test))))
+          (cond
+            (match (cdr match))
+            ((consp tree)
+             (let ((a (sublis alist (car tree) :key key :test test))
+                   (d (sublis alist (cdr tree) :key key :test test)))
+               (if (and (eql a (car tree)) (eql d (cdr tree)))
+                   tree
+                   (cons a d))))
+            (t tree))))))
 
 ;; ── tree-equal ──────────────────────────────────────────────────────────
 
