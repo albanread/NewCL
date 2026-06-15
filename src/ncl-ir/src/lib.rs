@@ -314,6 +314,14 @@ pub enum Expr {
     /// inlined loop. A direct branch to the loop exit; no flag, no
     /// ABORT_PENDING.
     LoopBreak { value: Box<Expr> },
+    /// Representation-inference marker: `inner` is *proven* (by the
+    /// `optimize` type-inference pass) to evaluate to a heap double-float.
+    /// Semantically transparent — `(the-float e)` ≡ `e` — but it tells
+    /// codegen it may unbox without the runtime tag-check diamond:
+    /// `emit_expr_repr` reads the f64 payload at cell 2 directly. Inserted
+    /// ONLY where the type is statically proven, so the unchecked load is
+    /// safe. See docs/compiler_completion.md (Slice 1).
+    TheFloat(Box<Expr>),
 }
 
 impl Expr {

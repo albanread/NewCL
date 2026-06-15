@@ -20,6 +20,7 @@ use new_asm;
 
 pub mod lower;
 pub mod macroexpand;
+mod optimize;
 
 thread_local! {
     /// Pointer to the active Session for this thread. Set by
@@ -626,6 +627,17 @@ pub(crate) fn compile_function_raw(
     // always exactly the function's actual return values when
     // the caller reads it. See lower::instrument_tail_for_mv.
     let body_expr = lower::instrument_tail_for_mv(body_expr);
+
+    // Lisp-aware representation inference: prove which values are
+    // double-floats and wrap their reads so emit unboxes them without the
+    // tag-check diamond. Runs last so it sees the final tree emit will see.
+    // Opt out with NCL_NO_INFER=1 for A/B comparison. See optimize.rs +
+    // docs/compiler_completion.md.
+    let body_expr = if std::env::var_os("NCL_NO_INFER").is_some() {
+        body_expr
+    } else {
+        optimize::infer_float_unboxing(body_expr)
+    };
 
     let lower_elapsed = startup_timing::elapsed(t_lower);
     let t_jit = startup_timing::now();

@@ -2842,6 +2842,42 @@ fn emit_expr_repr<'ctx>(
                 .map_err(|e| format!("store f64 local: {e}"))?;
             Ok(Repr::f64(f))
         }
+        // Representation-inference marker: the optimize pass proved `inner`
+        // is a heap double-float, so unbox WITHOUT the coerce_to_f64
+        // tag-check diamond — read the f64 payload at cell 2 directly.
+        // (Already-unboxed inner is returned as-is.) See optimize.rs.
+        Expr::TheFloat(inner) => {
+            let r = emit_expr_repr(
+                context, builder, function, helpers, arity, params, locals, inner,
+            )?;
+            match r {
+                Repr::F64 { .. } => Ok(r),
+                Repr::Word(w) => {
+                    let i64_t = context.i64_type();
+                    let ptr_t = context.ptr_type(AddressSpace::default());
+                    let f64_t = context.f64_type();
+                    let m = |e: inkwell::builder::BuilderError| format!("the_float: {e}");
+                    let base_int = builder
+                        .build_and(w, i64_t.const_int(!7u64, false), "tf_base")
+                        .map_err(m)?;
+                    let base_ptr = builder
+                        .build_int_to_ptr(base_int, ptr_t, "tf_ptr")
+                        .map_err(m)?;
+                    let slot = unsafe {
+                        builder
+                            .build_in_bounds_gep(
+                                i64_t, base_ptr, &[i64_t.const_int(2, false)], "tf_slot",
+                            )
+                            .map_err(m)?
+                    };
+                    let f = builder
+                        .build_load(f64_t, slot, "tf_f")
+                        .map_err(m)?
+                        .into_float_value();
+                    Ok(Repr::f64(f))
+                }
+            }
+        }
         Expr::Add(a, b) => emit_arith_repr(
             context, builder, function, helpers, arity, params, locals, ArithOp::Add, a, b,
         ),
@@ -2896,6 +2932,12 @@ fn emit_expr<'ctx>(
         // static-area box (zero per-eval allocation — the constant-fold
         // target). The unboxed value is produced by emit_expr_repr.
         Expr::Float { boxed, .. } => Ok(i64_t.const_int(*boxed, false)),
+        // Representation marker, semantically transparent in a Word
+        // context: just emit the (boxed-float) inner value. The unboxing
+        // benefit applies only on the f64 (emit_expr_repr) path.
+        Expr::TheFloat(inner) => {
+            emit_expr(context, builder, function, helpers, arity, params, locals, inner)
+        }
         Expr::Nil => Ok(i64_t.const_int(Word::NIL.raw(), false)),
         Expr::True => Ok(i64_t.const_int(Word::T.raw(), false)),
         Expr::Local(idx) => {
