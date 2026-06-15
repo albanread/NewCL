@@ -933,7 +933,7 @@ fn lower_call_in_mut(
             if env.has_float_decl
                 && args.len() == 1
                 && native_loop_lambda_body(&args[0])
-                    .map_or(false, |b| native_loop_inlinable(&b, coord)) =>
+                    .map_or(false, |b| native_loop_inlinable(&b, coord, Some(&*env))) =>
         {
             lower_native_loop_inline(&args[0], env, coord)
         }
@@ -1208,7 +1208,7 @@ fn form_has_closure(form: &Value, coord: &Arc<GcCoordinator>) -> bool {
             // When NOT inlinable, the lambda captures → it is a closure.
             "%NATIVE-LOOP" => {
                 if let Some(body) = items.get(1).and_then(native_loop_lambda_body) {
-                    if native_loop_inlinable(&body, coord) {
+                    if native_loop_inlinable(&body, coord, None) {
                         return false;
                     }
                 }
@@ -1252,11 +1252,40 @@ fn native_loop_lambda_body(arg: &Value) -> Option<Vec<Value>> {
 /// boundary for the ABORT_PENDING unwind to land on) can't model. A
 /// head we don't recognise falls to the conservative default (treat as
 /// a user call → not inlinable). See docs/performance-unbox-float.md.
-fn native_loop_inlinable(body_forms: &[Value], coord: &Arc<GcCoordinator>) -> bool {
-    body_forms.iter().all(|f| form_inline_safe(f, coord))
+fn native_loop_inlinable(
+    body_forms: &[Value],
+    coord: &Arc<GcCoordinator>,
+    env: Option<&LocalEnv>,
+) -> bool {
+    body_forms.iter().all(|f| form_inline_safe(f, coord, env))
 }
 
-fn form_inline_safe(form: &Value, coord: &Arc<GcCoordinator>) -> bool {
+/// True iff VALUE is provably a `double-float` by the SAME rules the
+/// `optimize` representation-inference pass uses to promote a local to an
+/// unboxed f64 slot: a float literal, an in-scope declared-`double-float`
+/// variable (`ParamF64`/`LocalF64` — immutable floats), or `+`/`-`/`*` of
+/// provably-float operands (CL contagion). This is a *strict subset* of
+/// what the pass proves float, which is what makes the inline-gate
+/// relaxation below sound: anything this accepts, the pass will promote to
+/// an f64 slot, so the would-be per-iteration box never reaches codegen.
+fn value_provably_float(v: &Value, env: Option<&LocalEnv>) -> bool {
+    match v {
+        Value::Float(_) => true,
+        Value::Symbol(s) => env.is_some_and(|e| {
+            matches!(e.find(&s.name), Some(Binding::ParamF64(_) | Binding::LocalF64(_)))
+        }),
+        Value::Cons(_) => list_to_vec(v).map_or(false, |items| {
+            matches!(
+                items.first(),
+                Some(Value::Symbol(h)) if matches!(&*h.name, "+" | "-" | "*")
+            ) && items.len() >= 2
+                && items[1..].iter().all(|a| value_provably_float(a, env))
+        }),
+        _ => false,
+    }
+}
+
+fn form_inline_safe(form: &Value, coord: &Arc<GcCoordinator>, env: Option<&LocalEnv>) -> bool {
     let items = match form {
         Value::Cons(_) => match list_to_vec(form) {
             Ok(v) => v,
@@ -1286,7 +1315,7 @@ fn form_inline_safe(form: &Value, coord: &Arc<GcCoordinator>) -> bool {
     match h {
         "QUOTE" => true,   // quoted data — not code
         "DECLARE" => true, // a no-op type/ignore declaration — not code
-        "THE" => items.get(2).map_or(true, |e| form_inline_safe(e, coord)),
+        "THE" => items.get(2).map_or(true, |e| form_inline_safe(e, coord, env)),
         "LET" | "LET*" => {
             // A binding with a COMPUTED (cons) initialiser that is NOT
             // declared `double-float` would box its (possibly f64) result
@@ -1306,6 +1335,16 @@ fn form_inline_safe(form: &Value, coord: &Arc<GcCoordinator>) -> bool {
                 }
                 None => Default::default(),
             };
+            // For the inference-driven relaxation below: bindings mutated
+            // in this let's body (mutated ⇒ boxed cell ⇒ not promotable to
+            // an f64 slot), and whether the `optimize` pass is enabled (the
+            // relaxation is sound ONLY because the pass promotes the
+            // proven-float local — see value_provably_float).
+            let mutated_here = match items.get(2..) {
+                Some(body) => mutated_in_body(body, &HashSet::new()),
+                None => Default::default(),
+            };
+            let inference_enabled = std::env::var_os("NCL_NO_INFER").is_none();
             let bindings_ok = match items.get(1) {
                 Some(bl) => list_to_vec(bl).map_or(false, |bs| {
                     bs.iter().all(|b| match b {
@@ -1322,16 +1361,27 @@ fn form_inline_safe(form: &Value, coord: &Arc<GcCoordinator>) -> bool {
                                 // `!is_special`), so a special+double-float
                                 // computed init would box per iteration — the
                                 // exact corruption hazard this gate forbids.
-                                (Some(Value::Symbol(s)), Some(Value::Cons(_))) => {
-                                    float_names.contains(&s.name)
-                                        && !special_names.contains(&s.name)
-                                        && !coord.is_special(coord.intern(&s.name))
+                                (Some(Value::Symbol(s)), Some(init @ Value::Cons(_))) => {
+                                    let not_special = !special_names.contains(&s.name)
+                                        && !coord.is_special(coord.intern(&s.name));
+                                    // (a) declared double-float → an f64 slot at
+                                    // lower time (the original allowance), OR
+                                    (float_names.contains(&s.name) && not_special)
+                                    // (b) the optimize pass will promote a provably-
+                                    // float, immutable, non-special binding to an f64
+                                    // slot — box-free — so this loop is safe to inline
+                                    // (Slice 4). Sound only with the pass enabled and
+                                    // only for immutable bindings (mutated ⇒ cell).
+                                        || (inference_enabled
+                                            && not_special
+                                            && !mutated_here.contains(&s.name)
+                                            && value_provably_float(init, env))
                                 }
                                 // atom/literal init or `(name)` → no float box
                                 _ => true,
                             };
                             let init_ok =
-                                pair.get(1).map_or(true, |i| form_inline_safe(i, coord));
+                                pair.get(1).map_or(true, |i| form_inline_safe(i, coord, env));
                             name_ok && computed_ok && init_ok
                         }),
                         _ => false,
@@ -1339,7 +1389,7 @@ fn form_inline_safe(form: &Value, coord: &Arc<GcCoordinator>) -> bool {
                 }),
                 None => true,
             };
-            bindings_ok && items[2..].iter().all(|f| form_inline_safe(f, coord))
+            bindings_ok && items[2..].iter().all(|f| form_inline_safe(f, coord, env))
         }
         // Special forms + primitive operators whose arguments are all
         // ordinary expressions. The arithmetic / comparison / data
@@ -1354,7 +1404,7 @@ fn form_inline_safe(form: &Value, coord: &Arc<GcCoordinator>) -> bool {
         | "EQ" | "EQL" | "EQUAL" | "CONS" | "LIST" | "CAR" | "CDR"
         | "FIRST" | "REST" | "NULL" | "CONSP" | "ATOM" | "LISTP"
         | "LENGTH" | "STRING=" | "CHAR" | "STRING-CHAR" | "AREF" | "SVREF" => {
-            items[1..].iter().all(|f| form_inline_safe(f, coord))
+            items[1..].iter().all(|f| form_inline_safe(f, coord, env))
         }
         _ => {
             // Operator application. Safe iff the head is a native
@@ -1364,7 +1414,7 @@ fn form_inline_safe(form: &Value, coord: &Arc<GcCoordinator>) -> bool {
             if call_is_lisp_compiled(sym.raw()) {
                 return false;
             }
-            items[1..].iter().all(|f| form_inline_safe(f, coord))
+            items[1..].iter().all(|f| form_inline_safe(f, coord, env))
         }
     }
 }

@@ -225,10 +225,27 @@ representation/check decision. An untrusted source can therefore never make it a
   lowering's. Gauntlet ALL-PASS, ANSI 490/56, bit-identical to `NCL_NO_INFER`; on the
   straight-line `poly` kernel **~4.7× over no-inference and ~2.5× over Slice 1** (the box
   elimination removed ~9M `ncl_box_float` allocations on top of the diamond removal).
-- **Slice 4** — fold inference into the inline-gate decision (per the Slice-2 finding) so a
-  proven-float local satisfies the gate, the loop inlines, and promotion reaches loop
-  bodies — the remaining lever for loop float code. Plus `Cons`/`Null` sharpening through
-  type tests (the hook for a later path-replication pass).
+- **Slice 4** — fold inference into the inline-gate decision (per the Slice-2 finding). *Done.*
+  The #2 inline gate now also allows a computed-init `Let` binding when the init is
+  **provably float** (`value_provably_float` — float literal, an in-scope `ParamF64`/`LocalF64`
+  declared float resolved via `env.find`, or `+`/`-`/`*` thereof — a strict *subset* of what
+  the pass promotes), the binding is **immutable** (not mutated in the let body — a mutated
+  local becomes a boxed cell, not promotable) and **non-special**, and inference is **enabled**.
+  So the loop inlines (the closure boundary vanishes), and the pass promotes the float local to
+  an f64 slot.
+
+  **This eliminates the #2 gate's hazard rather than reopening it.** The gate forbade inlining
+  because the float temp would be *boxed* per iteration (register-resident across a GC, not
+  precisely rooted — Gap-2). With promotion the temp is an f64 slot — not boxed, not a GC root —
+  so the hazard is gone. The soundness is airtight by the subset rule (gate-allows ⇒ init
+  genuinely float ⇒ pass promotes ⇒ no box reaches codegen) and the inference-enabled coupling.
+  Verified: gauntlet ALL-PASS, ANSI 490/56, and a GC-corruption stress (an allocating loop
+  driving GC while the promoted float local is live, under a 2 MB young heap) returns the correct
+  result identical to `NCL_NO_INFER`. The `(let ((a (* x x))) …)` loop that previously lowered to
+  a capturing lambda now inlines + unboxes (~1.2× on the kernel; more on float-heavier bodies).
+- **Slice 5 (future)** — `Cons`/`Null` sharpening through type tests (the hook for a later
+  path-replication pass), and cross-closure float propagation for loops that genuinely must
+  stay lambdas.
 - **Slice 3** — `Fixnum` propagation + the trimmed fixnum diamond (change #4), gated on the
   overflow-soundness discipline.
 - **Slice 4 (optional)** — `Cons`/`Null` sharpening through `IsCons`/`IsNull` tests; the hook
