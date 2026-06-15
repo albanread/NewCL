@@ -57,6 +57,10 @@ pub fn intern_value_symbol(coord: &GcCoordinator, s: &std::sync::Arc<Symbol>) ->
 pub enum Binding {
     /// Function parameter — read from the call's args[idx].
     Param(usize),
+    /// Function parameter declared `double-float` — read unboxed.
+    /// Only assigned to required params that are NOT mutated and NOT
+    /// special. See docs/performance-unbox-float.md Sprint 3.
+    ParamF64(usize),
     /// Let-bound local — read from the emitter's locals stack[idx].
     Local(usize),
     /// Closure reference — read from env[idx] in the current
@@ -69,6 +73,11 @@ pub enum Binding {
     ParamCell(usize),
     /// Let-bound local, boxed for mutation.
     LocalCell(usize),
+    /// Let-bound local declared `double-float` — stored unboxed in a
+    /// dedicated f64 stack slot (the carried index is the f64-slot, not
+    /// a `Local` index). Used for both immutable and (uncaptured)
+    /// mutable float locals. See docs/performance-unbox-float.md Sprint 2.
+    LocalF64(usize),
     /// Closure-captured cell. The captured Word IS the cons; reads
     /// auto-deref, writes go through SetCar.
     ClosureRefCell(usize),
@@ -93,6 +102,26 @@ pub struct LocalEnv {
     fn_bindings: Vec<(Arc<str>, Binding)>,
     local_count: usize,
     closure_count: usize,
+    /// Monotonic per-function counter of unboxed-f64 local slots. NOT
+    /// reset by `restore` — each float local across the whole function
+    /// gets a unique slot (allocas aren't stack-reused, which keeps the
+    /// codegen trivial and avoids aliasing). See docs/performance-
+    /// unbox-float.md Sprint 2.
+    f64_count: usize,
+    /// True while lowering the body of a loop the compiler proved safe
+    /// to inline (see `native_loop_inlinable`). In this state a
+    /// `(%loop-return v)` lowers to a direct `Expr::LoopBreak` (branch to
+    /// the inline loop's exit) instead of the flag-based `%loop-return`
+    /// runtime call. Reset to false inside any lambda body (for_lambda).
+    in_inline_loop: bool,
+    /// True once a `(double-float …)` / `(single-float …)` declaration
+    /// has been seen in this function (on a param or an enclosing let).
+    /// Auto-inlining of a simple `(loop …)` is gated on this — we only
+    /// transform loops in functions that opted into float types, keeping
+    /// the blast radius to exactly the code the unboxed-float work
+    /// targets and leaving all other loops byte-identical on
+    /// `%native-loop`. Reset per function / lambda.
+    has_float_decl: bool,
     /// Set when this env is the inner env of a lambda body. Lookups
     /// that miss in `bindings` fall back to here, capturing on hit.
     capture_parent: Option<Box<LocalEnv>>,
@@ -116,6 +145,9 @@ impl LocalEnv {
             fn_bindings: Vec::new(),
             local_count: 0,
             closure_count: 0,
+            f64_count: 0,
+            in_inline_loop: false,
+            has_float_decl: false,
             capture_parent: None,
             captures: Vec::new(),
         }
@@ -135,6 +167,13 @@ impl LocalEnv {
             fn_bindings: Vec::new(),
             local_count: 0,
             closure_count: 0,
+            f64_count: 0,
+            // A lambda body is NOT part of any enclosing inline loop —
+            // its (return) targets the lambda's own dynamic loop.
+            in_inline_loop: false,
+            // A lambda is its own function-ish scope; float declarations
+            // from the outer function don't apply to its loops.
+            has_float_decl: false,
             capture_parent: Some(Box::new(parent)),
             captures: Vec::new(),
         }
@@ -175,6 +214,14 @@ impl LocalEnv {
         let idx = self.closure_count;
         let (outer_expr, inner_binding) = match parent_b {
             Binding::Param(i) => (Expr::Param(i), Binding::ClosureRef(idx)),
+            // A float param is immutable (mutated ones aren't ParamF64),
+            // so capture-by-value is sound: snapshot the boxed value
+            // (F64ParamRead boxes via coerce in a Word/captures context).
+            Binding::ParamF64(i) => (Expr::F64ParamRead(i), Binding::ClosureRef(idx)),
+            // A captured float local is immutable here (mutable ones are
+            // gated away from LocalF64 when the body has a closure), so
+            // snapshot-by-value (the boxed current value) is sound.
+            Binding::LocalF64(slot) => (Expr::F64LocalRead(slot), Binding::ClosureRef(idx)),
             Binding::Local(i) => (Expr::Local(i), Binding::ClosureRef(idx)),
             Binding::ClosureRef(i) => (Expr::ClosureRef(i), Binding::ClosureRef(idx)),
             // Cell variants: capture the cons itself; inner sees a Cell.
@@ -220,6 +267,8 @@ impl LocalEnv {
         let idx = self.closure_count;
         let (outer_expr, inner_binding) = match parent_b {
             Binding::Param(i) => (Expr::Param(i), Binding::ClosureRef(idx)),
+            Binding::ParamF64(i) => (Expr::F64ParamRead(i), Binding::ClosureRef(idx)),
+            Binding::LocalF64(slot) => (Expr::F64LocalRead(slot), Binding::ClosureRef(idx)),
             Binding::Local(i) => (Expr::Local(i), Binding::ClosureRef(idx)),
             Binding::ClosureRef(i) => (Expr::ClosureRef(i), Binding::ClosureRef(idx)),
             Binding::ParamCell(i) => (Expr::Param(i), Binding::ClosureRefCell(idx)),
@@ -254,6 +303,45 @@ impl LocalEnv {
         self.bindings.push((name, Binding::LocalCell(idx)));
         self.local_count += 1;
         idx
+    }
+
+    /// Rebind a required parameter `Param(i)` to `ParamF64(i)` — read
+    /// unboxed. Caller must ensure the param is declared double-float,
+    /// not mutated, and not special. No-op if the name isn't a plain
+    /// `Param` (e.g. already promoted to a cell by mutation analysis).
+    /// Record that this function declared a float type (param or local),
+    /// enabling auto-inline of its simple `(loop …)`s. See
+    /// `has_float_decl` / docs/performance-unbox-float.md.
+    pub fn mark_float_decl(&mut self) {
+        self.has_float_decl = true;
+    }
+
+    pub fn rebind_as_param_f64(&mut self, name: &str) {
+        for (n, b) in self.bindings.iter_mut().rev() {
+            if &**n == name {
+                if let Binding::Param(i) = *b {
+                    *b = Binding::ParamF64(i);
+                }
+                break;
+            }
+        }
+    }
+
+    /// Allocate a fresh (monotonic, function-global) unboxed-f64 local
+    /// slot index. Not reused across scopes — see `f64_count`.
+    pub fn next_f64_slot(&mut self) -> usize {
+        let s = self.f64_count;
+        self.f64_count += 1;
+        s
+    }
+
+    /// Push a `double-float` let-local bound to f64 slot `slot`. It also
+    /// consumes a `Local`-vec position (the codegen pushes a dummy Word
+    /// there) so the dense `Local(i)` indexing of sibling non-float
+    /// bindings is undisturbed; reads go through `F64LocalRead(slot)`.
+    pub fn push_local_f64(&mut self, name: Arc<str>, slot: usize) {
+        self.bindings.push((name, Binding::LocalF64(slot)));
+        self.local_count += 1;
     }
 
     /// Promote an existing required-parameter binding `Param(i)` to a
@@ -300,7 +388,9 @@ impl LocalEnv {
 fn binding_read(b: Binding) -> Expr {
     match b {
         Binding::Param(i) => Expr::Param(i),
+        Binding::ParamF64(i) => Expr::F64ParamRead(i),
         Binding::Local(i) => Expr::Local(i),
+        Binding::LocalF64(slot) => Expr::F64LocalRead(slot),
         Binding::ClosureRef(i) => Expr::ClosureRef(i),
         Binding::ParamCell(i) => Expr::car(Expr::Param(i)),
         Binding::LocalCell(i) => Expr::car(Expr::Local(i)),
@@ -358,6 +448,10 @@ fn lower_in_mut(
             Ok(Expr::Word(w.raw()))
         }
         Value::Float(f) => {
+            // Pre-box the literal in the static area (the constant-fold
+            // target for Word contexts — zero per-eval allocation), and
+            // carry the raw f64 bits so the JIT can compute on it
+            // unboxed. See docs/performance-unbox-float.md Sprint 1.
             let w = ncl_runtime::float::alloc_float_in_static(
                 coord.static_area(), coord, *f,
             )
@@ -366,7 +460,7 @@ fn lower_in_mut(
                     "static area exhausted while allocating float literal".into(),
                 )
             })?;
-            Ok(Expr::Word(w.raw()))
+            Ok(Expr::Float { bits: f.to_bits(), boxed: w.raw() })
         }
         Value::Ratio(n, d) => {
             let w = ncl_runtime::ratio::alloc_ratio_in_static(
@@ -576,6 +670,14 @@ fn lower_call_in_mut(
     match head_name.as_str() {
         "+" => fold_arithmetic(&head_name, args, env, coord, 0, Expr::add),
         "*" => fold_arithmetic(&head_name, args, env, coord, 1, Expr::mul),
+        // Bitwise ops inline to dedicated nodes (raw tagged-fixnum op +
+        // bignum-aware slow path). Integers only, so — unlike mod /
+        // truncate / rem — they need no polymorphic Lisp wrapper.
+        // Variadic: identity is -1 for logand, 0 for logior/logxor.
+        "LOGAND" => fold_arithmetic(&head_name, args, env, coord, -1, Expr::logand),
+        "LOGIOR" => fold_arithmetic(&head_name, args, env, coord, 0, Expr::logior),
+        "LOGXOR" => fold_arithmetic(&head_name, args, env, coord, 0, Expr::logxor),
+        "ASH" => binary_op(&head_name, args, env, coord, Expr::ash),
         // TRUNCATE and REM used to be special-form-intercepted and
         // lowered to inline LLVM srem / sdiv. We demoted them to
         // ordinary native calls (truncate_shim / rem_shim in
@@ -819,6 +921,32 @@ fn lower_call_in_mut(
             binary_op(&head_name, args, env, coord, Expr::aref)
         }
         "LET" => lower_let(args, env, coord),
+        "FAST-LOOP" => lower_fast_loop(args, env, coord),
+        // Auto-inline a simple `(loop …)` (which macroexpanded to
+        // `(%native-loop (lambda () body))`) when the compiler can prove
+        // it safe — body calls no user functions and creates no closures
+        // (native_loop_inlinable). Then loop carries stay unboxed / in
+        // registers, exactly like `fast-loop`, with no source change. If
+        // the guard fails, control falls through to the ordinary call
+        // lowering (the catch-all), keeping the loop on %native-loop.
+        "%NATIVE-LOOP"
+            if env.has_float_decl
+                && args.len() == 1
+                && native_loop_lambda_body(&args[0])
+                    .map_or(false, |b| native_loop_inlinable(&b, coord, Some(&*env))) =>
+        {
+            lower_native_loop_inline(&args[0], env, coord)
+        }
+        // `(return v)` inside an inlined loop body → a direct break.
+        // Outside one, it falls through to the ordinary %loop-return
+        // call (flag-based), preserving its dynamic semantics.
+        "%LOOP-RETURN" if env.in_inline_loop => {
+            let v = match args.first() {
+                Some(a) => lower_in_mut(a, env, coord)?,
+                None => Expr::Nil,
+            };
+            Ok(Expr::LoopBreak { value: Box::new(v) })
+        }
         "FLET" => lower_flet(args, env, coord),
         "LABELS" => lower_labels(args, env, coord),
         // `(values v1 v2 ... vN)` — write all into the multi-value
@@ -841,6 +969,17 @@ fn lower_call_in_mut(
         // `declare` that somehow reaches evaluation (e.g. at top
         // level) is silently ignored per CL spec.
         "DECLARE" => Ok(Expr::Nil),
+        // (declaim (inline f) (notinline g) (optimize …) …) — global
+        // proclamation. We honour `inline`/`notinline` (the inliner reads
+        // the registry at defun + call-site lowering); all other declspecs
+        // (optimize / type / ftype / special …) are accepted and ignored.
+        // declaim's return value is unspecified in CL; we return T ("the
+        // declamation was accepted"), matching the de-facto convention the
+        // ANSI suite annotates. See crate::inline (§ Interprocedural inlining).
+        "DECLAIM" => {
+            process_declaim(args);
+            Ok(Expr::True)
+        }
         // (locally (declare (special ...)) body...) — establishes
         // local special declarations for the enclosed body. The
         // declares affect only the lexical scope of `body`.
@@ -870,6 +1009,14 @@ fn lower_call_in_mut(
             Ok(Expr::funcall(fn_expr, lowered_args?))
         }
         _ => {
+            // Inline-expansion fast path: if NAME was `(declaim (inline …))`d
+            // with a simple lambda list and this call is inlinable here, splice
+            // its body as `(let ((p a) …) body…)` and lower that in-place. The
+            // reachable-via-flet case was handled above, so NAME here is a
+            // global function reference. See crate::inline.
+            if let Some(result) = try_lower_inline_call(&head_name, args, env, coord) {
+                return result;
+            }
             let sym_word = coord.intern(&head_name);
             let lowered_args: Result<Vec<_>, _> = args
                 .iter()
@@ -878,6 +1025,80 @@ fn lower_call_in_mut(
             Ok(Expr::call(sym_word.raw(), lowered_args?))
         }
     }
+}
+
+/// Process `(declaim DECLSPEC …)` declspecs we care about. `inline`/
+/// `notinline` update the inline registry; everything else is ignored.
+fn process_declaim(args: &[Value]) {
+    for spec in args {
+        let Ok(items) = list_to_vec(spec) else { continue };
+        let Some(Value::Symbol(head)) = items.first() else {
+            continue;
+        };
+        match &*head.name {
+            "INLINE" => {
+                for n in &items[1..] {
+                    if let Value::Symbol(s) = n {
+                        crate::inline::request_inline(&s.name);
+                    }
+                }
+            }
+            "NOTINLINE" => {
+                for n in &items[1..] {
+                    if let Value::Symbol(s) = n {
+                        crate::inline::request_notinline(&s.name);
+                    }
+                }
+            }
+            // optimize / type / ftype / special / ignore … — not our concern.
+            _ => {}
+        }
+    }
+}
+
+/// If `head_name` names a `declaim inline` function whose captured body can be
+/// spliced at this call site, build `(let ((p1 a1) …) body…)` and lower it in
+/// the caller's env; otherwise return `None` (the caller emits a normal call).
+///
+/// The `let` reuses all of `lower_let`'s machinery: parallel left-to-right
+/// arg evaluation, boxing of mutated params, dynamic binding of special-named
+/// params, and f64-slot promotion — and the float-unboxing pass later runs
+/// over the spliced body, so unboxing crosses the call boundary. Params are
+/// bound by the `let`, so they shadow same-named caller locals correctly.
+fn try_lower_inline_call(
+    head_name: &str,
+    args: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Option<Result<Expr, CompileError>> {
+    if crate::inline::blocked(head_name) {
+        return None;
+    }
+    let def = crate::inline::lookup(head_name)?;
+    if def.params.len() != args.len() {
+        // Arity mismatch — fall through to a normal call, which signals the
+        // proper condition at runtime rather than silently mis-substituting.
+        return None;
+    }
+
+    // Build the binding list `((p1 a1) (p2 a2) …)`. Each param becomes a fresh
+    // symbol carrying the original name; `lower_let` resolves the body's
+    // references by name, so identity doesn't matter. Args are the ORIGINAL
+    // call-site forms — `lower_let` lowers them in the caller env (correct
+    // outer-scope, parallel-let evaluation).
+    let mut bindings = Vec::with_capacity(def.params.len());
+    for (p, a) in def.params.iter().zip(args.iter()) {
+        let psym = Value::Symbol(Symbol::fresh_uninterned(Arc::clone(p)));
+        bindings.push(Value::list([psym, a.clone()]));
+    }
+    let mut let_args = Vec::with_capacity(1 + def.body.len());
+    let_args.push(Value::list(bindings));
+    let_args.extend(def.body.iter().cloned());
+
+    crate::inline::enter(head_name);
+    let result = lower_let(&let_args, env, coord);
+    crate::inline::exit();
+    Some(result)
 }
 
 /// `(let ((var val) ...) body...)`. Bindings evaluated in OUTER env
@@ -1059,6 +1280,298 @@ pub fn mutated_in_body(
     out
 }
 
+/// True if any form (recursively) creates a closure — a `lambda`,
+/// `flet`, or `labels`. `#'(lambda …)` is found by recursion through
+/// the `function` form; `#'symbol` is not a closure. Used to gate
+/// unboxing of *mutable* float locals: a mutable float local kept in an
+/// f64 stack slot cannot be shared by reference with a capturing
+/// closure, so when a closure is present we fall back to the boxed
+/// (cons-cell) representation. Immutable float locals are always safe
+/// (captured by value). See docs/performance-unbox-float.md Sprint 2.
+fn form_has_closure(form: &Value, coord: &Arc<GcCoordinator>) -> bool {
+    let Ok(items) = list_to_vec(form) else { return false };
+    if let Some(Value::Symbol(s)) = items.first() {
+        match &*s.name {
+            "LAMBDA" | "FLET" | "LABELS" => return true,
+            "QUOTE" => return false,
+            // (%native-loop (lambda () body…)). When the compiler will
+            // inline this loop (its body calls no user fns / makes no
+            // closures), the lambda evaporates — it is NOT a real
+            // closure, so an enclosing float loop var stays unboxable.
+            // When NOT inlinable, the lambda captures → it is a closure.
+            "%NATIVE-LOOP" => {
+                if let Some(body) = items.get(1).and_then(native_loop_lambda_body) {
+                    if native_loop_inlinable(&body, coord, None) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            _ => {}
+        }
+    }
+    items.iter().any(|f| form_has_closure(f, coord))
+}
+
+fn body_has_closure(body_forms: &[Value], coord: &Arc<GcCoordinator>) -> bool {
+    body_forms.iter().any(|f| form_has_closure(f, coord))
+}
+
+/// Extract the body forms of a `(%native-loop ARG)`'s thunk: ARG must be
+/// `(lambda () body…)` with an empty parameter list. Returns the body
+/// forms, or None if ARG isn't a nullary lambda.
+fn native_loop_lambda_body(arg: &Value) -> Option<Vec<Value>> {
+    let items = list_to_vec(arg).ok()?;
+    match items.first() {
+        Some(Value::Symbol(s)) if &*s.name == "LAMBDA" => {
+            let params_empty = match items.get(1) {
+                Some(Value::Nil) => true,
+                Some(v) => list_to_vec(v).map(|p| p.is_empty()).unwrap_or(false),
+                None => false,
+            };
+            if params_empty { Some(items[2..].to_vec()) } else { None }
+        }
+        _ => None,
+    }
+}
+
+/// Conservatively decide whether a `(loop …)` body (the forms inside its
+/// `(lambda () …)`) is safe to lower as an inline loop. Safe means: no
+/// closure-creating or non-local-control form, and every operator is a
+/// special form or a *native primitive* — NOT a Lisp-compiled user
+/// function. That guarantees the only way out is a *lexical* `(return)`
+/// (lowered to a direct break) and rules out a *dynamic* `%loop-return`
+/// or a signal/return-from that the inline form (which has no lambda
+/// boundary for the ABORT_PENDING unwind to land on) can't model. A
+/// head we don't recognise falls to the conservative default (treat as
+/// a user call → not inlinable). See docs/performance-unbox-float.md.
+fn native_loop_inlinable(
+    body_forms: &[Value],
+    coord: &Arc<GcCoordinator>,
+    env: Option<&LocalEnv>,
+) -> bool {
+    body_forms.iter().all(|f| form_inline_safe(f, coord, env))
+}
+
+/// True iff VALUE is provably a `double-float` by the SAME rules the
+/// `optimize` representation-inference pass uses to promote a local to an
+/// unboxed f64 slot: a float literal, an in-scope declared-`double-float`
+/// variable (`ParamF64`/`LocalF64` — immutable floats), or `+`/`-`/`*` of
+/// provably-float operands (CL contagion). This is a *strict subset* of
+/// what the pass proves float, which is what makes the inline-gate
+/// relaxation below sound: anything this accepts, the pass will promote to
+/// an f64 slot, so the would-be per-iteration box never reaches codegen.
+fn value_provably_float(v: &Value, env: Option<&LocalEnv>) -> bool {
+    match v {
+        Value::Float(_) => true,
+        Value::Symbol(s) => env.is_some_and(|e| {
+            matches!(e.find(&s.name), Some(Binding::ParamF64(_) | Binding::LocalF64(_)))
+        }),
+        Value::Cons(_) => list_to_vec(v).map_or(false, |items| {
+            matches!(
+                items.first(),
+                Some(Value::Symbol(h)) if matches!(&*h.name, "+" | "-" | "*")
+            ) && items.len() >= 2
+                && items[1..].iter().all(|a| value_provably_float(a, env))
+        }),
+        _ => false,
+    }
+}
+
+fn form_inline_safe(form: &Value, coord: &Arc<GcCoordinator>, env: Option<&LocalEnv>) -> bool {
+    let items = match form {
+        Value::Cons(_) => match list_to_vec(form) {
+            Ok(v) => v,
+            Err(_) => return false, // improper list — bail conservatively
+        },
+        _ => return true, // atom (symbol / number / string / char / nil)
+    };
+    if items.is_empty() {
+        return true; // () == nil
+    }
+    let Value::Symbol(head) = &items[0] else {
+        return false; // computed / ((lambda …) …) head
+    };
+    let h = &*head.name;
+    // Closures, nested loops, and non-local control are never inlinable.
+    const BAD: &[&str] = &[
+        "LAMBDA", "FLET", "LABELS", "FUNCTION",
+        "LOOP", "%NATIVE-LOOP", "DO", "DO*", "DOTIMES", "DOLIST",
+        "BLOCK", "RETURN-FROM", "%NATIVE-BLOCK", "CATCH", "THROW",
+        "UNWIND-PROTECT", "%NATIVE-UNWIND-PROTECT", "HANDLER-CASE",
+        "HANDLER-BIND", "TAGBODY", "GO", "MULTIPLE-VALUE-CALL",
+        "MULTIPLE-VALUE-BIND", "MULTIPLE-VALUE-PROG1",
+    ];
+    if BAD.iter().any(|b| *b == h) {
+        return false;
+    }
+    match h {
+        "QUOTE" => true,   // quoted data — not code
+        "DECLARE" => true, // a no-op type/ignore declaration — not code
+        "THE" => items.get(2).map_or(true, |e| form_inline_safe(e, coord, env)),
+        "LET" | "LET*" => {
+            // A binding with a COMPUTED (cons) initialiser that is NOT
+            // declared `double-float` would box its (possibly f64) result
+            // into a Word local *every iteration* — and a per-iteration
+            // heap box inside an inlined loop is the corruption source
+            // (an undeclared float temp register-resident at a GC isn't
+            // precisely rooted). Refuse to inline such a loop; it falls
+            // back to the ordinary boxed loop macro, which is correct
+            // (just slower). Atom/literal inits (e.g. `(n 0)`, `(x y)`)
+            // allocate nothing per iteration, and a computed init that IS
+            // declared double-float lands in an unboxed f64 slot — both
+            // stay inlinable + fast. See docs/performance-unbox-float.md.
+            let (float_names, special_names) = match items.get(2..) {
+                Some(body) => {
+                    let (decl_specs, _) = strip_declares(body);
+                    (extract_float_names(&decl_specs), extract_special_names(&decl_specs))
+                }
+                None => Default::default(),
+            };
+            // For the inference-driven relaxation below: bindings mutated
+            // in this let's body (mutated ⇒ boxed cell ⇒ not promotable to
+            // an f64 slot), and whether the `optimize` pass is enabled (the
+            // relaxation is sound ONLY because the pass promotes the
+            // proven-float local — see value_provably_float).
+            let mutated_here = match items.get(2..) {
+                Some(body) => mutated_in_body(body, &HashSet::new()),
+                None => Default::default(),
+            };
+            let inference_enabled = std::env::var_os("NCL_NO_INFER").is_none();
+            let bindings_ok = match items.get(1) {
+                Some(bl) => list_to_vec(bl).map_or(false, |bs| {
+                    bs.iter().all(|b| match b {
+                        Value::Symbol(_) => true,
+                        Value::Cons(_) => list_to_vec(b).map_or(false, |pair| {
+                            let name_ok = matches!(pair.first(), Some(Value::Symbol(_)));
+                            let computed_ok = match (pair.first(), pair.get(1)) {
+                                // A computed init is only box-free (and thus
+                                // inline-loop-safe) when it lands in an
+                                // unboxed f64 slot: declared double-float AND
+                                // NOT special. `lower_let` boxes a special
+                                // binding's init under dynamic-bind even when
+                                // declared float (`is_float_local` requires
+                                // `!is_special`), so a special+double-float
+                                // computed init would box per iteration — the
+                                // exact corruption hazard this gate forbids.
+                                (Some(Value::Symbol(s)), Some(init @ Value::Cons(_))) => {
+                                    let not_special = !special_names.contains(&s.name)
+                                        && !coord.is_special(coord.intern(&s.name));
+                                    // (a) declared double-float → an f64 slot at
+                                    // lower time (the original allowance), OR
+                                    (float_names.contains(&s.name) && not_special)
+                                    // (b) the optimize pass will promote a provably-
+                                    // float, immutable, non-special binding to an f64
+                                    // slot — box-free — so this loop is safe to inline
+                                    // (Slice 4). Sound only with the pass enabled and
+                                    // only for immutable bindings (mutated ⇒ cell).
+                                        || (inference_enabled
+                                            && not_special
+                                            && !mutated_here.contains(&s.name)
+                                            && value_provably_float(init, env))
+                                }
+                                // atom/literal init or `(name)` → no float box
+                                _ => true,
+                            };
+                            let init_ok =
+                                pair.get(1).map_or(true, |i| form_inline_safe(i, coord, env));
+                            name_ok && computed_ok && init_ok
+                        }),
+                        _ => false,
+                    })
+                }),
+                None => true,
+            };
+            bindings_ok && items[2..].iter().all(|f| form_inline_safe(f, coord, env))
+        }
+        // Special forms + primitive operators whose arguments are all
+        // ordinary expressions. The arithmetic / comparison / data
+        // operators here are special-cased by `lower_call_in_mut` to
+        // *dedicated* Expr nodes (Add/Mul/Lt/Car/…), never an
+        // `Expr::Call` — so they're inline-safe regardless of whether the
+        // symbol also carries a (Lisp or native) function cell for `#'`.
+        "IF" | "PROGN" | "SETQ" | "SETF" | "WHEN" | "UNLESS" | "AND" | "OR"
+        | "NOT" | "VALUES" | "PROG1" | "PROG2" | "%LOOP-RETURN" | "RETURN"
+        | "PSETQ"
+        | "+" | "-" | "*" | "<" | ">" | "<=" | ">=" | "=" | "/="
+        | "EQ" | "EQL" | "EQUAL" | "CONS" | "LIST" | "CAR" | "CDR"
+        | "FIRST" | "REST" | "NULL" | "CONSP" | "ATOM" | "LISTP"
+        | "LENGTH" | "STRING=" | "CHAR" | "STRING-CHAR" | "AREF" | "SVREF" => {
+            items[1..].iter().all(|f| form_inline_safe(f, coord, env))
+        }
+        _ => {
+            // Operator application. Safe iff the head is a native
+            // primitive (not a Lisp-compiled user function — those may
+            // (return) dynamically or signal).
+            let sym = coord.intern(&head.name);
+            if call_is_lisp_compiled(sym.raw()) {
+                return false;
+            }
+            items[1..].iter().all(|f| form_inline_safe(f, coord, env))
+        }
+    }
+}
+
+/// `(fast-loop TEST RESULT BODY...)` — an inline loop with no capturing
+/// lambda, so loop-carried locals (declared `double-float`, or plain
+/// fixnum cells) stay unboxed / in registers across iterations. Each
+/// pass: if TEST is non-nil, stop and yield RESULT; otherwise run BODY
+/// (which steps the loop variables via `setq`) and repeat. TEST,
+/// RESULT, and BODY are lowered in the current env, so they see the
+/// enclosing `let`'s loop variables. See docs/performance-unbox-float.md.
+/// Lower a `(%native-loop (lambda () body…))` the compiler proved
+/// inlinable (see `native_loop_inlinable`) to an `Expr::InlineLoop`. The
+/// body is lowered IN THE CURRENT ENV (not a fresh lambda env), so loop
+/// variables resolve directly to the enclosing locals — no capture, no
+/// boxing. `in_inline_loop` is set so `(%loop-return v)` lowers to a
+/// direct `LoopBreak`.
+fn lower_native_loop_inline(
+    lambda_arg: &Value,
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
+    let body_forms = native_loop_lambda_body(lambda_arg)
+        .expect("caller's guard ensured a nullary lambda thunk");
+    let saved = env.in_inline_loop;
+    env.in_inline_loop = true;
+    let lowered: Result<Vec<_>, _> = body_forms
+        .iter()
+        .map(|f| lower_in_mut(f, env, coord))
+        .collect();
+    env.in_inline_loop = saved;
+    Ok(Expr::InlineLoop { body: Box::new(Expr::progn(lowered?)) })
+}
+
+fn lower_fast_loop(
+    args: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Result<Expr, CompileError> {
+    if args.len() < 2 {
+        return Err(CompileError::BadArity {
+            head: "FAST-LOOP".into(),
+            expected: "at least 2 (test result body...)",
+            got: args.len(),
+        });
+    }
+    let test = lower_in_mut(&args[0], env, coord)?;
+    let result = lower_in_mut(&args[1], env, coord)?;
+    let body = if args.len() == 2 {
+        Expr::Nil
+    } else {
+        let lowered: Result<Vec<_>, _> = args[2..]
+            .iter()
+            .map(|f| lower_in_mut(f, env, coord))
+            .collect();
+        Expr::progn(lowered?)
+    };
+    Ok(Expr::FastLoop {
+        test: Box::new(test),
+        result: Box::new(result),
+        body: Box::new(body),
+    })
+}
+
 fn lower_let(
     args: &[Value],
     env: &mut LocalEnv,
@@ -1172,15 +1685,44 @@ fn lower_let(
         .zip(is_special_binding.iter())
         .map(|(n, special)| !special && mutated.contains(n))
         .collect();
-    for (i, b) in needs_box.iter().enumerate() {
-        if *b {
+    // Unboxed-float locals: a binding declared (double-float ..) that is
+    // not special. A *mutable* float local is only unboxed when the body
+    // creates no closure — an f64 stack slot can't be shared by
+    // reference with a capturing lambda, so we fall back to the boxed
+    // cell there. Immutable float locals are always safe (captured by
+    // value). See docs/performance-unbox-float.md Sprint 2.
+    let locally_float = extract_float_names(&decl_specs);
+    if !locally_float.is_empty() {
+        // Float locals in this let → the function is float-aware; allow
+        // auto-inlining of loops in this scope (and inner scopes).
+        env.has_float_decl = true;
+    }
+    let body_closure = !locally_float.is_empty() && body_has_closure(body_forms, coord);
+    let is_float_local: Vec<bool> = binding_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            locally_float.contains(n)
+                && !is_special_binding[i]
+                && !(needs_box[i] && body_closure)
+        })
+        .collect();
+    let mut f64_slots: Vec<Option<usize>> = vec![None; binding_names.len()];
+    for i in 0..binding_names.len() {
+        if is_float_local[i] {
+            // Store the (coerced-to-f64) init into a dedicated f64 slot.
+            let slot = env.next_f64_slot();
+            f64_slots[i] = Some(slot);
+            let init = std::mem::replace(&mut binding_exprs[i], Expr::Nil);
+            binding_exprs[i] = Expr::F64LocalStore { slot, value: Box::new(init) };
+        } else if needs_box[i] {
             // Wrap init in (cons init nil) — the cell representation.
             let init = std::mem::replace(&mut binding_exprs[i], Expr::Nil);
             binding_exprs[i] = Expr::cons(init, Expr::Nil);
         }
     }
 
-    // Extend env with new LEXICAL locals (cell or plain). Special
+    // Extend env with new LEXICAL locals (cell, f64, or plain). Special
     // bindings are NOT added to the lexical env — symbol reads/writes
     // for them fall through to LoadGlobal/StoreGlobal as intended.
     let cp = env.checkpoint();
@@ -1191,6 +1733,8 @@ fn lower_let(
             // add the name to the lexical env. The temp will be
             // passed to DynamicBind as Expr::Local(slot_idx).
             env.push_local(Arc::from("__dyn_temp__"));
+        } else if is_float_local[i] {
+            env.push_local_f64(Arc::clone(name), f64_slots[i].unwrap());
         } else if needs_box[i] {
             env.push_local_cell(Arc::clone(name));
         } else {
@@ -1610,12 +2154,20 @@ fn lower_setq_pair(
         let value = lower_in_mut(value_form, env, coord)?;
         return match b {
             Binding::LocalCell(i) => Ok(Expr::set_car(Expr::Local(i), value)),
+            // Float local: store unboxed into its f64 slot (no cons box).
+            Binding::LocalF64(slot) => {
+                Ok(Expr::F64LocalStore { slot, value: Box::new(value) })
+            }
             Binding::ParamCell(i) => Ok(Expr::set_car(Expr::Param(i), value)),
             Binding::ClosureRefCell(i) => {
                 Ok(Expr::set_car(Expr::ClosureRef(i), value))
             }
             Binding::Param(_) => Err(CompileError::NotImplemented(format!(
                 "setq of function parameter: {name} (mutable parameters not yet supported)"
+            ))),
+            Binding::ParamF64(_) => Err(CompileError::NotImplemented(format!(
+                "setq of double-float parameter: {name} (a mutated param is never \
+                 declared-float-unboxed — this is an internal inconsistency)"
             ))),
             Binding::Local(_) => Err(CompileError::NotImplemented(format!(
                 "internal: non-cell local {name} reached setq path \
@@ -1883,6 +2435,42 @@ fn extract_special_names(specs: &[Value]) -> HashSet<Arc<str>> {
     out
 }
 
+/// Collect names declared as a float type — `(double-float a b)`,
+/// `(single-float x)` (treated as double — NCL floats are doubles, see
+/// plan §2.7), the supertype `(float …)`, or the `(type <ftype> …)`
+/// long form. Symbols are upcased by the reader, so we match upcase.
+pub fn extract_float_names(specs: &[Value]) -> HashSet<Arc<str>> {
+    fn is_float_type(n: &str) -> bool {
+        matches!(
+            n,
+            "DOUBLE-FLOAT" | "SINGLE-FLOAT" | "LONG-FLOAT" | "SHORT-FLOAT" | "FLOAT"
+        )
+    }
+    let mut out = HashSet::new();
+    for spec in specs {
+        let Ok(items) = list_to_vec(spec) else { continue };
+        let [Value::Symbol(head), rest @ ..] = items.as_slice() else { continue };
+        let names: &[Value] = if &*head.name == "TYPE" {
+            // (type <typespec> name...) — typespec must be a float type.
+            match rest {
+                [Value::Symbol(ty), ns @ ..] if is_float_type(&ty.name) => ns,
+                _ => continue,
+            }
+        } else if is_float_type(&head.name) {
+            // (double-float name...) shorthand declaration.
+            rest
+        } else {
+            continue;
+        };
+        for nv in names {
+            if let Value::Symbol(s) = nv {
+                out.insert(Arc::clone(&s.name));
+            }
+        }
+    }
+    out
+}
+
 /// (locally (declare ...) body...) — process local declarations
 /// for the enclosed body; evaluate the body in their scope.
 fn lower_locally(
@@ -2014,7 +2602,7 @@ fn lower_lambda(
     // lowering time, not evaluated as calls. Locally-declared
     // specials inside a lambda body are handled by the (let ...)
     // forms within; we just need to not trip on the bare DECLARE.
-    let (_decl_specs, body_forms) = strip_declares(all_body_forms);
+    let (decl_specs, body_forms) = strip_declares(all_body_forms);
 
     // Inner env starts with required params at Param(0..N) and a
     // capture parent that begins as a clone of `outer_env`. The
@@ -2048,6 +2636,24 @@ fn lower_lambda(
             let cell_init = Expr::cons(Expr::Param(i), Expr::Nil);
             inner_env.rebind_as_local_cell(name);
             req_box_prologue.push(cell_init);
+        }
+    }
+
+    // Unboxed-float parameters: a required param declared `(double-float
+    // ..)` that is not mutated (mutated ones were boxed above) and not
+    // special is read as a native f64 — same as `defun`'s float handling.
+    // Previously lambda bodies discarded their declares, so a float-typed
+    // lambda never unboxed its params or enabled loop auto-inlining.
+    let float_params = extract_float_names(&decl_specs);
+    if !float_params.is_empty() {
+        inner_env.mark_float_decl();
+        for pname in &params.required {
+            if float_params.contains(pname.as_ref())
+                && !body_mutations.contains(pname)
+                && !coord.is_special(coord.intern(pname))
+            {
+                inner_env.rebind_as_param_f64(pname);
+            }
         }
     }
 
@@ -2602,22 +3208,31 @@ fn chainable_cmp(
             lower_in_mut(&args[1], env, coord)?,
         )),
         _ => {
-            // Lower all args, then chain pairwise comparisons with AND.
-            let lowered: Result<Vec<_>, _> = args
+            // Evaluate each operand exactly once, left-to-right, into a
+            // fresh temp, then chain pairwise comparisons over the temps.
+            // Cloning the lowered Exprs into adjacent comparisons would
+            // emit every interior operand TWICE and double-run its side
+            // effects — e.g. `(= (incf x) (incf y) (incf z))` must bump
+            // each place once. (Same single-temp discipline as `lower_or`.)
+            let lowered: Vec<Expr> = args
                 .iter()
                 .map(|a| lower_in_mut(a, env, coord))
+                .collect::<Result<_, _>>()?;
+            let cp = env.checkpoint();
+            let idxs: Vec<usize> = (0..lowered.len())
+                .map(|_| env.push_local(std::sync::Arc::from("__cmp_tmp__")))
                 .collect();
-            let lowered = lowered?;
-            let mut pairs = Vec::new();
-            for i in 0..lowered.len() - 1 {
-                pairs.push(build(lowered[i].clone(), lowered[i + 1].clone()));
+            let mut pairs = Vec::with_capacity(idxs.len() - 1);
+            for w in idxs.windows(2) {
+                pairs.push(build(Expr::Local(w[0]), Expr::Local(w[1])));
             }
-            // Chain with nested if (short-circuit AND semantics)
+            env.restore(cp);
+            // Chain with nested if (short-circuit AND semantics).
             let mut result = pairs.pop().unwrap();
             while let Some(p) = pairs.pop() {
                 result = Expr::if_(p, result, Expr::Nil);
             }
-            Ok(result)
+            Ok(Expr::let_(lowered, result))
         }
     }
 }

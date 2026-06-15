@@ -38,7 +38,7 @@ fn alloc_bignum_raw(m: &mut MutatorState, sign: i8, limbs: &[u64]) -> Word {
     debug_assert!(*limbs.last().unwrap() != 0);
 
     let total_cells = BIGNUM_HEADER_CELLS + limbs.len();
-    let bignum_marker = m.coord().intern("%BIGNUM");
+    let bignum_marker = m.coord().marker_bignum();
 
     // alloc_vector_with_header writes the heap header and returns a
     // Vector-tagged Word; we then fill in the rest of the cells.
@@ -84,15 +84,12 @@ pub fn bignum_to_bigint(w: Word) -> BigInt {
     let n_limbs_word = Word::from_raw(unsafe { *p.add(3) });
     let sign = sign_word.as_fixnum().expect("bignum sign is fixnum") as i8;
     let n_limbs = n_limbs_word.as_fixnum().expect("bignum n_limbs is fixnum") as usize;
-    let limbs: Vec<u64> = (0..n_limbs)
-        .map(|i| unsafe { *p.add(BIGNUM_HEADER_CELLS + i) })
-        .collect();
-
-    // num-bigint takes u32 chunks for from_slice; we can also use
-    // BigUint::new which accepts u32 limbs. Convert our u64 limbs
-    // to u32 little-endian first.
+    // num-bigint's BigUint::new accepts u32 little-endian limbs. Split
+    // each u64 heap limb into its two u32 halves directly into the result
+    // vec — no intermediate Vec<u64> copy of the limbs.
     let mut u32_limbs = Vec::with_capacity(n_limbs * 2);
-    for &limb in &limbs {
+    for i in 0..n_limbs {
+        let limb = unsafe { *p.add(BIGNUM_HEADER_CELLS + i) };
         u32_limbs.push((limb & 0xFFFF_FFFF) as u32);
         u32_limbs.push((limb >> 32) as u32);
     }
@@ -407,6 +404,83 @@ pub extern "C-unwind" fn ncl_mod_promote(
         return crate::abi::signal_condition_string(mutator, "division by zero");
     }
     bigint_to_word(m, &na.mod_floor(&nb)).raw()
+}
+
+/// 2-operand JIT slow-path helpers for the inline bitwise ops. The JIT
+/// emits the both-fixnum fast path inline (a raw `and`/`or`/`xor` on the
+/// tagged words — tag bits are 000 for fixnums, so the result is
+/// correctly tagged) and calls these only when an operand is a bignum.
+/// ABI mirrors `ncl_add_promote`: `(mutator, a, b) -> Word`.
+fn bit_promote_2(
+    mutator: *mut MutatorState,
+    a_raw: u64,
+    b_raw: u64,
+    name: &str,
+    op: impl Fn(BigInt, BigInt) -> BigInt,
+) -> u64 {
+    let na = match integer_to_bigint(Word::from_raw(a_raw)) {
+        Some(n) => n,
+        None => return crate::abi::signal_condition_string(
+            mutator, &format!("{name}: non-integer argument"),
+        ),
+    };
+    let nb = match integer_to_bigint(Word::from_raw(b_raw)) {
+        Some(n) => n,
+        None => return crate::abi::signal_condition_string(
+            mutator, &format!("{name}: non-integer argument"),
+        ),
+    };
+    let m = unsafe { &mut *mutator };
+    bigint_to_word(m, &op(na, nb)).raw()
+}
+
+/// `(ash n shift)` slow path: 2-operand promote ABI. The JIT inlines the
+/// common small-left-shift fixnum case; this handles bignum `n`, large
+/// or negative shifts, and fixnum-overflow-to-bignum. Mirrors
+/// `ash_shim`'s bigint logic.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn ncl_ash_promote(mutator: *mut MutatorState, n_raw: u64, shift_raw: u64) -> u64 {
+    use num_traits::{Pow, Signed};
+    use num_integer::Integer;
+    let n = match integer_to_bigint(Word::from_raw(n_raw)) {
+        Some(n) => n,
+        None => return crate::abi::signal_condition_string(
+            mutator, "ash: first arg must be an integer"),
+    };
+    let shift = match Word::from_raw(shift_raw).as_fixnum() {
+        Some(s) => s,
+        None => return crate::abi::signal_condition_string(
+            mutator, "ash: shift count must be a fixnum"),
+    };
+    let result = if shift >= 0 {
+        if shift > u32::MAX as i64 {
+            return crate::abi::signal_condition_string(mutator, "ash: shift count too large");
+        }
+        n << (shift as usize)
+    } else {
+        let s = (-shift) as usize;
+        if n.is_negative() {
+            let divisor: BigInt = BigInt::from(2).pow(s as u32);
+            n.div_floor(&divisor)
+        } else {
+            n >> s
+        }
+    };
+    let m = unsafe { &mut *mutator };
+    bigint_to_word(m, &result).raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn ncl_logand_promote(m: *mut MutatorState, a: u64, b: u64) -> u64 {
+    bit_promote_2(m, a, b, "logand", |x, y| x & y)
+}
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn ncl_logior_promote(m: *mut MutatorState, a: u64, b: u64) -> u64 {
+    bit_promote_2(m, a, b, "logior", |x, y| x | y)
+}
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn ncl_logxor_promote(m: *mut MutatorState, a: u64, b: u64) -> u64 {
+    bit_promote_2(m, a, b, "logxor", |x, y| x ^ y)
 }
 
 // ─── Lisp-callable math shims (registered via install_native) ────────────

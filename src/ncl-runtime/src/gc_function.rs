@@ -79,6 +79,29 @@ pub fn alloc_function_in_static(
     Some(Word::from_ptr(p as *const u8, Tag::Function))
 }
 
+/// Allocate a NO-CAPTURE (empty env) Lisp closure in the static area, via
+/// the process coordinator. Returns the Function-tagged Word (raw), or
+/// `None` if no coordinator is installed or the static area is exhausted.
+///
+/// Called by the JIT at COMPILE time: a lambda with no free variables is a
+/// constant, so we allocate its Function record ONCE here and embed the
+/// Word as an IR constant, instead of calling `ncl_make_closure` on every
+/// evaluation. The static area never moves, so the embedded Word stays
+/// valid for the process lifetime. (`name` NIL, `env` NIL, `is_lisp` true —
+/// matching the anonymous-Lisp-lambda case in `ncl_make_closure`.)
+pub fn alloc_no_capture_closure_static(code_ptr: usize, arity: u32) -> Option<u64> {
+    let coord = crate::brk::gc_coordinator()?;
+    alloc_function_in_static(
+        coord.static_area(),
+        code_ptr,
+        arity,
+        Word::NIL,
+        Word::NIL,
+        true,
+    )
+    .map(|w| w.raw())
+}
+
 /// Return `true` if this Function was compiled by the NCL Lisp
 /// compiler (i.e. it manages the multi-value slot on its own), or
 /// `false` if it is a native Rust shim.

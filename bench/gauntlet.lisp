@@ -116,4 +116,107 @@
      (sort (list 5 3 9 1 7 2 8 4 6) #'<)
      '(1 2 3 4 5 6 7 8 9))
 
+;; ── unboxed-float arithmetic (Sprint 1) ─────────────────────────────
+;; Native f64 fast path for float-typed expressions; the value stays
+;; unboxed across the expression and boxes once at the escape. See
+;; docs/performance-unbox-float.md.
+(chk "float-mul"          (* 2.0 3.0) 6.0)
+(chk "float-add"          (+ 1.5 2.5) 4.0)
+(chk "float-sub"          (- 5.0 1.5) 3.5)
+(chk "float-chain"        (+ (* 2.0 3.0) 1.0) 7.0)
+(chk "float-nested"       (* (+ 1.0 1.0) (- 4.0 1.0)) 6.0)
+;; int→float contagion with a fixnum constant operand
+(chk "float-contagion+"   (+ 2.0 3) 5.0)
+(chk "float-contagion*"   (* 2 1.5) 3.0)
+(chk "float-contagion-"   (- 10 0.5) 9.5)
+;; comparisons — native ordered fcmp
+(chk "float->"            (> 3.0 2.0) t)
+(chk "float-<"            (< 1.0 2.0) t)
+(chk "float->="           (>= 4.0 4.0) t)
+(chk "float-<="           (<= 4.0 4.0) t)
+(chk "float-="            (= 1.0 1.0) t)
+(chk "float->-false"      (> 2.0 3.0) nil)
+(chk "float-cmp-mixed"    (< 1 2.0) t)
+(chk "float-=-mixed"      (= 2 2.0) t)
+;; -0.0 = 0.0 under IEEE ordered-equal
+(chk "float-negzero-="    (= 0.0 -0.0) t)
+;; a float that escapes to a Word (boxed in a list) then re-enters
+;; arithmetic via the generic/contagion path
+(chk "float-box-roundtrip" (+ (car (list 1.5)) 0.5) 2.0)
+(chk "float-eql"          (eql 2.0 2.0) t)
+(chk "eq-int-vs-float"    (eq 3 3.0) nil)
+;; integers MUST stay integers — no accidental float contagion
+(chk "int-add-stays-int"  (+ 1 2) 3)
+(chk "int-mul-stays-int"  (* 3 4) 12)
+(chk "int-cmp-stays"      (< 1 2) t)
+(chk "int-=-stays"        (= 3 3) t)
+(chk "bignum-still-ok"    (* 1000000000000 1000000000000) 1000000000000000000000000)
+
+;; ── declared double-float parameters (Sprint 3) ─────────────────────
+;; Params declared (double-float ...) are read unboxed; arithmetic on
+;; them is native f64 with one box at the escape.
+(defun g-dist2 (x y) (declare (double-float x y)) (+ (* x x) (* y y)))
+(defun g-pid   (x)   (declare (double-float x)) x)
+(defun g-lerp  (a b) (declare (double-float a b)) (+ a (* 0.5 (- b a))))
+(defun g-poly  (x)   (declare (double-float x)) (+ (* x (* x x)) (* 2.0 (* x x)) (* 3.0 x) 4.0))
+(defun g-cmpf  (x y) (declare (double-float x y)) (if (> x y) :x :y))
+;; (type double-float ...) long form, and an undeclared param mixing in.
+(defun g-scale (x k) (declare (type double-float x)) (* x k))
+(chk "fparam-dist2"   (g-dist2 3.0 4.0) 25.0)
+(chk "fparam-pid"     (g-pid 3.5) 3.5)
+(chk "fparam-lerp"    (g-lerp 0.0 10.0) 5.0)
+(chk "fparam-poly"    (g-poly 2.0) 26.0)
+(chk "fparam-cmp"     (g-cmpf 3.0 2.0) :x)
+(chk "fparam-cmp2"    (g-cmpf 1.0 2.0) :y)
+(chk "fparam-type-lf" (g-scale 2.0 3.0) 6.0)
+;; an integer arg to an undeclared mate still contaminates correctly
+(chk "fparam-mix-int" (g-scale 2.0 3) 6.0)
+
+;; ── declared double-float locals (Sprint 2) ─────────────────────────
+;; A (declare (double-float ..)) let-local is stored unboxed in an f64
+;; stack slot. Mutable locals captured by a loop-lambda safely fall back
+;; to the boxed representation — still correct, just not unboxed.
+(defun g-floc ()  (let ((x 2.0)) (declare (double-float x)) (* x x)))
+(defun g-floc2 () (let ((a 2.0)) (declare (double-float a))
+                    (let ((b (* a a))) (declare (double-float b)) (+ a b))))
+(defun g-floc-word () (let ((x 1.5)) (declare (double-float x)) (list x)))
+(defun g-floc-int-init () (let ((x 3)) (declare (double-float x)) (* x 2.0)))
+(defun g-facc (n) (let ((acc 0.0) (i 0)) (declare (double-float acc))
+                    (loop (when (>= i n) (return acc))
+                          (setq acc (+ acc 1.0)) (setq i (+ i 1)))))
+(chk "flocal-immut"     (g-floc) 4.0)
+(chk "flocal-nested"    (g-floc2) 6.0)
+(chk "flocal-word-ctx"  (g-floc-word) '(1.5))
+(chk "flocal-int-init"  (g-floc-int-init) 6.0)
+(chk "flocal-loop-acc"  (g-facc 100) 100.0)
+
+;; ── fast-loop: inline loop, unboxed loop carries (the real lever) ───
+;; (fast-loop TEST RESULT BODY...) — no capturing lambda, so declared
+;; double-float loop variables stay in f64 stack slots across iterations.
+(defun g-countup (n) (let ((i 0)) (fast-loop (>= i n) i (setq i (+ i 1)))))
+(defun g-fl-acc (n) (let ((acc 0.0) (i 0)) (declare (double-float acc))
+                      (fast-loop (>= i n) acc (setq acc (+ acc 2.0)) (setq i (+ i 1)))))
+(defun g-fl-empty () (let ((i 42)) (fast-loop t i)))   ; test true on entry
+(defun g-mbi (cx cy max)
+  (declare (double-float cx cy))
+  (let ((zx 0.0) (zy 0.0) (n 0))
+    (declare (double-float zx zy))
+    (fast-loop (or (>= n max) (> (+ (* zx zx) (* zy zy)) 4.0)) n
+      (let ((nx (+ (- (* zx zx) (* zy zy)) cx)) (ny (+ (* 2.0 (* zx zy)) cy)))
+        (declare (double-float nx ny)) (setq zx nx) (setq zy ny))
+      (setq n (+ n 1)))))
+(chk "floop-countup"   (g-countup 100000) 100000)
+(chk "floop-facc"      (g-fl-acc 50) 100.0)
+(chk "floop-empty"     (g-fl-empty) 42)
+(chk "floop-mbi-inset" (g-mbi 0.0 0.0 100) 100)
+(chk "floop-mbi-esc"   (g-mbi 2.0 2.0 100) 1)
+(chk "floop-mbi-mid"   (g-mbi -0.5 0.0 100) 100)
+;; nested fast-loop + GC churn alongside (cons-allocating loop body)
+(defun g-fl-nested ()
+  (let ((sum 0) (py 0))
+    (fast-loop (>= py 50) sum
+      (let ((px 0)) (fast-loop (>= px 50) nil (setq sum (+ sum 1)) (setq px (+ px 1))))
+      (setq py (+ py 1)))))
+(chk "floop-nested"    (g-fl-nested) 2500)
+
 (format t "~%GAUNTLET ~A~%" (if (= *fails* 0) "ALL-PASS" (format nil "~A FAILS" *fails*)))

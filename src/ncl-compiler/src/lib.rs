@@ -18,8 +18,10 @@ use ncl_runtime::{
 };
 use new_asm;
 
+mod inline;
 pub mod lower;
 pub mod macroexpand;
+mod optimize;
 
 thread_local! {
     /// Pointer to the active Session for this thread. Set by
@@ -497,16 +499,35 @@ pub(crate) fn compile_function_raw(
 ) -> Result<Word, EvalError> {
     let t_lower = startup_timing::now();
 
+    // Capture `(declare ...)` specs from the RAW body, BEFORE
+    // macroexpansion. `declare` is a no-op macro that expands to nil
+    // (core.lisp), so the metadata is destroyed by macroexpand_all —
+    // we must read the leading declares here to honour type
+    // declarations (e.g. (double-float ...)). See
+    // docs/performance-unbox-float.md Sprint 3.
+    let (decl_specs, _) = lower::strip_declares(body_forms);
+
     // First, expand any macros used in the body.
     let mut expanded_body: Vec<Value> = Vec::with_capacity(body_forms.len());
     for form in body_forms {
         expanded_body.push(macroexpand_all(form, coord, mutator)?);
     }
 
-    // Strip leading (declare ...) forms — they're processed at
-    // lowering time and must not be evaluated as function calls.
+    // Strip leading (declare ...) forms — after macroexpansion they are
+    // nil (the declare macro), but strip any that survive to keep the
+    // body clean.
     let (_, effective_body) = lower::strip_declares(&expanded_body);
     let effective_body = effective_body.to_vec();
+
+    // Capture this body for inline expansion at direct call sites, IFF it was
+    // `(declaim (inline NAME))`d with a simple (required-only) lambda list.
+    // The function is still compiled normally below (it must remain callable
+    // via #', apply, recursion, and non-inlinable sites) — this only records
+    // a copy. See inline.rs / docs/compiler_completion.md § Interprocedural.
+    let simple_lambda_list = params.optionals.is_empty()
+        && params.rest.is_none()
+        && params.keys.is_empty();
+    inline::maybe_record(name, simple_lambda_list, &params.required, &effective_body);
 
     // Build the env. Required params first at Param(0..N); the
     // shared prologue helper then layers optionals/rest/keys on
@@ -528,6 +549,26 @@ pub(crate) fn compile_function_raw(
             );
             env.rebind_as_local_cell(pname);
             req_box_prologue.push(cell_init);
+        }
+    }
+
+    // Unboxed-float parameters: a required param declared
+    // `(double-float ...)` that is NOT mutated (mutated ones were just
+    // boxed above) and NOT special is read as a native f64 — the JIT
+    // unboxes the argument once and computes without per-op boxing.
+    // See docs/performance-unbox-float.md Sprint 3.
+    let float_params = lower::extract_float_names(&decl_specs);
+    if !float_params.is_empty() {
+        // The function opted into float types — allow auto-inlining of
+        // its simple loops (gated in lower_call_in_mut on this flag).
+        env.mark_float_decl();
+        for pname in &params.required {
+            if float_params.contains(pname.as_ref())
+                && !body_mutations.contains(pname)
+                && !coord.is_special(coord.intern(pname))
+            {
+                env.rebind_as_param_f64(pname);
+            }
         }
     }
 
@@ -597,6 +638,17 @@ pub(crate) fn compile_function_raw(
     // always exactly the function's actual return values when
     // the caller reads it. See lower::instrument_tail_for_mv.
     let body_expr = lower::instrument_tail_for_mv(body_expr);
+
+    // Lisp-aware representation inference: prove which values are
+    // double-floats and wrap their reads so emit unboxes them without the
+    // tag-check diamond. Runs last so it sees the final tree emit will see.
+    // Opt out with NCL_NO_INFER=1 for A/B comparison. See optimize.rs +
+    // docs/compiler_completion.md.
+    let body_expr = if std::env::var_os("NCL_NO_INFER").is_some() {
+        body_expr
+    } else {
+        optimize::infer_float_unboxing(body_expr)
+    };
 
     let lower_elapsed = startup_timing::elapsed(t_lower);
     let t_jit = startup_timing::now();

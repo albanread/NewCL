@@ -124,6 +124,14 @@ pub fn install_gc_coordinator(coord: std::sync::Arc<crate::mutator::GcCoordinato
     }
 }
 
+/// The process-wide GC coordinator, if one has been installed. Used by the
+/// JIT (at compile time) to reach the static area for compile-time constant
+/// allocation — e.g. eliding a no-capture closure's per-evaluation alloc.
+/// `None` in unit-test contexts that compile without a running coordinator.
+pub fn gc_coordinator() -> Option<std::sync::Arc<crate::mutator::GcCoordinator>> {
+    GC_COORD.read().ok().and_then(|g| g.clone())
+}
+
 // ─── Win32 FFI ──────────────────────────────────────────────────────
 //
 // Hand-rolled rather than going through the `windows` crate so the

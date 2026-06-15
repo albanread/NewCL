@@ -122,7 +122,7 @@ pub fn make_complex(m: &mut MutatorState, re: Word, im: Word) -> Word {
 }
 
 fn alloc_complex_raw(m: &mut MutatorState, re: Word, im: Word) -> Word {
-    let marker = m.coord().intern("%COMPLEX");
+    let marker = m.coord().marker_complex();
     let w = m.alloc_typed_vector(HeapType::Complex, COMPLEX_PAYLOAD_CELLS);
     let p = w.as_mut_ptr::<u64>(Tag::Vector).expect("just-allocated vector");
     unsafe {

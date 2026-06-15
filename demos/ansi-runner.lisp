@@ -7,6 +7,15 @@
 ;;;; no real package system yet), defines `dotests` / `verify` /
 ;;;; `passed-test` / `failed-test`, then loads each chapter file by
 ;;;; absolute path. Counts pass/fail at the end.
+;;;;
+;;;; KNOWN NON-DETERMINISTIC TEST — the pass count varies by ±1 between
+;;;; runs (e.g. 490 vs 489) and that is EXPECTED, not a regression. The
+;;;; chapter-3 example `(< (zap 5 3) 3) => true` is itself random:
+;;;;   (defun zap (n m) (let ((a (make-array n)))
+;;;;     (dotimes (i n) (setf (aref a i) (random (+ i 1)))) (aref a m)))
+;;;; `(zap 5 3)` returns `(random 4)` ∈ {0,1,2,3}, so `(< … 3)` is true
+;;;; only 3/4 of the time — it "fails" ~1 run in 4. Don't chase it as a
+;;;; corruption/GC bug; it's a flaky hyperspec example, not our code.
 
 ;; ── No-op shims ─────────────────────────────────────────────────────
 

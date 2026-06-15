@@ -17,14 +17,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use inkwell::AddressSpace;
 use new_asm;
-use inkwell::IntPredicate;
+use inkwell::{FloatPredicate, IntPredicate};
 use inkwell::OptimizationLevel;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::execution_engine::{ExecutionEngine, JitFunction};
 use inkwell::module::{Linkage, Module};
 use inkwell::attributes::AttributeLoc;
-use inkwell::values::{AsValueRef, FunctionValue, IntValue, PhiValue};
+use inkwell::values::{AsValueRef, FloatValue, FunctionValue, IntValue, PhiValue, PointerValue};
 
 pub(crate) mod jit_mm;
 
@@ -34,7 +34,7 @@ use ncl_runtime::{
         ncl_truncate_promote, ncl_rem_promote,
     },
     complex::{ncl_add_complex, ncl_sub_complex, ncl_mul_complex},
-    ratio::ncl_cmp_full,
+    float::ncl_num_cmp,
     ncl_abort_pending, ncl_alloc_cons, ncl_apply, ncl_aref_generic, ncl_aset_generic,
     ncl_build_rest_list, ncl_call, ncl_dynamic_bind, ncl_dynamic_unbind, ncl_equal, ncl_funcall,
     ncl_length, ncl_load_function, ncl_load_value, ncl_lookup_keyword,
@@ -470,7 +470,7 @@ fn build_lisp_function(
     // function.get_nth_param(1)) so it always sees the post-GC env.
     let env_param = function.get_nth_param(1).unwrap().into_int_value();
     let mut locals: Vec<IntValue<'_>> = vec![env_param];
-    let result = emit_expr(
+    let result_repr = emit_expr_repr(
         context,
         &builder,
         &function,
@@ -480,6 +480,7 @@ fn build_lisp_function(
         &mut locals,
         body,
     )?;
+    let result = coerce_to_word(&builder, &function, &helpers, result_repr)?;
     // Only emit the return if the current block isn't already
     // terminated. A self-tail-call body whose every tail path loops
     // (e.g. `(if c (f ...) (g ...))` with both arms self-calls) leaves
@@ -736,7 +737,11 @@ fn build_engine_and_get_fn_addr(
         bind(engine, helpers.mul_promote, ncl_mul_complex as usize);
         bind(engine, helpers.truncate_promote, ncl_truncate_promote as usize);
         bind(engine, helpers.rem_promote, ncl_rem_promote as usize);
-        bind(engine, helpers.cmp_int, ncl_cmp_full as usize);
+        bind(engine, helpers.logand_promote, ncl_runtime::bignum::ncl_logand_promote as usize);
+        bind(engine, helpers.logior_promote, ncl_runtime::bignum::ncl_logior_promote as usize);
+        bind(engine, helpers.logxor_promote, ncl_runtime::bignum::ncl_logxor_promote as usize);
+        bind(engine, helpers.ash_promote, ncl_runtime::bignum::ncl_ash_promote as usize);
+        bind(engine, helpers.cmp_int, ncl_num_cmp as usize);
         bind(
             engine,
             helpers.debug_check_cons,
@@ -744,6 +749,8 @@ fn build_engine_and_get_fn_addr(
         );
         bind(engine, helpers.dynamic_bind, ncl_dynamic_bind as usize);
         bind(engine, helpers.dynamic_unbind, ncl_dynamic_unbind as usize);
+        bind(engine, helpers.box_float, ncl_runtime::float::ncl_box_float as usize);
+        bind(engine, helpers.unbox_float_checked, ncl_runtime::float::ncl_unbox_float_checked as usize);
     }
     // sadd/ssub/smul.with.overflow are LLVM intrinsics — LLVM
     // resolves them itself, no mapping needed.
@@ -806,6 +813,11 @@ struct Helpers<'ctx> {
     mul_promote: FunctionValue<'ctx>,
     truncate_promote: FunctionValue<'ctx>,
     rem_promote: FunctionValue<'ctx>,
+    /// Bignum-aware slow paths for the inline bitwise ops.
+    logand_promote: FunctionValue<'ctx>,
+    logior_promote: FunctionValue<'ctx>,
+    logxor_promote: FunctionValue<'ctx>,
+    ash_promote: FunctionValue<'ctx>,
     /// Cross-type integer comparison. Returns -1, 0, or +1 (i64).
     cmp_int: FunctionValue<'ctx>,
     /// LLVM intrinsic for signed-add-with-overflow. Returns
@@ -826,6 +838,22 @@ struct Helpers<'ctx> {
     /// of the dynamic scope.
     dynamic_bind: FunctionValue<'ctx>,
     dynamic_unbind: FunctionValue<'ctx>,
+    /// `ncl_box_float(mutator, f64) -> Word` — the `coerce_to_word(F64)`
+    /// boundary helper. Boxes an unboxed double into a heap Float at an
+    /// escape. See `docs/performance-unbox-float.md`.
+    box_float: FunctionValue<'ctx>,
+    /// `ncl_unbox_float_checked(mutator, Word) -> f64` — the checked slow
+    /// path of `coerce_to_f64(Word)`. Called when the Word is NOT a heap
+    /// Float (e.g. a non-float arg to a declared double-float param);
+    /// coerces a real or signals, instead of segfaulting.
+    unbox_float_checked: FunctionValue<'ctx>,
+    /// Per-function unboxed-f64 local slots (`Expr::F64LocalRead/Store`).
+    /// Lazily `alloca`'d in the entry block on first use, indexed by the
+    /// f64-slot number assigned during lowering. Interior-mutable so it
+    /// threads through the shared `helpers` ref like `tail_loop`, with no
+    /// new `emit_expr` parameter. Fresh per function (Helpers is rebuilt
+    /// per compile). See docs/performance-unbox-float.md Sprint 2.
+    f64_slots: std::cell::RefCell<Vec<Option<PointerValue<'ctx>>>>,
     /// Self-tail-call loop context, set while emitting the body of an
     /// `Expr::TailLoop`. `SelfTailNext` reads it to find the loop
     /// header block to branch back to and the per-parameter phi nodes
@@ -835,6 +863,12 @@ struct Helpers<'ctx> {
     /// adding a parameter to that (already large) function's signature
     /// and all ~40 of its recursive call sites.
     tail_loop: std::cell::RefCell<Option<TailCtx<'ctx>>>,
+    /// Stack of active `Expr::InlineLoop` frames. `Expr::LoopBreak`
+    /// reads the top frame to find the loop's exit block and records its
+    /// (value, predecessor-block) so the exit's result phi can be built.
+    /// A stack handles nesting defensively (inlinable bodies exclude
+    /// nested loops, so in practice it holds at most one frame).
+    inline_loops: std::cell::RefCell<Vec<InlineLoopFrame<'ctx>>>,
 }
 
 /// Loop context published by `Expr::TailLoop` for the `SelfTailNext`
@@ -845,6 +879,15 @@ struct Helpers<'ctx> {
 struct TailCtx<'ctx> {
     loop_header: inkwell::basic_block::BasicBlock<'ctx>,
     param_phis: Vec<PhiValue<'ctx>>,
+}
+
+/// Active `Expr::InlineLoop` context for the `Expr::LoopBreak`s nested
+/// in its body.
+struct InlineLoopFrame<'ctx> {
+    exit_block: inkwell::basic_block::BasicBlock<'ctx>,
+    /// (break value, the block the break branches from) — incomings for
+    /// the exit block's result phi.
+    breaks: Vec<(IntValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)>,
 }
 
 fn declare_runtime_helpers<'ctx>(
@@ -1105,6 +1148,15 @@ fn declare_runtime_helpers<'ctx>(
         promote_type,
         Some(Linkage::External),
     );
+    // Bitwise-op bignum slow paths (same promote ABI).
+    let logand_promote = module.add_function(
+        "ncl_logand_promote", promote_type, Some(Linkage::External));
+    let logior_promote = module.add_function(
+        "ncl_logior_promote", promote_type, Some(Linkage::External));
+    let logxor_promote = module.add_function(
+        "ncl_logxor_promote", promote_type, Some(Linkage::External));
+    let ash_promote = module.add_function(
+        "ncl_ash_promote", promote_type, Some(Linkage::External));
     let cmp_type = i64_t.fn_type(&[i64_t.into(), i64_t.into()], false);
     let cmp_int = module.add_function(
         "ncl_cmp_int",
@@ -1165,6 +1217,25 @@ fn declare_runtime_helpers<'ctx>(
         Some(Linkage::External),
     );
 
+    // ncl_box_float(mutator, f64) -> Word. The f64 arg lands in an XMM
+    // register per the platform C ABI (LLVM + Rust extern "C" agree on
+    // the `(ptr, double) -> i64` signature).
+    let f64_t = context.f64_type();
+    let box_float_type = i64_t.fn_type(&[ptr_t.into(), f64_t.into()], false);
+    let box_float = module.add_function(
+        "ncl_box_float",
+        box_float_type,
+        Some(Linkage::External),
+    );
+
+    // ncl_unbox_float_checked(mutator, Word) -> f64
+    let unbox_float_checked_type = f64_t.fn_type(&[ptr_t.into(), i64_t.into()], false);
+    let unbox_float_checked = module.add_function(
+        "ncl_unbox_float_checked",
+        unbox_float_checked_type,
+        Some(Linkage::External),
+    );
+
     Helpers {
         alloc_cons,
         push_root,
@@ -1196,6 +1267,10 @@ fn declare_runtime_helpers<'ctx>(
         mul_promote,
         truncate_promote,
         rem_promote,
+        logand_promote,
+        logior_promote,
+        logxor_promote,
+        ash_promote,
         cmp_int,
         sadd_with_overflow,
         ssub_with_overflow,
@@ -1203,7 +1278,11 @@ fn declare_runtime_helpers<'ctx>(
         debug_check_cons,
         dynamic_bind,
         dynamic_unbind,
+        box_float,
+        unbox_float_checked,
+        f64_slots: std::cell::RefCell::new(Vec::new()),
         tail_loop: std::cell::RefCell::new(None),
+        inline_loops: std::cell::RefCell::new(Vec::new()),
     }
 }
 
@@ -1252,7 +1331,11 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(&helpers.mul_promote, ncl_mul_complex as *const () as usize);
     engine.add_global_mapping(&helpers.truncate_promote, ncl_truncate_promote as *const () as usize);
     engine.add_global_mapping(&helpers.rem_promote, ncl_rem_promote as *const () as usize);
-    engine.add_global_mapping(&helpers.cmp_int, ncl_cmp_full as *const () as usize);
+    engine.add_global_mapping(&helpers.logand_promote, ncl_runtime::bignum::ncl_logand_promote as *const () as usize);
+    engine.add_global_mapping(&helpers.logior_promote, ncl_runtime::bignum::ncl_logior_promote as *const () as usize);
+    engine.add_global_mapping(&helpers.logxor_promote, ncl_runtime::bignum::ncl_logxor_promote as *const () as usize);
+    engine.add_global_mapping(&helpers.ash_promote, ncl_runtime::bignum::ncl_ash_promote as *const () as usize);
+    engine.add_global_mapping(&helpers.cmp_int, ncl_num_cmp as *const () as usize);
     engine.add_global_mapping(
         &helpers.debug_check_cons,
         ncl_runtime::ncl_debug_check_cons as *const () as usize,
@@ -1264,6 +1347,14 @@ fn register_runtime_helpers(engine: &ExecutionEngine<'_>, helpers: &Helpers<'_>)
     engine.add_global_mapping(
         &helpers.dynamic_unbind,
         ncl_runtime::ncl_dynamic_unbind as *const () as usize,
+    );
+    engine.add_global_mapping(
+        &helpers.box_float,
+        ncl_runtime::float::ncl_box_float as *const () as usize,
+    );
+    engine.add_global_mapping(
+        &helpers.unbox_float_checked,
+        ncl_runtime::float::ncl_unbox_float_checked as *const () as usize,
     );
     // sadd/ssub/smul.with.overflow are LLVM intrinsics — no
     // global mapping; LLVM resolves them itself.
@@ -1435,6 +1526,201 @@ fn emit_overflow_op<'ctx>(
         &slow_locals_post_wrap,
         &slow_params_post_wrap,
         slow_end_block,
+    )?;
+    Ok(phi.as_basic_value().into_int_value())
+}
+
+#[derive(Clone, Copy)]
+enum BitOp { And, Ior, Xor }
+
+/// Emit a tag-checked bitwise `logand`/`logior`/`logxor`. Fast path:
+/// both operands fixnum → the raw bitwise op on the *tagged* words. A
+/// fixnum's tag bits are 000, and `000 OP 000 = 000`, so the result is
+/// already a correctly-tagged fixnum — no untag/retag, no overflow.
+/// Slow path: a bignum-aware promote helper, safepoint-wrapped because
+/// it can allocate a bignum result. Mirrors `emit_overflow_op` minus the
+/// overflow intrinsic.
+#[allow(clippy::too_many_arguments)]
+fn emit_bitwise_op<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    params: &mut Vec<IntValue<'ctx>>,
+    locals: &mut Vec<IntValue<'ctx>>,
+    lhs: IntValue<'ctx>,
+    rhs: IntValue<'ctx>,
+    promote_helper: FunctionValue<'ctx>,
+    op: BitOp,
+    op_name: &str,
+) -> Result<IntValue<'ctx>, String> {
+    let i64_t = context.i64_type();
+    let seven = i64_t.const_int(7, false);
+    let zero = i64_t.const_zero();
+    let tag_or = builder
+        .build_or(lhs, rhs, &format!("{op_name}_tag_or"))
+        .map_err(|e| format!("or: {e}"))?;
+    let tag_bits = builder
+        .build_and(tag_or, seven, &format!("{op_name}_tag_bits"))
+        .map_err(|e| format!("and: {e}"))?;
+    let both_fixnum = builder
+        .build_int_compare(IntPredicate::EQ, tag_bits, zero, &format!("{op_name}_both_fix"))
+        .map_err(|e| format!("icmp: {e}"))?;
+
+    let fast_block = context.append_basic_block(*function, &format!("{op_name}_fast"));
+    let slow_block = context.append_basic_block(*function, &format!("{op_name}_slow"));
+    let join_block = context.append_basic_block(*function, &format!("{op_name}_join"));
+    builder
+        .build_conditional_branch(both_fixnum, fast_block, slow_block)
+        .map_err(|e| format!("br {op_name} tag-check: {e}"))?;
+
+    // Fast: raw bitwise op on the tagged words.
+    builder.position_at_end(fast_block);
+    let fast_result = match op {
+        BitOp::And => builder.build_and(lhs, rhs, &format!("{op_name}_fast")),
+        BitOp::Ior => builder.build_or(lhs, rhs, &format!("{op_name}_fast")),
+        BitOp::Xor => builder.build_xor(lhs, rhs, &format!("{op_name}_fast")),
+    }
+    .map_err(|e| format!("{op_name} fast: {e}"))?;
+    builder
+        .build_unconditional_branch(join_block)
+        .map_err(|e| format!("br fast→join {op_name}: {e}"))?;
+    let fast_end_block = builder.get_insert_block().unwrap();
+
+    // Slow: bignum-aware promote (allocates → safepoint-wrapped).
+    let fast_locals_snapshot = locals.clone();
+    let fast_params_snapshot = params.clone();
+    builder.position_at_end(slow_block);
+    let mutator_arg = function.get_nth_param(0).unwrap();
+    let extra_roots = [lhs, rhs];
+    let slow_result = emit_safepoint_wrap(
+        context, builder, function, helpers, params, locals, &extra_roots,
+        || {
+            let call = builder
+                .build_call(
+                    promote_helper,
+                    &[mutator_arg.into(), lhs.into(), rhs.into()],
+                    &format!("{op_name}_promote"),
+                )
+                .map_err(|e| format!("call {op_name}_promote: {e}"))?;
+            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+        },
+    )?;
+    emit_post_call_abort_check(context, builder, function, helpers)?;
+    let slow_locals_post_wrap = locals.clone();
+    let slow_params_post_wrap = params.clone();
+    builder
+        .build_unconditional_branch(join_block)
+        .map_err(|e| format!("br slow→join {op_name}: {e}"))?;
+    let slow_end_block = builder.get_insert_block().unwrap();
+
+    builder.position_at_end(join_block);
+    let phi = builder
+        .build_phi(i64_t, &format!("{op_name}_result"))
+        .map_err(|e| format!("phi {op_name}: {e}"))?;
+    phi.add_incoming(&[(&fast_result, fast_end_block), (&slow_result, slow_end_block)]);
+    merge_locals_params_at_join(
+        context, builder, locals, params,
+        &fast_locals_snapshot, &fast_params_snapshot, fast_end_block,
+        &slow_locals_post_wrap, &slow_params_post_wrap, slow_end_block,
+    )?;
+    Ok(phi.as_basic_value().into_int_value())
+}
+
+/// Emit `(ash n shift)`. Fast path: both operands fixnum, `shift` is a
+/// small non-negative count (`0..32`), and the left shift doesn't lose
+/// high bits. A fixnum is `v<<3`, so `(v<<3) << s == (v<<s) << 3` is the
+/// correctly-tagged result; the overflow check is
+/// `(tagged << s) >>a s == tagged`. Everything else — bignum `n`,
+/// negative/large shift, or overflow — falls to the safepoint-wrapped
+/// `ncl_ash_promote` (which also covers right shifts and bignum results).
+#[allow(clippy::too_many_arguments)]
+fn emit_ash_op<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    params: &mut Vec<IntValue<'ctx>>,
+    locals: &mut Vec<IntValue<'ctx>>,
+    n: IntValue<'ctx>,
+    shift: IntValue<'ctx>,
+) -> Result<IntValue<'ctx>, String> {
+    let i64_t = context.i64_type();
+    let seven = i64_t.const_int(7, false);
+    let zero = i64_t.const_zero();
+    let three = i64_t.const_int(3, false);
+    let lim = i64_t.const_int(32, false);
+
+    let tag_or = builder.build_or(n, shift, "ash_tag_or").map_err(|e| format!("or: {e}"))?;
+    let tag_bits = builder.build_and(tag_or, seven, "ash_tag_bits").map_err(|e| format!("and: {e}"))?;
+    let both_fix = builder
+        .build_int_compare(IntPredicate::EQ, tag_bits, zero, "ash_both_fix")
+        .map_err(|e| format!("icmp: {e}"))?;
+
+    let check_bb = context.append_basic_block(*function, "ash_check");
+    let shift_bb = context.append_basic_block(*function, "ash_shift");
+    let fast_bb = context.append_basic_block(*function, "ash_fast");
+    let slow_bb = context.append_basic_block(*function, "ash_slow");
+    let join_bb = context.append_basic_block(*function, "ash_join");
+
+    builder.build_conditional_branch(both_fix, check_bb, slow_bb)
+        .map_err(|e| format!("br ash tag: {e}"))?;
+
+    // Shift count in range 0..32? (unsigned compare: a negative untagged
+    // shift wraps to a huge value and fails → handled by the slow path).
+    builder.position_at_end(check_bb);
+    let shift_i = builder.build_right_shift(shift, three, true, "ash_shift_i")
+        .map_err(|e| format!("ashr: {e}"))?;
+    let in_range = builder
+        .build_int_compare(IntPredicate::ULT, shift_i, lim, "ash_in_range")
+        .map_err(|e| format!("icmp: {e}"))?;
+    builder.build_conditional_branch(in_range, shift_bb, slow_bb)
+        .map_err(|e| format!("br ash range: {e}"))?;
+
+    // Left shift + overflow check.
+    builder.position_at_end(shift_bb);
+    let candidate = builder.build_left_shift(n, shift_i, "ash_cand")
+        .map_err(|e| format!("shl: {e}"))?;
+    let back = builder.build_right_shift(candidate, shift_i, true, "ash_back")
+        .map_err(|e| format!("ashr: {e}"))?;
+    let no_ovf = builder
+        .build_int_compare(IntPredicate::EQ, back, n, "ash_no_ovf")
+        .map_err(|e| format!("icmp: {e}"))?;
+    builder.build_conditional_branch(no_ovf, fast_bb, slow_bb)
+        .map_err(|e| format!("br ash ovf: {e}"))?;
+
+    builder.position_at_end(fast_bb);
+    builder.build_unconditional_branch(join_bb).map_err(|e| format!("br ash fast: {e}"))?;
+    let fast_end = builder.get_insert_block().unwrap();
+
+    // Slow: bignum-aware ash (allocates → safepoint-wrapped).
+    let fast_locals_snapshot = locals.clone();
+    let fast_params_snapshot = params.clone();
+    builder.position_at_end(slow_bb);
+    let mutator_arg = function.get_nth_param(0).unwrap();
+    let extra_roots = [n, shift];
+    let slow_result = emit_safepoint_wrap(
+        context, builder, function, helpers, params, locals, &extra_roots,
+        || {
+            let call = builder
+                .build_call(helpers.ash_promote, &[mutator_arg.into(), n.into(), shift.into()], "ash_promote")
+                .map_err(|e| format!("call ash_promote: {e}"))?;
+            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+        },
+    )?;
+    emit_post_call_abort_check(context, builder, function, helpers)?;
+    let slow_locals_post_wrap = locals.clone();
+    let slow_params_post_wrap = params.clone();
+    builder.build_unconditional_branch(join_bb).map_err(|e| format!("br ash slow: {e}"))?;
+    let slow_end = builder.get_insert_block().unwrap();
+
+    builder.position_at_end(join_bb);
+    let phi = builder.build_phi(i64_t, "ash_result").map_err(|e| format!("phi ash: {e}"))?;
+    phi.add_incoming(&[(&candidate, fast_end), (&slow_result, slow_end)]);
+    merge_locals_params_at_join(
+        context, builder, locals, params,
+        &fast_locals_snapshot, &fast_params_snapshot, fast_end,
+        &slow_locals_post_wrap, &slow_params_post_wrap, slow_end,
     )?;
     Ok(phi.as_basic_value().into_int_value())
 }
@@ -1967,20 +2253,20 @@ fn emit_ref_eq<'ctx>(
     emit_bool_select(builder, cmp, i64_t)
 }
 
-fn emit_cmp<'ctx>(
+/// Integer/generic binary comparison on already-emitted Word operands.
+/// Fast path: raw i64 compare on both-fixnum; slow path: `ncl_cmp_full`
+/// numeric-tower compare. Takes pre-emitted values (not `Expr`s) so the
+/// float-aware caller can route here after coercing its operands to
+/// Word without re-emitting them (double side effects).
+fn emit_cmp_vals<'ctx>(
     context: &'ctx Context,
     builder: &Builder<'ctx>,
     function: &FunctionValue<'ctx>,
     helpers: &Helpers<'ctx>,
-    arity: u32,
-    params: &mut Vec<IntValue<'ctx>>,
-    locals: &mut Vec<IntValue<'ctx>>,
-    a: &Expr,
-    b: &Expr,
+    lhs: IntValue<'ctx>,
+    rhs: IntValue<'ctx>,
     pred: IntPredicate,
 ) -> Result<IntValue<'ctx>, String> {
-    let lhs = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
-    let rhs = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
     let i64_t = context.i64_type();
     let zero = i64_t.const_zero();
     let seven = i64_t.const_int(7, false);
@@ -2032,6 +2318,18 @@ fn emit_cmp<'ctx>(
     let slow_cmp = builder
         .build_int_compare(pred, cmp_result, zero, "cmp_slow")
         .map_err(|e| format!("icmp slow: {e}"))?;
+    // IEEE-unordered guard: ncl_num_cmp returns i64::MIN when a NaN
+    // operand makes the comparison unordered, and every ordered predicate
+    // (<,>,<=,>=,=) must then be false. (`/=` is shim-only and never
+    // reaches this inline path.) For ordinary -1/0/+1 results this is a
+    // no-op AND with `true`. See `ncl_num_cmp` in float.rs.
+    let i64_min = i64_t.const_int(i64::MIN as u64, false);
+    let ordered = builder
+        .build_int_compare(IntPredicate::NE, cmp_result, i64_min, "cmp_ordered")
+        .map_err(|e| format!("icmp ordered: {e}"))?;
+    let slow_cmp = builder
+        .build_and(slow_cmp, ordered, "cmp_slow_ord")
+        .map_err(|e| format!("and ordered: {e}"))?;
     let slow_result = emit_bool_select(builder, slow_cmp, i64_t)?;
     builder
         .build_unconditional_branch(join_block)
@@ -2076,6 +2374,545 @@ fn emit_tag_eq<'ctx>(
     emit_bool_select(builder, cmp, i64_t)
 }
 
+/// The representation of an emitted SSA value. Today everything is a
+/// tagged `Word` (i64). The unboxed-float work (see
+/// `docs/performance-unbox-float.md`) lets float-typed values flow as a
+/// native `f64` in a register and box only at an escape. `emit_expr`
+/// always yields `Word`; `emit_expr_repr` may yield `F64`.
+#[derive(Clone, Copy)]
+enum Repr<'ctx> {
+    /// A tagged NCL Word (i64). The universal representation.
+    Word(IntValue<'ctx>),
+    /// An unboxed IEEE-754 double in a register. Never a GC root.
+    /// `boxed_const` carries a pre-boxed static-area Word when the value
+    /// is a compile-time constant (a float literal), so `coerce_to_word`
+    /// folds back to that shared constant instead of a fresh young-heap
+    /// box. `None` for runtime-computed doubles.
+    F64 {
+        val: FloatValue<'ctx>,
+        boxed_const: Option<IntValue<'ctx>>,
+    },
+}
+
+impl<'ctx> Repr<'ctx> {
+    /// A runtime-computed (non-constant) unboxed double.
+    fn f64(val: FloatValue<'ctx>) -> Repr<'ctx> {
+        Repr::F64 { val, boxed_const: None }
+    }
+    fn is_f64(&self) -> bool {
+        matches!(self, Repr::F64 { .. })
+    }
+}
+
+/// Boundary coercion: an unboxed `F64` flowing into a Word context is
+/// boxed via `ncl_box_float`; a `Word` is the identity. For a
+/// compile-time-constant `F64`, Sprint 1 will fold this back to a
+/// static-area boxed constant (see plan §Sprint 1) instead of a
+/// per-evaluation young-heap box; until a constant `F64` is produced,
+/// the only inputs here are runtime values.
+fn coerce_to_word<'ctx>(
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    r: Repr<'ctx>,
+) -> Result<IntValue<'ctx>, String> {
+    match r {
+        Repr::Word(w) => Ok(w),
+        // Compile-time constant: fold back to the shared static-area box
+        // (zero per-eval allocation) instead of a fresh young-heap box.
+        Repr::F64 { boxed_const: Some(w), .. } => Ok(w),
+        Repr::F64 { val: f, boxed_const: None } => {
+            let mutator = function.get_nth_param(0).unwrap();
+            let call = builder
+                .build_call(helpers.box_float, &[mutator.into(), f.into()], "box_float")
+                .map_err(|e| format!("call ncl_box_float: {e}"))?;
+            Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
+        }
+    }
+}
+
+/// Boundary coercion: an `F64` is the identity; a `Word` is *unboxed*.
+/// The Word arm is **checked**: it inlines the fast path (the Word is a
+/// heap `Float` — read the f64 bits at cell 2 / byte 16) guarded by a
+/// type test `(w & 7)==3 (Tag::Vector) && (*(w&!7) & 31)==7
+/// (HeapType::Float)`, and on a miss calls `ncl_unbox_float_checked`
+/// (coerce a real, or signal). This guard is what keeps a non-float
+/// argument to a `(declare (double-float x))` parameter from
+/// dereferencing a non-pointer and segfaulting. The check is
+/// loop-invariant for a fixed param, so LLVM hoists it out of the loop —
+/// the hot path stays a single inlined load. (The bit constants are
+/// locked by `float::jit_float_layout_contract`.)
+fn coerce_to_f64<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    r: Repr<'ctx>,
+) -> Result<FloatValue<'ctx>, String> {
+    match r {
+        Repr::F64 { val, .. } => Ok(val),
+        Repr::Word(w) => {
+            let i64_t = context.i64_type();
+            let ptr_t = context.ptr_type(AddressSpace::default());
+            let f64_t = context.f64_type();
+            let m = |e: inkwell::builder::BuilderError| format!("coerce_to_f64: {e}");
+
+            // is_float fast-path gate: (w & 7) == 3 (Tag::Vector).
+            let tag = builder.build_and(w, i64_t.const_int(7, false), "cf_tag").map_err(m)?;
+            let is_vec = builder
+                .build_int_compare(IntPredicate::EQ, tag, i64_t.const_int(0b011, false), "cf_isvec")
+                .map_err(m)?;
+
+            let hdr_bb = context.append_basic_block(*function, "cf_hdr");
+            let fast_bb = context.append_basic_block(*function, "cf_fast");
+            let slow_bb = context.append_basic_block(*function, "cf_slow");
+            let cont_bb = context.append_basic_block(*function, "cf_cont");
+
+            builder.build_conditional_branch(is_vec, hdr_bb, slow_bb).map_err(m)?;
+
+            // hdr_bb: it's a Vector — confirm header type == HeapType::Float (7).
+            builder.position_at_end(hdr_bb);
+            let base_int = builder.build_and(w, i64_t.const_int(!7u64, false), "cf_base").map_err(m)?;
+            let base_ptr = builder.build_int_to_ptr(base_int, ptr_t, "cf_ptr").map_err(m)?;
+            let hdr = builder
+                .build_load(i64_t, base_ptr, "cf_hdrw")
+                .map_err(m)?
+                .into_int_value();
+            let ty = builder.build_and(hdr, i64_t.const_int(0b11111, false), "cf_ty").map_err(m)?;
+            let is_f = builder
+                .build_int_compare(IntPredicate::EQ, ty, i64_t.const_int(7, false), "cf_isf")
+                .map_err(m)?;
+            builder.build_conditional_branch(is_f, fast_bb, slow_bb).map_err(m)?;
+
+            // fast_bb: inline unbox — load cell 2 (byte 16) as a double.
+            builder.position_at_end(fast_bb);
+            let slot = unsafe {
+                builder
+                    .build_in_bounds_gep(i64_t, base_ptr, &[i64_t.const_int(2, false)], "cf_slot")
+                    .map_err(m)?
+            };
+            let fast_f = builder
+                .build_load(f64_t, slot, "cf_f")
+                .map_err(m)?
+                .into_float_value();
+            let fast_end = builder.get_insert_block().unwrap();
+            builder.build_unconditional_branch(cont_bb).map_err(m)?;
+
+            // slow_bb: not a float — coerce-a-real-or-signal (no segfault).
+            builder.position_at_end(slow_bb);
+            let mutator = function.get_nth_param(0).unwrap();
+            let slow_f = builder
+                .build_call(helpers.unbox_float_checked, &[mutator.into(), w.into()], "cf_chk")
+                .map_err(m)?
+                .try_as_basic_value()
+                .unwrap_basic()
+                .into_float_value();
+            let slow_end = builder.get_insert_block().unwrap();
+            builder.build_unconditional_branch(cont_bb).map_err(m)?;
+
+            builder.position_at_end(cont_bb);
+            let phi = builder.build_phi(f64_t, "cf_phi").map_err(m)?;
+            phi.add_incoming(&[(&fast_f, fast_end), (&slow_f, slow_end)]);
+            Ok(phi.as_basic_value().into_float_value())
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ArithOp { Add, Sub, Mul }
+
+/// If `r` (the already-emitted repr of `e`) can serve as an unboxed f64
+/// operand *statically*, return it. That is: an `F64` repr (a float
+/// literal or nested float arithmetic), OR a fixnum *constant* literal,
+/// which contaminates to float under CL's float/integer rules. A
+/// runtime Word of unknown type returns `None` — it must NOT be
+/// force-unboxed (Sprint 1 does no type inference; that arrives in
+/// Sprints 2-4).
+fn repr_as_f64_static<'ctx>(
+    context: &'ctx Context,
+    r: &Repr<'ctx>,
+    e: &Expr,
+) -> Option<FloatValue<'ctx>> {
+    match r {
+        Repr::F64 { val, .. } => Some(*val),
+        Repr::Word(_) => match e {
+            // An integer literal contaminates to an exact double.
+            Expr::Const(n) => Some(context.f64_type().const_float(*n as f64)),
+            _ => None,
+        },
+    }
+}
+
+/// `+ - *` with the float fast path. Emits native `fadd`/`fsub`/`fmul`
+/// (→ `Repr::F64`, value stays unboxed) when at least one operand is
+/// float-typed and BOTH operands reduce statically to f64; otherwise
+/// the existing tagged-fixnum / bignum-promote path, unchanged.
+#[allow(clippy::too_many_arguments)]
+fn emit_arith_repr<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    arity: u32,
+    params: &mut Vec<IntValue<'ctx>>,
+    locals: &mut Vec<IntValue<'ctx>>,
+    op: ArithOp,
+    a: &Expr,
+    b: &Expr,
+) -> Result<Repr<'ctx>, String> {
+    let ra = emit_expr_repr(context, builder, function, helpers, arity, params, locals, a)?;
+    let rb = emit_expr_repr(context, builder, function, helpers, arity, params, locals, b)?;
+    if ra.is_f64() || rb.is_f64() {
+        if let (Some(fa), Some(fb)) =
+            (repr_as_f64_static(context, &ra, a), repr_as_f64_static(context, &rb, b))
+        {
+            let val = match op {
+                ArithOp::Add => builder.build_float_add(fa, fb, "fadd"),
+                ArithOp::Sub => builder.build_float_sub(fa, fb, "fsub"),
+                ArithOp::Mul => builder.build_float_mul(fa, fb, "fmul"),
+            }
+            .map_err(|e| format!("native float arith: {e}"))?;
+            return Ok(Repr::f64(val));
+        }
+    }
+    // Fallback: tagged-Word integer / generic path (today's behaviour).
+    // Coercing an F64 operand here boxes it — correct: a float mixed
+    // with a runtime non-float Word routes through the generic helper,
+    // which handles contagion.
+    let lhs = coerce_to_word(builder, function, helpers, ra)?;
+    let rhs = coerce_to_word(builder, function, helpers, rb)?;
+    let i64_t = context.i64_type();
+    let res = match op {
+        ArithOp::Add => emit_overflow_op(
+            context, builder, function, helpers, params, locals,
+            lhs, rhs, lhs, rhs, helpers.sadd_with_overflow, helpers.add_promote, "add",
+        )?,
+        ArithOp::Sub => emit_overflow_op(
+            context, builder, function, helpers, params, locals,
+            lhs, rhs, lhs, rhs, helpers.ssub_with_overflow, helpers.sub_promote, "sub",
+        )?,
+        ArithOp::Mul => {
+            let three = i64_t.const_int(3, false);
+            let rhs_untagged = builder
+                .build_right_shift(rhs, three, true, "untag_rhs")
+                .map_err(|e| format!("ashr: {e}"))?;
+            emit_overflow_op(
+                context, builder, function, helpers, params, locals,
+                lhs, rhs_untagged, lhs, rhs, helpers.smul_with_overflow, helpers.mul_promote, "mul",
+            )?
+        }
+    };
+    Ok(Repr::Word(res))
+}
+
+/// Numeric comparison with the float fast path. Native *ordered* `fcmp`
+/// (IEEE semantics: NaN compares `false`, so `(= nan nan)` ⇒ NIL) when
+/// at least one operand is float-typed and both reduce to f64; otherwise
+/// the tagged-fixnum / numeric-tower compare on Words. The boxed path
+/// routes through `ncl_num_cmp`, which returns the `i64::MIN` unordered
+/// sentinel for a NaN operand; `emit_cmp_vals` maps that to "false" for
+/// every ordered predicate, so the boxed path is now IEEE-ordered too.
+#[allow(clippy::too_many_arguments)]
+fn emit_cmp_repr<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    arity: u32,
+    params: &mut Vec<IntValue<'ctx>>,
+    locals: &mut Vec<IntValue<'ctx>>,
+    a: &Expr,
+    b: &Expr,
+    fpred: FloatPredicate,
+    ipred: IntPredicate,
+) -> Result<Repr<'ctx>, String> {
+    let ra = emit_expr_repr(context, builder, function, helpers, arity, params, locals, a)?;
+    let rb = emit_expr_repr(context, builder, function, helpers, arity, params, locals, b)?;
+    if ra.is_f64() || rb.is_f64() {
+        if let (Some(fa), Some(fb)) =
+            (repr_as_f64_static(context, &ra, a), repr_as_f64_static(context, &rb, b))
+        {
+            let cmp = builder
+                .build_float_compare(fpred, fa, fb, "fcmp")
+                .map_err(|e| format!("native fcmp: {e}"))?;
+            return Ok(Repr::Word(emit_bool_select(builder, cmp, context.i64_type())?));
+        }
+    }
+    let lhs = coerce_to_word(builder, function, helpers, ra)?;
+    let rhs = coerce_to_word(builder, function, helpers, rb)?;
+    Ok(Repr::Word(emit_cmp_vals(
+        context, builder, function, helpers, lhs, rhs, ipred,
+    )?))
+}
+
+/// Get (lazily allocating in the entry block) the `f64*` stack slot for
+/// an unboxed-float local. Entry-block placement keeps the alloca
+/// `static` so the backend can promote it to a register/phi; allocating
+/// it mid-loop would not promote. The slot is a non-pointer stack cell —
+/// it is never a GC root and never reloaded across a safepoint.
+fn f64_slot_ptr<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    slot: usize,
+) -> Result<PointerValue<'ctx>, String> {
+    {
+        let slots = helpers.f64_slots.borrow();
+        if let Some(Some(p)) = slots.get(slot) {
+            return Ok(*p);
+        }
+    }
+    // Allocate at the start of the entry block, then restore position.
+    let entry = function
+        .get_first_basic_block()
+        .ok_or("function has no entry block")?;
+    let saved = builder.get_insert_block();
+    match entry.get_first_instruction() {
+        Some(first) => builder.position_before(&first),
+        None => builder.position_at_end(entry),
+    }
+    let ptr = builder
+        .build_alloca(context.f64_type(), &format!("f64slot{slot}"))
+        .map_err(|e| format!("alloca f64 slot: {e}"))?;
+    if let Some(b) = saved {
+        builder.position_at_end(b);
+    }
+    let mut slots = helpers.f64_slots.borrow_mut();
+    if slots.len() <= slot {
+        slots.resize(slot + 1, None);
+    }
+    slots[slot] = Some(ptr);
+    Ok(ptr)
+}
+
+/// Emit `value` and coerce it to an unboxed f64 for storing into a
+/// float local. A float expr yields its f64 directly; an integer
+/// *constant* literal is `sitofp`'d (so a float local initialised with
+/// an int literal — `(let ((x 3)) (declare (double-float x)))` — becomes
+/// 3.0 rather than an unchecked unbox of a non-heap fixnum); any other
+/// Word takes the unchecked unbox (the declaration is a promise).
+#[allow(clippy::too_many_arguments)]
+fn emit_f64_store_value<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    arity: u32,
+    params: &mut Vec<IntValue<'ctx>>,
+    locals: &mut Vec<IntValue<'ctx>>,
+    value: &Expr,
+) -> Result<FloatValue<'ctx>, String> {
+    let r = emit_expr_repr(context, builder, function, helpers, arity, params, locals, value)?;
+    match r {
+        Repr::F64 { val, .. } => Ok(val),
+        Repr::Word(w) => {
+            if let Expr::Const(n) = value {
+                Ok(context.f64_type().const_float(*n as f64))
+            } else {
+                coerce_to_f64(context, builder, function, helpers, Repr::Word(w))
+            }
+        }
+    }
+}
+
+/// Emit `e` purely for its side effects, discarding its value WITHOUT
+/// boxing a discarded float. A `(setq float-local …)` in statement
+/// position would otherwise emit a dead `ncl_box_float` every iteration
+/// (LLVM can't DCE it — allocation is a side effect). Used ONLY for the
+/// `fast-loop` body (whose value is unused); it recurses through
+/// Progn/Let tails so nested float stores are covered. Deliberately
+/// scoped to fast-loop — it does NOT change the global Progn/Let
+/// emission, so non-loop code is byte-for-byte unaffected. Anything not
+/// recognised as float-producing falls back to the normal Word emit and
+/// is discarded.
+#[allow(clippy::too_many_arguments)]
+fn emit_for_effect<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    arity: u32,
+    params: &mut Vec<IntValue<'ctx>>,
+    locals: &mut Vec<IntValue<'ctx>>,
+    e: &Expr,
+) -> Result<(), String> {
+    match e {
+        Expr::Progn(forms) => {
+            for f in forms {
+                // A LoopBreak / return mid-Progn terminates the block;
+                // the rest of the forms are unreachable — stop emitting
+                // (emitting into a terminated block is invalid).
+                if builder
+                    .get_insert_block()
+                    .and_then(|b| b.get_terminator())
+                    .is_some()
+                {
+                    break;
+                }
+                emit_for_effect(context, builder, function, helpers, arity, params, locals, f)?;
+            }
+            Ok(())
+        }
+        Expr::Let { bindings, body } => {
+            let saved = locals.len();
+            for binding in bindings {
+                match binding {
+                    Expr::F64LocalStore { .. } => {
+                        emit_expr_repr(
+                            context, builder, function, helpers, arity, params, locals, binding,
+                        )?;
+                        locals.push(context.i64_type().const_int(Word::NIL.raw(), false));
+                    }
+                    _ => {
+                        let v = emit_expr(
+                            context, builder, function, helpers, arity, params, locals, binding,
+                        )?;
+                        locals.push(v);
+                    }
+                }
+            }
+            emit_for_effect(context, builder, function, helpers, arity, params, locals, body)?;
+            locals.truncate(saved);
+            Ok(())
+        }
+        // Float-producing forms: emit via the repr path and drop the
+        // f64 — no box. (An If/cond in statement position falls to the
+        // Word path below and would box a float branch; the common
+        // fast-loop body is straight-line setqs, so this is fine.)
+        Expr::F64LocalStore { .. }
+        | Expr::Float { .. }
+        | Expr::F64LocalRead(_)
+        | Expr::F64ParamRead(_)
+        | Expr::Add(..)
+        | Expr::Sub(..)
+        | Expr::Mul(..) => {
+            emit_expr_repr(context, builder, function, helpers, arity, params, locals, e)?;
+            Ok(())
+        }
+        _ => {
+            emit_expr(context, builder, function, helpers, arity, params, locals, e)?;
+            Ok(())
+        }
+    }
+}
+
+/// Representation-aware expression emitter. Float-typed arms compute on
+/// unboxed `f64` and may return `Repr::F64`; everything else falls
+/// through to `emit_expr` (always a `Word`).
+fn emit_expr_repr<'ctx>(
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+    function: &FunctionValue<'ctx>,
+    helpers: &Helpers<'ctx>,
+    arity: u32,
+    params: &mut Vec<IntValue<'ctx>>,
+    locals: &mut Vec<IntValue<'ctx>>,
+    expr: &Expr,
+) -> Result<Repr<'ctx>, String> {
+    match expr {
+        Expr::Float { bits, boxed } => Ok(Repr::F64 {
+            val: context.f64_type().const_float(f64::from_bits(*bits)),
+            boxed_const: Some(context.i64_type().const_int(*boxed, false)),
+        }),
+        // A declared double-float param: unbox the boxed argument to a
+        // native f64 (unchecked — the declaration is a promise). LLVM
+        // CSEs repeated unboxes of the same loop-invariant param.
+        Expr::F64ParamRead(idx) => {
+            let w = *params
+                .get(*idx)
+                .ok_or_else(|| format!("F64ParamRead({idx}) out of range for arity {arity}"))?;
+            Ok(Repr::f64(coerce_to_f64(context, builder, function, helpers, Repr::Word(w))?))
+        }
+        Expr::F64LocalRead(slot) => {
+            let ptr = f64_slot_ptr(context, builder, function, helpers, *slot)?;
+            let v = builder
+                .build_load(context.f64_type(), ptr, "f64local")
+                .map_err(|e| format!("load f64 local: {e}"))?
+                .into_float_value();
+            Ok(Repr::f64(v))
+        }
+        Expr::F64LocalStore { slot, value } => {
+            let f = emit_f64_store_value(
+                context, builder, function, helpers, arity, params, locals, value,
+            )?;
+            let ptr = f64_slot_ptr(context, builder, function, helpers, *slot)?;
+            builder
+                .build_store(ptr, f)
+                .map_err(|e| format!("store f64 local: {e}"))?;
+            Ok(Repr::f64(f))
+        }
+        // Representation-inference marker: the optimize pass proved `inner`
+        // is a heap double-float, so unbox WITHOUT the coerce_to_f64
+        // tag-check diamond — read the f64 payload at cell 2 directly.
+        // (Already-unboxed inner is returned as-is.) See optimize.rs.
+        Expr::TheFloat(inner) => {
+            let r = emit_expr_repr(
+                context, builder, function, helpers, arity, params, locals, inner,
+            )?;
+            match r {
+                Repr::F64 { .. } => Ok(r),
+                Repr::Word(w) => {
+                    let i64_t = context.i64_type();
+                    let ptr_t = context.ptr_type(AddressSpace::default());
+                    let f64_t = context.f64_type();
+                    let m = |e: inkwell::builder::BuilderError| format!("the_float: {e}");
+                    let base_int = builder
+                        .build_and(w, i64_t.const_int(!7u64, false), "tf_base")
+                        .map_err(m)?;
+                    let base_ptr = builder
+                        .build_int_to_ptr(base_int, ptr_t, "tf_ptr")
+                        .map_err(m)?;
+                    let slot = unsafe {
+                        builder
+                            .build_in_bounds_gep(
+                                i64_t, base_ptr, &[i64_t.const_int(2, false)], "tf_slot",
+                            )
+                            .map_err(m)?
+                    };
+                    let f = builder
+                        .build_load(f64_t, slot, "tf_f")
+                        .map_err(m)?
+                        .into_float_value();
+                    Ok(Repr::f64(f))
+                }
+            }
+        }
+        Expr::Add(a, b) => emit_arith_repr(
+            context, builder, function, helpers, arity, params, locals, ArithOp::Add, a, b,
+        ),
+        Expr::Sub(a, b) => emit_arith_repr(
+            context, builder, function, helpers, arity, params, locals, ArithOp::Sub, a, b,
+        ),
+        Expr::Mul(a, b) => emit_arith_repr(
+            context, builder, function, helpers, arity, params, locals, ArithOp::Mul, a, b,
+        ),
+        Expr::Lt(a, b) => emit_cmp_repr(
+            context, builder, function, helpers, arity, params, locals, a, b,
+            FloatPredicate::OLT, IntPredicate::SLT,
+        ),
+        Expr::Gt(a, b) => emit_cmp_repr(
+            context, builder, function, helpers, arity, params, locals, a, b,
+            FloatPredicate::OGT, IntPredicate::SGT,
+        ),
+        Expr::Le(a, b) => emit_cmp_repr(
+            context, builder, function, helpers, arity, params, locals, a, b,
+            FloatPredicate::OLE, IntPredicate::SLE,
+        ),
+        Expr::Ge(a, b) => emit_cmp_repr(
+            context, builder, function, helpers, arity, params, locals, a, b,
+            FloatPredicate::OGE, IntPredicate::SGE,
+        ),
+        Expr::NumEq(a, b) => emit_cmp_repr(
+            context, builder, function, helpers, arity, params, locals, a, b,
+            FloatPredicate::OEQ, IntPredicate::EQ,
+        ),
+        _ => Ok(Repr::Word(emit_expr(
+            context, builder, function, helpers, arity, params, locals, expr,
+        )?)),
+    }
+}
+
 fn emit_expr<'ctx>(
     context: &'ctx Context,
     builder: &Builder<'ctx>,
@@ -2091,6 +2928,16 @@ fn emit_expr<'ctx>(
     match expr {
         Expr::Const(n) => Ok(i64_t.const_int(Word::fixnum(*n).raw(), false)),
         Expr::Word(w) => Ok(i64_t.const_int(*w, false)),
+        // A float literal in a Word context: load the pre-allocated
+        // static-area box (zero per-eval allocation — the constant-fold
+        // target). The unboxed value is produced by emit_expr_repr.
+        Expr::Float { boxed, .. } => Ok(i64_t.const_int(*boxed, false)),
+        // Representation marker, semantically transparent in a Word
+        // context: just emit the (boxed-float) inner value. The unboxing
+        // benefit applies only on the f64 (emit_expr_repr) path.
+        Expr::TheFloat(inner) => {
+            emit_expr(context, builder, function, helpers, arity, params, locals, inner)
+        }
         Expr::Nil => Ok(i64_t.const_int(Word::NIL.raw(), false)),
         Expr::True => Ok(i64_t.const_int(Word::T.raw(), false)),
         Expr::Local(idx) => {
@@ -2113,15 +2960,38 @@ fn emit_expr<'ctx>(
                 .copied()
                 .ok_or_else(|| format!("Param({idx}) out of range for arity {arity}"))
         }
+        // In a Word context, a float param is just its original boxed
+        // argument Word — no unbox/rebox round-trip. The unboxed f64 is
+        // produced by emit_expr_repr.
+        Expr::F64ParamRead(idx) => {
+            params
+                .get(*idx)
+                .copied()
+                .ok_or_else(|| format!("F64ParamRead({idx}) out of range for arity {arity}"))
+        }
+        // Float local in a Word context (read used as a value, or a setq
+        // whose result escapes): compute the f64 then box it.
+        Expr::F64LocalRead(_) | Expr::F64LocalStore { .. } => {
+            let r = emit_expr_repr(
+                context, builder, function, helpers, arity, params, locals, expr,
+            )?;
+            coerce_to_word(builder, function, helpers, r)
+        }
         Expr::Progn(forms) => {
             if forms.is_empty() {
                 return Ok(i64_t.const_int(Word::NIL.raw(), false));
             }
-            let mut last = i64_t.const_int(Word::NIL.raw(), false);
-            for f in forms {
-                last = emit_expr(context, builder, function, helpers, arity, params, locals, f)?;
+            // Non-last forms are evaluated for effect and discarded —
+            // emit them via the repr path so a discarded float result
+            // isn't boxed (a dead ncl_box_float per statement). Only the
+            // last form's value becomes the Progn's (Word) value.
+            for f in &forms[..forms.len() - 1] {
+                emit_expr_repr(context, builder, function, helpers, arity, params, locals, f)?;
             }
-            Ok(last)
+            emit_expr(
+                context, builder, function, helpers, arity, params, locals,
+                forms.last().unwrap(),
+            )
         }
         Expr::Let { bindings, body } => {
             let saved = locals.len();
@@ -2129,10 +2999,24 @@ fn emit_expr<'ctx>(
                 // Evaluate in CURRENT locals (outer scope) — let's
                 // parallel-binding semantics. The binding doesn't
                 // see itself or sibling bindings.
-                let v = emit_expr(
-                    context, builder, function, helpers, arity, params, locals, binding,
-                )?;
-                locals.push(v);
+                match binding {
+                    // A float-local init stores into its own f64 slot;
+                    // the locals-vec position is a dummy (reads go via
+                    // F64LocalRead, never Local(i)). Emit via the repr
+                    // path so we do NOT box the value just to discard it.
+                    Expr::F64LocalStore { .. } => {
+                        emit_expr_repr(
+                            context, builder, function, helpers, arity, params, locals, binding,
+                        )?;
+                        locals.push(i64_t.const_int(Word::NIL.raw(), false));
+                    }
+                    _ => {
+                        let v = emit_expr(
+                            context, builder, function, helpers, arity, params, locals, binding,
+                        )?;
+                        locals.push(v);
+                    }
+                }
             }
             let result = emit_expr(
                 context, builder, function, helpers, arity, params, locals, body,
@@ -2446,6 +3330,18 @@ fn emit_expr<'ctx>(
             let idx = N.fetch_add(1, Ordering::Relaxed);
             let lam_name = format!("lambda_{idx}");
             let code_addr = build_lisp_function(&lam_name, body, *lam_arity)?;
+            // No-capture lambda → a constant closure. Allocate its Function
+            // record ONCE, now (compile time), in the non-moving static area
+            // and embed it as an IR constant — eliding the per-evaluation
+            // ncl_make_closure heap allocation entirely. Falls through to the
+            // runtime path if no coordinator is installed / static exhausted.
+            if captures.is_empty() {
+                if let Some(w) = ncl_runtime::gc_function::alloc_no_capture_closure_static(
+                    code_addr, *lam_arity,
+                ) {
+                    return Ok(i64_t.const_int(w, false));
+                }
+            }
             // 2. Evaluate each capture expression in CURRENT scope.
             let cap_vals: Vec<IntValue> = captures
                 .iter()
@@ -2644,45 +3540,17 @@ fn emit_expr<'ctx>(
             emit_post_call_abort_check(context, builder, function, helpers)?;
             Ok(result)
         }
-        Expr::Add(a, b) => {
-            let lhs = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
-            let rhs = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
-            emit_overflow_op(
-                context, builder, function, helpers, params, locals,
-                lhs, rhs, lhs, rhs,
-                helpers.sadd_with_overflow, helpers.add_promote,
-                "add",
-            )
-        }
-        Expr::Sub(a, b) => {
-            let lhs = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
-            let rhs = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
-            emit_overflow_op(
-                context, builder, function, helpers, params, locals,
-                lhs, rhs, lhs, rhs,
-                helpers.ssub_with_overflow, helpers.sub_promote,
-                "sub",
-            )
-        }
-        Expr::Mul(a, b) => {
-            let lhs = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
-            let rhs = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
-            // (a<<3) * (b<<3) overflows the *fixnum* range when a*b
-            // doesn't fit in 61 bits. We pre-shift rhs by 3 so the
-            // intrinsic operates on (a<<3) * b (which equals (a*b)<<3).
-            // smul.with.overflow then catches any overflow of i64 —
-            // i.e., any (a*b) that wouldn't fit in 61 bits given the
-            // <<3. Slow path uses the ORIGINAL tagged operands.
-            let three = i64_t.const_int(3, false);
-            let rhs_untagged = builder
-                .build_right_shift(rhs, three, true, "untag_rhs")
-                .map_err(|e| format!("ashr: {e}"))?;
-            emit_overflow_op(
-                context, builder, function, helpers, params, locals,
-                lhs, rhs_untagged, lhs, rhs,
-                helpers.smul_with_overflow, helpers.mul_promote,
-                "mul",
-            )
+        // `+ - *` and the numeric comparisons delegate to the
+        // representation-aware emitter (which has the unboxed-float fast
+        // path) and box the result back to a Word for this Word context.
+        // The fixnum/bignum behaviour is unchanged when no operand is a
+        // float. See emit_arith_repr / emit_cmp_repr.
+        Expr::Add(..) | Expr::Sub(..) | Expr::Mul(..)
+        | Expr::Lt(..) | Expr::Gt(..) | Expr::Le(..) | Expr::Ge(..) | Expr::NumEq(..) => {
+            let r = emit_expr_repr(
+                context, builder, function, helpers, arity, params, locals, expr,
+            )?;
+            coerce_to_word(builder, function, helpers, r)
         }
         Expr::Truncate(a, b) => {
             let lhs = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
@@ -2702,6 +3570,29 @@ fn emit_expr<'ctx>(
                 context, builder, function, helpers, params, locals,
                 lhs, rhs, helpers.rem_promote, true, "rem",
             )
+        }
+        Expr::LogAnd(a, b) => {
+            let lhs = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
+            let rhs = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
+            emit_bitwise_op(context, builder, function, helpers, params, locals,
+                lhs, rhs, helpers.logand_promote, BitOp::And, "logand")
+        }
+        Expr::LogIor(a, b) => {
+            let lhs = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
+            let rhs = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
+            emit_bitwise_op(context, builder, function, helpers, params, locals,
+                lhs, rhs, helpers.logior_promote, BitOp::Ior, "logior")
+        }
+        Expr::LogXor(a, b) => {
+            let lhs = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
+            let rhs = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
+            emit_bitwise_op(context, builder, function, helpers, params, locals,
+                lhs, rhs, helpers.logxor_promote, BitOp::Xor, "logxor")
+        }
+        Expr::Ash(a, b) => {
+            let n = emit_expr(context, builder, function, helpers, arity, params, locals, a)?;
+            let shift = emit_expr(context, builder, function, helpers, arity, params, locals, b)?;
+            emit_ash_op(context, builder, function, helpers, params, locals, n, shift)
         }
         Expr::Cons(car, cdr) => {
             let car_val = emit_expr(context, builder, function, helpers, arity, params, locals, car)?;
@@ -2743,11 +3634,6 @@ fn emit_expr<'ctx>(
             emit_car_or_cdr(context, builder, function, helpers, cons_val, /*is_cdr=*/true)
         }
         Expr::Eq(a, b) => emit_ref_eq(context, builder, function, helpers, arity, params, locals, a, b),
-        Expr::Lt(a, b) => emit_cmp(context, builder, function, helpers, arity, params, locals, a, b, IntPredicate::SLT),
-        Expr::Gt(a, b) => emit_cmp(context, builder, function, helpers, arity, params, locals, a, b, IntPredicate::SGT),
-        Expr::Le(a, b) => emit_cmp(context, builder, function, helpers, arity, params, locals, a, b, IntPredicate::SLE),
-        Expr::Ge(a, b) => emit_cmp(context, builder, function, helpers, arity, params, locals, a, b, IntPredicate::SGE),
-        Expr::NumEq(a, b) => emit_cmp(context, builder, function, helpers, arity, params, locals, a, b, IntPredicate::EQ),
         Expr::IsNull(x) => {
             let v = emit_expr(context, builder, function, helpers, arity, params, locals, x)?;
             let nil = i64_t.const_int(Word::NIL.raw(), false);
@@ -3183,6 +4069,223 @@ fn emit_expr<'ctx>(
             // and the `If` / function-epilogue logic checks for an
             // existing terminator before adding their own). NIL is a
             // harmless placeholder.
+            Ok(i64_t.const_int(Word::NIL.raw(), false))
+        }
+        Expr::FastLoop { test, result, body } => {
+            // Inline loop with a real back-edge in THIS function — no
+            // capturing lambda, so loop-carried unboxed-f64 locals (which
+            // live in entry-block allocas, NOT in `locals`/`params`)
+            // persist across iterations with zero boxing. The only values
+            // that need loop-header phis are the Word slots in
+            // `locals`/`params`, which the safepoint wrap may reload mid-
+            // iteration (e.g. a cons cell relocated by a GC). Mirrors the
+            // TailLoop phi pattern, generalised to both vectors.
+            let preheader = builder.get_insert_block().unwrap();
+            let pre_locals = locals.clone();
+            let pre_params = params.clone();
+            let header = context.append_basic_block(*function, "floop_header");
+            let body_bb = context.append_basic_block(*function, "floop_body");
+            let exit_bb = context.append_basic_block(*function, "floop_exit");
+            builder
+                .build_unconditional_branch(header)
+                .map_err(|e| format!("floop preheader br: {e}"))?;
+
+            // Header phis (must be first in the block), seeded from the
+            // preheader; the body's back-edge adds the second incoming.
+            builder.position_at_end(header);
+            let mut local_phis: Vec<PhiValue> = Vec::with_capacity(pre_locals.len());
+            for (i, v) in pre_locals.iter().enumerate() {
+                let phi = builder
+                    .build_phi(i64_t, &format!("floop_l{i}"))
+                    .map_err(|e| format!("floop local phi: {e}"))?;
+                phi.add_incoming(&[(v, preheader)]);
+                local_phis.push(phi);
+            }
+            let mut param_phis: Vec<PhiValue> = Vec::with_capacity(pre_params.len());
+            for (i, v) in pre_params.iter().enumerate() {
+                let phi = builder
+                    .build_phi(i64_t, &format!("floop_p{i}"))
+                    .map_err(|e| format!("floop param phi: {e}"))?;
+                phi.add_incoming(&[(v, preheader)]);
+                param_phis.push(phi);
+            }
+            for (i, phi) in local_phis.iter().enumerate() {
+                locals[i] = phi.as_basic_value().into_int_value();
+            }
+            for (i, phi) in param_phis.iter().enumerate() {
+                params[i] = phi.as_basic_value().into_int_value();
+            }
+
+            // Exit test, evaluated from the loop-header state. Truthy
+            // (non-NIL) ⇒ leave the loop. The test may itself reload
+            // locals/params (if it allocates); the post-test values
+            // dominate both successor blocks, so snapshot them for use in
+            // the body and exit.
+            let test_val = emit_expr(
+                context, builder, function, helpers, arity, params, locals, test,
+            )?;
+            let nil = i64_t.const_int(Word::NIL.raw(), false);
+            let is_true = builder
+                .build_int_compare(IntPredicate::NE, test_val, nil, "floop_test")
+                .map_err(|e| format!("floop test cmp: {e}"))?;
+            let iter_locals = locals.clone();
+            let iter_params = params.clone();
+            builder
+                .build_conditional_branch(is_true, exit_bb, body_bb)
+                .map_err(|e| format!("floop cond br: {e}"))?;
+
+            // Body: step the loop variables (setq → f64-slot store /
+            // set-car), then branch back, feeding the post-body slot
+            // values into the header phis.
+            builder.position_at_end(body_bb);
+            for i in 0..locals.len() { locals[i] = iter_locals[i]; }
+            for i in 0..params.len() { params[i] = iter_params[i]; }
+            // Effect context: the body's value is unused (fast-loop yields
+            // RESULT), so emit it without boxing discarded float stores.
+            emit_for_effect(
+                context, builder, function, helpers, arity, params, locals, body,
+            )?;
+            let body_end = builder.get_insert_block().unwrap();
+            for (i, phi) in local_phis.iter().enumerate() {
+                phi.add_incoming(&[(&locals[i], body_end)]);
+            }
+            for (i, phi) in param_phis.iter().enumerate() {
+                phi.add_incoming(&[(&params[i], body_end)]);
+            }
+            builder
+                .build_unconditional_branch(header)
+                .map_err(|e| format!("floop back-edge br: {e}"))?;
+
+            // Exit: yield RESULT, computed from the loop-header state.
+            builder.position_at_end(exit_bb);
+            for i in 0..locals.len() { locals[i] = iter_locals[i]; }
+            for i in 0..params.len() { params[i] = iter_params[i]; }
+            let result_val = emit_expr(
+                context, builder, function, helpers, arity, params, locals, result,
+            )?;
+            Ok(result_val)
+        }
+        Expr::InlineLoop { body } => {
+            // Auto-inlined `(loop …)`: a real back-edge in this function
+            // (no capturing lambda), so loop carries stay unboxed. Same
+            // header-phi scheme as FastLoop; exits via LoopBreak, whose
+            // values feed the exit block's result phi.
+            let preheader = builder.get_insert_block().unwrap();
+            let pre_locals = locals.clone();
+            let pre_params = params.clone();
+            let header = context.append_basic_block(*function, "iloop_header");
+            let exit_bb = context.append_basic_block(*function, "iloop_exit");
+            builder
+                .build_unconditional_branch(header)
+                .map_err(|e| format!("iloop preheader br: {e}"))?;
+
+            builder.position_at_end(header);
+            let mut local_phis: Vec<PhiValue> = Vec::with_capacity(pre_locals.len());
+            for (i, v) in pre_locals.iter().enumerate() {
+                let phi = builder
+                    .build_phi(i64_t, &format!("iloop_l{i}"))
+                    .map_err(|e| format!("iloop local phi: {e}"))?;
+                phi.add_incoming(&[(v, preheader)]);
+                local_phis.push(phi);
+            }
+            let mut param_phis: Vec<PhiValue> = Vec::with_capacity(pre_params.len());
+            for (i, v) in pre_params.iter().enumerate() {
+                let phi = builder
+                    .build_phi(i64_t, &format!("iloop_p{i}"))
+                    .map_err(|e| format!("iloop param phi: {e}"))?;
+                phi.add_incoming(&[(v, preheader)]);
+                param_phis.push(phi);
+            }
+            for (i, phi) in local_phis.iter().enumerate() {
+                locals[i] = phi.as_basic_value().into_int_value();
+            }
+            for (i, phi) in param_phis.iter().enumerate() {
+                params[i] = phi.as_basic_value().into_int_value();
+            }
+
+            // Publish the loop frame so nested LoopBreaks find the exit.
+            helpers.inline_loops.borrow_mut().push(InlineLoopFrame {
+                exit_block: exit_bb,
+                breaks: Vec::new(),
+            });
+            // Body runs for effect (its value is unused; the loop yields
+            // a break value). emit_for_effect avoids boxing discarded
+            // float stores.
+            emit_for_effect(context, builder, function, helpers, arity, params, locals, body)?;
+            // Back-edge — unless the body diverged (e.g. an unconditional
+            // break left the block terminated).
+            if builder
+                .get_insert_block()
+                .and_then(|b| b.get_terminator())
+                .is_none()
+            {
+                let body_end = builder.get_insert_block().unwrap();
+                for (i, phi) in local_phis.iter().enumerate() {
+                    phi.add_incoming(&[(&locals[i], body_end)]);
+                }
+                for (i, phi) in param_phis.iter().enumerate() {
+                    phi.add_incoming(&[(&params[i], body_end)]);
+                }
+                builder
+                    .build_unconditional_branch(header)
+                    .map_err(|e| format!("iloop back-edge br: {e}"))?;
+            }
+
+            let frame = helpers.inline_loops.borrow_mut().pop().unwrap();
+            builder.position_at_end(exit_bb);
+            // Reset the local/param slots to their loop-header phi values
+            // (which dominate exit_bb — the exit is reached only via breaks
+            // inside the body, all dominated by the header). Without this,
+            // the slots still hold body-latch SSA values that do NOT
+            // dominate the exit, so any code after the loop that reads them
+            // is an invalid-IR miscompile (e.g. publishing garbage as a GC
+            // root). FastLoop resets identically at its exit. NOTE: this is
+            // the breaking iteration's *start* value; loops should surface
+            // results via `(return x)` (captured precisely by the result
+            // phi below), not by reading mutated loop variables afterwards.
+            for (i, phi) in local_phis.iter().enumerate() {
+                locals[i] = phi.as_basic_value().into_int_value();
+            }
+            for (i, phi) in param_phis.iter().enumerate() {
+                params[i] = phi.as_basic_value().into_int_value();
+            }
+            if frame.breaks.is_empty() {
+                // No break — an infinite loop. The exit is unreachable.
+                builder
+                    .build_unreachable()
+                    .map_err(|e| format!("iloop unreachable: {e}"))?;
+                Ok(i64_t.const_int(Word::NIL.raw(), false))
+            } else {
+                let phi = builder
+                    .build_phi(i64_t, "iloop_result")
+                    .map_err(|e| format!("iloop result phi: {e}"))?;
+                for (v, b) in &frame.breaks {
+                    phi.add_incoming(&[(v, *b)]);
+                }
+                Ok(phi.as_basic_value().into_int_value())
+            }
+        }
+        Expr::LoopBreak { value } => {
+            let v = emit_expr(context, builder, function, helpers, arity, params, locals, value)?;
+            let cur = builder.get_insert_block().unwrap();
+            let exit = {
+                let frames = helpers.inline_loops.borrow();
+                frames
+                    .last()
+                    .ok_or_else(|| "LoopBreak emitted outside an InlineLoop".to_string())?
+                    .exit_block
+            };
+            builder
+                .build_unconditional_branch(exit)
+                .map_err(|e| format!("loopbreak br: {e}"))?;
+            helpers
+                .inline_loops
+                .borrow_mut()
+                .last_mut()
+                .unwrap()
+                .breaks
+                .push((v, cur));
+            // The block is now terminated; this value is never used.
             Ok(i64_t.const_int(Word::NIL.raw(), false))
         }
         Expr::Call { sym_word, args } => {

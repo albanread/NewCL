@@ -18,6 +18,14 @@ pub enum Expr {
     /// resolved values whose tagged bit pattern is known. Emitted
     /// as a single i64 constant.
     Word(u64),
+    /// A float literal. `bits` is the IEEE-754 f64 bit pattern (used
+    /// for the unboxed `Repr::F64` value the JIT can compute on
+    /// natively); `boxed` is the raw Word of a pre-allocated static-area
+    /// boxed Float — the constant-fold target when the literal is needed
+    /// as a tagged Word, so a float literal in a Word context costs zero
+    /// per-evaluation allocation (matching pre-unboxing behaviour). See
+    /// `docs/performance-unbox-float.md` Sprint 1.
+    Float { bits: u64, boxed: u64 },
     /// The literal `nil`.
     Nil,
     /// The truth value `t`.
@@ -26,6 +34,13 @@ pub enum Expr {
     /// Only valid inside a function body — top-level expressions
     /// don't have parameters and Param is a compile error there.
     Param(usize),
+    /// Read the Nth parameter as an unboxed `f64`. Emitted when the
+    /// parameter is `(declare (double-float ...))`'d. In a float
+    /// context the JIT unboxes the (boxed-float) argument once and
+    /// computes natively; in a Word context it uses the original boxed
+    /// argument. The unbox is unchecked — the declaration is a promise
+    /// (CL `(safety 0)` semantics). See docs/performance-unbox-float.md.
+    F64ParamRead(usize),
     /// `&rest` accessor: build and return a freshly-allocated list
     /// containing args[start..n_args] in order. Used at the entry
     /// of variadic functions to bind the rest parameter. The
@@ -70,6 +85,17 @@ pub enum Expr {
     /// the let bindings were entered (per nested let scopes), reset
     /// when the let scope exits.
     Local(usize),
+    /// Read an unboxed `f64` local from its dedicated stack slot
+    /// (`slot` is a per-function f64-slot index, distinct from `Local`
+    /// indices). Emitted for a `let` local declared `(double-float ..)`.
+    /// See docs/performance-unbox-float.md Sprint 2.
+    F64LocalRead(usize),
+    /// Store an unboxed `f64` into local slot `slot` (the value is
+    /// coerced to f64) and yield it. The lowered form of a float local's
+    /// `let`-init and of `(setq float-local v)`. Mutation is in-place in
+    /// the stack slot — no heap cons box, so the value stays unboxed
+    /// across a loop.
+    F64LocalStore { slot: usize, value: Box<Expr> },
     /// Sequential evaluation: each form runs, the last one's value
     /// is the result. Empty progn yields `nil` per CL convention.
     Progn(Vec<Expr>),
@@ -98,6 +124,20 @@ pub enum Expr {
     /// LLVM `srem` and CL's `rem`). Both operands tagged; result is
     /// already tagged because `srem (a<<3) (b<<3) = (a rem b) << 3`.
     Rem(Box<Expr>, Box<Expr>),
+    /// Bitwise `logand` / `logior` / `logxor` on integers. Fixnums are
+    /// `n<<3` (tag 000), so the raw bitwise op on the tagged words yields
+    /// the correctly-tagged result with no untag/retag — the JIT inlines
+    /// that for the both-fixnum case and calls a bignum-aware helper
+    /// otherwise. Integers only (no float contagion), so unlike `mod` /
+    /// `truncate` these are safe to lower to dedicated nodes.
+    LogAnd(Box<Expr>, Box<Expr>),
+    LogIor(Box<Expr>, Box<Expr>),
+    LogXor(Box<Expr>, Box<Expr>),
+    /// `(ash n shift)` — arithmetic shift. The JIT inlines the common
+    /// case (both fixnum, small non-negative shift, no overflow) as a
+    /// shifted-and-overflow-checked tagged op; everything else (bignum,
+    /// negative/large shift, overflow) falls to `ncl_ash_promote`.
+    Ash(Box<Expr>, Box<Expr>),
     /// Allocate a cons cell. Calls `ncl_alloc_cons` at runtime.
     Cons(Box<Expr>, Box<Expr>),
     /// Read the car field of a cons.
@@ -249,6 +289,39 @@ pub enum Expr {
     /// "returns" — its block ends in the back-branch — so its result
     /// value is unused (codegen yields NIL as a placeholder).
     SelfTailNext { args: Vec<Expr> },
+    /// Inline loop — the lowered form of `(fast-loop TEST RESULT
+    /// BODY…)`. Semantics: `loop { if TEST → break with RESULT; else
+    /// BODY }`. Unlike `(loop …)` (which expands to a capturing lambda
+    /// and forces every loop-carried variable to be heap-boxed), this
+    /// emits a real back-edge in the SAME function, so loop variables
+    /// stay in registers / unboxed f64 stack slots. Loop variables live
+    /// in the enclosing scope and are stepped by `setq` in BODY. See
+    /// docs/performance-unbox-float.md.
+    FastLoop {
+        test: Box<Expr>,
+        result: Box<Expr>,
+        body: Box<Expr>,
+    },
+    /// Inline infinite loop with embedded breaks — the lowered form of a
+    /// `(loop …)` the compiler proved safe to inline (body calls no user
+    /// functions and creates no closures; see `native_loop_inlinable`).
+    /// `body` runs forever; a `LoopBreak` exits with a value. Same
+    /// register/unboxed-carry benefit as `FastLoop`, but matches the
+    /// `(loop … (return v) …)` shape. See docs/performance-unbox-float.md.
+    InlineLoop { body: Box<Expr> },
+    /// Break the innermost enclosing `InlineLoop`, yielding `value` —
+    /// the lowered form of `(return v)` (`%loop-return`) inside an
+    /// inlined loop. A direct branch to the loop exit; no flag, no
+    /// ABORT_PENDING.
+    LoopBreak { value: Box<Expr> },
+    /// Representation-inference marker: `inner` is *proven* (by the
+    /// `optimize` type-inference pass) to evaluate to a heap double-float.
+    /// Semantically transparent — `(the-float e)` ≡ `e` — but it tells
+    /// codegen it may unbox without the runtime tag-check diamond:
+    /// `emit_expr_repr` reads the f64 payload at cell 2 directly. Inserted
+    /// ONLY where the type is statically proven, so the unchecked load is
+    /// safe. See docs/compiler_completion.md (Slice 1).
+    TheFloat(Box<Expr>),
 }
 
 impl Expr {
@@ -259,6 +332,10 @@ impl Expr {
         Expr::Truncate(Box::new(a), Box::new(b))
     }
     pub fn rem(a: Expr, b: Expr) -> Expr { Expr::Rem(Box::new(a), Box::new(b)) }
+    pub fn logand(a: Expr, b: Expr) -> Expr { Expr::LogAnd(Box::new(a), Box::new(b)) }
+    pub fn logior(a: Expr, b: Expr) -> Expr { Expr::LogIor(Box::new(a), Box::new(b)) }
+    pub fn logxor(a: Expr, b: Expr) -> Expr { Expr::LogXor(Box::new(a), Box::new(b)) }
+    pub fn ash(n: Expr, shift: Expr) -> Expr { Expr::Ash(Box::new(n), Box::new(shift)) }
     pub fn cons(car: Expr, cdr: Expr) -> Expr { Expr::Cons(Box::new(car), Box::new(cdr)) }
     pub fn car(x: Expr) -> Expr { Expr::Car(Box::new(x)) }
     pub fn cdr(x: Expr) -> Expr { Expr::Cdr(Box::new(x)) }

@@ -42,9 +42,6 @@ fn usage() {
     eprintln!("  multiple --eval / --load / --check can be chained; --repl runs after them");
     eprintln!();
     eprintln!("Environment variables:");
-    eprintln!("  NCL_HEAP_BACKEND     pick the GC implementation:");
-    eprintln!("                         semispace  (default, production)");
-    eprintln!("                         page-heap  (under construction — see docs/GC_DESIGN.md)");
     eprintln!("  NCL_LIBRARY          override the Library/ directory location");
     eprintln!("  NCL_PACK_DIR         override the packs/ directory (Win32 metadata pack)");
     eprintln!("  NCL_YOUNG_MB         young-heap reservation in MB (default 256)");

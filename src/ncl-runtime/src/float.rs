@@ -27,7 +27,7 @@ pub const FLOAT_PAYLOAD_CELLS: u32 = 2;
 
 /// Allocate a float on the young heap.
 pub fn alloc_float(m: &mut MutatorState, value: f64) -> Word {
-    let marker = m.coord().intern("%FLOAT");
+    let marker = m.coord().marker_float();
     let w = m.alloc_typed_vector(HeapType::Float, FLOAT_PAYLOAD_CELLS);
     let p = w.as_mut_ptr::<u64>(Tag::Vector).expect("just-allocated vector");
     unsafe {
@@ -53,6 +53,42 @@ pub fn alloc_float_in_static(
         *p.add(2) = value.to_bits();
     }
     Some(Word::from_ptr(p as *const u8, Tag::Vector))
+}
+
+/// Box a raw `f64` into a heap `Float` Word. The JIT's
+/// `coerce_to_word(F64)` boundary calls this at an *escape* — when an
+/// unboxed double must become a tagged Word (stored into a cons/vector,
+/// returned, passed to a generic call, …). The result is a young-heap
+/// allocation; it is kept alive across any later GC by the conservative
+/// stack pin while it lives in a JIT register, exactly like every other
+/// freshly-allocated intermediate. See `docs/performance-unbox-float.md`.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn ncl_box_float(mutator: *mut MutatorState, value: f64) -> u64 {
+    let m = unsafe { &mut *mutator };
+    alloc_float(m, value).raw()
+}
+
+/// Checked slow path for the JIT's `coerce_to_f64(Word)` boundary. The
+/// JIT inlines the fast path (the Word *is* a heap `Float`, read cell 2)
+/// and calls this ONLY when the Word is not a float — e.g. a
+/// `(declare (double-float x))` parameter that received a non-float at
+/// runtime. Coerces any real (fixnum / bignum / ratio → nearest double)
+/// and signals a condition for a non-real, instead of dereferencing a
+/// non-pointer (which segfaults — that was the bug). On the signalled
+/// path it returns NaN; the pending condition is taken at the caller's
+/// next abort check.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn ncl_unbox_float_checked(mutator: *mut MutatorState, w_raw: u64) -> f64 {
+    match to_f64(Word::from_raw(w_raw)) {
+        Some(f) => f,
+        None => {
+            crate::abi::signal_condition_string(
+                mutator,
+                "double-float-declared value is not a real number",
+            );
+            f64::NAN
+        }
+    }
 }
 
 /// True iff WORD is a heap-allocated float.
@@ -266,6 +302,35 @@ pub extern "C-unwind" fn ncl_cmp_real(a_raw: u64, b_raw: u64) -> i64 {
         };
     }
     crate::bignum::ncl_cmp_int(a_raw, b_raw)
+}
+
+/// True iff comparing A and B is IEEE-*unordered* — at least one operand
+/// is a float NaN. CL's number comparisons (`<`, `>`, `<=`, `>=`, `=`)
+/// must all return NIL when an operand is NaN, and `/=` must return T.
+///
+/// `ncl_cmp_real`/`ncl_cmp_full` collapse the unordered case to 0
+/// ("equal") because they return a 3-way ordering, and `eql`/`equal`
+/// rely on that tower compare. So we detect the unordered case
+/// *separately* at the comparison-predicate sites (the abi.rs shims and
+/// the JIT's `ncl_num_cmp`) rather than perturbing the shared compare.
+pub fn cmp_unordered(a: Word, b: Word) -> bool {
+    (is_float(a) && float_value(a).is_nan()) || (is_float(b) && float_value(b).is_nan())
+}
+
+/// Numeric-tower comparison for the JIT's inlined `<`/`>`/`<=`/`>=`/`=`
+/// slow path. Identical to `ncl_cmp_full` for ordered operands; returns
+/// the sentinel `i64::MIN` when the comparison is IEEE-unordered (a NaN
+/// operand). The JIT maps that sentinel to "false" for every ordered
+/// predicate (see `emit_cmp_vals`). `eql`/`equal`/`equalp` keep calling
+/// `ncl_cmp_full` directly and are unaffected.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn ncl_num_cmp(a_raw: u64, b_raw: u64) -> i64 {
+    let a = Word::from_raw(a_raw);
+    let b = Word::from_raw(b_raw);
+    if cmp_unordered(a, b) {
+        return i64::MIN;
+    }
+    crate::ratio::ncl_cmp_full(a_raw, b_raw)
 }
 
 // ─── Lisp-callable shims ─────────────────────────────────────────────────
@@ -581,6 +646,40 @@ mod tests {
         assert_eq!(float_to_string(1.5), "1.5");
         // ryu picks shortest representation
         assert_eq!(float_to_string(0.1 + 0.2), "0.30000000000000004");
+    }
+
+    /// Locks the exact heap layout the JIT hardcodes when it inlines
+    /// float unbox/box (`coerce_to_f64` / `coerce_to_word` in
+    /// `ncl-llvm`). If any of these constants move, the JIT codegen must
+    /// change in lockstep. See `docs/performance-unbox-float.md` §2.1.
+    #[test]
+    fn jit_float_layout_contract() {
+        let coord = GcCoordinator::new(small_config());
+        let mut m = coord.register_mutator();
+        let w = alloc_float(&mut m, 1.5);
+
+        // (1) A float Word carries Tag::Vector == 0b011 == 3.
+        assert_eq!(w.raw() & 7, 3, "float Word tag must be Tag::Vector (3)");
+
+        // (2) Clearing the tag bits yields the heap base (cell 0 = the
+        //     header). HeapType::Float == 7 lives in the header's low 5
+        //     bits (TYPE_SHIFT = 0, TYPE_MASK = 31).
+        let base = (w.raw() & !7u64) as *const u64;
+        let header = unsafe { *base };
+        assert_eq!(header & 31, 7, "header low 5 bits must be HeapType::Float (7)");
+
+        // (3) The raw f64 bits live at cell 2 == byte 16.
+        let bits = unsafe { *base.add(2) };
+        assert_eq!(f64::from_bits(bits), 1.5, "f64 payload at cell 2 (byte 16)");
+
+        // (4) ncl_box_float produces the identical layout.
+        let b = ncl_box_float(&mut m as *mut MutatorState, -0.0);
+        assert_eq!(b & 7, 3);
+        let bbase = (b & !7u64) as *const u64;
+        assert_eq!(unsafe { *bbase } & 31, 7);
+        let bbits = unsafe { *bbase.add(2) };
+        // -0.0 round-trips bit-exactly (sign bit preserved).
+        assert!(f64::from_bits(bbits) == 0.0 && f64::from_bits(bbits).is_sign_negative());
     }
 
     #[test]
