@@ -218,12 +218,17 @@ representation/check decision. An untrusted source can therefore never make it a
   follow it.
 - **Slice 3** — the box-elimination promotion (change #3): rewrite an immutable proven-float
   `Let` binding to `F64LocalStore` + its reads to `F64LocalRead` (an f64 slot), killing the
-  per-binding `ncl_box_float` allocation as well as the read diamonds. All the emit pieces
-  are in place (the `Let` arm boxes-free for `F64LocalStore` bindings, `emit_expr` boxes
-  `F64LocalRead` only in Word contexts, the f64-slot table auto-resizes). Requires the walk
-  to be *exhaustive* (a missed read of a promoted local would read the binding's NIL
-  placeholder) and an f64-slot scan to avoid colliding with lowering's slots. Then fold
-  inference into the inline-gate decision (per the Slice-2 finding) to extend it to loops.
+  per-binding `ncl_box_float` allocation as well as the read diamonds. *Done* — supersedes
+  Slices 1–2's `TheFloat` read-wrapping with the strictly-better f64-slot representation.
+  The walk is exhaustive (every read of a promoted local is rewritten, so the binding's NIL
+  placeholder slot is never read) and an `f64_slot_count` scan keeps promoted slots above
+  lowering's. Gauntlet ALL-PASS, ANSI 490/56, bit-identical to `NCL_NO_INFER`; on the
+  straight-line `poly` kernel **~4.7× over no-inference and ~2.5× over Slice 1** (the box
+  elimination removed ~9M `ncl_box_float` allocations on top of the diamond removal).
+- **Slice 4** — fold inference into the inline-gate decision (per the Slice-2 finding) so a
+  proven-float local satisfies the gate, the loop inlines, and promotion reaches loop
+  bodies — the remaining lever for loop float code. Plus `Cons`/`Null` sharpening through
+  type tests (the hook for a later path-replication pass).
 - **Slice 3** — `Fixnum` propagation + the trimmed fixnum diamond (change #4), gated on the
   overflow-soundness discipline.
 - **Slice 4 (optional)** — `Cons`/`Null` sharpening through `IsCons`/`IsNull` tests; the hook
