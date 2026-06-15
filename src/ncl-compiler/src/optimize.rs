@@ -83,9 +83,16 @@ fn walk(e: Expr, env: &mut Vec<AbsType>, in_loop: bool) -> (AbsType, Expr) {
         }
 
         // ── local read: the one place a wrap is inserted ──────────────────
+        // Slice 2: wrap inside loops too. A plain `Local` read is always
+        // immutable — mutation forces a boxed cell (Car/SetCar) or an f64
+        // slot (F64LocalStore), never a plain-Local reassignment, and even
+        // FastLoop carries are cells/f64-slots — so a proven-float plain
+        // Local keeps its type across loop iterations. (`in_loop` is no
+        // longer consulted here; kept threaded for future use.)
         Expr::Local(i) => {
+            let _ = in_loop;
             let t = env.get(i).copied().unwrap_or(AbsType::Other);
-            if t.is_float() && !in_loop {
+            if t.is_float() {
                 (AbsType::Float, Expr::TheFloat(Box::new(Expr::Local(i))))
             } else {
                 (t, Expr::Local(i))

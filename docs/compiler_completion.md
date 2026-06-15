@@ -200,8 +200,30 @@ representation/check decision. An untrusted source can therefore never make it a
 - **Slice 1** — float unboxing from declarations + literals + float arithmetic, straight-line
   + `If` only (no loops, no fixnum, no overflow). Wires changes #1 and #2. Smallest slice
   that measurably deletes diamonds with zero loop/overflow reasoning to get wrong.
-- **Slice 2** — loop fixpoint (loop-carried float accumulators) + the box/unbox-roundtrip
-  peephole (change #3).
+- **Slice 2** — extend the wrap into loop bodies (sound: a plain `Local` read is always
+  immutable, since mutation forces a cell or f64 slot — even FastLoop carries — so a
+  proven-float plain Local keeps its type across iterations). *Done.*
+
+  **Finding (important).** Slice 2 is sound but its practical reach is bounded by an
+  interaction with the inline gate. A loop with an *undeclared computed-init* float local
+  (`(let ((a (* x x))) …)` inside `(loop …)`) is **refused auto-inlining** by the Slice-1
+  #2 gate, so it lowers to a capturing lambda. Inside that lambda the float param is a
+  `ClosureRef`, whose float-ness this pass does not track (closure boundary ⇒ `Other`), so
+  nothing gets proven float and the wrap never fires. Loops that *do* inline already carry
+  declared floats (already unboxed). Net: Slice 2 only helps inlined loops that hold an
+  undeclared float local with a *non-computed* init — a narrow set. **The real loop lever
+  is to run inference BEFORE the inline gate and let a proven-float fact (a) satisfy the
+  gate so the loop inlines, and (b) drive promotion to an f64 slot.** That is the
+  substantive next step, bigger than a tree pass: inference must inform lowering, not just
+  follow it.
+- **Slice 3** — the box-elimination promotion (change #3): rewrite an immutable proven-float
+  `Let` binding to `F64LocalStore` + its reads to `F64LocalRead` (an f64 slot), killing the
+  per-binding `ncl_box_float` allocation as well as the read diamonds. All the emit pieces
+  are in place (the `Let` arm boxes-free for `F64LocalStore` bindings, `emit_expr` boxes
+  `F64LocalRead` only in Word contexts, the f64-slot table auto-resizes). Requires the walk
+  to be *exhaustive* (a missed read of a promoted local would read the binding's NIL
+  placeholder) and an f64-slot scan to avoid colliding with lowering's slots. Then fold
+  inference into the inline-gate decision (per the Slice-2 finding) to extend it to loops.
 - **Slice 3** — `Fixnum` propagation + the trimmed fixnum diamond (change #4), gated on the
   overflow-soundness discipline.
 - **Slice 4 (optional)** — `Cons`/`Null` sharpening through `IsCons`/`IsNull` tests; the hook
