@@ -18,6 +18,7 @@ use ncl_runtime::{
 };
 use new_asm;
 
+mod inline;
 pub mod lower;
 pub mod macroexpand;
 mod optimize;
@@ -517,6 +518,16 @@ pub(crate) fn compile_function_raw(
     // body clean.
     let (_, effective_body) = lower::strip_declares(&expanded_body);
     let effective_body = effective_body.to_vec();
+
+    // Capture this body for inline expansion at direct call sites, IFF it was
+    // `(declaim (inline NAME))`d with a simple (required-only) lambda list.
+    // The function is still compiled normally below (it must remain callable
+    // via #', apply, recursion, and non-inlinable sites) — this only records
+    // a copy. See inline.rs / docs/compiler_completion.md § Interprocedural.
+    let simple_lambda_list = params.optionals.is_empty()
+        && params.rest.is_none()
+        && params.keys.is_empty();
+    inline::maybe_record(name, simple_lambda_list, &params.required, &effective_body);
 
     // Build the env. Required params first at Param(0..N); the
     // shared prologue helper then layers optionals/rest/keys on

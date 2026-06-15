@@ -969,6 +969,17 @@ fn lower_call_in_mut(
         // `declare` that somehow reaches evaluation (e.g. at top
         // level) is silently ignored per CL spec.
         "DECLARE" => Ok(Expr::Nil),
+        // (declaim (inline f) (notinline g) (optimize …) …) — global
+        // proclamation. We honour `inline`/`notinline` (the inliner reads
+        // the registry at defun + call-site lowering); all other declspecs
+        // (optimize / type / ftype / special …) are accepted and ignored.
+        // declaim's return value is unspecified in CL; we return T ("the
+        // declamation was accepted"), matching the de-facto convention the
+        // ANSI suite annotates. See crate::inline (§ Interprocedural inlining).
+        "DECLAIM" => {
+            process_declaim(args);
+            Ok(Expr::True)
+        }
         // (locally (declare (special ...)) body...) — establishes
         // local special declarations for the enclosed body. The
         // declares affect only the lexical scope of `body`.
@@ -998,6 +1009,14 @@ fn lower_call_in_mut(
             Ok(Expr::funcall(fn_expr, lowered_args?))
         }
         _ => {
+            // Inline-expansion fast path: if NAME was `(declaim (inline …))`d
+            // with a simple lambda list and this call is inlinable here, splice
+            // its body as `(let ((p a) …) body…)` and lower that in-place. The
+            // reachable-via-flet case was handled above, so NAME here is a
+            // global function reference. See crate::inline.
+            if let Some(result) = try_lower_inline_call(&head_name, args, env, coord) {
+                return result;
+            }
             let sym_word = coord.intern(&head_name);
             let lowered_args: Result<Vec<_>, _> = args
                 .iter()
@@ -1006,6 +1025,80 @@ fn lower_call_in_mut(
             Ok(Expr::call(sym_word.raw(), lowered_args?))
         }
     }
+}
+
+/// Process `(declaim DECLSPEC …)` declspecs we care about. `inline`/
+/// `notinline` update the inline registry; everything else is ignored.
+fn process_declaim(args: &[Value]) {
+    for spec in args {
+        let Ok(items) = list_to_vec(spec) else { continue };
+        let Some(Value::Symbol(head)) = items.first() else {
+            continue;
+        };
+        match &*head.name {
+            "INLINE" => {
+                for n in &items[1..] {
+                    if let Value::Symbol(s) = n {
+                        crate::inline::request_inline(&s.name);
+                    }
+                }
+            }
+            "NOTINLINE" => {
+                for n in &items[1..] {
+                    if let Value::Symbol(s) = n {
+                        crate::inline::request_notinline(&s.name);
+                    }
+                }
+            }
+            // optimize / type / ftype / special / ignore … — not our concern.
+            _ => {}
+        }
+    }
+}
+
+/// If `head_name` names a `declaim inline` function whose captured body can be
+/// spliced at this call site, build `(let ((p1 a1) …) body…)` and lower it in
+/// the caller's env; otherwise return `None` (the caller emits a normal call).
+///
+/// The `let` reuses all of `lower_let`'s machinery: parallel left-to-right
+/// arg evaluation, boxing of mutated params, dynamic binding of special-named
+/// params, and f64-slot promotion — and the float-unboxing pass later runs
+/// over the spliced body, so unboxing crosses the call boundary. Params are
+/// bound by the `let`, so they shadow same-named caller locals correctly.
+fn try_lower_inline_call(
+    head_name: &str,
+    args: &[Value],
+    env: &mut LocalEnv,
+    coord: &Arc<GcCoordinator>,
+) -> Option<Result<Expr, CompileError>> {
+    if crate::inline::blocked(head_name) {
+        return None;
+    }
+    let def = crate::inline::lookup(head_name)?;
+    if def.params.len() != args.len() {
+        // Arity mismatch — fall through to a normal call, which signals the
+        // proper condition at runtime rather than silently mis-substituting.
+        return None;
+    }
+
+    // Build the binding list `((p1 a1) (p2 a2) …)`. Each param becomes a fresh
+    // symbol carrying the original name; `lower_let` resolves the body's
+    // references by name, so identity doesn't matter. Args are the ORIGINAL
+    // call-site forms — `lower_let` lowers them in the caller env (correct
+    // outer-scope, parallel-let evaluation).
+    let mut bindings = Vec::with_capacity(def.params.len());
+    for (p, a) in def.params.iter().zip(args.iter()) {
+        let psym = Value::Symbol(Symbol::fresh_uninterned(Arc::clone(p)));
+        bindings.push(Value::list([psym, a.clone()]));
+    }
+    let mut let_args = Vec::with_capacity(1 + def.body.len());
+    let_args.push(Value::list(bindings));
+    let_args.extend(def.body.iter().cloned());
+
+    crate::inline::enter(head_name);
+    let result = lower_let(&let_args, env, coord);
+    crate::inline::exit();
+    Some(result)
 }
 
 /// `(let ((var val) ...) body...)`. Bindings evaluated in OUTER env

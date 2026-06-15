@@ -297,3 +297,65 @@ is not):**
 - Reference (BSD, study-only, do not copy): `E:/CL/SICL/Code/Cleavir/Type-inference/` —
   `type-descriptor.lisp` (the coarsen-to-representation-leaves manifesto) and `transfer.lisp`
   (the `meet`/`difference` narrowing).
+
+## 10. Interprocedural — IR-level inlining (`declaim inline`)
+
+The float-inference pass above is **intra-function**: its facts die at every call
+boundary. That boundary is also where NCL is structurally weakest. Each Lisp function
+compiles into its *own* LLVM module (`build_lisp_function` → `create_module("ncl_fn")`),
+so LLVM's interprocedural passes have one function to chew on and never fire across Lisp
+calls. And every inter-function call is **late-bound** (load the symbol's function cell,
+tag-check, load `code_ptr`, `build_indirect_call`) with a **boxed uniform ABI** (args spilled
+to an `i64` array) — opaque to LLVM even if functions were co-located, and required by CL's
+redefinition semantics. Net: LLVM cannot, and should not, do cross-function optimization here.
+The fix is the Cleavir move — do the one interprocedural transform that is both
+standard-sanctioned and high-value **above** the backend, at the IR.
+
+**What it does.** When a function is `(declaim (inline f))`d *before* it compiles, its
+macroexpanded, declare-stripped body + required-param names are captured into a process
+registry (`crate::inline`). At a later direct call `(f a1 … aN)`, lowering splices the source
+form `(let ((p1 a1) … (pN aN)) body…)` in place and lowers *that* in the caller's env. The
+function is still compiled normally (it must remain reachable via `#'f`, `apply`, recursion,
+and non-inlinable sites) — inlining is an additional fast path at direct call sites.
+
+**Why splice as a `let` at lowering (not the `Expr` tree).** Post-lowering, variables are flat
+per-function slot indices (`Local(i)`, `Param(i)`, `F64LocalStore{slot}`) — splicing a callee's
+`Expr` would collide indices. A source-level `(let …)` lowered in the caller assigns fresh slots
+and reuses *all* of `lower_let`: parallel left-to-right arg evaluation, boxing of mutated params,
+dynamic binding of special-named params, and f64-slot promotion. Crucially the float-inference
+pass then runs over the spliced body — so **representation inference finally crosses the call
+boundary** — and eliminating the call also deletes its GC-root push/pop + safepoint wrap, the
+single largest measured cost in call-heavy code.
+
+**Contract (CLHS 3.2.2.3).** An inline-declared function's callers may use a saved copy of its
+definition; a later redefinition need not update already-compiled callers. `(declaim (notinline
+f))` cancels it for future callers.
+
+**Soundness.** Params are bound by the `let`, so they correctly *shadow* same-named caller
+locals (no param capture). Function calls in the body resolve through the symbol cell, never the
+lexical env (never captured). Specials resolve dynamically (never captured). Residual risk — a
+body reference to a *non-special global variable* whose bare name collides with a caller local —
+requires un-earmuffed global use AND a name clash, outside idiomatic CL; gated behind opt-in
+`declaim inline` and exercised by the regression suites. Only **simple** (required-only) lambda
+lists are captured — the `let` substitution is exact for those. Recursion is bounded: a name
+being inlined on the active path emits a normal call (direct + mutual recursion terminate after
+one level); a depth cap backstops long non-recursive chains. `NCL_NO_INLINE=1` disables the
+splice.
+
+**Validation.** Gauntlet ALL-PASS; ANSI **493/56** (up from 490/56 — `(declaim …)` was an
+undefined-function error before, now conformant: it returns `T` and 3 chapter-3 declaim forms
+pass; zero pass→fail regressions, confirmed by failure-set diff). Nine targeted correctness
+cases (single-eval ordering, mutated-param boxing, float-crossing, recursion termination,
+`notinline`, `#'f` reachability, zero-arg, nested inline) all pass. ~**1.67×** on a call-bound
+loop (`(declaim (inline addone)) … (addone s)` per iteration), proving the splice fires and the
+call boundary — dispatch + root traffic — is gone.
+
+**File map.**
+
+- New: `src/ncl-compiler/src/inline.rs` — the registry (`request_inline` / `request_notinline`
+  / `maybe_record` / `lookup`), the thread-local recursion/depth guard, `NCL_NO_INLINE`.
+- `src/ncl-compiler/src/lib.rs` — `mod inline;`; capture call in `compile_function_raw` right
+  after `effective_body`.
+- `src/ncl-compiler/src/lower.rs` — the `"DECLAIM"` arm + `process_declaim` (records inline/
+  notinline, ignores other declspecs, returns `T`); `try_lower_inline_call` (builds + lowers the
+  `(let …)`) wired into the generic-call fallthrough.
