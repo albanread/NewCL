@@ -46,18 +46,24 @@ programs. It is **not** a complete ANSI implementation yet — see
 
 ### Performance
 
-NCL emits real native code, not a tree-walk. Honest numbers (2026-06,
-measured against SBCL 2.6.4 on the same machine):
+The yardstick is **SBCL** — the mature, gold-standard CL compiler, and it
+is *much* faster than NCL. That's expected: SBCL has 20+ years of native
+codegen and GC tuning. The goal for a young, from-scratch JIT is to stay
+**within an order of magnitude**, and on a real workload we now do. Honest
+numbers (2026-06, same machine, SBCL 2.6.4):
 
-- **Float kernels** — ~3–4× faster via the unboxing pass; matches a hand
-  `(declare (double-float …))` without needing the declaration.
 - **Symbolic / heavy-backtracking** (Norvig Prolog solving the Zebra
-  puzzle, `demos/prolog.lisp`) — **≈10× SBCL** (1.08 s vs 0.10 s) after
-  stdlib hot-path tuning; was 18× before.
-- Allocation is competitive (`cons` ≈ 2× SBCL) and GC is usually *not* the
-  bottleneck. The remaining gap is per-call overhead from a late-bound,
-  boxed calling convention — the next compiler lever is an unboxed /
-  known-call ABI.
+  puzzle, `demos/prolog.lisp`): **SBCL is ~10× faster** — SBCL 0.10 s vs
+  NCL 1.08 s. SBCL was ~18× faster before this round of stdlib hot-path
+  tuning. Closing to *only* ~10× slower than SBCL on a heavy symbolic
+  program is the milestone here.
+- **Float kernels**: NCL's unboxing pass makes its *own* code ~3–4× faster
+  (it matches a hand `(declare (double-float …))` without the declaration).
+- Allocation is competitive — `cons` is only ~2× slower than SBCL — and GC
+  is usually *not* the bottleneck. The dominant remaining gap is per-call
+  overhead: NCL's function calls are ~18× SBCL's, from a late-bound, boxed
+  calling convention. The next compiler lever is an unboxed / known-call
+  ABI to close that.
 
 ### Conformance
 
