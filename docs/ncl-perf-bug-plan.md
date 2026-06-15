@@ -162,6 +162,24 @@ core walkers), keep `elt` only for vectors/strings; two-pass
 - **23. `bignum_to_bigint` allocates an extra intermediate Vec** per operand read (bignum.rs 87–99). *perf-minor · small.* **Fix:** push the two u32 halves straight from the heap read into the preallocated vec.
 - **24. `SETQ`→`SETF` symbol-macro rewrite re-macroexpands** value forms twice (macroexpand.rs 514–540). *perf-minor · small.* **Fix:** build the progn from already-expanded pieces; expand only the `setf` place; skip the outer re-walk.
 
+### Closure allocation — capturing closures leak Function records into static (finding 2026-06-15)
+- **25. Every evaluation of a *capturing* `(lambda …)` permanently consumes static-area memory.**  *correctness (latent OOM) + perf-major · medium.*
+  `ncl_make_closure` (abi.rs:648) allocates the Function record via `alloc_function_in_static` (gc_function.rs:61) — the static area is **never reclaimed** (gc_function.rs:1–8, abi.rs:654–664). So a capturing closure created in a loop leaks one ~48-byte Function record per evaluation, plus a young-heap env Vector. abi.rs:654–664 documents *why* it's static: the young-heap path was tried and reverted — conservative stack-pinning + promote-on-first-survival turned every transient into a tenured object and spiralled to OOM; the documented cure was "tighten pinner + age-threshold promotion" at the GC layer.
+
+  **Evidence (`(gc-stats)`, 1M evaluations each, release build):**
+  | workload | ΔSTATIC-USED | ΔYOUNG-USED | minor GCs |
+  |---|---|---|---|
+  | no-capture `(lambda (x) (+ x 1))` *(post-elision)* | **+1.6 KB** (one cached closure) | 0 | 0 |
+  | capturing `(lambda (x) (+ x k))` | **+48 MB** (Function records, **leaked**) | +16 MB (env Vectors, GC-reclaimable) | 0 |
+
+  At ~48 B/closure, ~22M capturing-closure evaluations exhaust the 1 GB static area → hard OOM. A long-running `(loop … (mapcar (lambda (x) (+ x k)) …))` will eventually crash. The dominant cost is the **static leak**, not young-GC pressure (the env Vectors *are* reclaimable).
+
+  **Status:** the *no-capture* case is fixed — `perf(jit): elide no-capture closures` (01d351b) allocates the record once at compile time and embeds the Word as an IR constant (a no-free-var lambda is a constant; closure identity for a stateless lambda is CL-implementation-defined). The *capturing* leak is **deferred by decision (2026-06-15)** — recorded here, not yet scheduled.
+
+  **Fix options (when scheduled):**
+  - **(A) Young-allocate + reclaim** the Function record so dead closures are collected. The page-heap (now the only backend) already has age-threshold promotion (G0→G1→Tenured), which lifts *one* of the two documented blockers; it still uses conservative stack pinning, so this needs careful rooting validation (cf. the old `demos/life.lisp` gen-25 `lambda_1317` crash). Touches the GC alloc path → gated by the "don't touch GC without a very good reason" rule (a latent OOM is a good reason, but validation cost is real). Fixes *all* capturing closures, escaping or not.
+  - **(B) Stack-allocate non-escaping closures** (Tier-2 escape analysis): closures that provably don't outlive their creating frame go on the stack — avoids the heap entirely, no GC code touched, aligns with the "avoid GC" framing. Larger compiler change; does **not** help closures that genuinely escape (those still need a reclaimable home — i.e. still want (A)).
+
 ---
 
 ## Sprint plan
