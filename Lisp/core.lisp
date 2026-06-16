@@ -67,11 +67,35 @@
     ((vectorp seq) (coerce (%revappend (coerce seq 'list) nil) 'vector))
     (t (error "REVERSE: argument is not a sequence: ~S" seq))))
 
-(defun append (a b)
-  ;; Binary append. Variadic CL append lands when &rest does.
+(defun %append2 (a b)
+  ;; Binary append primitive: copy list A, sharing tail B. Used by the
+  ;; variadic `append` and other early stdlib that wants the 2-arg form
+  ;; without paying for &rest unpacking.
   (if (null a)
       b
-      (cons (car a) (append (cdr a) b))))
+      (cons (car a) (%append2 (cdr a) b))))
+
+(defun %append-lists (lists)
+  ;; Fold a list of lists right-to-left with %append2. The final list is
+  ;; shared (not copied); all earlier ones are copied — per CL APPEND.
+  (cond
+    ((null lists) nil)
+    ((null (cdr lists)) (car lists))
+    (t (%append2 (car lists) (%append-lists (cdr lists))))))
+
+(defun append (&optional a b &rest more)
+  "CL APPEND — concatenate lists into one. Every list but the last is
+   copied; the last is shared. The 0/1/2-arg cases bind directly (no
+   &rest list allocated) — that path is hot (e.g. Prolog clause
+   expansion). For these, B nil is unambiguous: (append), (append X),
+   and (append X nil) all reduce to A.
+     (append)        => NIL
+     (append X)      => X
+     (append X Y)    => copy X onto Y
+     (append X Y …)  => fold right, sharing the last list."
+  (cond
+    ((null more) (if (null b) a (%append2 a b)))
+    (t (%append2 a (%append-lists (cons b more))))))
 
 ;; -- mapcar, mapc, every, some (variadic) ----------------------------------
 ;;
@@ -831,6 +855,42 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
              (block ,block-name
                ,@(%tagbody-build-dispatch segments tag-alist block-name pc-var 0)
                -1))))))
+
+;; ── PROG / PROG* ──────────────────────────────────────────────────
+;;
+;; CLHS 5.3: PROG combines BLOCK, LET, and TAGBODY into one form —
+;;   (prog ({var | (var [init])}*) declaration* {tag | statement}*)
+;; expands to
+;;   (block nil (let (...) declaration* (tagbody {tag | statement}*))).
+;; PROG* is identical but binds sequentially (LET*). `return` exits the
+;; implicit `block nil`; the longjmp-based BLOCK unwinds cleanly through
+;; the tagbody driver (its own block is a gensym, never `nil`).
+
+(defun %prog-split-declares (body acc)
+  "Peel leading (declare …) forms off BODY. Returns (reversed-decls . rest)."
+  (if (and (consp body)
+           (consp (car body))
+           (eq (car (car body)) 'declare))
+      (%prog-split-declares (cdr body) (cons (car body) acc))
+      (cons acc body)))
+
+(defun %expand-prog (let-op varlist body)
+  "Build the (block nil (let-op … decls (tagbody …))) expansion."
+  (let* ((split (%prog-split-declares body nil))
+         (decls (reverse (car split)))
+         (forms (cdr split)))
+    (list 'block nil
+          (append (list let-op varlist)
+                  decls
+                  (list (cons 'tagbody forms))))))
+
+(defmacro prog (varlist &rest body)
+  "(prog ({var|(var [init])}*) decl* {tag|stmt}*) — parallel bindings."
+  (%expand-prog 'let varlist body))
+
+(defmacro prog* (varlist &rest body)
+  "(prog* ({var|(var [init])}*) decl* {tag|stmt}*) — sequential bindings."
+  (%expand-prog 'let* varlist body))
 
 ;; ── Extended LOOP ─────────────────────────────────────────────────
 ;;
