@@ -2034,15 +2034,23 @@ fn lower_cond(
         ));
     }
     let test = lower_in_mut(&clause[0], env, coord)?;
-    // Body: implicit progn of forms after the test.
-    // CL's `(test)` (clause with only a test) would return test's
-    // value if non-nil; defer that case.
-    let body = if clause.len() == 1 {
-        return Err(CompileError::NotImplemented(
-            "cond clause with only a test (no body) not yet supported"
-                .to_string(),
+    // CLHS: a clause with only a test `(test)` returns the test's value
+    // when it is non-nil, else falls through. The test must be evaluated
+    // exactly once, so — like `or` — bind it to a synthetic local and
+    // reuse it for both the predicate and the result:
+    //   (let ((tmp test)) (if tmp tmp rest))
+    if clause.len() == 1 {
+        let cp = env.checkpoint();
+        let tmp_idx = env.push_local(std::sync::Arc::from("__cond_tmp__"));
+        let rest = lower_cond(&clauses[1..], env, coord)?;
+        env.restore(cp);
+        return Ok(Expr::let_(
+            vec![test],
+            Expr::if_(Expr::Local(tmp_idx), Expr::Local(tmp_idx), rest),
         ));
-    } else if clause.len() == 2 {
+    }
+    // Body: implicit progn of forms after the test.
+    let body = if clause.len() == 2 {
         lower_in_mut(&clause[1], env, coord)?
     } else {
         let lowered: Result<Vec<_>, _> = clause[1..]
