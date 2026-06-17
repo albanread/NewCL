@@ -68,10 +68,16 @@ numbers (2026-06, same machine, SBCL 2.6.4):
 ### Conformance
 
 The Corman/ANSI test chapters (`demos/ansi-runner.lisp`) currently pass
-**≈493 / fail ≈56**. Known weak spots: parts of the type system
-(`subtypep`, `typep` on compound types), some `coerce` targets, a few CLOS
-corners (`with-slots` / `with-accessors` edge cases), and the full extended
-`loop`. The performance "gauntlet" (`bench/gauntlet.lisp`) is ALL-PASS.
+**≈622 / fail ≈64** (≈98 of the remainder are forms that don't yet read or
+compile). Most of those un-run forms cluster behind a handful of
+single-feature *chapter-killers* — one unsupported construct aborts a whole
+chapter at load time — tracked in [docs/ansi-killers.md](docs/ansi-killers.md).
+The biggest remaining ones: read-time `#S(...)` struct literals (all of
+chapter 8), LOOP's conditional sublanguage (`else` / `it` / `end`), and the
+`define-setf-expander` / `get-setf-expansion` protocol. Other weak spots:
+parts of the type system (`subtypep`, `typep` on compound types), some
+`coerce` targets, and a few CLOS corners. The performance "gauntlet"
+(`bench/gauntlet.lisp`) is ALL-PASS.
 
 ### Known gaps
 
