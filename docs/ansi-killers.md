@@ -4,7 +4,7 @@
 ANSI hyperspec-examples chapters (`E:/CL/cormanlisp/test/ansi-chapter-*.lisp`).*
 
 ```
-passed: 751   failed: 77   errors: 91   total: 919   (every chapter loads fully)
+passed: 757   failed: 83   errors: 79   total: 919   (every chapter loads fully)
 ```
 
 ## The "chapter-killer" pattern (mostly retired)
@@ -20,7 +20,7 @@ no panics. The remaining `failed`/`errors` are forms that *actually executed*
 and produced a wrong/no answer, which is honest: the gaps are visible
 per-form rather than masked by an early chapter abort.
 
-Work so far took the count from **622 → 751 (+129)** and, more importantly,
+Work so far took the count from **622 → 757 (+135)** and, more importantly,
 took the suite from 784 forms run to **919** (chapters 5, 6, 8 previously
 aborted partway). What remains is no longer quick clause-adds — each is a
 substantial single feature.

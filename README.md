@@ -68,7 +68,7 @@ numbers (2026-06, same machine, SBCL 2.6.4):
 ### Conformance
 
 The Corman/ANSI test chapters (`demos/ansi-runner.lisp`) currently pass
-**≈751 / fail ≈77 / error ≈91** of **919 forms run** (up from ≈622 with three
+**≈757 / fail ≈83 / error ≈79** of **919 forms run** (up from ≈622 with three
 chapters aborting). The suite now **loads every chapter to completion** — no
 chapter-killer aborts and no worker-thread panics — so the gaps are honest
 *failures/errors on forms that actually executed*, not whole chapters hidden

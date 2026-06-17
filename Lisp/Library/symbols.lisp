@@ -473,6 +473,18 @@ UNWIND-PROTECT yet), but the common case of normal return is correct."
                           (mapcar (lambda (f) (list 'multiple-value-list f))
                                   forms))))))
 
+;; ── THE ────────────────────────────────────────────────────────────────────
+;;
+;; (the value-type form) — a type declaration that asserts FORM yields a
+;; value of VALUE-TYPE. NCL does not yet act on the assertion, so THE just
+;; evaluates and returns FORM (preserving multiple values via the bare
+;; form). VALUE-TYPE is not evaluated.
+
+(defmacro the (value-type form)
+  "Type-assertion wrapper; evaluates to FORM. The type is not checked."
+  (declare (ignore value-type))
+  form)
+
 ;; ── FUNCTION-LAMBDA-EXPRESSION ─────────────────────────────────────────────
 ;;
 ;; CLHS returns (values lambda-expression closure-p name); all three are
