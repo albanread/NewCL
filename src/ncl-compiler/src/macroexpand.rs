@@ -545,56 +545,8 @@ pub fn macroexpand_all(
         if let Some(macro_fn) =
             lookup_local_macro(&head_name).or_else(|| coord.macro_for(&head_name))
         {
-            let args_value = cdr_of(v);
-            let args_vec = list_to_vec(&args_value)?;
-            let mut arg_words: Vec<u64> = Vec::with_capacity(args_vec.len());
-            for a in &args_vec {
-                arg_words.push(value_to_word(a, mutator, coord)?.raw());
-            }
-            // Defensive arity check. A macro expander's prologue reads
-            // its required positional parameters straight out of the
-            // args array; calling it with fewer would read PAST the end
-            // into uninitialised memory, whose bytes can carry any tag —
-            // a forwarding pointer, a bogus symbol — and then crash deep
-            // in `word_to_value` or at runtime. Report a clean compile
-            // error instead. (`arity` is the required-param count set by
-            // `compile_function_raw`.)
-            let required = gc_function::arity(macro_fn) as usize;
-            if arg_words.len() < required {
-                return Err(EvalError::Compile(crate::CompileError::MacroError(
-                    format!(
-                        "macro ({head_name} …) called with {} argument(s) \
-                         but requires at least {}",
-                        arg_words.len(),
-                        required
-                    ),
-                )));
-            }
-            let env = gc_function::env(macro_fn);
-            let code = gc_function::code_ptr(macro_fn);
-            let f: gc_function::LispCodeFn =
-                unsafe { std::mem::transmute(code) };
-            // Guard the expander call: bump HANDLER_DEPTH so any
-            // condition it signals (undefined function, type error,
-            // explicit `error`) defers and is reported as a clean
-            // compile error instead of calling std::process::abort()
-            // — which on Windows looks exactly like a stack overflow.
-            let guard = ncl_runtime::abi::condition_guard_enter();
-            let result_word_raw = unsafe {
-                f(
-                    mutator as *mut _,
-                    env.raw(),
-                    arg_words.as_ptr(),
-                    arg_words.len() as u64,
-                )
-            };
-            if let Some(cond_raw) = ncl_runtime::abi::condition_guard_exit(guard) {
-                let msg = ncl_runtime::format_word_aesthetic(Word::from_raw(cond_raw));
-                return Err(EvalError::Compile(crate::CompileError::MacroError(
-                    format!("while expanding macro ({head_name} …): {msg}"),
-                )));
-            }
-            let result_value = word_to_value(Word::from_raw(result_word_raw))?;
+            let result_value =
+                expand_macro_call_once(v, macro_fn, &head_name, coord, mutator)?;
             return macroexpand_all(&result_value, coord, mutator);
         }
     }
@@ -610,6 +562,101 @@ pub fn macroexpand_all(
         acc = Value::cons(expanded, acc);
     }
     Ok(acc)
+}
+
+/// Invoke the macro `macro_fn` on the call form `v` exactly ONCE,
+/// returning the (unexpanded) result form. Shared by `macroexpand_all`
+/// (which then recursively expands the result) and `macroexpand_toplevel`
+/// (which loops on the head only).
+fn expand_macro_call_once(
+    v: &Value,
+    macro_fn: Word,
+    head_name: &str,
+    coord: &Arc<GcCoordinator>,
+    mutator: &mut MutatorState,
+) -> Result<Value, EvalError> {
+    let args_value = cdr_of(v);
+    let args_vec = list_to_vec(&args_value)?;
+    let mut arg_words: Vec<u64> = Vec::with_capacity(args_vec.len());
+    for a in &args_vec {
+        arg_words.push(value_to_word(a, mutator, coord)?.raw());
+    }
+    // Defensive arity check. A macro expander's prologue reads its
+    // required positional parameters straight out of the args array;
+    // calling it with fewer would read PAST the end into uninitialised
+    // memory, whose bytes can carry any tag — a forwarding pointer, a
+    // bogus symbol — and then crash deep in `word_to_value` or at
+    // runtime. Report a clean compile error instead.
+    let required = gc_function::arity(macro_fn) as usize;
+    if arg_words.len() < required {
+        return Err(EvalError::Compile(crate::CompileError::MacroError(
+            format!(
+                "macro ({head_name} …) called with {} argument(s) \
+                 but requires at least {}",
+                arg_words.len(),
+                required
+            ),
+        )));
+    }
+    let env = gc_function::env(macro_fn);
+    let code = gc_function::code_ptr(macro_fn);
+    let f: gc_function::LispCodeFn = unsafe { std::mem::transmute(code) };
+    // Guard the expander call: bump HANDLER_DEPTH so any condition it
+    // signals (undefined function, type error, explicit `error`) defers
+    // and is reported as a clean compile error instead of calling
+    // std::process::abort() — which on Windows looks exactly like a
+    // stack overflow.
+    let guard = ncl_runtime::abi::condition_guard_enter();
+    let result_word_raw = unsafe {
+        f(
+            mutator as *mut _,
+            env.raw(),
+            arg_words.as_ptr(),
+            arg_words.len() as u64,
+        )
+    };
+    if let Some(cond_raw) = ncl_runtime::abi::condition_guard_exit(guard) {
+        let msg = ncl_runtime::format_word_aesthetic(Word::from_raw(cond_raw));
+        return Err(EvalError::Compile(crate::CompileError::MacroError(
+            format!("while expanding macro ({head_name} …): {msg}"),
+        )));
+    }
+    word_to_value(Word::from_raw(result_word_raw))
+}
+
+/// Expand only the HEAD macro of `v`, repeatedly, WITHOUT recursing into
+/// subforms. Returns the form once its head no longer names a macro.
+///
+/// The loader uses this to detect a top-level `(progn …)` — possibly
+/// produced by a macro such as `dotests`/`defstruct` — BEFORE the full
+/// recursive `macroexpand_all`. That lets it splice the progn into
+/// sequential top-level forms (CLHS §3.2.3.1) so one subform's
+/// compile-time side effects (defmacro / defstruct registration) are
+/// visible to later siblings — which a single non-sequential
+/// `macroexpand_all` pass over the whole form would not provide.
+pub fn macroexpand_toplevel(
+    v: &Value,
+    coord: &Arc<GcCoordinator>,
+    mutator: &mut MutatorState,
+) -> Result<Value, EvalError> {
+    let mut cur = v.clone();
+    loop {
+        if !matches!(cur, Value::Cons(_)) {
+            return Ok(cur);
+        }
+        let head_name = match head_symbol_name(&cur) {
+            Some(h) => h,
+            None => return Ok(cur),
+        };
+        // QUOTE / DECLARE / special-form heads are not registered macros,
+        // so the lookup below simply fails and we stop on them.
+        match lookup_local_macro(&head_name).or_else(|| coord.macro_for(&head_name)) {
+            Some(macro_fn) => {
+                cur = expand_macro_call_once(&cur, macro_fn, &head_name, coord, mutator)?;
+            }
+            None => return Ok(cur),
+        }
+    }
 }
 
 /// Rebuild a form like `(head ... a1 a2 a3)` where the first

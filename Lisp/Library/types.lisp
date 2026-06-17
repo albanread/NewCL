@@ -322,11 +322,25 @@
     ;; — see note above.
     (t
      (let ((expander (gethash type *type-expanders*)))
-       (if expander
-           ;; User-defined: expand and recurse.
-           (%new-typep object (funcall expander type))
-           ;; Built-in named type: delegate to the Rust shim.
-           (funcall *%original-typep%* object type))))))
+       (cond
+         ;; User-defined: expand and recurse.
+         (expander (%new-typep object (funcall expander type)))
+         ;; A registered DEFSTRUCT type — recognise instances and walk
+         ;; the :include chain (e.g. (typep (make-astronaut) 'person)).
+         ;; Guarded so it is inert before structures.lisp loads. Only
+         ;; vector-represented structs (the default); :type-list structs
+         ;; fall through. vectorp/gethash/svref never call typep.
+         ((and (boundp '*defstruct-info*)
+               (gethash type *defstruct-info*)
+               (vectorp object)
+               (> (length object) 0)
+               ;; gethash with an eq test returns NIL for a non-symbol key,
+               ;; so this also serves as the "slot 0 is a struct tag" test
+               ;; without calling symbolp (which would route through typep).
+               (gethash (svref object 0) *defstruct-info*))
+          (%ds-isa (svref object 0) type))
+         ;; Built-in named type: delegate to the Rust shim.
+         (t (funcall *%original-typep%* object type)))))))
 
 ;; CL: a compiled function. NCL JIT-compiles every function at
 ;; definition, so every function is a compiled function.

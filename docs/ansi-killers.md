@@ -4,7 +4,7 @@
 ANSI hyperspec-examples chapters (`E:/CL/cormanlisp/test/ansi-chapter-*.lisp`).*
 
 ```
-passed: 745   failed: 81   errors: 93   total: 919   (every chapter loads fully)
+passed: 751   failed: 77   errors: 91   total: 919   (every chapter loads fully)
 ```
 
 ## The "chapter-killer" pattern (mostly retired)
@@ -20,13 +20,25 @@ no panics. The remaining `failed`/`errors` are forms that *actually executed*
 and produced a wrong/no answer, which is honest: the gaps are visible
 per-form rather than masked by an early chapter abort.
 
-Work so far took the count from **622 → 745 (+123)** and, more importantly,
+Work so far took the count from **622 → 751 (+129)** and, more importantly,
 took the suite from 784 forms run to **919** (chapters 5, 6, 8 previously
 aborted partway). What remains is no longer quick clause-adds — each is a
 substantial single feature.
 
 ## Fixed (later pass)
 
+- **Top-level `(progn …)` sequencing** (`ncl-compiler`: `eval_value` +
+  `macroexpand_toplevel`) — CLHS §3.2.3.1. The loader now detects a top-level
+  progn via a *head-only* macro expansion BEFORE the full recursive
+  `macroexpand_all`, and processes each subform sequentially. This makes one
+  subform's compile-time side effects (defmacro/defstruct registration) visible
+  to later siblings within the same top-level form — which fixes `defstruct
+  :include` of a sibling inside the same `dotests` block (astronaut/truck/
+  pickup), and the `typep`-on-struct-subtype test. (+6, and removes a whole
+  class of "same-form ordering" surprises.)
+- **`typep` on struct subtypes** (`Library/types.lisp`) — `%new-typep` now
+  recognises registered DEFSTRUCT types and walks the `:include` chain via
+  `%ds-isa`, guarded so it is inert before `structures.lisp` loads.
 - **Full `defstruct`** (`Library/structures.lisp`, +30) — option-list name
   form with `(:conc-name)`, `(:constructor name [boa-arglist])` incl.
   BOA + `&optional`/`&rest`/`&aux`, `(:copier)`, `(:predicate)`, `(:include
@@ -93,22 +105,14 @@ substantial single feature.
   `aref`/`aset` and `array-rank`/`array-dimension`. Invasive to the array/GC
   layout — a dedicated effort, not a clause-add.
 
-### Struct⇄print parity + `defstruct :include` within one top-level form
-- **Struct print parity:** the `=> #S(TYPE …)` comparison tests (~11 in
-  chapter 8) still fail. The actual value is a tagged `SIMPLE-VECTOR`; the
-  expected `#S(...)` is read (by the cheap-partial reader) into a quoted
-  `(make-TYPE …)` cons, so `equalp(vector, cons)` is NIL. Real `#S` reading
-  (a struct value at read time) + printing structs as `#S(...)` + `equalp` on
-  structs would close these. Until then they are known false-fails.
-- **`:include` in one top-level form:** `defstruct` records each struct's
-  slots in `*defstruct-info*` as a side effect of macroexpansion, and a child
-  `(:include parent)` reads it. NCL macroexpands a whole top-level form's
-  subforms *non-sequentially*, so a child that includes a sibling defined in
-  the **same** `(progn …)`/`dotests` block (chapter 8's astronaut/truck/pickup)
-  doesn't see the parent yet. Across separate top-level forms it works. The
-  proper fix is CLHS §3.2.3.1 top-level-`progn` sequencing in the loader
-  (`eval_value`): detect a top-level `progn` *before* the full recursive
-  `macroexpand_all` and process each subform sequentially.
+### Struct⇄print parity  *(~11 false-fails in chapter 8)*
+- The `=> #S(TYPE …)` comparison tests still fail. The actual value is a
+  tagged `SIMPLE-VECTOR`; the expected `#S(...)` is read (by the cheap-partial
+  reader) into a quoted `(make-TYPE …)` cons, so `equalp(vector, cons)` is NIL.
+  Closing these needs real `#S` reading (a struct value at read time) +
+  printing structs as `#S(...)` + structural `equalp` on structs — a coherent
+  "real structs print/read/compare" feature. Until then they are known
+  false-fails (the accessor/predicate/constructor tests all pass).
 
 ### `getf` / `ldb` setf places  *(last setf-expander corners)*
 - `(setf (getf place k) v)` needs an expander that rewrites the *underlying*

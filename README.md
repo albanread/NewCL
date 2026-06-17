@@ -68,7 +68,7 @@ numbers (2026-06, same machine, SBCL 2.6.4):
 ### Conformance
 
 The Corman/ANSI test chapters (`demos/ansi-runner.lisp`) currently pass
-**≈745 / fail ≈81 / error ≈93** of **919 forms run** (up from ≈622 with three
+**≈751 / fail ≈77 / error ≈91** of **919 forms run** (up from ≈622 with three
 chapters aborting). The suite now **loads every chapter to completion** — no
 chapter-killer aborts and no worker-thread panics — so the gaps are honest
 *failures/errors on forms that actually executed*, not whole chapters hidden
@@ -83,9 +83,8 @@ once-only `push`/`pop`/`rotatef`/`shiftf`), `multiple-value-call`,
 tracked in [docs/ansi-killers.md](docs/ansi-killers.md): **multidimensional
 arrays** (`make-array` on a dimension list + N-index `aref`), struct⇄print
 parity (NCL prints structs as `SIMPLE-VECTOR`, so `=> #S(...)` comparisons
-still differ), `defstruct :include` *within a single top-level form* (an
-NCL macroexpand-sequencing limitation), the `getf` / `ldb` setf places, and
-parts of the type system (`subtypep`, compound `typep`). The performance
+still differ), the `getf` / `ldb` setf places, and parts of the type system
+(`subtypep`, compound `typep`). The performance
 "gauntlet" (`bench/gauntlet.lisp`) is ALL-PASS.
 
 ### Known gaps

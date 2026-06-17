@@ -34,7 +34,7 @@ thread_local! {
 }
 
 pub use lower::{lower, lower_in, CompileError, LocalEnv};
-pub use macroexpand::{macroexpand_all, value_to_word, word_to_value};
+pub use macroexpand::{macroexpand_all, macroexpand_toplevel, value_to_word, word_to_value};
 
 // ─── Startup timing ─────────────────────────────────────────────────────────
 //
@@ -209,8 +209,27 @@ impl Session {
         if let Some((name, params, body_lines)) = match_defasm(v)? {
             return self.handle_defasm(&name, &params, &body_lines);
         }
-        // Otherwise: macroexpand fully, then compile.
-        let expanded = macroexpand_all(v, &self.coord, &mut self.mutator)?;
+        // CL convention (§3.2.3.1): a top-level `(progn …)` — whether
+        // written directly or produced by a macro (defstruct, dotests, …)
+        // — treats each body form as itself a top-level form, processed
+        // SEQUENTIALLY. We detect it via a HEAD-ONLY expansion *before*
+        // the full recursive `macroexpand_all`: expanding the whole form
+        // at once would expand every sibling in one non-sequential pass,
+        // so one subform's compile-time side effects (a defmacro/defstruct
+        // registration) would NOT be visible when a later sibling is
+        // expanded. Splicing the raw subforms and recursing gives each its
+        // own `macroexpand_all`, in order.
+        let head_expanded = macroexpand_toplevel(v, &self.coord, &mut self.mutator)?;
+        if let Some(body_forms) = match_top_level_progn(&head_expanded) {
+            let mut last = Word::NIL;
+            for form in &body_forms {
+                last = self.eval_value(form)?;
+            }
+            return Ok(last);
+        }
+        // Otherwise: macroexpand fully, then compile. (Start from the
+        // head-expanded form to avoid re-expanding the head macro.)
+        let expanded = macroexpand_all(&head_expanded, &self.coord, &mut self.mutator)?;
         // After full expansion, re-run the fast-path recognisers so that
         // macros which expand to `defmacro` / `defun` are properly handled.
         // Example: `(define-modify-macro appendf (&rest r) append)` expands
@@ -221,19 +240,6 @@ impl Session {
         }
         if let Some((name, params, body_forms)) = match_defun(&expanded)? {
             return self.handle_defun(&name, &params, &body_forms);
-        }
-        // CL convention: `(progn …)` at top level treats each body
-        // form as itself a top-level form. This is what lets a
-        // macro expand into multiple top-level definitions (e.g.
-        // defstruct emits `(progn (defun make-x …) (defun x-y …)
-        // (defun %setf-x-y …) …)`). Recurse into eval_value so each
-        // body form re-runs the defun/defmacro recognisers.
-        if let Some(body_forms) = match_top_level_progn(&expanded) {
-            let mut last = Word::NIL;
-            for form in body_forms {
-                last = self.eval_value(&form)?;
-            }
-            return Ok(last);
         }
         let expr = lower(&expanded, &self.coord).map_err(EvalError::Compile)?;
         let mutator_ptr = &mut *self.mutator as *mut _;
