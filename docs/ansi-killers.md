@@ -4,68 +4,109 @@
 ANSI hyperspec-examples chapters (`E:/CL/cormanlisp/test/ansi-chapter-*.lisp`).*
 
 ```
-passed: 622   failed: 64   errors: 98   total: 784
+passed: 703   failed: 78   errors: 138   total: 919   (every chapter loads fully)
 ```
 
-## The "chapter-killer" pattern
+## The "chapter-killer" pattern (mostly retired)
 
 The suite loads each chapter file form-by-form at **compile time**. A single
 unsupported construct — an unknown LOOP clause, a reader dispatch we don't
-handle, a compiler `NotImplemented` — raises during load and **aborts the
-rest of that chapter**: every test after it never runs. So a handful of
-missing features hide a large fraction of the `errors` count. The suite is a
-deliberate checklist (each `dotests` block exercises one feature), which is
-why it surfaces gaps one at a time, and why each fix tends to unlock a *burst*
-of passes rather than one.
+handle, a compiler `NotImplemented`, or a worker-thread **panic** — used to
+raise during load and **abort the rest of that chapter**: every test after it
+never ran. So a handful of missing features hid a large fraction of the count.
 
-This session took the count from **493 → 622 (+129)** by killing killers in
-chapters 5 and 6. What remains is no longer quick clause-adds — each is a
+As of this session **all seven chapters now load to completion** — no aborts,
+no panics. The remaining `failed`/`errors` are forms that *actually executed*
+and produced a wrong/no answer, which is honest: the gaps are visible
+per-form rather than masked by an early chapter abort.
+
+This session took the count from **622 → 703 (+81)** and, more importantly,
+took the suite from 784 forms run to **919** (chapters 5, 6, 8 previously
+aborted partway). What remains is no longer quick clause-adds — each is a
 substantial single feature.
 
-## Live killers (each aborts its chapter at the cited point)
+## Fixed this session
 
-### Chapter 8 — `#S(...)` read-time struct literals  *(≈56 locked, 100% of chapter)*
-- **Symptom:** `read error: UnsupportedSharpDispatch { ch: 'S', … "struct
-  literals (#S) not supported" }` — `src/ncl-reader/src/parser.rs:286`.
-- **Why hard:** CLHS `#S` is *read-time construction* — `#S(door :x 1)` must
-  produce an actual `door` instance while parsing. But `ncl-reader` is a
-  standalone parser crate with no access to the runtime struct registry /
-  constructors. Needs a reader→runtime hook (or a deferred-construction node
-  the compiler materialises). Even then, the many `=> #S(...)` comparison
-  tests need struct value↔`test-equalp` parity (NCL prints structs as
-  `SIMPLE-VECTOR` today, so `type-of` and printed form differ from CL).
-- **Cheap partial:** have the reader expand `#S(NAME :k v …)` into the form
-  `(make-NAME :k v …)`. Unblocks the chapter LOAD so all the
-  accessor/predicate/copier/`defstruct`-option tests run; only the direct
-  `=> #S(...)` data-position comparisons stay failing.
+- **LOOP conditional sublanguage** (`Library/loop.lisp`, +36) — `else`, the
+  anaphoric `it`, the `end` preposition, nested `when/when/else`, and the
+  **parallel-stepping** fix for `and`-joined `for` clauses (each sibling now
+  reads the *old* values via a temp-capture step block). Chapter 6 fully
+  unlocked.
+- **`#S(...)` read-time struct literals** (`ncl-reader/src/parser.rs`) —
+  reader now expands `#S(NAME :k v …)` into the constructor call
+  `(make-NAME :k v …)`, mirroring `#C` → `(complex …)`. Unblocks the chapter-8
+  *load* (see the chapter-8 caveat below for why it yields few *passes*).
+- **explicit-keyword `&key`** (`ncl-compiler/src/lib.rs`,
+  `parse_param_list_inner`) — `((keyword-name var) [default [supplied-p]])`.
+  The keyword string is built from the real symbol (`:NAME` for a keyword
+  symbol, bare `NAME` otherwise — NCL's runtime symbol table is flat by name).
+- **`aref`/`(setf aref)` no longer panic** (`ncl-runtime/src/abi.rs` +
+  `ncl-llvm`) — a bad index / out-of-range / non-array now signals a
+  **catchable** condition (CLHS type-error) instead of crashing the worker
+  thread. `ncl_aref_generic` gained a `mutator` param for the error path; the
+  fast path is unchanged (no new abort-check). This is what lets the suite
+  *complete* instead of dying in chapter 8 on a stale-cons accessor.
+- **N-index `aref`/`(setf aref)` compile** (`ncl-compiler/src/lower.rs`) —
+  the 2-arg form stays the fast primitive; ≥3-arg falls through to an
+  ordinary late-bound call / the `%SETF-AREF` rewrite, so a 2-D `(aref a i j)`
+  *compiles* (and runtime-signals, since multidim arrays are unimplemented)
+  rather than aborting chapter 5 at load with `BadArity`.
+- **setf-expander protocol** (`Library/places.lisp`):
+  - `rplaca` / `rplacd` were genuinely **undefined** — now defined over
+    `(setf (car …))` / `(setf (cdr …))`. This alone unblocked `middleguy`
+    (its writer calls `rplaca`).
+  - `define-setf-expander` + a `*setf-expanders*` registry that
+    `get-setf-expansion` now consults before its generic syntactic fallback.
+  - `push` / `pop` redefined for **once-only** subform evaluation (the
+    core.lisp versions evaluated the place twice).
+  - `rotatef` / `shiftf` rewritten via `get-setf-expansion` for once-only
+    semantics (side-effecting subforms like `(nth (incf n) x)` now evaluate
+    exactly once). Shared helper `%collect-setf-expansions`.
 
-### Chapter 6 — LOOP conditional sublanguage  *(≈41 locked from CLAUSE-GROUPING on)*
-- **Symptom:** `MacroError("while expanding macro (LOOP …): #<SIMPLE-ERROR>")`
-  at the `CLAUSE-GROUPING` block (`ansi-chapter-6.lisp:414`).
-- **Missing:** `else`, the anaphoric `it`, the `end` preposition, and nested
-  `when … when … else`. Also parallel `and`-joined **for**-clauses
-  (`for x … and y …` step in parallel — currently mis-stepped sequentially,
-  a *correctness* bug, not an abort).
-- **Self-contained:** all in `Lisp/Library/loop.lisp` (disk-loaded — no
-  rebuild to iterate). Build on `%parse-when-unless` (already handles
-  `when … and …` since this session) and the `result-override` plan slot.
-- Behind it sit DO/DO*, DOTIMES, DOLIST, a second LOOP block, and LOOP-FINISH
-  — mostly non-LOOP and likely to pass once the abort clears.
+## Live blockers (now per-form, not chapter-aborting)
 
-### Chapter 5 — explicit-keyword `&key`, then the setf-expander protocol  *(≈42 locked)*
-- **Symptom:** `NotImplemented("init-form name must be a symbol, got (#:X
-  #:X)")` at `(defun xy (&key ((x x) 0) …) …)` (`ansi-chapter-5.lisp:1076`).
-- **Missing #1:** the `((keyword-name var) [default])` form of `&key`
-  parameters (compiler lambda-list parser, `parse_param_list`).
-- **Missing #2 (next in line):** `define-setf-expander` and
-  `get-setf-expansion` — the full subform-evaluated-once setf-expander
-  protocol. Long-form `defsetf` already lands (this session) via the
-  `%SETF-NAME` writer-function shim; the expander protocol is the harder,
-  separate piece.
+### Multidimensional arrays  *(blocks the chapter-5 2-D `xy` setf demo)*
+- **Symptom:** `(make-array '(10 10))` →
+  `"multidimensional arrays (2 dimensions) are not yet supported"`
+  (`abi.rs:make_array_dimension`); N-index `aref` now compiles but
+  runtime-signals.
+- **Why hard:** arrays are flat `Tag::Vector`s with a single length and **no
+  dimension metadata**. Real support needs a representation carrying
+  rank+dims (header change or a wrapper struct) plus row-major index math in
+  `aref`/`aset` and `array-rank`/`array-dimension`. Invasive to the array/GC
+  layout — a dedicated effort, not a clause-add.
 
-## Notable *non*-bugs among the 64 FAILEDs (harness/printer mismatches)
+### Full `defstruct` option-lists  *(most of chapter 8)*
+- **Symptom:** `(defstruct (door (:conc-name dr-)) …)` and friends don't
+  abort, but the embedded `defstruct` macro (`core.lisp`) treats the whole
+  option-list as the struct *name*, silently defining a garbage constructor
+  and never defining the conc-named accessors / copier / predicate. So the
+  accessor tests become runtime errors.
+- **Missing:** `(:conc-name)`, `(:include)`, `(:type list)`, `:named`,
+  `(:constructor make-… (args))` incl. BOA + `&aux`, `(:copier)`,
+  `(:predicate)`, `(:initial-offset)`. Plus **struct⇄print parity**: NCL
+  prints structs as `SIMPLE-VECTOR`, so every `=> #S(...)` comparison fails
+  even when construction works (the `#S` reader fix can't help these — they
+  are data-position comparisons of a vector against a quoted cons).
+- A real `defstruct` rewrite in `core.lisp` (rebuild) is the unlock.
 
-Do **not** chase these as code bugs:
+### `getf` / `ldb` setf places  *(last setf-expander corners)*
+- `(setf (getf place k) v)` needs an expander that rewrites the *underlying*
+  place (getf's first subform is itself a place); it currently lowers to a
+  nonexistent `%SETF-GETF`. `(setf (ldb (byte …) int) v)` needs an `ldb`
+  setf-expander registered in `bits.lisp`. Direct `(setf (custom …) v)` for a
+  `define-setf-expander` place also isn't rerouted through the registry —
+  NCL's `SETF` is a hardwired special form (`lower.rs`) using the
+  `%SETF-NAME` writer-function convention, so a *complete* fix needs a small
+  `macroexpand.rs` `SETF` arm that routes non-native compound places through
+  a `%setf-expand` Lisp macro (the registry already exists to back it).
+- Note the `dotests` harness compiles a whole block before running it, so a
+  `define-setf-expander` registered at *runtime* in one test entry isn't
+  visible to the *compile* of a sibling `(setf (lastguy …) …)` entry — the
+  expander **definition** test passes; the direct-setf use after it does not.
+
+## Notable *non*-bugs (harness/printer mismatches — don't chase)
+
 - `#C(4.56 0.0)` vs expected `(COMPLEX 4.56 0.0)` — NCL prints standard
   reader syntax; arguably *more* correct than the hyperspec example text.
 - `(type-of (expt 2 40))` → `FIXNUM` not `BIGNUM` — NCL fixnums are 61-bit;
@@ -73,12 +114,8 @@ Do **not** chase these as code bugs:
 - Full-precision float printing (`3.2911733607066247` vs `3.291173`).
 - `(< (ZAP 5 3) 3)` — a documented *flaky* hyperspec example (`zap` returns
   `(random 4)`); fails ~1 run in 4. See the header of `demos/ansi-runner.lisp`.
-
-## Fixed this session (for reference)
-- `(cond (test))` test-only clause (`+71`) — `lower.rs`.
-- Variadic `append` (was binary; dropped args past the 2nd) + `PROG`/`PROG*`
-  (`+26`) — `core.lisp`.
-- Nested `(defun (setf X) …)` + long-form `defsetf` (`+2`) — `lower.rs`,
-  `places.lisp`.
-- LOOP `nconc`/`of-type`/`always`/`never`/`thereis`/bare-type-designators
-  (`+21`) and `and`-conjoined sub-clauses (`+6`) — `loop.lisp`.
+- `with-output-to-string` returns `""` (string-stream capture is a separate,
+  unrelated bug surfaced while testing LOOP — not a LOOP problem).
+- `(defmacro …)` / `define-modify-macro` / `define-setf-expander` *inside* a
+  `dotests` lambda don't register (NCL registers macros at compile time, but
+  these sit in a runtime lambda body) — a harness artifact, not a feature gap.

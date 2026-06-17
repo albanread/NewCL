@@ -1088,9 +1088,9 @@ fn declare_runtime_helpers<'ctx>(
         Some(Linkage::External),
     );
 
-    // ncl_aref_generic(v, i) -> u64
+    // ncl_aref_generic(mutator, v, i) -> u64  (mutator for the error path)
     let aref_generic_type =
-        i64_t.fn_type(&[i64_t.into(), i64_t.into()], false);
+        i64_t.fn_type(&[i64_t.into(), i64_t.into(), i64_t.into()], false);
     let aref_generic = module.add_function(
         "ncl_aref_generic",
         aref_generic_type,
@@ -3919,13 +3919,16 @@ fn emit_expr<'ctx>(
             Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
         }
         Expr::Aref(v, i) => {
-            // ncl_aref_generic(v_word, i_word) — both tagged.
+            // ncl_aref_generic(mutator, v_word, i_word) — both tagged.
+            // The mutator (param 0) is passed so the error path can
+            // signal a catchable condition instead of panicking.
+            let mutator_arg = function.get_nth_param(0).unwrap();
             let vv = emit_expr(context, builder, function, helpers, arity, params, locals, v)?;
             let vi = emit_expr(context, builder, function, helpers, arity, params, locals, i)?;
             let call = builder
                 .build_call(
                     helpers.aref_generic,
-                    &[vv.into(), vi.into()],
+                    &[mutator_arg.into(), vv.into(), vi.into()],
                     "aref",
                 )
                 .map_err(|e| format!("build_call aref_generic: {e}"))?;

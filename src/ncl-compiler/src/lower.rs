@@ -916,8 +916,13 @@ fn lower_call_in_mut(
             binary_op(&head_name, args, env, coord, Expr::string_char)
         }
         // (aref v i) / (svref v i) — polymorphic read; runtime
-        // tag-dispatches between strings and vectors.
-        "AREF" | "SVREF" => {
+        // tag-dispatches between strings and vectors. Only the 1-index
+        // form is a fast primitive; an N-index (multidimensional) aref
+        // falls through to an ordinary late-bound call on the AREF
+        // function cell so the form COMPILES rather than aborting the
+        // chapter at load (multidim arrays are not yet supported at
+        // runtime, so such a call signals a catchable condition).
+        "AREF" | "SVREF" if args.len() == 2 => {
             binary_op(&head_name, args, env, coord, Expr::aref)
         }
         "LET" => lower_let(args, env, coord),
@@ -2277,14 +2282,11 @@ fn lower_setf(
             let value = lower_in_mut(value_form, env, coord)?;
             Ok(Expr::set_cdr(cons, value))
         }
-        "AREF" | "SVREF" => {
-            if place_args.len() != 2 {
-                return Err(CompileError::BadArity {
-                    head: format!("setf {place_head}"),
-                    expected: "(aref v i)",
-                    got: place_args.len(),
-                });
-            }
+        // Only the 1-index form is a fast primitive; an N-index
+        // (multidimensional) (setf (aref v i j …) val) falls through to
+        // the generic %SETF-AREF rewrite below so the form COMPILES
+        // (multidim arrays are unsupported at runtime → catchable error).
+        "AREF" | "SVREF" if place_args.len() == 2 => {
             // Polymorphic — runtime tag dispatches to vector or string.
             let v = lower_in_mut(&place_args[0], env, coord)?;
             let idx = lower_in_mut(&place_args[1], env, coord)?;

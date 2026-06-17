@@ -74,7 +74,7 @@
                  sum summing count counting
                  minimize minimizing maximize maximizing
                  always never thereis
-                 when unless if))))
+                 when unless if else end))))
 
 ;; ── Tokeniser-as-cursor ───────────────────────────────────────────────────
 ;;
@@ -201,11 +201,45 @@
 (defun %parse-for (plan cur)
   "Parse one or more parallel for-bindings joined by `and`:
      (for i from 1 to 3 and j in list ...)
-   All bindings step together; the loop ends when ANY iterator
-   terminates (NCL treats sequential for-clauses as parallel too)."
-  (%parse-one-for plan cur)
-  (when (%cur-eat-keyword? cur 'and)
-    (%parse-for plan cur)))
+   `and`-joined siblings step in PARALLEL: each sibling's step reads the
+   OLD values of the others. We get this by snapshotting iter-steps,
+   parsing the whole group, then re-emitting its added steps as one block
+   that captures every (setq VAR RHS)'s RHS into a temp first, then
+   assigns. A lone for-clause (no `and`) keeps today's behaviour, and
+   separate top-level `for` heads (each a fresh %parse-for call) remain
+   SEQUENTIAL, as CL specifies."
+  (let ((saved-steps (loop-plan-iter-steps plan))
+        (saw-and nil))
+    (%parse-one-for plan cur)
+    (loop
+      (if (%cur-eat-keyword? cur 'and)
+          (progn (setq saw-and t) (%parse-one-for plan cur))
+          (return nil)))
+    (when saw-and
+      ;; Peel the steps this parallel group added (front-to-back =
+      ;; source order), then rebuild as a single parallel-step block.
+      (let ((added nil) (p (loop-plan-iter-steps plan)))
+        (loop
+          (when (eq p saved-steps) (return nil))
+          (setq added (cons (car p) added))
+          (setq p (cdr p)))
+        (setf (loop-plan-iter-steps plan) saved-steps)
+        (let ((binds nil) (assigns nil))
+          (dolist (f added)
+            (cond
+              ;; simple (setq VAR RHS): capture RHS into a temp so a
+              ;; sibling reads VAR's OLD value, then assign from the temp.
+              ((and (consp f) (eq (car f) 'setq))
+               (let ((g (gensym "PSTEP-")))
+                 (setq binds   (cons (list g (caddr f)) binds))
+                 (setq assigns (cons (list 'setq (cadr f) g) assigns))))
+              ;; guarded steps (the `across` index/element pair) pass
+              ;; through unchanged — they already self-order.
+              (t (setq assigns (cons f assigns)))))
+          (%plan-add-step plan
+            (if binds
+                `(let ,(reverse binds) ,@(reverse assigns) nil)
+                `(progn ,@(reverse assigns) nil))))))))
 
 (defun %parse-one-for (plan cur)
   "(for VAR <spec>). spec is one of:
@@ -597,37 +631,60 @@
 ;; Implementation: save the body list (a shared tail, since adders
 ;; only cons onto the front), parse the sub-clause, then peel the
 ;; new front cells off as the additions and wrap them.
-(defun %parse-when-unless (plan cur negate)
-  (let* ((expr (%cur-eat! cur))
-         (saved-tail (loop-plan-body plan)))
+(defun %parse-cond-group (plan cur it-var)
+  "Parse one conditional sub-clause plus any `and`-joined siblings, peel
+   the body forms they added (restoring source order), substitute the
+   anaphoric `it` with IT-VAR throughout, and return them. Leaves the
+   plan body trimmed back to its pre-group state. Mirrors the saved-tail
+   EQ-peel idiom that conditional parsing has always used."
+  (let ((saved-tail (loop-plan-body plan)))
     (%parse-one-clause plan cur)
-    ;; `and`-conjoined sub-clauses share this when/unless test, e.g.
-    ;; `when C collect X into a and count Y into b`. Each adds its own
-    ;; body forms (and its own accumulator/with-binding, which persist);
-    ;; the capture below grabs ALL of them and wraps them in one guard.
     (loop
       (if (%cur-eat-keyword? cur 'and)
           (%parse-one-clause plan cur)
           (return nil)))
-    ;; body is reverse-accumulated: everything in front of
-    ;; SAVED-TAIL (compared by EQ) was added by the sub-clause.
-    ;; Pushing front-to-back restores the additions' source order.
     (let ((added nil)
           (p (loop-plan-body plan)))
       (loop
         (when (eq p saved-tail) (return nil))
         (setq added (cons (car p) added))
         (setq p (cdr p)))
-      ;; Trim plan body back to its pre-sub-clause state.
       (setf (loop-plan-body plan) saved-tail)
-      ;; Wrap the additions in an if.
-      (let ((wrapped
-             (cond
-               ((null added) nil)
-               (negate `(unless ,expr ,@added))
-               (t      `(when ,expr ,@added)))))
-        (when wrapped
-          (%plan-add-body plan wrapped))))))
+      (mapcar (lambda (f) (%loop-subst-it f it-var)) added))))
+
+(defun %parse-when-unless (plan cur negate)
+  "Parse `when/if/unless TEST clause… [and clause…]… [else clause…] [end]`.
+   TEST is evaluated EXACTLY ONCE and bound to the anaphoric `it`, visible
+   to both branches (so `when (member x l) collect it` collects the test
+   value). `negate` (for `unless`) puts the primary clauses in the FALSE
+   branch. Nested when/unless/if work because %parse-one-clause dispatches
+   conditionals back here, and the resulting guarded form is captured by
+   the enclosing %parse-cond-group like any other sub-clause."
+  (let* ((expr (%cur-eat! cur))
+         (it-var (gensym "IT-"))
+         (then (%parse-cond-group plan cur it-var))
+         (else (when (%cur-eat-keyword? cur 'else)
+                 (%parse-cond-group plan cur it-var))))
+    ;; Optional closing `end` for this conditional group.
+    (%cur-eat-keyword? cur 'end)
+    ;; Map then/else onto the true/false branches (`unless` swaps them).
+    ;; Build the narrowest guard so we never emit (if X nil nil) or an
+    ;; empty-binding let, both of which the lowerer has historically
+    ;; disliked.
+    (let* ((true-forms  (if negate else then))
+           (false-forms (if negate then else))
+           (guard
+            (cond
+              ((and true-forms false-forms)
+               `(let ((,it-var ,expr))
+                  (if ,it-var (progn ,@true-forms) (progn ,@false-forms))))
+              (true-forms
+               `(let ((,it-var ,expr)) (when ,it-var ,@true-forms)))
+              (false-forms
+               `(let ((,it-var ,expr)) (unless ,it-var ,@false-forms)))
+              (t nil))))
+      (when guard
+        (%plan-add-body plan guard)))))
 
 ;; Helper used by when/unless to parse exactly one sub-clause.
 (defun %parse-one-clause (plan cur)
@@ -649,6 +706,13 @@
       ((eq head 'maximize)   (%parse-maximize plan cur))
       ((eq head 'maximizing) (%parse-maximize plan cur))
       ((eq head 'return)     (%parse-return plan cur))
+      ;; Nested conditionals: a when/unless/if may itself be a sub-clause
+      ;; of an enclosing conditional. Recurse into %parse-when-unless,
+      ;; which adds its guarded form to the body; the enclosing
+      ;; %parse-cond-group then captures and re-wraps it.
+      ((eq head 'when)       (%parse-when-unless plan cur nil))
+      ((eq head 'unless)     (%parse-when-unless plan cur t))
+      ((eq head 'if)         (%parse-when-unless plan cur nil))
       (t (error "loop: unsupported sub-clause head ~A" head)))))
 
 ;; ── Top-level parser ──────────────────────────────────────────────────────
@@ -714,6 +778,19 @@
        ((null (cdr form)) `(return-from ,name nil))
        (t `(return-from ,name ,(cadr form)))))
     (t (mapcar (lambda (sub) (%loop-rewrite-return sub name)) form))))
+
+(defun %loop-subst-it (form it-var)
+  "Replace the anaphoric symbol `it` with IT-VAR throughout FORM. Stops
+   descending into nested (loop …)/(block …) like %loop-rewrite-return so
+   an inner construct's own `it` (already substituted to its own gensym
+   when it was parsed) is never re-bound. CLHS: `it` names the value of
+   the nearest enclosing when/unless/if test."
+  (cond
+    ((eq form 'it) it-var)
+    ((atom form) form)
+    ((eq (car form) 'loop) form)
+    ((eq (car form) 'block) form)
+    (t (mapcar (lambda (sub) (%loop-subst-it sub it-var)) form))))
 
 (defun %loop-result-form (plan)
   "Pick the final-value form. CL says the value of the last

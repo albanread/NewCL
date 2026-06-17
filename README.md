@@ -68,15 +68,22 @@ numbers (2026-06, same machine, SBCL 2.6.4):
 ### Conformance
 
 The Corman/ANSI test chapters (`demos/ansi-runner.lisp`) currently pass
-**≈622 / fail ≈64** (≈98 of the remainder are forms that don't yet read or
-compile). Most of those un-run forms cluster behind a handful of
-single-feature *chapter-killers* — one unsupported construct aborts a whole
-chapter at load time — tracked in [docs/ansi-killers.md](docs/ansi-killers.md).
-The biggest remaining ones: read-time `#S(...)` struct literals (all of
-chapter 8), LOOP's conditional sublanguage (`else` / `it` / `end`), and the
-`define-setf-expander` / `get-setf-expansion` protocol. Other weak spots:
-parts of the type system (`subtypep`, `typep` on compound types), some
-`coerce` targets, and a few CLOS corners. The performance "gauntlet"
+**≈703 / fail ≈78 / error ≈138** of **919 forms run**. Crucially the suite
+now **loads every chapter to completion** — no chapter-killer aborts and no
+worker-thread panics — so the gaps are honest *failures/errors on forms that
+actually executed*, not whole chapters hidden behind one unread construct.
+(For comparison, the suite previously ran only 784 forms because chapters 5,
+6 and 8 aborted partway; closing those killers exposed ~135 more forms, of
+which 81 became net new passes.) The remaining work is tracked in
+[docs/ansi-killers.md](docs/ansi-killers.md). The biggest remaining ones are
+no longer single-clause adds: **multidimensional arrays** (`make-array` on a
+dimension list + N-index `aref`; blocks the 2-D `xy` setf demo in chapter 5),
+**full `defstruct` option-lists** (`:conc-name` / `:include` / `:type list` /
+`:constructor` / BOA, plus struct⇄print parity — most of chapter 8), and the
+`getf` / `ldb` setf places (the last setf-expander corners). Other weak
+spots: parts of the type system (`subtypep`, `typep` on compound types),
+`multiple-value-call`, `function-lambda-expression`, some `coerce` targets,
+and a few CLOS corners. The performance "gauntlet"
 (`bench/gauntlet.lisp`) is ALL-PASS.
 
 ### Known gaps

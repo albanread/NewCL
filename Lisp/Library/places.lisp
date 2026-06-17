@@ -124,6 +124,24 @@
 ;; So we accept the place-fn's lambda-list implicitly via a single
 ;; &REST capture and apply through it.
 
+;; ── RPLACA / RPLACD ──────────────────────────────────────────────────────
+;;
+;; The destructive cons mutators. NCL lowers (setf (car x) v) / (setf
+;; (cdr x) v) natively, so these are thin wrappers over that. They
+;; return the CONS (not the new value) per CLHS. Defined here because
+;; the setf accessors used below (and long-form DEFSETF templates such
+;; as those in the ANSI suite) call them.
+
+(defun rplaca (cons new-car)
+  "Replace the car of CONS with NEW-CAR; return CONS."
+  (setf (car cons) new-car)
+  cons)
+
+(defun rplacd (cons new-cdr)
+  "Replace the cdr of CONS with NEW-CDR; return CONS."
+  (setf (cdr cons) new-cdr)
+  cons)
+
 (defun %strip-backquote (form)
   "Turn a (BACKQUOTE template) read form with plain (UNQUOTE x) markers
    into the equivalent literal code: `(progn (f ,a ,b) ,a) => (progn (f
@@ -212,30 +230,38 @@
 ;; outside CL bootstrap code), the result will be wrong; that's the
 ;; same trade-off our PUSH and INCF make today.
 
+(defun %collect-setf-expansions (places)
+  "Expand each place in PLACES via get-setf-expansion, returning four
+   parallel lists: a flat (var val) binding list (subforms once, in
+   left-to-right order), and per-place lists of store gensyms, writers,
+   and readers."
+  (let ((binds nil) (stores nil) (writers nil) (readers nil))
+    (dolist (p places)
+      (multiple-value-bind (vars vals strs writer reader) (get-setf-expansion p)
+        (dolist (vv (mapcar #'list vars vals)) (setq binds (cons vv binds)))
+        (setq stores  (cons (car strs) stores))
+        (setq writers (cons writer writers))
+        (setq readers (cons reader readers))))
+    (values (nreverse binds) (nreverse stores)
+            (nreverse writers) (nreverse readers))))
+
 (defmacro rotatef (&rest places)
   "Rotate values stored at PLACES one step to the left.
-   (rotatef a b c) ≡ A←B, B←C, C←A. Returns NIL."
+   (rotatef a b c) ≡ A←B, B←C, C←A. Returns NIL. Each place's subforms
+   are evaluated exactly once (CLHS 5.1.1.1) via get-setf-expansion."
   (cond
     ((null places) nil)
     ((null (cdr places)) nil)  ; single place — no-op
     (t
-     (let ((temps (mapcar (lambda (p) (declare (ignore p)) (gensym "ROT-"))
-                          places))
-           (vals  (mapcar (lambda (p) p) places)))
-       ;; LET binds each temp to its place's current value, then we
-       ;; SETF each place to its left-neighbour's saved value. The
-       ;; first place gets the last temp.
-       (let ((bindings (mapcar #'list temps vals))
-             (writes  (let ((ws nil))
-                        (do ((ps places (cdr ps))
-                             (ts (cdr temps) (cdr ts)))
-                            ((null (cdr ps))
-                             (setq ws (cons `(setf ,(car ps) ,(car temps)) ws))
-                             (nreverse ws))
-                          (setq ws (cons `(setf ,(car ps) ,(car ts)) ws))))))
-         `(let ,bindings
-            ,@writes
-            nil))))))
+     (multiple-value-bind (binds stores writers readers)
+         (%collect-setf-expansions places)
+       ;; store_i := OLD value of the next place (last wraps to first);
+       ;; all stores bound (reading old values) before any writer runs.
+       (let* ((rotated (append (cdr readers) (list (car readers))))
+              (store-binds (mapcar #'list stores rotated)))
+         (cons 'let*
+               (cons (append binds store-binds)
+                     (append writers (list nil)))))))))
 
 (defmacro shiftf (&rest args)
   "Shift values stored at PLACES one step to the right; returns the
@@ -253,21 +279,19 @@
                           ((null (cdr all)) (nreverse out))
                         (setq out (cons (car all) out))
                         (setq all (cdr all)))))
-            (new-val (car (last args)))
-            (temps   (mapcar (lambda (p) (declare (ignore p))
-                               (gensym "SHIFT-"))
-                             places))
-            (bindings (mapcar #'list temps places))
-            (writes   (let ((ws nil))
-                        (do ((ps places (cdr ps))
-                             (ts (cdr temps) (cdr ts)))
-                            ((null (cdr ps))
-                             (setq ws (cons `(setf ,(car ps) ,new-val) ws))
-                             (nreverse ws))
-                          (setq ws (cons `(setf ,(car ps) ,(car ts)) ws))))))
-       `(let ,bindings
-          ,@writes
-          ,(car temps))))))
+            (new-val (car (last args))))
+       (multiple-value-bind (binds stores writers readers)
+           (%collect-setf-expansions places)
+         ;; result := OLD value of place1 (returned). store_i := OLD value
+         ;; of place_{i+1}; the last place gets NEW-VAL. Subforms once.
+         (let* ((result (gensym "SHIFT-"))
+                (shifted (append (cdr readers) (list new-val)))
+                (store-binds (mapcar #'list stores shifted)))
+           (cons 'let*
+                 (cons (append binds
+                               (list (list result (car readers)))
+                               store-binds)
+                       (append writers (list result))))))))))
 
 ;; ── PSETQ / PSETF ────────────────────────────────────────────────────────────
 ;;
@@ -339,9 +363,27 @@
 ;; The ENVIRONMENT argument is accepted for CL compatibility but ignored;
 ;; NCL does not yet have compile-time environment objects.
 
+;; ── Custom setf-expander registry ─────────────────────────────────────────
+;;
+;; DEFINE-SETF-EXPANDER installs an expander function here, keyed by the
+;; place-operator symbol. get-setf-expansion consults it before the
+;; generic syntactic fallback. An expander takes the place's ARGS (the
+;; cdr of the place form) and returns the 5 setf-expansion values.
+
+(defvar *setf-expanders* (make-hash-table :test 'eq)
+  "Place-operator symbol -> expander fn of the place's args.")
+
+(defun %register-setf-expander (name fn)
+  (setf (gethash name *setf-expanders*) fn)
+  name)
+
+(defun %setf-expander-for (name)
+  (gethash name *setf-expanders*))
+
 (defun get-setf-expansion (place &optional environment)
   "Return (values vars vals stores writer reader) for the generalised place PLACE.
-   ENVIRONMENT is accepted for compatibility but ignored in NCL."
+   ENVIRONMENT is accepted for compatibility but ignored in NCL. A place
+   whose operator has a registered expander (DEFINE-SETF-EXPANDER) uses it."
   (declare (ignore environment))
   (cond
     ;; Bare symbol — read/write directly.
@@ -350,19 +392,60 @@
        (values nil nil (list store)
                `(setq ,place ,store)
                place)))
-    ;; (accessor arg1 ... argN) — general case.
     ((consp place)
-     (let* ((fn    (car place))
-            (args  (cdr place))
-            (vars  (mapcar (lambda (a) (declare (ignore a)) (gensym "G-")) args))
-            (store (gensym "STORE-")))
-       (values vars
-               args
-               (list store)
-               `(setf (,fn ,@vars) ,store)
-               `(,fn ,@vars))))
+     (let ((fn (car place)) (args (cdr place)))
+       (let ((expander (%setf-expander-for fn)))
+         (if expander
+             ;; Custom expander is responsible for its own gensyms /
+             ;; once-only semantics.
+             (apply expander args)
+             ;; (accessor arg1 ... argN) — generic syntactic fallback.
+             (let ((vars  (mapcar (lambda (a) (declare (ignore a)) (gensym "G-")) args))
+                   (store (gensym "STORE-")))
+               (values vars
+                       args
+                       (list store)
+                       `(setf (,fn ,@vars) ,store)
+                       `(,fn ,@vars)))))))
     (t
      (error "get-setf-expansion: cannot expand place ~S" place))))
+
+;; ── DEFINE-SETF-EXPANDER ───────────────────────────────────────────────────
+;;
+;; (define-setf-expander ACCESS-FN LAMBDA-LIST body…) — body is the
+;; expander: given the place's subforms (bound by LAMBDA-LIST), it
+;; returns the 5 setf-expansion values. We compile body into a function
+;; and register it. NCL has no compile-time environment objects, so a
+;; trailing/embedded &environment VAR is stripped and VAR is bound to
+;; NIL inside the body (same convention as define-modify-macro).
+;;
+;; NOTE: this registers an EXPANDER consulted by get-setf-expansion (and
+;; thus by incf/push/pop/rotatef/shiftf/psetf). Direct (setf (ACCESS …) v)
+;; goes through NCL's hardwired SETF special form, which uses the
+;; %SETF-ACCESS writer-function convention rather than this registry —
+;; so direct setf of a define-setf-expander place is not rerouted here.
+
+(defmacro define-setf-expander (access-fn lambda-list &rest body)
+  (let ((env-var nil)
+        (clean nil)
+        (ll lambda-list))
+    (do ()
+        ((null ll))
+      (cond
+        ((eq (car ll) '&environment)
+         (setq env-var (cadr ll))
+         (setq ll (cddr ll)))
+        (t (setq clean (cons (car ll) clean))
+           (setq ll (cdr ll)))))
+    (setq clean (nreverse clean))
+    `(progn
+       (%register-setf-expander ',access-fn
+         (function (lambda ,clean
+                     ,(if env-var
+                          ;; bind &environment VAR to NIL around the body
+                          (cons 'let (cons (list (list env-var nil)) body))
+                          (cons 'progn body)))))
+       ',access-fn)))
 
 ;; ── DEFINE-MODIFY-MACRO ──────────────────────────────────────────────────────
 ;;
@@ -427,6 +510,36 @@
            ;; Build (let* (binding...) writer) without nested backquote —
            ;; NCL does not support nested backquotes yet.
            (cons 'let* (cons (nreverse let-list) (list writer))))))))
+
+;; ── PUSH / POP (once-only) ───────────────────────────────────────────────
+;;
+;; core.lisp defines PUSH/POP textually (evaluating PLACE twice). Now
+;; that get-setf-expansion exists, redefine them here (places.lisp loads
+;; after core.lisp) to evaluate each place subform exactly once — CLHS
+;; 5.1.1.1. Built with (cons 'let* …) like define-modify-macro because
+;; NCL has no nested backquote.
+
+(defmacro push (value place)
+  "Prepend VALUE to the list at PLACE. VALUE is evaluated first, then
+   the place's subforms (each exactly once), then the store happens."
+  (multiple-value-bind (vars vals stores writer reader) (get-setf-expansion place)
+    (let ((vtmp (gensym "V-")))
+      (cons 'let*
+            (cons (append (list (list vtmp value))
+                          (mapcar #'list vars vals)
+                          (list (list (car stores) (list 'cons vtmp reader))))
+                  (list writer))))))
+
+(defmacro pop (place)
+  "Remove and return the head of the list at PLACE; the place's subforms
+   are evaluated exactly once."
+  (multiple-value-bind (vars vals stores writer reader) (get-setf-expansion place)
+    (let ((old (gensym "OLD-")))
+      (cons 'let*
+            (cons (append (mapcar #'list vars vals)
+                          (list (list old reader)
+                                (list (car stores) (list 'cdr old))))
+                  (list (list 'prog1 (list 'car old) writer)))))))
 
 (provide 'places)
 nil

@@ -2342,10 +2342,10 @@ pub struct OptParam {
 
 /// One `&key` parameter. `keyword` is the colon-prefixed name used
 /// by callers (e.g. `:FAMILY`); `name` is the binding name inside
-/// the body. CL allows `((:other-name name) default)` to decouple
-/// them; for now we only support the common case where keyword
-/// equals `:NAME`. `default` lazily evaluated, same shape as for
-/// optionals.
+/// the body. CL also allows `((keyword-name var) default)` to
+/// decouple them (parsed in `ArglistMode::Key`): `keyword` then holds
+/// the explicit caller-visible keyword string. `default` lazily
+/// evaluated, same shape as for optionals.
 #[derive(Debug, Clone)]
 pub struct KeyParam {
     pub name: Arc<str>,
@@ -2494,15 +2494,82 @@ pub(crate) fn parse_param_list_inner(v: &Value) -> Result<ParamSpec, String> {
                         ));
                     }
                     ArglistMode::Key => {
-                        let (name, default, supplied_p) = parse_init_form(&head)?;
-                        // Convention: the matching keyword is `:NAME`.
-                        let kw_name = format!(":{}", name);
-                        keys.push(KeyParam {
-                            name,
-                            keyword: Arc::from(kw_name.as_str()),
-                            default,
-                            supplied_p,
-                        });
+                        // CLHS 3.4.1.4: a &key parameter may be a bare
+                        // symbol, `(var [default [supplied-p]])`, or the
+                        // explicit-keyword form
+                        // `((keyword-name var) [default [supplied-p]])`
+                        // which decouples the caller-visible keyword from
+                        // the local variable.
+                        let explicit_inner = match &head {
+                            Value::Cons(c) => match &c.car {
+                                Value::Cons(_) => Some(c.car.clone()),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some(inner_list) = explicit_inner {
+                            let inner = list_to_vec_of_value(&inner_list)?;
+                            if inner.len() != 2 {
+                                return Err(format!(
+                                    "&key spec (keyword-name var) needs exactly 2 \
+                                     elements, got {}",
+                                    inner.len()
+                                ));
+                            }
+                            let Value::Symbol(kw_sym) = &inner[0] else {
+                                return Err(format!(
+                                    "&key keyword-name must be a symbol, got {:?}",
+                                    inner[0]
+                                ));
+                            };
+                            let Value::Symbol(var_sym) = &inner[1] else {
+                                return Err(format!(
+                                    "&key variable must be a symbol, got {:?}",
+                                    inner[1]
+                                ));
+                            };
+                            // The runtime symbol table is keyed by bare
+                            // name, with a `:` prefix only for keyword-
+                            // package symbols (see lower::intern_value_symbol).
+                            // Match callers the same way: a keyword
+                            // keyword-name matches `:NAME`; any other
+                            // symbol is matched by its literal bare name
+                            // (callers pass the quoted symbol).
+                            let keyword: Arc<str> = if crate::lower::is_keyword(kw_sym) {
+                                Arc::from(format!(":{}", kw_sym.name).as_str())
+                            } else {
+                                Arc::clone(&kw_sym.name)
+                            };
+                            let name = Arc::clone(&var_sym.name);
+                            // default / supplied-p follow the inner cell.
+                            let elems = list_to_vec_of_value(&head)?;
+                            if elems.len() > 3 {
+                                return Err(
+                                    "&key spec ((keyword-name var) [default \
+                                     [supplied-p]]) has too many elements"
+                                        .into(),
+                                );
+                            }
+                            let default = elems.get(1).cloned();
+                            let supplied_p = match elems.get(2) {
+                                Some(Value::Symbol(s)) => Some(Arc::clone(&s.name)),
+                                Some(other) => return Err(format!(
+                                    "supplied-p must be a symbol, got {other:?}"
+                                )),
+                                None => None,
+                            };
+                            keys.push(KeyParam { name, keyword, default, supplied_p });
+                        } else {
+                            let (name, default, supplied_p) = parse_init_form(&head)?;
+                            // Convention: the matching keyword is `:NAME`.
+                            let kw_name = format!(":{}", name);
+                            keys.push(KeyParam {
+                                name,
+                                keyword: Arc::from(kw_name.as_str()),
+                                default,
+                                supplied_p,
+                            });
+                        }
                     }
                 }
             }

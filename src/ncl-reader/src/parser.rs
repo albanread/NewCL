@@ -283,14 +283,7 @@ impl<'a> Parser<'a> {
                 },
                 Some(span),
             )),
-            ('S' | 's', None) => Err(self.err_at(
-                ReaderErrorKind::UnsupportedSharpDispatch {
-                    ch: 'S',
-                    prefix,
-                    reason: "struct literals (#S) not supported in Phase 1c",
-                },
-                Some(span),
-            )),
+            ('S' | 's', None) => self.read_struct_literal(span).map(Some),
             ('P' | 'p', None) => Err(self.err_at(
                 ReaderErrorKind::UnsupportedSharpDispatch {
                     ch: 'P',
@@ -378,6 +371,58 @@ impl<'a> Parser<'a> {
             Value::Symbol(complex_sym),
             Value::cons(re, Value::cons(im, Value::Nil)),
         ))
+    }
+
+    /// `#S(NAME :slot value …)` — struct read-time literal.
+    ///
+    /// CLHS specifies `#S` constructs an *actual* instance at read
+    /// time, but `ncl-reader` is a standalone crate with no access to
+    /// the runtime struct registry. We take the same deferred-form
+    /// route as `#C`: expand into the constructor call
+    /// `(MAKE-NAME :slot value …)`, which the compiler materialises.
+    /// The default constructor that `defstruct NAME` defines is named
+    /// `MAKE-NAME` (interned in NAME's home package), and its keyword
+    /// arguments are the slot keywords — exactly the `:slot value`
+    /// pairs that follow NAME in `#S(...)`. So the rewrite is a
+    /// faithful constructor call for every default-constructed struct.
+    fn read_struct_literal(&mut self, span: crate::token::Span)
+        -> Result<Value, ReaderError>
+    {
+        // Read `(NAME :slot value …)` as an ordinary list.
+        let inner = self.read_form()?;
+        let (head, rest) = match &inner {
+            Value::Cons(c) => (c.car.clone(), c.cdr.clone()),
+            _ => return Err(self.err_at(
+                ReaderErrorKind::UnsupportedSharpDispatch {
+                    ch: 'S',
+                    prefix: None,
+                    reason: "#S requires a list (NAME :slot value …)",
+                },
+                Some(span),
+            )),
+        };
+        // The structure name must be a symbol.
+        let name_sym = match &head {
+            Value::Symbol(s) => Arc::clone(s),
+            _ => return Err(self.err_at(
+                ReaderErrorKind::UnsupportedSharpDispatch {
+                    ch: 'S',
+                    prefix: None,
+                    reason: "#S structure name must be a symbol",
+                },
+                Some(span),
+            )),
+        };
+        // MAKE-<NAME>, interned in NAME's home package (so it resolves
+        // to the constructor `defstruct` defined there). Fall back to
+        // the current package for an uninterned name.
+        let ctor_name = format!("MAKE-{}", name_sym.name);
+        let pkg = name_sym
+            .home
+            .clone()
+            .unwrap_or_else(|| Arc::clone(&self.current_package));
+        let ctor_sym = pkg.intern(&ctor_name).0;
+        Ok(Value::cons(Value::Symbol(ctor_sym), rest))
     }
 
     fn read_feature_test_then_form(&mut self, want: bool) -> Result<Option<Value>, ReaderError> {

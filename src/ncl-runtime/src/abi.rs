@@ -3470,31 +3470,52 @@ pub extern "C-unwind" fn vector_shim(
 }
 
 /// `(svref v i)` and `(aref v i)` for vectors. JIT-callable from
-/// the polymorphic AREF lowering. Bounds-checked; out-of-range
-/// indices panic.
+/// the polymorphic AREF lowering. A bad index, an out-of-range
+/// index, or a non-array first argument signals a CATCHABLE Lisp
+/// condition (CLHS: these are `type-error`/`error`, not crashes) —
+/// applying e.g. a struct accessor to a non-struct must be
+/// recoverable under `handler-case`, not a worker-thread panic.
 ///
-/// SAFETY: arguments come from JIT'd code; both must be valid
-/// Words. `v` must be Vector- or String-tagged for the dispatch
-/// to make sense.
+/// The `mutator` is threaded in solely so the error path can
+/// allocate the condition string; the fast path never touches it.
+/// Signalling records a pending condition and returns NIL — the
+/// JIT's next post-call abort-check trips and unwinds, exactly like
+/// every other signal site (see `record_pending_condition`).
+///
+/// SAFETY: arguments come from JIT'd code; all must be valid Words,
+/// and `mutator` a valid live pointer.
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn ncl_aref_generic(v: u64, i: u64) -> u64 {
+pub extern "C-unwind" fn ncl_aref_generic(
+    mutator: *mut crate::mutator::MutatorState,
+    v: u64,
+    i: u64,
+) -> u64 {
     let vw = Word::from_raw(v);
     let iw = Word::from_raw(i);
     let idx = match iw.as_fixnum() {
         Some(n) if n >= 0 => n as usize,
-        _ => panic!("aref: index must be a non-negative fixnum, got {iw:?}"),
+        _ => return signal_condition_string(
+            mutator,
+            &format!("aref: index must be a non-negative fixnum, got {iw:?}"),
+        ),
     };
     match vw.tag() {
         Tag::Vector => {
             let n = vector_payload_len(vw) as usize;
             if idx >= n {
-                panic!("aref: index {idx} out of bounds for vector of length {n}");
+                return signal_condition_string(
+                    mutator,
+                    &format!("aref: index {idx} out of bounds for vector of length {n}"),
+                );
             }
             vector_cell(vw, idx as u32)
         }
         // ncl_string_char takes a raw (untagged) index.
         Tag::String => crate::abi::ncl_string_char(v, idx as u64),
-        _ => panic!("aref: not a sequence: {vw:?}"),
+        _ => signal_condition_string(
+            mutator,
+            &format!("aref: {vw:?} is not an array"),
+        ),
     }
 }
 
@@ -3512,14 +3533,18 @@ pub extern "C-unwind" fn ncl_aset_generic(
     let iw = Word::from_raw(i);
     let idx = match iw.as_fixnum() {
         Some(n) if n >= 0 => n as usize,
-        _ => panic!("(setf aref): index must be a non-negative fixnum, got {iw:?}"),
+        _ => return signal_condition_string(
+            mutator,
+            &format!("(setf aref): index must be a non-negative fixnum, got {iw:?}"),
+        ),
     };
     match vw.tag() {
         Tag::Vector => {
             let n = vector_payload_len(vw) as usize;
             if idx >= n {
-                panic!(
-                    "(setf aref): index {idx} out of bounds for vector of length {n}"
+                return signal_condition_string(
+                    mutator,
+                    &format!("(setf aref): index {idx} out of bounds for vector of length {n}"),
                 );
             }
             set_vector_cell(mutator, vw, idx as u32, val);
@@ -3527,7 +3552,10 @@ pub extern "C-unwind" fn ncl_aset_generic(
         }
         // ncl_string_set takes a raw (untagged) index.
         Tag::String => crate::abi::ncl_string_set(v, idx as u64, val),
-        _ => panic!("(setf aref): not a sequence: {vw:?}"),
+        _ => signal_condition_string(
+            mutator,
+            &format!("(setf aref): {vw:?} is not an array"),
+        ),
     }
 }
 
