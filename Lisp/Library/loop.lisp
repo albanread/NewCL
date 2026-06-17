@@ -792,6 +792,20 @@
     ((eq (car form) 'block) form)
     (t (mapcar (lambda (sub) (%loop-subst-it sub it-var)) form))))
 
+(defun %loop-rewrite-finish (form tag)
+  "Rewrite `(loop-finish)` to `(return-from TAG nil)` throughout FORM,
+   so it jumps past the iteration to the loop's finally/result. Stops at
+   nested (loop …)/(block …) — an inner construct's loop-finish is its
+   own (CLHS: loop-finish refers to the innermost lexically-enclosing
+   extended LOOP)."
+  (cond
+    ((atom form) form)
+    ((eq (car form) 'loop) form)
+    ((eq (car form) 'block) form)
+    ((and (eq (car form) 'loop-finish) (null (cdr form)))
+     `(return-from ,tag nil))
+    (t (mapcar (lambda (sub) (%loop-rewrite-finish sub tag)) form))))
+
 (defun %loop-result-form (plan)
   "Pick the final-value form. CL says the value of the last
    accumulator clause; collect's accumulator was built with cons-
@@ -840,6 +854,11 @@
          finally-forms ...
          result-form))"
   (let* ((name (or (loop-plan-name plan) 'nil))
+         ;; A dedicated block tag so (loop-finish) can jump past the
+         ;; iteration (and any `initially`) to the finally/result, i.e.
+         ;; terminate the loop *normally* — distinct from `return`, which
+         ;; %loop-rewrite-return sends to the outer NAME block.
+         (finish-tag (gensym "LOOP-FINISH-"))
          ;; Plan list fields are reverse-accumulated (see the plan
          ;; structure comment) — restore source order here, once.
          (all-bindings
@@ -867,10 +886,14 @@
          ;; the implicit block. The body's accumulator-setq forms
          ;; we added don't contain `return`, but it's harmless to
          ;; walk them.
-         (body (mapcar (lambda (f) (%loop-rewrite-return f name))
+         (body (mapcar (lambda (f)
+                         (%loop-rewrite-finish (%loop-rewrite-return f name)
+                                               finish-tag))
                        (reverse (loop-plan-body plan))))
          (steps (reverse (loop-plan-iter-steps plan)))
-         (initially (mapcar (lambda (f) (%loop-rewrite-return f name))
+         (initially (mapcar (lambda (f)
+                              (%loop-rewrite-finish (%loop-rewrite-return f name)
+                                                    finish-tag))
                             (reverse (loop-plan-initially plan))))
          (finally (mapcar (lambda (f) (%loop-rewrite-return f name))
                           (reverse (loop-plan-finally plan))))
@@ -904,12 +927,16 @@
                   ,step-clause)))))
       `(block ,name
          (let* ,all-bindings
-           ,@initially
-           (loop
-             (cond
-               (,test-form (return nil))
-               (t ,@body
-                  ,post-test-cond)))
+           ;; `initially` + the iteration live inside FINISH-TAG so that
+           ;; (loop-finish), from either, exits straight to the
+           ;; reversals/finally/result below.
+           (block ,finish-tag
+             ,@initially
+             (loop
+               (cond
+                 (,test-form (return nil))
+                 (t ,@body
+                    ,post-test-cond))))
            ,@(%loop-collect-into-reversals plan)
            ,@finally
            ,result)))))

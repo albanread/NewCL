@@ -458,5 +458,45 @@ UNWIND-PROTECT yet), but the common case of normal return is correct."
         (values form nil)
         (values (macroexpand expansion environment) t))))
 
+;; ── MULTIPLE-VALUE-CALL ────────────────────────────────────────────────────
+;;
+;; (multiple-value-call FN form*) calls FN with ALL the values produced
+;; by each form, concatenated left to right. CL makes this a special
+;; form; a macro that splices each form's `multiple-value-list` and
+;; `apply`s is equivalent for our purposes.
+
+(defmacro multiple-value-call (function-form &rest forms)
+  "Call FUNCTION-FORM with all values returned by each FORM, in order."
+  (cons 'apply
+        (cons function-form
+              (list (cons 'append
+                          (mapcar (lambda (f) (list 'multiple-value-list f))
+                                  forms))))))
+
+;; ── FUNCTION-LAMBDA-EXPRESSION ─────────────────────────────────────────────
+;;
+;; CLHS returns (values lambda-expression closure-p name); all three are
+;; implementation-dependent and the ANSI examples accept any answer. NCL
+;; compiles to native code and does not retain source lambda lists, so we
+;; report "not available": NIL lambda-expression, closure-p true (we can't
+;; prove otherwise), NIL name.
+
+(defun function-lambda-expression (function)
+  "Return (values lambda-expression closure-p name). NCL retains no
+   source form, so the lambda-expression is NIL."
+  (declare (ignore function))
+  (values nil t nil))
+
+;; ── Implementation limits ──────────────────────────────────────────────────
+;; Reasonable, self-consistent values; the ANSI suite treats each as
+;; implementation-dependent.
+
+(defconstant call-arguments-limit 4096
+  "Upper bound on the number of arguments in a function call.")
+(defconstant lambda-parameters-limit 4096
+  "Upper bound on the number of parameters in a lambda list.")
+(defconstant multiple-values-limit 4096
+  "Upper bound on the number of values a form may return.")
+
 (provide 'symbols)
 nil

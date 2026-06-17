@@ -142,6 +142,11 @@
   (setf (cdr cons) new-cdr)
   cons)
 
+;; (setf (symbol-value SYM) V) lowers to (%setf-symbol-value V SYM).
+(defun %setf-symbol-value (new-value symbol)
+  "Writer for (setf (symbol-value sym) v) — assigns SYM's dynamic value."
+  (set symbol new-value))
+
 (defun %strip-backquote (form)
   "Turn a (BACKQUOTE template) read form with plain (UNQUOTE x) markers
    into the equivalent literal code: `(progn (f ,a ,b) ,a) => (progn (f
