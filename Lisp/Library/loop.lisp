@@ -792,6 +792,19 @@
     ((eq (car form) 'block) form)
     (t (mapcar (lambda (sub) (%loop-subst-it sub it-var)) form))))
 
+(defun %loop-uses-finish-p (form)
+  "T iff FORM contains a `(loop-finish)` belonging to THIS loop (stops at
+   nested loop/block, mirroring %loop-rewrite-finish). Lets %loop-emit skip
+   the finish block + rewrite entirely for the common no-loop-finish case —
+   an empty (block …) per loop is not free."
+  (cond
+    ((atom form) nil)
+    ((eq (car form) 'loop) nil)
+    ((eq (car form) 'block) nil)
+    ((and (eq (car form) 'loop-finish) (null (cdr form))) t)
+    (t (or (%loop-uses-finish-p (car form))
+           (%loop-uses-finish-p (cdr form))))))
+
 (defun %loop-rewrite-finish (form tag)
   "Rewrite `(loop-finish)` to `(return-from TAG nil)` throughout FORM,
    so it jumps past the iteration to the loop's finally/result. Stops at
@@ -859,6 +872,11 @@
          ;; terminate the loop *normally* — distinct from `return`, which
          ;; %loop-rewrite-return sends to the outer NAME block.
          (finish-tag (gensym "LOOP-FINISH-"))
+         ;; Only pay for the loop-finish block + rewrite when a
+         ;; (loop-finish) is actually present (rare). Otherwise the loop
+         ;; expands exactly as before — no extra block on the hot path.
+         (uses-finish (or (some #'%loop-uses-finish-p (loop-plan-body plan))
+                          (some #'%loop-uses-finish-p (loop-plan-initially plan))))
          ;; Plan list fields are reverse-accumulated (see the plan
          ;; structure comment) — restore source order here, once.
          (all-bindings
@@ -887,13 +905,13 @@
          ;; we added don't contain `return`, but it's harmless to
          ;; walk them.
          (body (mapcar (lambda (f)
-                         (%loop-rewrite-finish (%loop-rewrite-return f name)
-                                               finish-tag))
+                         (let ((r (%loop-rewrite-return f name)))
+                           (if uses-finish (%loop-rewrite-finish r finish-tag) r)))
                        (reverse (loop-plan-body plan))))
          (steps (reverse (loop-plan-iter-steps plan)))
          (initially (mapcar (lambda (f)
-                              (%loop-rewrite-finish (%loop-rewrite-return f name)
-                                                    finish-tag))
+                              (let ((r (%loop-rewrite-return f name)))
+                                (if uses-finish (%loop-rewrite-finish r finish-tag) r)))
                             (reverse (loop-plan-initially plan))))
          (finally (mapcar (lambda (f) (%loop-rewrite-return f name))
                           (reverse (loop-plan-finally plan))))
@@ -925,21 +943,28 @@
                `(cond
                   (,post-test-form (return nil))
                   ,step-clause)))))
-      `(block ,name
-         (let* ,all-bindings
-           ;; `initially` + the iteration live inside FINISH-TAG so that
-           ;; (loop-finish), from either, exits straight to the
-           ;; reversals/finally/result below.
-           (block ,finish-tag
-             ,@initially
-             (loop
-               (cond
-                 (,test-form (return nil))
-                 (t ,@body
-                    ,post-test-cond))))
-           ,@(%loop-collect-into-reversals plan)
-           ,@finally
-           ,result)))))
+      (let* ((loop-form
+              `(loop
+                 (cond
+                   (,test-form (return nil))
+                   (t ,@body
+                      ,post-test-cond))))
+             ;; Wrap `initially` + the iteration in FINISH-TAG only when
+             ;; (loop-finish) is used, so it can jump straight to the
+             ;; reversals/finally/result. The common case emits the forms
+             ;; directly — no extra block.
+             (iter-section
+              (if uses-finish
+                  (list (append (list 'block finish-tag)
+                                initially
+                                (list loop-form)))
+                  (append initially (list loop-form)))))
+        `(block ,name
+           (let* ,all-bindings
+             ,@iter-section
+             ,@(%loop-collect-into-reversals plan)
+             ,@finally
+             ,result))))))
 
 ;; ── Macro redefinition ────────────────────────────────────────────────────
 ;;
