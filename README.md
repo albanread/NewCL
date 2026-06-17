@@ -68,23 +68,25 @@ numbers (2026-06, same machine, SBCL 2.6.4):
 ### Conformance
 
 The Corman/ANSI test chapters (`demos/ansi-runner.lisp`) currently pass
-**≈703 / fail ≈78 / error ≈138** of **919 forms run**. Crucially the suite
-now **loads every chapter to completion** — no chapter-killer aborts and no
-worker-thread panics — so the gaps are honest *failures/errors on forms that
-actually executed*, not whole chapters hidden behind one unread construct.
-(For comparison, the suite previously ran only 784 forms because chapters 5,
-6 and 8 aborted partway; closing those killers exposed ~135 more forms, of
-which 81 became net new passes.) The remaining work is tracked in
-[docs/ansi-killers.md](docs/ansi-killers.md). The biggest remaining ones are
-no longer single-clause adds: **multidimensional arrays** (`make-array` on a
-dimension list + N-index `aref`; blocks the 2-D `xy` setf demo in chapter 5),
-**full `defstruct` option-lists** (`:conc-name` / `:include` / `:type list` /
-`:constructor` / BOA, plus struct⇄print parity — most of chapter 8), and the
-`getf` / `ldb` setf places (the last setf-expander corners). Other weak
-spots: parts of the type system (`subtypep`, `typep` on compound types),
-`multiple-value-call`, `function-lambda-expression`, some `coerce` targets,
-and a few CLOS corners. The performance "gauntlet"
-(`bench/gauntlet.lisp`) is ALL-PASS.
+**≈745 / fail ≈81 / error ≈93** of **919 forms run** (up from ≈622 with three
+chapters aborting). The suite now **loads every chapter to completion** — no
+chapter-killer aborts and no worker-thread panics — so the gaps are honest
+*failures/errors on forms that actually executed*, not whole chapters hidden
+behind one unread construct. Recently landed: LOOP's full conditional
+sublanguage (`else`/`it`/`end`/nested, parallel `and`-`for`, `loop-finish`),
+`#S` literals, explicit-keyword `&key`, a from-scratch `defstruct` with the
+full option-list surface (`:conc-name` / `:include` / `:type list` /
+`:constructor` + BOA / `:copier` / `:predicate` / per-slot options), the
+setf-expander protocol (`define-setf-expander` / `get-setf-expansion`,
+once-only `push`/`pop`/`rotatef`/`shiftf`), `multiple-value-call`,
+`function-lambda-expression`, and catchable `aref`. The remaining work is
+tracked in [docs/ansi-killers.md](docs/ansi-killers.md): **multidimensional
+arrays** (`make-array` on a dimension list + N-index `aref`), struct⇄print
+parity (NCL prints structs as `SIMPLE-VECTOR`, so `=> #S(...)` comparisons
+still differ), `defstruct :include` *within a single top-level form* (an
+NCL macroexpand-sequencing limitation), the `getf` / `ldb` setf places, and
+parts of the type system (`subtypep`, compound `typep`). The performance
+"gauntlet" (`bench/gauntlet.lisp`) is ALL-PASS.
 
 ### Known gaps
 

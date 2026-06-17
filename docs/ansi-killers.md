@@ -4,7 +4,7 @@
 ANSI hyperspec-examples chapters (`E:/CL/cormanlisp/test/ansi-chapter-*.lisp`).*
 
 ```
-passed: 703   failed: 78   errors: 138   total: 919   (every chapter loads fully)
+passed: 745   failed: 81   errors: 93   total: 919   (every chapter loads fully)
 ```
 
 ## The "chapter-killer" pattern (mostly retired)
@@ -20,12 +20,29 @@ no panics. The remaining `failed`/`errors` are forms that *actually executed*
 and produced a wrong/no answer, which is honest: the gaps are visible
 per-form rather than masked by an early chapter abort.
 
-This session took the count from **622 → 703 (+81)** and, more importantly,
+Work so far took the count from **622 → 745 (+123)** and, more importantly,
 took the suite from 784 forms run to **919** (chapters 5, 6, 8 previously
 aborted partway). What remains is no longer quick clause-adds — each is a
 substantial single feature.
 
-## Fixed this session
+## Fixed (later pass)
+
+- **Full `defstruct`** (`Library/structures.lisp`, +30) — option-list name
+  form with `(:conc-name)`, `(:constructor name [boa-arglist])` incl.
+  BOA + `&optional`/`&rest`/`&aux`, `(:copier)`, `(:predicate)`, `(:include
+  parent overrides…)`, `(:type list)`, `:named`, `(:initial-offset n)`, and
+  per-slot `:read-only`/`:type`. The plain symbol-name path stays compatible
+  with the bootstrap structs. Most of chapter 8 now passes (~38/56). Two
+  residual limits: (a) `=> #S(...)` comparisons still fail because NCL prints
+  structs as `SIMPLE-VECTOR` (the value is a tagged vector, the expected is a
+  quoted cons), and (b) `:include` of a sibling defined in the *same* top-level
+  form (see the macroexpand-sequencing note below).
+- **`multiple-value-call`** macro, **`function-lambda-expression`**, the
+  `call-arguments-limit`/`lambda-parameters-limit`/`multiple-values-limit`
+  constants, **`%setf-symbol-value`**, and **`loop-finish`** (terminate a
+  LOOP normally from body or `initially`) — all in `Library/`.
+
+## Fixed (first pass)
 
 - **LOOP conditional sublanguage** (`Library/loop.lisp`, +36) — `else`, the
   anaphoric `it`, the `end` preposition, nested `when/when/else`, and the
@@ -76,19 +93,22 @@ substantial single feature.
   `aref`/`aset` and `array-rank`/`array-dimension`. Invasive to the array/GC
   layout — a dedicated effort, not a clause-add.
 
-### Full `defstruct` option-lists  *(most of chapter 8)*
-- **Symptom:** `(defstruct (door (:conc-name dr-)) …)` and friends don't
-  abort, but the embedded `defstruct` macro (`core.lisp`) treats the whole
-  option-list as the struct *name*, silently defining a garbage constructor
-  and never defining the conc-named accessors / copier / predicate. So the
-  accessor tests become runtime errors.
-- **Missing:** `(:conc-name)`, `(:include)`, `(:type list)`, `:named`,
-  `(:constructor make-… (args))` incl. BOA + `&aux`, `(:copier)`,
-  `(:predicate)`, `(:initial-offset)`. Plus **struct⇄print parity**: NCL
-  prints structs as `SIMPLE-VECTOR`, so every `=> #S(...)` comparison fails
-  even when construction works (the `#S` reader fix can't help these — they
-  are data-position comparisons of a vector against a quoted cons).
-- A real `defstruct` rewrite in `core.lisp` (rebuild) is the unlock.
+### Struct⇄print parity + `defstruct :include` within one top-level form
+- **Struct print parity:** the `=> #S(TYPE …)` comparison tests (~11 in
+  chapter 8) still fail. The actual value is a tagged `SIMPLE-VECTOR`; the
+  expected `#S(...)` is read (by the cheap-partial reader) into a quoted
+  `(make-TYPE …)` cons, so `equalp(vector, cons)` is NIL. Real `#S` reading
+  (a struct value at read time) + printing structs as `#S(...)` + `equalp` on
+  structs would close these. Until then they are known false-fails.
+- **`:include` in one top-level form:** `defstruct` records each struct's
+  slots in `*defstruct-info*` as a side effect of macroexpansion, and a child
+  `(:include parent)` reads it. NCL macroexpands a whole top-level form's
+  subforms *non-sequentially*, so a child that includes a sibling defined in
+  the **same** `(progn …)`/`dotests` block (chapter 8's astronaut/truck/pickup)
+  doesn't see the parent yet. Across separate top-level forms it works. The
+  proper fix is CLHS §3.2.3.1 top-level-`progn` sequencing in the loader
+  (`eval_value`): detect a top-level `progn` *before* the full recursive
+  `macroexpand_all` and process each subform sequentially.
 
 ### `getf` / `ldb` setf places  *(last setf-expander corners)*
 - `(setf (getf place k) v)` needs an expander that rewrites the *underlying*
