@@ -601,6 +601,14 @@
   (let* ((expr (%cur-eat! cur))
          (saved-tail (loop-plan-body plan)))
     (%parse-one-clause plan cur)
+    ;; `and`-conjoined sub-clauses share this when/unless test, e.g.
+    ;; `when C collect X into a and count Y into b`. Each adds its own
+    ;; body forms (and its own accumulator/with-binding, which persist);
+    ;; the capture below grabs ALL of them and wraps them in one guard.
+    (loop
+      (if (%cur-eat-keyword? cur 'and)
+          (%parse-one-clause plan cur)
+          (return nil)))
     ;; body is reverse-accumulated: everything in front of
     ;; SAVED-TAIL (compared by EQ) was added by the sub-clause.
     ;; Pushing front-to-back restores the additions' source order.
