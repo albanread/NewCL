@@ -50,20 +50,31 @@ The yardstick is **SBCL** — the mature, gold-standard CL compiler, and it
 is *much* faster than NCL. That's expected: SBCL has 20+ years of native
 codegen and GC tuning. The goal for a young, from-scratch JIT is to stay
 **within an order of magnitude**, and on a real workload we now do. Honest
-numbers (2026-06, same machine, SBCL 2.6.4):
+numbers (2026-06, same machine, SBCL 2.6.5):
 
 - **Symbolic / heavy-backtracking** (Norvig Prolog solving the Zebra
-  puzzle, `demos/prolog.lisp`): **SBCL is ~10× faster** — SBCL 0.10 s vs
-  NCL 1.08 s. SBCL was ~18× faster before this round of stdlib hot-path
-  tuning. Closing to *only* ~10× slower than SBCL on a heavy symbolic
-  program is the milestone here.
+  puzzle, `demos/prolog.lisp`): **SBCL is ~6× faster** — SBCL ~0.10 s vs
+  NCL ~0.59 s (`bench/zebra-time.lisp`; SBCL via `bench/zebra-sbcl.lisp`).
+  This used to be ~10×: two stdlib/compiler fixes closed the gap. (1) The
+  hash-table walks (`gethash` & friends) were `(loop …)`, which lowers to a
+  body-thunk closure that `ncl_make_closure` allocates in the immortal
+  static area *per call* — `typep`→`gethash` runs on every type check, so
+  the Zebra solve leaked ~2 M closures (~95 MB) and triggered three
+  expensive promoting GCs. Rewriting those loops as self-tail-recursion
+  (no thunk) eliminated the leak and the GCs. (2) `symbolp` is now a
+  tag-check intrinsic (like `consp`/`atom`/`listp`/`null`) instead of
+  `(typep x 'symbol)`, removing ~1 M hash lookups from the unifier's hot
+  path. Net: 2.9 s → 0.59 s, and the solve now runs with **zero GC cycles**.
 - **Float kernels**: NCL's unboxing pass makes its *own* code ~3–4× faster
   (it matches a hand `(declare (double-float …))` without the declaration).
 - Allocation is competitive — `cons` is only ~2× slower than SBCL — and GC
   is usually *not* the bottleneck. The dominant remaining gap is per-call
   overhead: NCL's function calls are ~18× SBCL's, from a late-bound, boxed
   calling convention. The next compiler lever is an unboxed / known-call
-  ABI to close that.
+  ABI to close that. A known leak also remains: any non-inlined
+  `loop`/`block`/`unwind-protect`/`catch` body-thunk is still allocated in
+  the immortal static area (escape analysis to young-allocate or elide them
+  is future work).
 
 ### Conformance
 
