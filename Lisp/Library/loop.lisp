@@ -70,8 +70,10 @@
                '(for as with while until repeat named
                  initially finally do doing return
                  collect collecting append appending
+                 nconc nconcing
                  sum summing count counting
                  minimize minimizing maximize maximizing
+                 always never thereis
                  when unless if))))
 
 ;; ── Tokeniser-as-cursor ───────────────────────────────────────────────────
@@ -128,6 +130,8 @@
                         ; post-body-tests.
   (finally nil)         ; forms — run after natural completion
   (accumulators nil)    ; ((kind var . extras) ...) for the result computation
+  (result-override nil) ; (FORM) wrapper set by always/never/thereis to fix
+                        ; the loop's value on NORMAL completion; NIL = none
   )
 
 (defun %plan-add-with (plan var init)
@@ -186,6 +190,14 @@
              (%loop-pattern-bindings (cdr pattern) (list 'cdr source))))
     (t (error "loop: bad destructuring pattern ~A" pattern))))
 
+(defun %loop-for-spec-keyword-p (tok)
+  "T iff TOK introduces a FOR iteration path. Used to tell an iteration
+   keyword apart from a bare type designator sitting between the var and
+   its spec (e.g. the `fixnum` in `for i fixnum from 3`)."
+  (and (symbolp tok)
+       (member tok '(in on across being =
+                     from upfrom downfrom to upto below downto above by))))
+
 (defun %parse-for (plan cur)
   "Parse one or more parallel for-bindings joined by `and`:
      (for i from 1 to 3 and j in list ...)
@@ -209,10 +221,16 @@
    doesn't yet act on CL type declarations, and accepting+ignoring
    matches what the test corpus assumes."
   (let ((var (%cur-eat! cur)))
-    ;; Skip optional `of-type TYPE`. Token-eater eats both; the
-    ;; declared type is discarded.
-    (when (%cur-eat-keyword? cur 'of-type)
-      (%cur-eat! cur))
+    ;; Optional type designator between VAR and its iteration spec
+    ;; (CL 6.1.1.7): either `of-type TYPE`, or a BARE designator like
+    ;; `fixnum`/`float`/`t`/`nil`/compound. NCL ignores declared types,
+    ;; so eat and discard. A bare type is simply whatever sits there that
+    ;; is NOT one of the for-spec introducers (in/on/=/from/…).
+    (cond
+      ((%cur-eat-keyword? cur 'of-type) (%cur-eat! cur))
+      ((and (not (%cur-empty? cur))
+            (not (%loop-for-spec-keyword-p (%cur-peek cur))))
+       (%cur-eat! cur)))
     (cond
       ;; for VAR in LIST  (VAR may be a destructuring pattern)
       ((%cur-eat-keyword? cur 'in)
@@ -439,6 +457,14 @@
   (when (%cur-eat-keyword? cur 'into)
     (%cur-eat! cur)))
 
+(defun %skip-of-type (cur)
+  "Consume an optional `of-type TYPE` modifier that may trail an
+   accumulation clause (CL 6.1.3: `sum form [into var] [of-type type]`).
+   NCL boxes values uniformly, so the declared type is advisory — parse
+   it and discard."
+  (when (%cur-eat-keyword? cur 'of-type)
+    (%cur-eat! cur)))
+
 (defun %parse-collect (plan cur)
   (let* ((expr (%cur-eat! cur))
          (into (%parse-into? cur))
@@ -455,10 +481,21 @@
     (%plan-add-body plan `(setq ,acc (append* ,acc ,expr)))
     (%plan-add-accumulator plan 'append acc into)))
 
+(defun %parse-nconc (plan cur)
+  ;; Like append, but splices destructively (CL 6.1.3). Only lists the
+  ;; body actually conses are mutated; the accumulator order is direct.
+  (let* ((expr (%cur-eat! cur))
+         (into (%parse-into? cur))
+         (acc (or into (gensym "NCONC-"))))
+    (%plan-add-with plan acc nil)
+    (%plan-add-body plan `(setq ,acc (nconc ,acc ,expr)))
+    (%plan-add-accumulator plan 'append acc into)))
+
 (defun %parse-sum (plan cur)
   (let* ((expr (%cur-eat! cur))
          (into (%parse-into? cur))
          (acc (or into (gensym "SUM-"))))
+    (%skip-of-type cur)
     (%plan-add-with plan acc 0)
     (%plan-add-body plan `(setq ,acc (+ ,acc ,expr)))
     (%plan-add-accumulator plan 'sum acc into)))
@@ -467,6 +504,7 @@
   (let* ((expr (%cur-eat! cur))
          (into (%parse-into? cur))
          (acc (or into (gensym "COUNT-"))))
+    (%skip-of-type cur)
     (%plan-add-with plan acc 0)
     (%plan-add-body plan `(when ,expr (setq ,acc (+ ,acc 1))))
     (%plan-add-accumulator plan 'count acc into)))
@@ -476,6 +514,7 @@
          (into (%parse-into? cur))
          (acc (or into (gensym "MIN-")))
          (val (gensym "V-")))
+    (%skip-of-type cur)
     (%plan-add-with plan acc nil)
     (%plan-add-body plan
                     `(let ((,val ,expr))
@@ -488,6 +527,7 @@
          (into (%parse-into? cur))
          (acc (or into (gensym "MAX-")))
          (val (gensym "V-")))
+    (%skip-of-type cur)
     (%plan-add-with plan acc nil)
     (%plan-add-body plan
                     `(let ((,val ,expr))
@@ -519,6 +559,34 @@
       (t (%plan-add-finally plan (%cur-eat! cur))))))
 
 ;; (return EXPR) — exit with EXPR. Returns from the implicit block.
+;; ── Boolean termination clauses (CL 6.1.4) ───────────────────────────────
+;;
+;;   always EXPR  — value T unless some EXPR is NIL, then exit NIL now.
+;;   never  EXPR  — value T unless some EXPR is non-NIL, then exit NIL now.
+;;   thereis EXPR — value NIL unless some EXPR is non-NIL, then exit it now.
+;;
+;; Early exit is a hard `return-from` (the enclosing FINALLY is skipped, per
+;; spec). On normal completion the loop's value is fixed via result-override.
+
+(defun %parse-always (plan cur)
+  (let ((expr (%cur-eat! cur))
+        (name (or (loop-plan-name plan) 'nil)))
+    (%plan-add-body plan `(unless ,expr (return-from ,name nil)))
+    (setf (loop-plan-result-override plan) (list t))))
+
+(defun %parse-never (plan cur)
+  (let ((expr (%cur-eat! cur))
+        (name (or (loop-plan-name plan) 'nil)))
+    (%plan-add-body plan `(when ,expr (return-from ,name nil)))
+    (setf (loop-plan-result-override plan) (list t))))
+
+(defun %parse-thereis (plan cur)
+  (let ((expr (%cur-eat! cur))
+        (name (or (loop-plan-name plan) 'nil))
+        (v (gensym "THEREIS-")))
+    (%plan-add-body plan `(let ((,v ,expr)) (when ,v (return-from ,name ,v))))
+    (setf (loop-plan-result-override plan) (list nil))))
+
 (defun %parse-return (plan cur)
   (let ((expr (%cur-eat! cur))
         (name (or (loop-plan-name plan) 'nil)))
@@ -562,6 +630,8 @@
       ((eq head 'collecting) (%parse-collect plan cur))
       ((eq head 'append)     (%parse-append plan cur))
       ((eq head 'appending)  (%parse-append plan cur))
+      ((eq head 'nconc)      (%parse-nconc plan cur))
+      ((eq head 'nconcing)   (%parse-nconc plan cur))
       ((eq head 'sum)        (%parse-sum plan cur))
       ((eq head 'summing)    (%parse-sum plan cur))
       ((eq head 'count)      (%parse-count plan cur))
@@ -600,6 +670,8 @@
                ((eq head 'collecting) (%parse-collect plan cur))
                ((eq head 'append)     (%parse-append plan cur))
                ((eq head 'appending)  (%parse-append plan cur))
+               ((eq head 'nconc)      (%parse-nconc plan cur))
+               ((eq head 'nconcing)   (%parse-nconc plan cur))
                ((eq head 'sum)        (%parse-sum plan cur))
                ((eq head 'summing)    (%parse-sum plan cur))
                ((eq head 'count)      (%parse-count plan cur))
@@ -611,6 +683,9 @@
                ((eq head 'when)       (%parse-when-unless plan cur nil))
                ((eq head 'unless)     (%parse-when-unless plan cur t))
                ((eq head 'if)         (%parse-when-unless plan cur nil))
+               ((eq head 'always)     (%parse-always plan cur))
+               ((eq head 'never)      (%parse-never plan cur))
+               ((eq head 'thereis)    (%parse-thereis plan cur))
                ((eq head 'return)     (%parse-return plan cur))
                (t (error "loop: unknown clause head ~A" head)))))))
     plan))
@@ -637,7 +712,10 @@
    accumulator clause; collect's accumulator was built with cons-
    prepend so we reverse it back. Accumulators with an `into` variable
    bind that variable instead and contribute NOTHING to the loop value
-   — the user retrieves them via `finally`."
+   — the user retrieves them via `finally`. A boolean clause
+   (always/never/thereis) overrides the value on normal completion."
+  (when (loop-plan-result-override plan)
+    (return-from %loop-result-form (car (loop-plan-result-override plan))))
   (let ((anon (remove-if (lambda (a) (cddr a))   ; cddr = the into-var, if any
                          ;; stored newest-first; restore source order
                          ;; so (car (last anon)) is the LAST clause.
