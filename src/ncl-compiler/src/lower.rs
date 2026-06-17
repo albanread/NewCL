@@ -2783,12 +2783,34 @@ fn lower_nested_defun(
             args.len()
         )));
     }
-    let name = match &args[0] {
+    let name: Arc<str> = match &args[0] {
         Value::Symbol(s) => Arc::clone(&s.name),
+        // `(defun (setf NAME) …)` — accepted here exactly as in the
+        // top-level path (`match_defun_like`): mangle to `%SETF-NAME`
+        // so the generic-setf fallback (`(setf (NAME …) v)` →
+        // `(%SETF-NAME v …)`) finds the writer. Needed because the
+        // long form of `defsetf` expands to a non-top-level
+        // `(defun (setf NAME) …)`.
+        Value::Cons(_) => {
+            let parts = list_to_vec(&args[0])?;
+            let ok = parts.len() == 2
+                && matches!(&parts[0], Value::Symbol(s) if &*s.name == "SETF");
+            match (ok, parts.get(1)) {
+                (true, Some(Value::Symbol(tgt))) => {
+                    Arc::from(format!("%SETF-{}", tgt.name))
+                }
+                _ => {
+                    return Err(CompileError::BadDefun(format!(
+                        "nested defun name must be a symbol or (SETF SYMBOL); \
+                         got {:?}",
+                        args[0]
+                    )));
+                }
+            }
+        }
         other => {
             return Err(CompileError::BadDefun(format!(
-                "nested defun name must be a symbol \
-                 (the (setf …) shape is top-level only); got {other:?}"
+                "nested defun name must be a symbol or (SETF SYMBOL); got {other:?}"
             )));
         }
     };

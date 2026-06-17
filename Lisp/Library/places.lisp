@@ -124,23 +124,55 @@
 ;; So we accept the place-fn's lambda-list implicitly via a single
 ;; &REST capture and apply through it.
 
-(defmacro defsetf (access-fn setter-fn)
-  "Short-form DEFSETF. (defsetf place-fn setter-fn) means: a
-   (setf (place-fn arg…) val) form evaluates to (setter-fn arg… val).
-   SETTER-FN must take one more argument than PLACE-FN, with the
-   new value as its last positional argument.
+(defun %strip-backquote (form)
+  "Turn a (BACKQUOTE template) read form with plain (UNQUOTE x) markers
+   into the equivalent literal code: `(progn (f ,a ,b) ,a) => (progn (f
+   a b) a). Used by long-form DEFSETF, whose template body — evaluated
+   at macroexpand time in the real protocol — is run directly at the
+   setter's call time here instead (equivalent for side-effect-free
+   place subforms, the same assumption the short form makes). Nested
+   backquote and ,@ splicing are not handled."
+  (cond
+    ((not (consp form)) form)
+    ((and (symbolp (car form)) (string= (symbol-name (car form)) "UNQUOTE"))
+     (car (cdr form)))
+    ((and (symbolp (car form)) (string= (symbol-name (car form)) "BACKQUOTE"))
+     (%strip-backquote (car (cdr form))))
+    (t (cons (%strip-backquote (car form))
+             (%strip-backquote (cdr form))))))
 
-   Long-form DEFSETF and DEFINE-SETF-EXPANDER are not yet
-   implemented; use (defun (setf NAME) (val args…) …) directly
-   for cases the short form doesn't cover."
-  ;; Wrap in progn so the top-level recogniser walks the inner
-  ;; defun — a bare (defun …) produced by a macro hits the
-  ;; \"defun only at top level\" guard otherwise.
-  (let ((val (gensym "VAL-"))
-        (args (gensym "ARGS-")))
-    `(progn
-       (defun (setf ,access-fn) (,val &rest ,args)
-         (apply (function ,setter-fn) (append ,args (list ,val)))))))
+(defmacro defsetf (access-fn arg2 &rest rest)
+  "DEFSETF — register how (setf (ACCESS-FN …) val) is computed.
+
+   Short form: (defsetf access-fn setter-fn) — (setf (access-fn arg…)
+   val) evaluates to (setter-fn arg… val); SETTER-FN takes one more
+   argument than ACCESS-FN, the new value last.
+
+   Long form: (defsetf access-fn (lambda-list) (store-var…) body…) —
+   body is a template producing the update form. We install it as the
+   `(setf access-fn)` writer with params (store-var… . lambda-list);
+   NCL's setf fallback routes (setf (access-fn a…) v) to
+   (%setf-access-fn v a…), matching that order. Place subforms are
+   assumed side-effect-free (as in the short form).
+
+   DEFINE-SETF-EXPANDER (full subform-once protocol) is still separate."
+  (if (and (null rest) (symbolp arg2))
+      ;; ── short form ──
+      ;; Wrap in progn so the top-level recogniser walks the inner defun.
+      (let ((val (gensym "VAL-"))
+            (args (gensym "ARGS-")))
+        `(progn
+           (defun (setf ,access-fn) (,val &rest ,args)
+             (apply (function ,arg2) (append ,args (list ,val))))
+           ',access-fn))
+      ;; ── long form ──
+      (let ((lambda-list arg2)
+            (store-vars (car rest))
+            (body (cdr rest)))
+        `(progn
+           (defun (setf ,access-fn) ,(append store-vars lambda-list)
+             ,@(mapcar #'%strip-backquote body))
+           ',access-fn))))
 
 ;; ── INCF / DECF ─────────────────────────────────────────────────────────
 ;;
