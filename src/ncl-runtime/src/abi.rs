@@ -2021,7 +2021,9 @@ pub extern "C-unwind" fn typep_shim(
         "ATOM" => obj.tag() != Tag::Cons,
         "CONS" => obj.tag() == Tag::Cons,
         "LIST" => obj.is_nil() || obj.tag() == Tag::Cons,
-        "SYMBOL" => obj.tag() == Tag::Symbol || obj.is_nil(),
+        // NIL and T are symbols but are Immediate-tagged, not
+        // Symbol-tagged. (Matches Expr::IsSymbol in the JIT.)
+        "SYMBOL" => obj.tag() == Tag::Symbol || obj.is_nil() || obj.raw() == Word::T.raw(),
         "KEYWORD" => is_keyword(obj),
         "FIXNUM" => obj.tag() == Tag::Fixnum,
         "BIGNUM" => crate::bignum::is_bignum(obj),

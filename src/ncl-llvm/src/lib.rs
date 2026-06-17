@@ -3678,6 +3678,36 @@ fn emit_expr<'ctx>(
                 .map_err(|e| format!("or: {e}"))?;
             emit_bool_select(builder, either, i64_t)
         }
+        Expr::IsSymbol(x) => {
+            // symbolp = (tag == Symbol) OR (x == NIL) OR (x == T).
+            // NIL and T are Immediate-tagged, not Symbol-tagged, but
+            // are symbols per CL; everything else with Tag::Symbol
+            // (interned, uninterned, keywords) is a symbol too.
+            let v = emit_expr(context, builder, function, helpers, arity, params, locals, x)?;
+            let mask = i64_t.const_int(0b111, false);
+            let tag_bits = builder
+                .build_and(v, mask, "tag_bits")
+                .map_err(|e| format!("and: {e}"))?;
+            let sym_tag = i64_t.const_int(Tag::Symbol as u64, false);
+            let is_sym = builder
+                .build_int_compare(IntPredicate::EQ, tag_bits, sym_tag, "is_sym")
+                .map_err(|e| format!("icmp: {e}"))?;
+            let nil = i64_t.const_int(Word::NIL.raw(), false);
+            let is_nil = builder
+                .build_int_compare(IntPredicate::EQ, v, nil, "is_nil")
+                .map_err(|e| format!("icmp: {e}"))?;
+            let t_word = i64_t.const_int(Word::T.raw(), false);
+            let is_t = builder
+                .build_int_compare(IntPredicate::EQ, v, t_word, "is_t")
+                .map_err(|e| format!("icmp: {e}"))?;
+            let sym_or_nil = builder
+                .build_or(is_sym, is_nil, "sym_or_nil")
+                .map_err(|e| format!("or: {e}"))?;
+            let is_symbol = builder
+                .build_or(sym_or_nil, is_t, "is_symbol")
+                .map_err(|e| format!("or: {e}"))?;
+            emit_bool_select(builder, is_symbol, i64_t)
+        }
         Expr::If(cond, then_branch, else_branch) => {
             let cond_val = emit_expr(context, builder, function, helpers, arity, params, locals, cond)?;
             let nil_word = i64_t.const_int(Word::NIL.raw(), false);

@@ -902,6 +902,11 @@ fn lower_call_in_mut(
         "CONSP" => unary_op(&head_name, args, env, coord, Expr::is_cons),
         "ATOM" => unary_op(&head_name, args, env, coord, Expr::is_atom),
         "LISTP" => unary_op(&head_name, args, env, coord, Expr::is_listp),
+        // SYMBOLP: tag==Symbol OR nil OR t. Intrinsified (like the
+        // predicates above) so it compiles to a few tag tests instead
+        // of `(typep x 'symbol)`, which did two GETHASH lookups per
+        // call — a hot-path cost in unification-heavy code.
+        "SYMBOLP" => unary_op(&head_name, args, env, coord, Expr::is_symbol),
         // EQL is NOT inlined like EQ. EQ is object identity (a single
         // word compare); EQL additionally treats two numbers of the
         // same type and value as equal (floats/bignums/ratios/complex
@@ -1500,7 +1505,7 @@ fn form_inline_safe(form: &Value, coord: &Arc<GcCoordinator>, env: Option<&Local
         | "PSETQ"
         | "+" | "-" | "*" | "<" | ">" | "<=" | ">=" | "=" | "/="
         | "EQ" | "EQL" | "EQUAL" | "CONS" | "LIST" | "CAR" | "CDR"
-        | "FIRST" | "REST" | "NULL" | "CONSP" | "ATOM" | "LISTP"
+        | "FIRST" | "REST" | "NULL" | "CONSP" | "ATOM" | "LISTP" | "SYMBOLP"
         | "LENGTH" | "STRING=" | "CHAR" | "STRING-CHAR" | "AREF" | "SVREF" => {
             items[1..].iter().all(|f| form_inline_safe(f, coord, env))
         }

@@ -160,10 +160,13 @@ pub enum Expr {
     /// Type predicates. Each returns `t` (Word::T) or `nil`.
     /// `null` checks `is x == nil`. `consp` / `atom` / `listp`
     /// check the tag bits (atom = !cons; listp = nil or cons).
+    /// `symbolp` is `tag == Symbol` OR `nil` OR `t` (NIL and T are
+    /// immediates, not Symbol-tagged, but are symbols per CL).
     IsNull(Box<Expr>),
     IsCons(Box<Expr>),
     IsAtom(Box<Expr>),
     IsListp(Box<Expr>),
+    IsSymbol(Box<Expr>),
     /// Conditional. If the first sub-expression evaluates to
     /// anything other than `nil`, evaluate the second; else the
     /// third.
@@ -349,6 +352,7 @@ impl Expr {
     pub fn is_cons(x: Expr) -> Expr { Expr::IsCons(Box::new(x)) }
     pub fn is_atom(x: Expr) -> Expr { Expr::IsAtom(Box::new(x)) }
     pub fn is_listp(x: Expr) -> Expr { Expr::IsListp(Box::new(x)) }
+    pub fn is_symbol(x: Expr) -> Expr { Expr::IsSymbol(Box::new(x)) }
     pub fn if_(c: Expr, t: Expr, e: Expr) -> Expr {
         Expr::If(Box::new(c), Box::new(t), Box::new(e))
     }

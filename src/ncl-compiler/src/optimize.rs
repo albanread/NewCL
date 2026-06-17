@@ -226,6 +226,7 @@ fn walk(e: Expr, cx: &mut Ctx) -> (AbsType, Expr) {
         Expr::IsCons(a) => (AbsType::Other, Expr::IsCons(walk_box(a, cx))),
         Expr::IsAtom(a) => (AbsType::Other, Expr::IsAtom(walk_box(a, cx))),
         Expr::IsListp(a) => (AbsType::Other, Expr::IsListp(walk_box(a, cx))),
+        Expr::IsSymbol(a) => (AbsType::Other, Expr::IsSymbol(walk_box(a, cx))),
         Expr::Call { sym_word, args } => (
             AbsType::Other,
             Expr::Call { sym_word, args: walk_vec(args, cx) },
@@ -239,8 +240,24 @@ fn walk(e: Expr, cx: &mut Ctx) -> (AbsType, Expr) {
         Expr::StringEq(a, b) => (AbsType::Other, Expr::StringEq(walk_box(a, cx), walk_box(b, cx))),
         Expr::StringChar(a, b) => (AbsType::Other, Expr::StringChar(walk_box(a, cx), walk_box(b, cx))),
         Expr::Aref(a, b) => (AbsType::Other, Expr::Aref(walk_box(a, cx), walk_box(b, cx))),
-        Expr::SetCar(a, b) => (AbsType::Other, Expr::SetCar(walk_box(a, cx), walk_box(b, cx))),
-        Expr::SetCdr(a, b) => (AbsType::Other, Expr::SetCdr(walk_box(a, cx), walk_box(b, cx))),
+        // Tripwire for the load-bearing cross-pass invariant: a local we
+        // promoted to an unboxed f64 slot must NEVER be a mutation target.
+        // Promotion is sound only because lowering cons-boxes every mutated
+        // local (`(setq x v)` → `SetCar(Local(box), v)`), so a mutated
+        // local's init is `(cons …)` → type Other → never promoted. If
+        // lowering ever hands a mutable local a direct float init (the
+        // `LocalF64`-for-mutation path already exists for *declared* floats —
+        // see lower.rs), this pass would promote it to an immutable f64 slot
+        // and the store would silently evaporate. Catch that the instant it
+        // happens rather than miscompiling on some float workload later.
+        Expr::SetCar(a, b) => {
+            assert_not_promoted(a.as_ref(), cx, "SetCar");
+            (AbsType::Other, Expr::SetCar(walk_box(a, cx), walk_box(b, cx)))
+        }
+        Expr::SetCdr(a, b) => {
+            assert_not_promoted(a.as_ref(), cx, "SetCdr");
+            (AbsType::Other, Expr::SetCdr(walk_box(a, cx), walk_box(b, cx)))
+        }
         Expr::SetChar { s, idx, ch } => (
             AbsType::Other,
             Expr::SetChar { s: walk_box(s, cx), idx: walk_box(idx, cx), ch: walk_box(ch, cx) },
@@ -294,6 +311,23 @@ fn walk(e: Expr, cx: &mut Ctx) -> (AbsType, Expr) {
         | Expr::LoadGlobal(_)
         | Expr::ClosureRef(_)
         | Expr::LoadFunction(_) => (AbsType::Other, e),
+    }
+}
+
+/// Debug tripwire: a store whose target is a promoted (unboxed-f64)
+/// local means the "mutated locals are cons-boxed, hence never promoted"
+/// invariant has been violated upstream in lowering. Fail loudly here
+/// (debug builds / `cargo test`) rather than miscompiling silently.
+/// Zero cost in release.
+#[inline]
+fn assert_not_promoted(target: &Expr, cx: &Ctx, op: &str) {
+    if let Expr::Local(i) = target {
+        debug_assert!(
+            !matches!(cx.promo.get(*i), Some(Some(_))),
+            "optimize: {op} targets Local({i}), which was promoted to an \
+             unboxed f64 slot — a mutated local must never be promoted. \
+             Lowering's cons-box-on-mutation invariant has broken."
+        );
     }
 }
 
@@ -360,6 +394,7 @@ fn each_child(e: &Expr, f: &mut dyn FnMut(&Expr)) {
         | Expr::IsCons(b)
         | Expr::IsAtom(b)
         | Expr::IsListp(b)
+        | Expr::IsSymbol(b)
         | Expr::Length(b)
         | Expr::TheFloat(b)
         | Expr::LoopBreak { value: b }
