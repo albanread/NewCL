@@ -15,6 +15,8 @@ See [MANIFESTO.md](MANIFESTO.md) for the design and what we have
 committed to. This file will fill in as the system grows; the
 manifesto is the spec.
 
+![NCL running — editor, Mandelbrot renderer, and Othello AI](docs/screenshot.png)
+
 ## Status
 
 **Working JIT-compiled Common Lisp** (v0.0.0 — pre-1.0; internals and
