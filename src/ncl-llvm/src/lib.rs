@@ -1088,9 +1088,9 @@ fn declare_runtime_helpers<'ctx>(
         Some(Linkage::External),
     );
 
-    // ncl_aref_generic(v, i) -> u64
+    // ncl_aref_generic(mutator, v, i) -> u64  (mutator for the error path)
     let aref_generic_type =
-        i64_t.fn_type(&[i64_t.into(), i64_t.into()], false);
+        i64_t.fn_type(&[i64_t.into(), i64_t.into(), i64_t.into()], false);
     let aref_generic = module.add_function(
         "ncl_aref_generic",
         aref_generic_type,
@@ -3678,6 +3678,36 @@ fn emit_expr<'ctx>(
                 .map_err(|e| format!("or: {e}"))?;
             emit_bool_select(builder, either, i64_t)
         }
+        Expr::IsSymbol(x) => {
+            // symbolp = (tag == Symbol) OR (x == NIL) OR (x == T).
+            // NIL and T are Immediate-tagged, not Symbol-tagged, but
+            // are symbols per CL; everything else with Tag::Symbol
+            // (interned, uninterned, keywords) is a symbol too.
+            let v = emit_expr(context, builder, function, helpers, arity, params, locals, x)?;
+            let mask = i64_t.const_int(0b111, false);
+            let tag_bits = builder
+                .build_and(v, mask, "tag_bits")
+                .map_err(|e| format!("and: {e}"))?;
+            let sym_tag = i64_t.const_int(Tag::Symbol as u64, false);
+            let is_sym = builder
+                .build_int_compare(IntPredicate::EQ, tag_bits, sym_tag, "is_sym")
+                .map_err(|e| format!("icmp: {e}"))?;
+            let nil = i64_t.const_int(Word::NIL.raw(), false);
+            let is_nil = builder
+                .build_int_compare(IntPredicate::EQ, v, nil, "is_nil")
+                .map_err(|e| format!("icmp: {e}"))?;
+            let t_word = i64_t.const_int(Word::T.raw(), false);
+            let is_t = builder
+                .build_int_compare(IntPredicate::EQ, v, t_word, "is_t")
+                .map_err(|e| format!("icmp: {e}"))?;
+            let sym_or_nil = builder
+                .build_or(is_sym, is_nil, "sym_or_nil")
+                .map_err(|e| format!("or: {e}"))?;
+            let is_symbol = builder
+                .build_or(sym_or_nil, is_t, "is_symbol")
+                .map_err(|e| format!("or: {e}"))?;
+            emit_bool_select(builder, is_symbol, i64_t)
+        }
         Expr::If(cond, then_branch, else_branch) => {
             let cond_val = emit_expr(context, builder, function, helpers, arity, params, locals, cond)?;
             let nil_word = i64_t.const_int(Word::NIL.raw(), false);
@@ -3919,13 +3949,16 @@ fn emit_expr<'ctx>(
             Ok(call.try_as_basic_value().unwrap_basic().into_int_value())
         }
         Expr::Aref(v, i) => {
-            // ncl_aref_generic(v_word, i_word) — both tagged.
+            // ncl_aref_generic(mutator, v_word, i_word) — both tagged.
+            // The mutator (param 0) is passed so the error path can
+            // signal a catchable condition instead of panicking.
+            let mutator_arg = function.get_nth_param(0).unwrap();
             let vv = emit_expr(context, builder, function, helpers, arity, params, locals, v)?;
             let vi = emit_expr(context, builder, function, helpers, arity, params, locals, i)?;
             let call = builder
                 .build_call(
                     helpers.aref_generic,
-                    &[vv.into(), vi.into()],
+                    &[mutator_arg.into(), vv.into(), vi.into()],
                     "aref",
                 )
                 .map_err(|e| format!("build_call aref_generic: {e}"))?;

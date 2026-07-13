@@ -1,8 +1,17 @@
 [workspace]
 members = [
+    # Vendored dependencies (formerly external paths / git deps)
+    "crates/new-asm",
+    "crates/newgc-core",
+    "crates/newaudio-core",
+    "crates/newaudio-abc",
+    "crates/newaudio-win",
+    "crates/newaudio",
+    # Doc / Mermaid render stack (vendored from NewFactor)
     "crates/doc-crate",
     "crates/docpane",
     "crates/selkie",
+    # NCL core crates
     "src/ncl-cl",
     "src/ncl-compiler",
     "src/ncl-driver",
@@ -23,6 +32,12 @@ version = "0.0.0"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+
+# Cross-crate references used by the vendored newaudio family.
+[workspace.dependencies]
+newaudio-core = { path = "crates/newaudio-core" }
+newaudio-abc  = { path = "crates/newaudio-abc" }
+newaudio-win  = { path = "crates/newaudio-win" }
 
 [profile.release]
 opt-level = 3

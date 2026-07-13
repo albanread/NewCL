@@ -67,11 +67,35 @@
     ((vectorp seq) (coerce (%revappend (coerce seq 'list) nil) 'vector))
     (t (error "REVERSE: argument is not a sequence: ~S" seq))))
 
-(defun append (a b)
-  ;; Binary append. Variadic CL append lands when &rest does.
+(defun %append2 (a b)
+  ;; Binary append primitive: copy list A, sharing tail B. Used by the
+  ;; variadic `append` and other early stdlib that wants the 2-arg form
+  ;; without paying for &rest unpacking.
   (if (null a)
       b
-      (cons (car a) (append (cdr a) b))))
+      (cons (car a) (%append2 (cdr a) b))))
+
+(defun %append-lists (lists)
+  ;; Fold a list of lists right-to-left with %append2. The final list is
+  ;; shared (not copied); all earlier ones are copied — per CL APPEND.
+  (cond
+    ((null lists) nil)
+    ((null (cdr lists)) (car lists))
+    (t (%append2 (car lists) (%append-lists (cdr lists))))))
+
+(defun append (&optional a b &rest more)
+  "CL APPEND — concatenate lists into one. Every list but the last is
+   copied; the last is shared. The 0/1/2-arg cases bind directly (no
+   &rest list allocated) — that path is hot (e.g. Prolog clause
+   expansion). For these, B nil is unambiguous: (append), (append X),
+   and (append X nil) all reduce to A.
+     (append)        => NIL
+     (append X)      => X
+     (append X Y)    => copy X onto Y
+     (append X Y …)  => fold right, sharing the last list."
+  (cond
+    ((null more) (if (null b) a (%append2 a b)))
+    (t (%append2 a (%append-lists (cons b more))))))
 
 ;; -- mapcar, mapc, every, some (variadic) ----------------------------------
 ;;
@@ -831,6 +855,42 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
              (block ,block-name
                ,@(%tagbody-build-dispatch segments tag-alist block-name pc-var 0)
                -1))))))
+
+;; ── PROG / PROG* ──────────────────────────────────────────────────
+;;
+;; CLHS 5.3: PROG combines BLOCK, LET, and TAGBODY into one form —
+;;   (prog ({var | (var [init])}*) declaration* {tag | statement}*)
+;; expands to
+;;   (block nil (let (...) declaration* (tagbody {tag | statement}*))).
+;; PROG* is identical but binds sequentially (LET*). `return` exits the
+;; implicit `block nil`; the longjmp-based BLOCK unwinds cleanly through
+;; the tagbody driver (its own block is a gensym, never `nil`).
+
+(defun %prog-split-declares (body acc)
+  "Peel leading (declare …) forms off BODY. Returns (reversed-decls . rest)."
+  (if (and (consp body)
+           (consp (car body))
+           (eq (car (car body)) 'declare))
+      (%prog-split-declares (cdr body) (cons (car body) acc))
+      (cons acc body)))
+
+(defun %expand-prog (let-op varlist body)
+  "Build the (block nil (let-op … decls (tagbody …))) expansion."
+  (let* ((split (%prog-split-declares body nil))
+         (decls (reverse (car split)))
+         (forms (cdr split)))
+    (list 'block nil
+          (append (list let-op varlist)
+                  decls
+                  (list (cons 'tagbody forms))))))
+
+(defmacro prog (varlist &rest body)
+  "(prog ({var|(var [init])}*) decl* {tag|stmt}*) — parallel bindings."
+  (%expand-prog 'let varlist body))
+
+(defmacro prog* (varlist &rest body)
+  "(prog* ({var|(var [init])}*) decl* {tag|stmt}*) — sequential bindings."
+  (%expand-prog 'let* varlist body))
 
 ;; ── Extended LOOP ─────────────────────────────────────────────────
 ;;
@@ -2846,53 +2906,62 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
   "Return the test symbol HT was created with."
   (%ht-test ht))
 
+;; Hash-table bucket walks are written as SELF-TAIL-RECURSIVE helpers,
+;; NOT (loop …). A `(loop …)` lowers to `%native-loop` with a body
+;; thunk — `ncl_make_closure` allocates a fresh Function record in the
+;; (immortal) static area on EVERY call, which never gets reclaimed.
+;; gethash is on the hottest paths in the system (typep → gethash twice
+;; per call; symbol plists; struct/type/setf registries), so that thunk
+;; leaked ~2 closures per type-check — ~95 MB per Zebra solve. A tail
+;; call instead is turned into a tight in-place loop by the compiler's
+;; self-tail-call elimination: no thunk, no allocation, no leak.
+
+(defun %gethash-scan (bucket test key default)
+  (cond
+    ((null bucket) (values default nil))
+    ((%ht-keys-match test (car (car bucket)) key)
+     (values (cdr (car bucket)) t))
+    (t (%gethash-scan (cdr bucket) test key default))))
+
 (defun gethash (key ht &optional default)
   "Look up KEY in HT. Returns the associated value, or DEFAULT
    if none. Returns NIL as the secondary value when the key was
    absent, T when it was found."
-  (let ((bucket (%ht-bucket ht (%ht-bucket-index ht key)))
-        (test (%ht-test ht))
-        (result default)
-        (found nil))
-    (loop
-      (cond
-        ((null bucket) (return nil))
-        (t (let ((pair (car bucket)))
-             (cond
-               ((%ht-keys-match test (car pair) key)
-                (setq result (cdr pair))
-                (setq found t)
-                (setq bucket nil))
-               (t (setq bucket (cdr bucket))))))))
-    (if found
-        (values result t)
-        (values default nil))))
+  (%gethash-scan (%ht-bucket ht (%ht-bucket-index ht key))
+                 (%ht-test ht) key default))
+
+(defun %hash-set-scan (cur test key val)
+  ;; Update the matching pair in place; return T if found, NIL if not.
+  (cond
+    ((null cur) nil)
+    ((%ht-keys-match test (car (car cur)) key)
+     (setf (cdr (car cur)) val)
+     t)
+    (t (%hash-set-scan (cdr cur) test key val))))
 
 (defun %hash-set (ht key val)
   "Insert or update KEY → VAL. Returns VAL. Used by
    `(setf (gethash ...) ...)` lowering."
   (let* ((bi (%ht-bucket-index ht key))
          (bucket (%ht-bucket ht bi))
-         (test (%ht-test ht))
-         (cur bucket)
-         (done nil))
-    (loop
-      (cond
-        ((or done (null cur))
-         ;; Not found in walk — prepend a fresh pair to the
-         ;; bucket. Inserting at the head is O(1) and keeps the
-         ;; small-bucket hot path tight.
-         (cond
-           ((not done)
-            (%ht-set-bucket ht bi (cons (cons key val) bucket))
-            (%ht-bump-count ht 1)))
-         (return val))
-        (t (let ((pair (car cur)))
-             (cond
-               ((%ht-keys-match test (car pair) key)
-                (setf (cdr pair) val)
-                (setq done t))
-               (t (setq cur (cdr cur))))))))))
+         (test (%ht-test ht)))
+    (if (%hash-set-scan bucket test key val)
+        val
+        ;; Not found — prepend a fresh pair (O(1) head insert).
+        (progn
+          (%ht-set-bucket ht bi (cons (cons key val) bucket))
+          (%ht-bump-count ht 1)
+          val))))
+
+(defun %remhash-scan (prev cur ht test key)
+  ;; Splice CUR out of the chain (CUR follows PREV). T if removed.
+  (cond
+    ((null cur) nil)
+    ((%ht-keys-match test (car (car cur)) key)
+     (setf (cdr prev) (cdr cur))
+     (%ht-bump-count ht -1)
+     t)
+    (t (%remhash-scan cur (cdr cur) ht test key))))
 
 (defun remhash (key ht)
   "Remove KEY from HT. Returns T if it was present, NIL otherwise."
@@ -2906,51 +2975,35 @@ NCL does not support interactive restarts; this behaves like ETYPECASE."
        (%ht-set-bucket ht bi (cdr bucket))
        (%ht-bump-count ht -1)
        t)
-      (t
-       ;; Walk with prev/cur so we can splice cur out by setting
-       ;; (cdr prev) = (cdr cur).
-       (let ((prev bucket)
-             (cur (cdr bucket))
-             (found nil))
-         (loop
-           (cond
-             ((null cur) (return nil))
-             ((%ht-keys-match test (car (car cur)) key)
-              (setf (cdr prev) (cdr cur))
-              (%ht-bump-count ht -1)
-              (setq found t)
-              (setq cur nil))
-             (t (setq prev cur)
-                (setq cur (cdr cur)))))
-         found)))))
+      (t (%remhash-scan bucket (cdr bucket) ht test key)))))
+
+(defun %clrhash-loop (ht i n)
+  (cond
+    ((>= i n) nil)
+    (t (%ht-set-bucket ht i nil)
+       (%clrhash-loop ht (+ i 1) n))))
 
 (defun clrhash (ht)
   "Empty HT. Returns HT."
-  (let ((i 0)
-        (n (%ht-nbuckets ht)))
-    (loop
-      (cond
-        ((>= i n) (return nil))
-        (t (%ht-set-bucket ht i nil)
-           (setq i (+ i 1)))))
-    (setf (svref ht 1) 0)
-    ht))
+  (%clrhash-loop ht 0 (%ht-nbuckets ht))
+  (setf (svref ht 1) 0)
+  ht)
+
+(defun %maphash-bucket (fn bucket)
+  (cond
+    ((null bucket) nil)
+    (t (funcall fn (car (car bucket)) (cdr (car bucket)))
+       (%maphash-bucket fn (cdr bucket)))))
+
+(defun %maphash-loop (fn ht i n)
+  (cond
+    ((>= i n) nil)
+    (t (%maphash-bucket fn (%ht-bucket ht i))
+       (%maphash-loop fn ht (+ i 1) n))))
 
 (defun maphash (fn ht)
   "Call FN with each key and value of HT. Returns NIL."
-  (let ((i 0)
-        (n (%ht-nbuckets ht)))
-    (loop
-      (cond
-        ((>= i n) (return nil))
-        (t
-         (let ((bucket (%ht-bucket ht i)))
-           (loop
-             (cond
-               ((null bucket) (return nil))
-               (t (funcall fn (car (car bucket)) (cdr (car bucket)))
-                  (setq bucket (cdr bucket))))))
-         (setq i (+ i 1)))))))
+  (%maphash-loop fn ht 0 (%ht-nbuckets ht)))
 
 ;; -- Symbol property lists ---------------------------------------------------
 ;;

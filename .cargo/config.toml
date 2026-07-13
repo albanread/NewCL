@@ -1,11 +1,20 @@
-# Workstation-local LLVM install prefix. inkwell / llvm-sys read this
-# at build time to find headers and libs. The env-var name encodes the
-# major LLVM version, e.g. LLVM_SYS_221_PREFIX for the 22.1.x series.
+# Project-level Cargo configuration.
 #
-# Update the path if your LLVM install lives elsewhere. We use the
-# same install as our sibling project NewCP.
+# LLVM prerequisite: NCL's JIT backend (ncl-llvm) links against LLVM 22.1.
+# You must set LLVM_SYS_221_PREFIX to your LLVM install before building:
+#
+#   Windows (PowerShell):
+#     $env:LLVM_SYS_221_PREFIX = "C:\path\to\llvm\install"
+#     # or permanently:
+#     setx LLVM_SYS_221_PREFIX "C:\path\to\llvm\install"
+#
+#   Linux / macOS:
+#     export LLVM_SYS_221_PREFIX=/path/to/llvm/install
+#
+# Pre-built LLVM 22.1 binaries: https://github.com/llvm/llvm-project/releases
+# The trimmed install only needs the headers + LLVM-C.dll / libLLVM.so.
+
 [env]
-LLVM_SYS_221_PREFIX = "C:\\projects\\LLVM\\install"
 # Test threads need large stacks: each test loads the full stdlib
 # (macroexpansion + LLVM codegen recurse deeply in debug mode).
 # 8 MiB matches the ncl-driver worker thread.

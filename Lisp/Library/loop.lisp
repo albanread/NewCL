@@ -70,9 +70,11 @@
                '(for as with while until repeat named
                  initially finally do doing return
                  collect collecting append appending
+                 nconc nconcing
                  sum summing count counting
                  minimize minimizing maximize maximizing
-                 when unless if))))
+                 always never thereis
+                 when unless if else end))))
 
 ;; ── Tokeniser-as-cursor ───────────────────────────────────────────────────
 ;;
@@ -128,6 +130,8 @@
                         ; post-body-tests.
   (finally nil)         ; forms — run after natural completion
   (accumulators nil)    ; ((kind var . extras) ...) for the result computation
+  (result-override nil) ; (FORM) wrapper set by always/never/thereis to fix
+                        ; the loop's value on NORMAL completion; NIL = none
   )
 
 (defun %plan-add-with (plan var init)
@@ -186,14 +190,56 @@
              (%loop-pattern-bindings (cdr pattern) (list 'cdr source))))
     (t (error "loop: bad destructuring pattern ~A" pattern))))
 
+(defun %loop-for-spec-keyword-p (tok)
+  "T iff TOK introduces a FOR iteration path. Used to tell an iteration
+   keyword apart from a bare type designator sitting between the var and
+   its spec (e.g. the `fixnum` in `for i fixnum from 3`)."
+  (and (symbolp tok)
+       (member tok '(in on across being =
+                     from upfrom downfrom to upto below downto above by))))
+
 (defun %parse-for (plan cur)
   "Parse one or more parallel for-bindings joined by `and`:
      (for i from 1 to 3 and j in list ...)
-   All bindings step together; the loop ends when ANY iterator
-   terminates (NCL treats sequential for-clauses as parallel too)."
-  (%parse-one-for plan cur)
-  (when (%cur-eat-keyword? cur 'and)
-    (%parse-for plan cur)))
+   `and`-joined siblings step in PARALLEL: each sibling's step reads the
+   OLD values of the others. We get this by snapshotting iter-steps,
+   parsing the whole group, then re-emitting its added steps as one block
+   that captures every (setq VAR RHS)'s RHS into a temp first, then
+   assigns. A lone for-clause (no `and`) keeps today's behaviour, and
+   separate top-level `for` heads (each a fresh %parse-for call) remain
+   SEQUENTIAL, as CL specifies."
+  (let ((saved-steps (loop-plan-iter-steps plan))
+        (saw-and nil))
+    (%parse-one-for plan cur)
+    (loop
+      (if (%cur-eat-keyword? cur 'and)
+          (progn (setq saw-and t) (%parse-one-for plan cur))
+          (return nil)))
+    (when saw-and
+      ;; Peel the steps this parallel group added (front-to-back =
+      ;; source order), then rebuild as a single parallel-step block.
+      (let ((added nil) (p (loop-plan-iter-steps plan)))
+        (loop
+          (when (eq p saved-steps) (return nil))
+          (setq added (cons (car p) added))
+          (setq p (cdr p)))
+        (setf (loop-plan-iter-steps plan) saved-steps)
+        (let ((binds nil) (assigns nil))
+          (dolist (f added)
+            (cond
+              ;; simple (setq VAR RHS): capture RHS into a temp so a
+              ;; sibling reads VAR's OLD value, then assign from the temp.
+              ((and (consp f) (eq (car f) 'setq))
+               (let ((g (gensym "PSTEP-")))
+                 (setq binds   (cons (list g (caddr f)) binds))
+                 (setq assigns (cons (list 'setq (cadr f) g) assigns))))
+              ;; guarded steps (the `across` index/element pair) pass
+              ;; through unchanged — they already self-order.
+              (t (setq assigns (cons f assigns)))))
+          (%plan-add-step plan
+            (if binds
+                `(let ,(reverse binds) ,@(reverse assigns) nil)
+                `(progn ,@(reverse assigns) nil))))))))
 
 (defun %parse-one-for (plan cur)
   "(for VAR <spec>). spec is one of:
@@ -209,10 +255,16 @@
    doesn't yet act on CL type declarations, and accepting+ignoring
    matches what the test corpus assumes."
   (let ((var (%cur-eat! cur)))
-    ;; Skip optional `of-type TYPE`. Token-eater eats both; the
-    ;; declared type is discarded.
-    (when (%cur-eat-keyword? cur 'of-type)
-      (%cur-eat! cur))
+    ;; Optional type designator between VAR and its iteration spec
+    ;; (CL 6.1.1.7): either `of-type TYPE`, or a BARE designator like
+    ;; `fixnum`/`float`/`t`/`nil`/compound. NCL ignores declared types,
+    ;; so eat and discard. A bare type is simply whatever sits there that
+    ;; is NOT one of the for-spec introducers (in/on/=/from/…).
+    (cond
+      ((%cur-eat-keyword? cur 'of-type) (%cur-eat! cur))
+      ((and (not (%cur-empty? cur))
+            (not (%loop-for-spec-keyword-p (%cur-peek cur))))
+       (%cur-eat! cur)))
     (cond
       ;; for VAR in LIST  (VAR may be a destructuring pattern)
       ((%cur-eat-keyword? cur 'in)
@@ -439,6 +491,14 @@
   (when (%cur-eat-keyword? cur 'into)
     (%cur-eat! cur)))
 
+(defun %skip-of-type (cur)
+  "Consume an optional `of-type TYPE` modifier that may trail an
+   accumulation clause (CL 6.1.3: `sum form [into var] [of-type type]`).
+   NCL boxes values uniformly, so the declared type is advisory — parse
+   it and discard."
+  (when (%cur-eat-keyword? cur 'of-type)
+    (%cur-eat! cur)))
+
 (defun %parse-collect (plan cur)
   (let* ((expr (%cur-eat! cur))
          (into (%parse-into? cur))
@@ -455,10 +515,21 @@
     (%plan-add-body plan `(setq ,acc (append* ,acc ,expr)))
     (%plan-add-accumulator plan 'append acc into)))
 
+(defun %parse-nconc (plan cur)
+  ;; Like append, but splices destructively (CL 6.1.3). Only lists the
+  ;; body actually conses are mutated; the accumulator order is direct.
+  (let* ((expr (%cur-eat! cur))
+         (into (%parse-into? cur))
+         (acc (or into (gensym "NCONC-"))))
+    (%plan-add-with plan acc nil)
+    (%plan-add-body plan `(setq ,acc (nconc ,acc ,expr)))
+    (%plan-add-accumulator plan 'append acc into)))
+
 (defun %parse-sum (plan cur)
   (let* ((expr (%cur-eat! cur))
          (into (%parse-into? cur))
          (acc (or into (gensym "SUM-"))))
+    (%skip-of-type cur)
     (%plan-add-with plan acc 0)
     (%plan-add-body plan `(setq ,acc (+ ,acc ,expr)))
     (%plan-add-accumulator plan 'sum acc into)))
@@ -467,6 +538,7 @@
   (let* ((expr (%cur-eat! cur))
          (into (%parse-into? cur))
          (acc (or into (gensym "COUNT-"))))
+    (%skip-of-type cur)
     (%plan-add-with plan acc 0)
     (%plan-add-body plan `(when ,expr (setq ,acc (+ ,acc 1))))
     (%plan-add-accumulator plan 'count acc into)))
@@ -476,6 +548,7 @@
          (into (%parse-into? cur))
          (acc (or into (gensym "MIN-")))
          (val (gensym "V-")))
+    (%skip-of-type cur)
     (%plan-add-with plan acc nil)
     (%plan-add-body plan
                     `(let ((,val ,expr))
@@ -488,6 +561,7 @@
          (into (%parse-into? cur))
          (acc (or into (gensym "MAX-")))
          (val (gensym "V-")))
+    (%skip-of-type cur)
     (%plan-add-with plan acc nil)
     (%plan-add-body plan
                     `(let ((,val ,expr))
@@ -519,6 +593,34 @@
       (t (%plan-add-finally plan (%cur-eat! cur))))))
 
 ;; (return EXPR) — exit with EXPR. Returns from the implicit block.
+;; ── Boolean termination clauses (CL 6.1.4) ───────────────────────────────
+;;
+;;   always EXPR  — value T unless some EXPR is NIL, then exit NIL now.
+;;   never  EXPR  — value T unless some EXPR is non-NIL, then exit NIL now.
+;;   thereis EXPR — value NIL unless some EXPR is non-NIL, then exit it now.
+;;
+;; Early exit is a hard `return-from` (the enclosing FINALLY is skipped, per
+;; spec). On normal completion the loop's value is fixed via result-override.
+
+(defun %parse-always (plan cur)
+  (let ((expr (%cur-eat! cur))
+        (name (or (loop-plan-name plan) 'nil)))
+    (%plan-add-body plan `(unless ,expr (return-from ,name nil)))
+    (setf (loop-plan-result-override plan) (list t))))
+
+(defun %parse-never (plan cur)
+  (let ((expr (%cur-eat! cur))
+        (name (or (loop-plan-name plan) 'nil)))
+    (%plan-add-body plan `(when ,expr (return-from ,name nil)))
+    (setf (loop-plan-result-override plan) (list t))))
+
+(defun %parse-thereis (plan cur)
+  (let ((expr (%cur-eat! cur))
+        (name (or (loop-plan-name plan) 'nil))
+        (v (gensym "THEREIS-")))
+    (%plan-add-body plan `(let ((,v ,expr)) (when ,v (return-from ,name ,v))))
+    (setf (loop-plan-result-override plan) (list nil))))
+
 (defun %parse-return (plan cur)
   (let ((expr (%cur-eat! cur))
         (name (or (loop-plan-name plan) 'nil)))
@@ -529,29 +631,60 @@
 ;; Implementation: save the body list (a shared tail, since adders
 ;; only cons onto the front), parse the sub-clause, then peel the
 ;; new front cells off as the additions and wrap them.
-(defun %parse-when-unless (plan cur negate)
-  (let* ((expr (%cur-eat! cur))
-         (saved-tail (loop-plan-body plan)))
+(defun %parse-cond-group (plan cur it-var)
+  "Parse one conditional sub-clause plus any `and`-joined siblings, peel
+   the body forms they added (restoring source order), substitute the
+   anaphoric `it` with IT-VAR throughout, and return them. Leaves the
+   plan body trimmed back to its pre-group state. Mirrors the saved-tail
+   EQ-peel idiom that conditional parsing has always used."
+  (let ((saved-tail (loop-plan-body plan)))
     (%parse-one-clause plan cur)
-    ;; body is reverse-accumulated: everything in front of
-    ;; SAVED-TAIL (compared by EQ) was added by the sub-clause.
-    ;; Pushing front-to-back restores the additions' source order.
+    (loop
+      (if (%cur-eat-keyword? cur 'and)
+          (%parse-one-clause plan cur)
+          (return nil)))
     (let ((added nil)
           (p (loop-plan-body plan)))
       (loop
         (when (eq p saved-tail) (return nil))
         (setq added (cons (car p) added))
         (setq p (cdr p)))
-      ;; Trim plan body back to its pre-sub-clause state.
       (setf (loop-plan-body plan) saved-tail)
-      ;; Wrap the additions in an if.
-      (let ((wrapped
-             (cond
-               ((null added) nil)
-               (negate `(unless ,expr ,@added))
-               (t      `(when ,expr ,@added)))))
-        (when wrapped
-          (%plan-add-body plan wrapped))))))
+      (mapcar (lambda (f) (%loop-subst-it f it-var)) added))))
+
+(defun %parse-when-unless (plan cur negate)
+  "Parse `when/if/unless TEST clause… [and clause…]… [else clause…] [end]`.
+   TEST is evaluated EXACTLY ONCE and bound to the anaphoric `it`, visible
+   to both branches (so `when (member x l) collect it` collects the test
+   value). `negate` (for `unless`) puts the primary clauses in the FALSE
+   branch. Nested when/unless/if work because %parse-one-clause dispatches
+   conditionals back here, and the resulting guarded form is captured by
+   the enclosing %parse-cond-group like any other sub-clause."
+  (let* ((expr (%cur-eat! cur))
+         (it-var (gensym "IT-"))
+         (then (%parse-cond-group plan cur it-var))
+         (else (when (%cur-eat-keyword? cur 'else)
+                 (%parse-cond-group plan cur it-var))))
+    ;; Optional closing `end` for this conditional group.
+    (%cur-eat-keyword? cur 'end)
+    ;; Map then/else onto the true/false branches (`unless` swaps them).
+    ;; Build the narrowest guard so we never emit (if X nil nil) or an
+    ;; empty-binding let, both of which the lowerer has historically
+    ;; disliked.
+    (let* ((true-forms  (if negate else then))
+           (false-forms (if negate then else))
+           (guard
+            (cond
+              ((and true-forms false-forms)
+               `(let ((,it-var ,expr))
+                  (if ,it-var (progn ,@true-forms) (progn ,@false-forms))))
+              (true-forms
+               `(let ((,it-var ,expr)) (when ,it-var ,@true-forms)))
+              (false-forms
+               `(let ((,it-var ,expr)) (unless ,it-var ,@false-forms)))
+              (t nil))))
+      (when guard
+        (%plan-add-body plan guard)))))
 
 ;; Helper used by when/unless to parse exactly one sub-clause.
 (defun %parse-one-clause (plan cur)
@@ -562,6 +695,8 @@
       ((eq head 'collecting) (%parse-collect plan cur))
       ((eq head 'append)     (%parse-append plan cur))
       ((eq head 'appending)  (%parse-append plan cur))
+      ((eq head 'nconc)      (%parse-nconc plan cur))
+      ((eq head 'nconcing)   (%parse-nconc plan cur))
       ((eq head 'sum)        (%parse-sum plan cur))
       ((eq head 'summing)    (%parse-sum plan cur))
       ((eq head 'count)      (%parse-count plan cur))
@@ -571,6 +706,13 @@
       ((eq head 'maximize)   (%parse-maximize plan cur))
       ((eq head 'maximizing) (%parse-maximize plan cur))
       ((eq head 'return)     (%parse-return plan cur))
+      ;; Nested conditionals: a when/unless/if may itself be a sub-clause
+      ;; of an enclosing conditional. Recurse into %parse-when-unless,
+      ;; which adds its guarded form to the body; the enclosing
+      ;; %parse-cond-group then captures and re-wraps it.
+      ((eq head 'when)       (%parse-when-unless plan cur nil))
+      ((eq head 'unless)     (%parse-when-unless plan cur t))
+      ((eq head 'if)         (%parse-when-unless plan cur nil))
       (t (error "loop: unsupported sub-clause head ~A" head)))))
 
 ;; ── Top-level parser ──────────────────────────────────────────────────────
@@ -600,6 +742,8 @@
                ((eq head 'collecting) (%parse-collect plan cur))
                ((eq head 'append)     (%parse-append plan cur))
                ((eq head 'appending)  (%parse-append plan cur))
+               ((eq head 'nconc)      (%parse-nconc plan cur))
+               ((eq head 'nconcing)   (%parse-nconc plan cur))
                ((eq head 'sum)        (%parse-sum plan cur))
                ((eq head 'summing)    (%parse-sum plan cur))
                ((eq head 'count)      (%parse-count plan cur))
@@ -611,6 +755,9 @@
                ((eq head 'when)       (%parse-when-unless plan cur nil))
                ((eq head 'unless)     (%parse-when-unless plan cur t))
                ((eq head 'if)         (%parse-when-unless plan cur nil))
+               ((eq head 'always)     (%parse-always plan cur))
+               ((eq head 'never)      (%parse-never plan cur))
+               ((eq head 'thereis)    (%parse-thereis plan cur))
                ((eq head 'return)     (%parse-return plan cur))
                (t (error "loop: unknown clause head ~A" head)))))))
     plan))
@@ -632,12 +779,55 @@
        (t `(return-from ,name ,(cadr form)))))
     (t (mapcar (lambda (sub) (%loop-rewrite-return sub name)) form))))
 
+(defun %loop-subst-it (form it-var)
+  "Replace the anaphoric symbol `it` with IT-VAR throughout FORM. Stops
+   descending into nested (loop …)/(block …) like %loop-rewrite-return so
+   an inner construct's own `it` (already substituted to its own gensym
+   when it was parsed) is never re-bound. CLHS: `it` names the value of
+   the nearest enclosing when/unless/if test."
+  (cond
+    ((eq form 'it) it-var)
+    ((atom form) form)
+    ((eq (car form) 'loop) form)
+    ((eq (car form) 'block) form)
+    (t (mapcar (lambda (sub) (%loop-subst-it sub it-var)) form))))
+
+(defun %loop-uses-finish-p (form)
+  "T iff FORM contains a `(loop-finish)` belonging to THIS loop (stops at
+   nested loop/block, mirroring %loop-rewrite-finish). Lets %loop-emit skip
+   the finish block + rewrite entirely for the common no-loop-finish case —
+   an empty (block …) per loop is not free."
+  (cond
+    ((atom form) nil)
+    ((eq (car form) 'loop) nil)
+    ((eq (car form) 'block) nil)
+    ((and (eq (car form) 'loop-finish) (null (cdr form))) t)
+    (t (or (%loop-uses-finish-p (car form))
+           (%loop-uses-finish-p (cdr form))))))
+
+(defun %loop-rewrite-finish (form tag)
+  "Rewrite `(loop-finish)` to `(return-from TAG nil)` throughout FORM,
+   so it jumps past the iteration to the loop's finally/result. Stops at
+   nested (loop …)/(block …) — an inner construct's loop-finish is its
+   own (CLHS: loop-finish refers to the innermost lexically-enclosing
+   extended LOOP)."
+  (cond
+    ((atom form) form)
+    ((eq (car form) 'loop) form)
+    ((eq (car form) 'block) form)
+    ((and (eq (car form) 'loop-finish) (null (cdr form)))
+     `(return-from ,tag nil))
+    (t (mapcar (lambda (sub) (%loop-rewrite-finish sub tag)) form))))
+
 (defun %loop-result-form (plan)
   "Pick the final-value form. CL says the value of the last
    accumulator clause; collect's accumulator was built with cons-
    prepend so we reverse it back. Accumulators with an `into` variable
    bind that variable instead and contribute NOTHING to the loop value
-   — the user retrieves them via `finally`."
+   — the user retrieves them via `finally`. A boolean clause
+   (always/never/thereis) overrides the value on normal completion."
+  (when (loop-plan-result-override plan)
+    (return-from %loop-result-form (car (loop-plan-result-override plan))))
   (let ((anon (remove-if (lambda (a) (cddr a))   ; cddr = the into-var, if any
                          ;; stored newest-first; restore source order
                          ;; so (car (last anon)) is the LAST clause.
@@ -677,6 +867,16 @@
          finally-forms ...
          result-form))"
   (let* ((name (or (loop-plan-name plan) 'nil))
+         ;; A dedicated block tag so (loop-finish) can jump past the
+         ;; iteration (and any `initially`) to the finally/result, i.e.
+         ;; terminate the loop *normally* — distinct from `return`, which
+         ;; %loop-rewrite-return sends to the outer NAME block.
+         (finish-tag (gensym "LOOP-FINISH-"))
+         ;; Only pay for the loop-finish block + rewrite when a
+         ;; (loop-finish) is actually present (rare). Otherwise the loop
+         ;; expands exactly as before — no extra block on the hot path.
+         (uses-finish (or (some #'%loop-uses-finish-p (loop-plan-body plan))
+                          (some #'%loop-uses-finish-p (loop-plan-initially plan))))
          ;; Plan list fields are reverse-accumulated (see the plan
          ;; structure comment) — restore source order here, once.
          (all-bindings
@@ -704,10 +904,14 @@
          ;; the implicit block. The body's accumulator-setq forms
          ;; we added don't contain `return`, but it's harmless to
          ;; walk them.
-         (body (mapcar (lambda (f) (%loop-rewrite-return f name))
+         (body (mapcar (lambda (f)
+                         (let ((r (%loop-rewrite-return f name)))
+                           (if uses-finish (%loop-rewrite-finish r finish-tag) r)))
                        (reverse (loop-plan-body plan))))
          (steps (reverse (loop-plan-iter-steps plan)))
-         (initially (mapcar (lambda (f) (%loop-rewrite-return f name))
+         (initially (mapcar (lambda (f)
+                              (let ((r (%loop-rewrite-return f name)))
+                                (if uses-finish (%loop-rewrite-finish r finish-tag) r)))
                             (reverse (loop-plan-initially plan))))
          (finally (mapcar (lambda (f) (%loop-rewrite-return f name))
                           (reverse (loop-plan-finally plan))))
@@ -739,17 +943,28 @@
                `(cond
                   (,post-test-form (return nil))
                   ,step-clause)))))
-      `(block ,name
-         (let* ,all-bindings
-           ,@initially
-           (loop
-             (cond
-               (,test-form (return nil))
-               (t ,@body
-                  ,post-test-cond)))
-           ,@(%loop-collect-into-reversals plan)
-           ,@finally
-           ,result)))))
+      (let* ((loop-form
+              `(loop
+                 (cond
+                   (,test-form (return nil))
+                   (t ,@body
+                      ,post-test-cond))))
+             ;; Wrap `initially` + the iteration in FINISH-TAG only when
+             ;; (loop-finish) is used, so it can jump straight to the
+             ;; reversals/finally/result. The common case emits the forms
+             ;; directly — no extra block.
+             (iter-section
+              (if uses-finish
+                  (list (append (list 'block finish-tag)
+                                initially
+                                (list loop-form)))
+                  (append initially (list loop-form)))))
+        `(block ,name
+           (let* ,all-bindings
+             ,@iter-section
+             ,@(%loop-collect-into-reversals plan)
+             ,@finally
+             ,result))))))
 
 ;; ── Macro redefinition ────────────────────────────────────────────────────
 ;;

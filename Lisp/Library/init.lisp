@@ -31,6 +31,7 @@
 (require 'symbols)                       ; symbol-plist/get/remprop, destructuring-bind, prog1/2
 (require 'lists)                         ; mapl/maplist/mapcan/mapcon, pairlis/acons, tailp/ldiff
 (require 'places)                        ; (setf first/rest/cddr/...) + defsetf short form
+(require 'structures)                    ; full defstruct: options, :include, BOA, :type list
 (require 'numbers)                       ; polymorphic floor/ceiling/round/truncate/mod/rem
 (require 'boole)                         ; boole-* constants + boole fn + derived logops
 (require 'bits)                          ; byte/ldb/dpb/mask-field/deposit-field

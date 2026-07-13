@@ -902,6 +902,11 @@ fn lower_call_in_mut(
         "CONSP" => unary_op(&head_name, args, env, coord, Expr::is_cons),
         "ATOM" => unary_op(&head_name, args, env, coord, Expr::is_atom),
         "LISTP" => unary_op(&head_name, args, env, coord, Expr::is_listp),
+        // SYMBOLP: tag==Symbol OR nil OR t. Intrinsified (like the
+        // predicates above) so it compiles to a few tag tests instead
+        // of `(typep x 'symbol)`, which did two GETHASH lookups per
+        // call — a hot-path cost in unification-heavy code.
+        "SYMBOLP" => unary_op(&head_name, args, env, coord, Expr::is_symbol),
         // EQL is NOT inlined like EQ. EQ is object identity (a single
         // word compare); EQL additionally treats two numbers of the
         // same type and value as equal (floats/bignums/ratios/complex
@@ -916,8 +921,13 @@ fn lower_call_in_mut(
             binary_op(&head_name, args, env, coord, Expr::string_char)
         }
         // (aref v i) / (svref v i) — polymorphic read; runtime
-        // tag-dispatches between strings and vectors.
-        "AREF" | "SVREF" => {
+        // tag-dispatches between strings and vectors. Only the 1-index
+        // form is a fast primitive; an N-index (multidimensional) aref
+        // falls through to an ordinary late-bound call on the AREF
+        // function cell so the form COMPILES rather than aborting the
+        // chapter at load (multidim arrays are not yet supported at
+        // runtime, so such a call signals a catchable condition).
+        "AREF" | "SVREF" if args.len() == 2 => {
             binary_op(&head_name, args, env, coord, Expr::aref)
         }
         "LET" => lower_let(args, env, coord),
@@ -1495,7 +1505,7 @@ fn form_inline_safe(form: &Value, coord: &Arc<GcCoordinator>, env: Option<&Local
         | "PSETQ"
         | "+" | "-" | "*" | "<" | ">" | "<=" | ">=" | "=" | "/="
         | "EQ" | "EQL" | "EQUAL" | "CONS" | "LIST" | "CAR" | "CDR"
-        | "FIRST" | "REST" | "NULL" | "CONSP" | "ATOM" | "LISTP"
+        | "FIRST" | "REST" | "NULL" | "CONSP" | "ATOM" | "LISTP" | "SYMBOLP"
         | "LENGTH" | "STRING=" | "CHAR" | "STRING-CHAR" | "AREF" | "SVREF" => {
             items[1..].iter().all(|f| form_inline_safe(f, coord, env))
         }
@@ -2034,15 +2044,23 @@ fn lower_cond(
         ));
     }
     let test = lower_in_mut(&clause[0], env, coord)?;
-    // Body: implicit progn of forms after the test.
-    // CL's `(test)` (clause with only a test) would return test's
-    // value if non-nil; defer that case.
-    let body = if clause.len() == 1 {
-        return Err(CompileError::NotImplemented(
-            "cond clause with only a test (no body) not yet supported"
-                .to_string(),
+    // CLHS: a clause with only a test `(test)` returns the test's value
+    // when it is non-nil, else falls through. The test must be evaluated
+    // exactly once, so — like `or` — bind it to a synthetic local and
+    // reuse it for both the predicate and the result:
+    //   (let ((tmp test)) (if tmp tmp rest))
+    if clause.len() == 1 {
+        let cp = env.checkpoint();
+        let tmp_idx = env.push_local(std::sync::Arc::from("__cond_tmp__"));
+        let rest = lower_cond(&clauses[1..], env, coord)?;
+        env.restore(cp);
+        return Ok(Expr::let_(
+            vec![test],
+            Expr::if_(Expr::Local(tmp_idx), Expr::Local(tmp_idx), rest),
         ));
-    } else if clause.len() == 2 {
+    }
+    // Body: implicit progn of forms after the test.
+    let body = if clause.len() == 2 {
         lower_in_mut(&clause[1], env, coord)?
     } else {
         let lowered: Result<Vec<_>, _> = clause[1..]
@@ -2269,14 +2287,11 @@ fn lower_setf(
             let value = lower_in_mut(value_form, env, coord)?;
             Ok(Expr::set_cdr(cons, value))
         }
-        "AREF" | "SVREF" => {
-            if place_args.len() != 2 {
-                return Err(CompileError::BadArity {
-                    head: format!("setf {place_head}"),
-                    expected: "(aref v i)",
-                    got: place_args.len(),
-                });
-            }
+        // Only the 1-index form is a fast primitive; an N-index
+        // (multidimensional) (setf (aref v i j …) val) falls through to
+        // the generic %SETF-AREF rewrite below so the form COMPILES
+        // (multidim arrays are unsupported at runtime → catchable error).
+        "AREF" | "SVREF" if place_args.len() == 2 => {
             // Polymorphic — runtime tag dispatches to vector or string.
             let v = lower_in_mut(&place_args[0], env, coord)?;
             let idx = lower_in_mut(&place_args[1], env, coord)?;
@@ -2775,12 +2790,34 @@ fn lower_nested_defun(
             args.len()
         )));
     }
-    let name = match &args[0] {
+    let name: Arc<str> = match &args[0] {
         Value::Symbol(s) => Arc::clone(&s.name),
+        // `(defun (setf NAME) …)` — accepted here exactly as in the
+        // top-level path (`match_defun_like`): mangle to `%SETF-NAME`
+        // so the generic-setf fallback (`(setf (NAME …) v)` →
+        // `(%SETF-NAME v …)`) finds the writer. Needed because the
+        // long form of `defsetf` expands to a non-top-level
+        // `(defun (setf NAME) …)`.
+        Value::Cons(_) => {
+            let parts = list_to_vec(&args[0])?;
+            let ok = parts.len() == 2
+                && matches!(&parts[0], Value::Symbol(s) if &*s.name == "SETF");
+            match (ok, parts.get(1)) {
+                (true, Some(Value::Symbol(tgt))) => {
+                    Arc::from(format!("%SETF-{}", tgt.name))
+                }
+                _ => {
+                    return Err(CompileError::BadDefun(format!(
+                        "nested defun name must be a symbol or (SETF SYMBOL); \
+                         got {:?}",
+                        args[0]
+                    )));
+                }
+            }
+        }
         other => {
             return Err(CompileError::BadDefun(format!(
-                "nested defun name must be a symbol \
-                 (the (setf …) shape is top-level only); got {other:?}"
+                "nested defun name must be a symbol or (SETF SYMBOL); got {other:?}"
             )));
         }
     };

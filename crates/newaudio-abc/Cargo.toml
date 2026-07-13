@@ -1,0 +1,12 @@
+[package]
+name = "newaudio-abc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ABC notation parser and MIDI generator/writer."
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest = "1"

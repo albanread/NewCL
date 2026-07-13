@@ -1,0 +1,27 @@
+;;;; zebra-gc.lisp — zebra solve with full GC pause-time accounting.
+(require 'time)
+(load "demos/prolog.lisp")
+
+(defun stat (k) (getf (gc-stats) k))
+
+(format t "~%=== Timed zebra solve w/ GC pause accounting ===~%")
+(let* ((t0     (get-internal-real-time))
+       (g0     (stat :minor-gcs))
+       (p0     (stat :bytes-promoted-total))
+       (pause0 (stat :total-minor-pause-us))
+       (oldu0  (stat :old-used))
+       (r      (solve '(zebra ?houses ?water ?zebra)))
+       (t1     (get-internal-real-time)))
+  (declare (ignore r))
+  (let ((wall-ns (- t1 t0))
+        (pause-us (- (stat :total-minor-pause-us) pause0)))
+    (format t "  wall time        : ~A s~%" (%seconds wall-ns))
+    (format t "  minor GC cycles  : ~A~%" (- (stat :minor-gcs) g0))
+    (format t "  bytes promoted   : ~A~%" (- (stat :bytes-promoted-total) p0))
+    (format t "  old-used delta   : ~A~%" (- (stat :old-used) oldu0))
+    (format t "  GC pause total   : ~A us  (~A ms)~%" pause-us (truncate pause-us 1000))
+    (format t "  max minor pause  : ~A us~%" (stat :max-minor-pause-us))
+    (format t "  young-cap        : ~A~%" (stat :young-cap))
+    (format t "  GC %% of wall     : ~A %%~%"
+            (truncate (* 100 (* pause-us 1000)) wall-ns))))
+(format t "done.~%")
