@@ -1,0 +1,16 @@
+[package]
+name = "newaudio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NewAudio: game-focused sound synthesis and ABC notation playback for Windows."
+
+[lints]
+workspace = true
+
+[dependencies]
+newaudio-core = { workspace = true }
+newaudio-abc  = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+newaudio-win  = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "newaudio-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sample-rate-agnostic sound synthesis: waveforms, envelopes, presets, WAV writer."
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest = "1"
