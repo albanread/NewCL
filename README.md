@@ -108,30 +108,103 @@ still differ), the `getf` / `ldb` setf places, and parts of the type system
 
 ## Building & running
 
-**Prerequisites:** a Rust toolchain (stable, 2024 edition) and **LLVM 22.1**.
-NCL's JIT backend (`ncl-llvm`) links against LLVM-C. You must point
-`llvm-sys` at your LLVM install before building:
+### Step 1 — Rust toolchain
+
+Install Rust stable via [rustup](https://rustup.rs/). NCL requires the
+**2024 edition** (stable 1.85 or later).
+
+### Step 2 — LLVM 22.1
+
+NCL's JIT backend links against **LLVM 22.1** via `llvm-sys`. This is the
+only prerequisite not bundled in the repo.
+
+**Option A — download a pre-built release** (quickest):
+Download the LLVM 22.1.x release archive from
+https://github.com/llvm/llvm-project/releases and unpack it. You only
+need the `include/`, `lib/`, and `bin/` directories (the `LLVM-C` shared
+library / import lib + headers). A trimmed install is fine; you do not
+need Clang or the LLVM tools themselves.
+
+**Option B — build LLVM from source** (full control, takes ~30 min):
+```
+cmake -S llvm -B build -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DLLVM_TARGETS_TO_BUILD=X86 \
+      -DLLVM_BUILD_LLVM_DYLIB=ON \
+      -DCMAKE_INSTALL_PREFIX=/path/to/install
+cmake --build build --target install
+```
+
+Once you have the install directory, point `llvm-sys` at it by setting
+an environment variable **before** running `cargo build`:
 
 ```
-# Windows (PowerShell — set once, then open a new shell):
+# Windows — set permanently (takes effect in new shells):
 setx LLVM_SYS_221_PREFIX "C:\path\to\llvm22\install"
+
+# Windows — current session only:
+$env:LLVM_SYS_221_PREFIX = "C:\path\to\llvm22\install"
 
 # Linux / macOS:
 export LLVM_SYS_221_PREFIX=/path/to/llvm22/install
 ```
 
-Pre-built LLVM 22.1 binaries are available at
-https://github.com/llvm/llvm-project/releases — only the headers and
-`LLVM-C.dll` / `libLLVM.so` are needed (a trimmed install is fine).
+The variable name encodes the major version (`221` = LLVM 22.1). If you
+get a build error like *"No suitable version of LLVM was found"*, this
+variable is either unset or points at the wrong directory.
 
-Everything else — all Rust source, the GC, audio, and doc-render
-crates — is vendored in this repo under `crates/`. No sibling
-projects or network fetches are required beyond the crates.io registry.
+### Step 3 — clone and build
+
+Everything else is in this repo. No sibling projects, no extra git
+fetches — all Rust crates (GC engine, audio, doc renderer, ASM helpers)
+are vendored under `crates/`, and `cargo` fetches crates.io deps
+automatically.
 
 ```
-cargo build --release                                          # console REPL  -> target/release/ncl.exe
-cargo build --release --features gui-app -p ncl-driver        # GUI build     -> target/release/ncl.exe
+git clone https://github.com/albanread/NewCL.git
+cd NewCL
+
+# Console REPL / batch runner:
+cargo build --release
+# → target/release/ncl.exe  (Windows)  /  target/release/ncl  (Linux)
+
+# Windows GUI build (MDI shell, iGui, Direct2D):
+cargo build --release --features gui-app -p ncl-driver
+# → target/release/ncl.exe
 ```
 
-In a packaged release the console binary is shipped as `nclterm.exe` and
-the GUI binary as `ncl.exe`. Run a program with `ncl.exe -l file.lisp`.
+### Running
+
+```
+# Interactive REPL:
+ncl.exe
+
+# Load and run a Lisp file:
+ncl.exe -l demos/prolog.lisp
+
+# Run the ANSI conformance suite:
+ncl.exe -l demos/ansi-runner.lisp
+
+# Timed benchmark:
+ncl.exe -l bench/zebra-time.lisp
+```
+
+In a packaged release the console binary is `nclterm.exe` and the GUI
+binary is `ncl.exe`.
+
+### Repository layout
+
+```
+src/          NCL compiler, runtime, reader, LLVM codegen, loader, driver
+Lisp/         Standard library: core.lisp (embedded) + Library/ (disk-loaded)
+crates/       Vendored dependencies (all in-repo, no external paths needed)
+  newgc-core      Generational page-heap GC engine
+  new-asm         Shared ASM-procedure helpers for JIT crates
+  newaudio*       PCM synthesis + ABC parser + Windows waveOut mixer
+  docpane         Direct2D markdown + Mermaid diagram renderer
+  selkie          Mermaid diagram parser (text → IR)
+  doc-crate       Headless doc-snapshot tool (CI / review aid)
+demos/        Runnable Lisp programs and the ANSI test runner
+bench/        Benchmark scripts
+docs/         Design notes and conformance tracking
+```
