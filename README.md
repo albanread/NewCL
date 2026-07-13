@@ -108,12 +108,29 @@ still differ), the `getf` / `ldb` setf places, and parts of the type system
 
 ## Building & running
 
-Requires a Rust toolchain and LLVM (see [MANIFESTO.md](MANIFESTO.md) /
-the build notes).
+**Prerequisites:** a Rust toolchain (stable, 2024 edition) and **LLVM 22.1**.
+NCL's JIT backend (`ncl-llvm`) links against LLVM-C. You must point
+`llvm-sys` at your LLVM install before building:
 
 ```
-cargo build --release                              # console REPL  -> target/release/ncl.exe
-cargo build --release --features gui-app -p ncl-driver   # GUI build -> target/release/ncl.exe
+# Windows (PowerShell — set once, then open a new shell):
+setx LLVM_SYS_221_PREFIX "C:\path\to\llvm22\install"
+
+# Linux / macOS:
+export LLVM_SYS_221_PREFIX=/path/to/llvm22/install
+```
+
+Pre-built LLVM 22.1 binaries are available at
+https://github.com/llvm/llvm-project/releases — only the headers and
+`LLVM-C.dll` / `libLLVM.so` are needed (a trimmed install is fine).
+
+Everything else — all Rust source, the GC, audio, and doc-render
+crates — is vendored in this repo under `crates/`. No sibling
+projects or network fetches are required beyond the crates.io registry.
+
+```
+cargo build --release                                          # console REPL  -> target/release/ncl.exe
+cargo build --release --features gui-app -p ncl-driver        # GUI build     -> target/release/ncl.exe
 ```
 
 In a packaged release the console binary is shipped as `nclterm.exe` and
